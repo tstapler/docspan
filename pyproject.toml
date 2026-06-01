@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "markgate"
+version = "0.1.0"
+description = "Push and pull markdown to Google Docs and Confluence from a single CLI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Tyler Stapler", email = "tystapler@gmail.com"}
+]
+keywords = ["markdown", "google-docs", "confluence", "sync", "docs-as-code", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = [
+    # Core
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "PyYAML>=6.0",
+    "pydantic>=2.0.0",
+    # Google Docs backend
+    "google-auth>=2.23.0",
+    "google-auth-oauthlib>=1.1.0",
+    "google-auth-httplib2>=0.1.1",
+    "google-api-python-client>=2.108.0",
+    "markdownify>=0.11.6",
+    # Confluence backend
+    "requests>=2.25.0",
+    "httpx>=0.24.0",
+    # Utilities
+    "python-dateutil>=2.8.2",
+    "schedule>=1.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "types-PyYAML>=6.0.0",
+    "types-requests>=2.25.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tstapler/markgate"
+Issues = "https://github.com/tstapler/markgate/issues"
+
+[project.scripts]
+markgate = "markgate.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/markgate"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
