@@ -129,7 +129,7 @@ uv run markgate --help
 ## Origins
 
 `markgate` is built on two foundations:
-- [`markdown-confluence`](https://github.com/tstapler/markdown-confluence) — battle-tested Confluence publish pipeline
+- [`markdown-confluence`](https://github.com/tstapler/markdown-confluence) — Confluence publish pipeline
 - [`google-docs-obsidian-sync`](https://github.com/zxc3309/google-docs-obsidian-sync) — Google Docs sync engine (fork)
 
 ---
