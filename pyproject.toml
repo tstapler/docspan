@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "markgate"
-version = "0.1.0"
+name = "docspan"
+dynamic = ["version"]
 description = "Push and pull markdown to Google Docs and Confluence from a single CLI"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -43,7 +43,6 @@ dependencies = [
     "httpx>=0.24.0",
     # Utilities
     "python-dateutil>=2.8.2",
-    "schedule>=1.2.0",
     # Merge
     "merge3>=0.0.16",
     "mistune>=3.0",
@@ -60,14 +59,19 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tstapler/markgate"
-Issues = "https://github.com/tstapler/markgate/issues"
+Homepage = "https://github.com/tstapler/docspan"
+Repository = "https://github.com/tstapler/docspan"
+Issues = "https://github.com/tstapler/docspan/issues"
+Changelog = "https://github.com/tstapler/docspan/releases"
 
 [project.scripts]
-markgate = "markgate.cli.main:app"
+docspan = "docspan.cli.main:app"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/markgate"]
+packages = ["src/docspan"]
 
 [tool.ruff]
 line-length = 100

@@ -1,11 +1,11 @@
-# markgate
+# docspan
 
 Push and pull markdown to Google Docs and Confluence from a single CLI.
 
 ```
-pip install markgate
-markgate auth setup google_docs
-markgate push docs/design-doc.md
+pip install docspan
+docspan auth setup google_docs
+docspan push docs/design-doc.md
 ```
 
 ---
@@ -13,27 +13,27 @@ markgate push docs/design-doc.md
 ## Install
 
 ```bash
-pipx install markgate
+pipx install docspan
 # or
-pip install markgate
+pip install docspan
 # or
-uv tool install markgate
+uv tool install docspan
 ```
 
 ## Quick start
 
 **1. Copy the example config:**
 ```bash
-cp markgate.yaml.example markgate.yaml
+cp docspan.yaml.example docspan.yaml
 ```
 
 **2. Set up auth for your backend(s):**
 ```bash
-markgate auth setup google_docs
-markgate auth setup confluence
+docspan auth setup google_docs
+docspan auth setup confluence
 ```
 
-**3. Add mappings to `markgate.yaml`:**
+**3. Add mappings to `docspan.yaml`:**
 ```yaml
 mappings:
   - local: docs/design-doc.md
@@ -44,10 +44,10 @@ mappings:
 
 **4. Push or pull:**
 ```bash
-markgate push                     # push all mappings
-markgate push docs/design-doc.md  # push one file
-markgate pull                     # pull all mappings
-markgate status                   # show mapping table
+docspan push                     # push all mappings
+docspan push docs/design-doc.md  # push one file
+docspan pull                     # pull all mappings
+docspan status                   # show mapping table
 ```
 
 ---
@@ -56,24 +56,24 @@ markgate status                   # show mapping table
 
 | Command | Description |
 |---|---|
-| `markgate push [file]` | Convert local markdown and update the remote doc |
-| `markgate pull [file]` | Fetch remote doc and write as local markdown |
-| `markgate status` | Show all configured mappings |
-| `markgate auth setup <backend>` | Interactive auth wizard |
+| `docspan push [file]` | Convert local markdown and update the remote doc |
+| `docspan pull [file]` | Fetch remote doc and write as local markdown |
+| `docspan status` | Show all configured mappings |
+| `docspan auth setup <backend>` | Interactive auth wizard |
 
-**Global flags:** `--config path/to/markgate.yaml`, `--dry-run`
+**Global flags:** `--config path/to/docspan.yaml`, `--dry-run`
 
 ---
 
 ## Backends
 
 ### Google Docs
-Requires a Google Cloud project with the Drive and Docs APIs enabled.
-Run `markgate auth setup google_docs` — it opens a browser OAuth flow and saves a token locally.
+Requires a Google Cloud project with the Drive and Docs APIs enabled, and a service account with editor access to your docs.
+Run `docspan auth setup google_docs` for step-by-step setup instructions.
 
 ### Confluence
 Requires an Atlassian API token.
-Set via env vars or `markgate auth setup confluence`:
+Set via env vars or `docspan auth setup confluence`:
 
 ```bash
 export CONFLUENCE_BASE_URL=https://yourorg.atlassian.net
@@ -88,8 +88,8 @@ export CONFLUENCE_API_TOKEN=your-token
 ```yaml
 backends:
   google_docs:
-    credentials_path: ~/.markgate/google_credentials.json
-    token_path: .markgate/google_token.json
+    credentials_path: ~/.docspan/google_credentials.json
+    token_path: .docspan/google_token.json
   confluence:
     base_url: https://yourorg.atlassian.net
     username: you@yourorg.com
@@ -106,29 +106,29 @@ mappings:
 
 ## Adding a new backend
 
-1. Create `src/markgate/backends/<name>/backend.py`
-2. Subclass `markgate.backends.base.Backend` and implement `push()`, `pull()`, `auth_setup()`, `validate_config()`
-3. Register in `src/markgate/backends/__init__.py`
+1. Create `src/docspan/backends/<name>/backend.py`
+2. Subclass `docspan.backends.base.Backend` and implement `push()`, `pull()`, `auth_setup()`, `validate_config()`
+3. Register in `src/docspan/backends/__init__.py`
 
-See `src/markgate/backends/google_docs/backend.py` for a reference implementation.
+See `src/docspan/backends/google_docs/backend.py` for a reference implementation.
 
 ---
 
 ## Development
 
 ```bash
-git clone https://github.com/tstapler/markgate
-cd markgate
+git clone https://github.com/tstapler/docspan
+cd docspan
 uv sync --extra dev
 uv run pytest
-uv run markgate --help
+uv run docspan --help
 ```
 
 ---
 
 ## Origins
 
-`markgate` is built on two foundations:
+`docspan` is built on two foundations:
 - [`markdown-confluence`](https://github.com/tstapler/markdown-confluence) — Confluence publish pipeline
 - [`google-docs-obsidian-sync`](https://github.com/zxc3309/google-docs-obsidian-sync) — Google Docs sync engine (fork)
 

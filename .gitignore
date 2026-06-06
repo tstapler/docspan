@@ -32,6 +32,7 @@ account_b_credentials.json
 
 # Configuration files with sensitive data
 config.yaml
+markgate.yaml
 
 # State files
 .sync_state.json
@@ -54,3 +55,10 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl

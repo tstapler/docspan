@@ -1,0 +1,32 @@
+# docspan.yaml — map local markdown files to remote docs
+#
+# Copy to docspan.yaml and fill in your IDs.
+# Credentials are set via environment variables or docspan auth setup.
+
+backends:
+  google_docs:
+    credentials_path: ~/.docspan/google_credentials.json
+    token_path: .docspan/google_token.json
+
+  confluence:
+    base_url: https://yourorg.atlassian.net
+    username: you@yourorg.com
+    # api_token: set via CONFLUENCE_API_TOKEN env var
+
+mappings:
+  - local: docs/design-doc.md
+    backend: google_docs
+    remote_id: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms
+    direction: both
+
+  - local: docs/architecture.md
+    backend: confluence
+    remote_id: "1234567890"
+    direction: push
+
+  - local: notes/meeting-notes.md
+    backend: google_docs
+    remote_id: 1abc123def456
+    direction: pull
+
+sync_interval: 300  # seconds, used by `docspan watch`
