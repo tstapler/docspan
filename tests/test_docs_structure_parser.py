@@ -1,5 +1,7 @@
 """Unit tests for DocsStructureParser — pure dict-to-AST logic, no network."""
 
+from __future__ import annotations
+
 import pytest
 
 from docspan.backends.google_docs.docs_structure_parser import (
