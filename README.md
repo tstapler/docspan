@@ -1,7 +1,7 @@
 # docspan
 
 [![PyPI](https://img.shields.io/pypi/v/docspan)](https://pypi.org/project/docspan/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Push and pull markdown to Google Docs and Confluence from a single CLI. docspan provides bidirectional sync with three-way merge conflict detection, structural diff push that preserves comments on unchanged paragraphs, and a simple YAML-based configuration file.
 

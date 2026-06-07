@@ -1,0 +1,25 @@
+# markgate.yaml.example — copy to markgate.yaml and fill in your values.
+#
+# markgate.yaml is gitignored by default (it may contain API tokens).
+# Commit this example file instead.
+
+backends:
+  google_docs:
+    credentials_path: /path/to/service-account.json
+    # or set ACCOUNT_A_CREDENTIALS_PATH env var
+
+  confluence:
+    base_url: https://yourorg.atlassian.net
+    username: you@yourorg.com
+    # api_token: set via CONFLUENCE_API_TOKEN env var
+
+mappings:
+  - local: docs/design-doc.md
+    backend: google_docs
+    remote_id: YOUR_GOOGLE_DOC_ID
+    direction: both
+
+  - local: docs/page.md
+    backend: confluence
+    remote_id: YOUR_CONFLUENCE_PAGE_ID
+    direction: both
