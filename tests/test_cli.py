@@ -5,15 +5,14 @@ Tests verify exit codes and output text; no real backends or network calls.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
-import pytest
 from typer.testing import CliRunner
 
 from docspan.backends.base import Backend, PullResult, PushResult
 from docspan.cli.main import app
-from docspan.config import MarkgateConfig, Mapping
+from docspan.config import Mapping, MarkgateConfig
 from docspan.core.orchestrator import PullOutcome, PushOutcome
 from docspan.core.state import MappingState, SyncState, sha256_of_content
 

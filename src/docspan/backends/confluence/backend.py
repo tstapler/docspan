@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import getpass
 import logging
 import os
 import pathlib
@@ -200,14 +199,13 @@ class ConfluenceBackend(Backend):
         print("=" * 40)
         base_url = input("Confluence base URL (e.g. https://yourorg.atlassian.net): ").strip()
         username = input("Atlassian username (email): ").strip()
-        api_token = getpass.getpass("API token (from id.atlassian.com/manage-profile/security/api-tokens): ")
         print(
             f"\nAdd to markgate.yaml:\n\n"
             f"backends:\n"
             f"  confluence:\n"
             f"    base_url: {base_url}\n"
             f"    username: {username}\n"
-            f"    api_token: <paste your token here>\n"
+            f"    api_token: <your-token>  # from id.atlassian.com/manage-profile/security/api-tokens\n"
         )
         print("Done. Test with: docspan status")
 
