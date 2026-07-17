@@ -28,12 +28,16 @@ if TYPE_CHECKING:
 # Path helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_state_path(config_path: Optional[str]) -> str:
-    state_dir = _state_dir(config_path)
-    return os.path.join(state_dir, STATE_FILENAME)
+def get_state_path(config_path: Optional[str], prefix: Optional[str] = None) -> str:
+    return os.path.join(get_state_dir(config_path, prefix), STATE_FILENAME)
 
 
-def get_state_dir(config_path: Optional[str]) -> str:
+def get_state_dir(config_path: Optional[str], prefix: Optional[str] = None) -> str:
+    # Central-config mode: storage lives under XDG state home, namespaced by prefix.
+    if prefix:
+        from docspan.core.xdg import state_dir_for_prefix
+        return str(state_dir_for_prefix(prefix))
+    # Legacy mode: storage sits beside the markgate.yaml (or cwd).
     return _state_dir(config_path)
 
 

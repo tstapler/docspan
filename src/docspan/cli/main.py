@@ -14,7 +14,12 @@ from rich.console import Console
 from rich.table import Table
 
 from docspan.backends import BACKENDS
-from docspan.config import MarkgateConfig, load_config
+from docspan.config import (
+    MarkgateConfig,
+    load_central_config,
+    load_config,
+    resolve_active_project,
+)
 from docspan.core import (
     MappingState,
     SyncState,
@@ -25,7 +30,7 @@ from docspan.core import (
     orchestrate_push,
     record_state,
 )
-from docspan.core.paths import ORIG_SUFFIX
+from docspan.core.paths import BASE_STORE_DIR, ORIG_SUFFIX, STATE_FILENAME
 
 app = typer.Typer(
     name="docspan",
@@ -35,8 +40,10 @@ app = typer.Typer(
 )
 auth_app = typer.Typer(help="Manage authentication for backends.")
 conflicts_app = typer.Typer(help="Manage merge conflicts.")
+config_app = typer.Typer(help="Manage the central docspan config (project registry).")
 app.add_typer(auth_app, name="auth")
 app.add_typer(conflicts_app, name="conflicts")
+app.add_typer(config_app, name="config")
 
 console = Console()
 err_console = Console(stderr=True, style="bold red")
@@ -69,6 +76,17 @@ def _load_state(state_path: str) -> SyncState:
         return SyncState()
 
 
+def _resolve(config_path: Optional[str], prefix: Optional[str]):
+    """Resolve the active markgate config + storage prefix from flags / central config.
+
+    Returns (config, markgate_path, prefix). Storage helpers take (markgate_path, prefix):
+    a prefix routes state under XDG; no prefix keeps legacy beside-the-file storage.
+    """
+    markgate_path, resolved_prefix = resolve_active_project(prefix=prefix, config_path=config_path)
+    config = load_config(markgate_path)
+    return config, markgate_path, resolved_prefix
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # push command
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,10 +97,11 @@ def push(
         None, help="Local markdown files to push (default: all mappings)"
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without writing"),
 ) -> None:
     """Push local markdown to remote docs."""
-    config = load_config(config_path)
+    config, config_path, prefix = _resolve(config_path, prefix)
     mappings = config.mappings
 
     if files:
@@ -95,8 +114,8 @@ def push(
         err_console.print("No mappings configured. Add entries to markgate.yaml.")
         raise typer.Exit(1)
 
-    state_path = get_state_path(config_path)
-    state_dir = get_state_dir(config_path)
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
     state = _load_state(state_path)
 
     had_error = False
@@ -138,10 +157,11 @@ def pull(
         None, help="Local paths to pull into (default: all mappings)"
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Pull remote docs into local markdown files."""
-    config = load_config(config_path)
+    config, config_path, prefix = _resolve(config_path, prefix)
     mappings = config.mappings
 
     if files:
@@ -151,8 +171,8 @@ def pull(
         err_console.print("No mappings configured.")
         raise typer.Exit(1)
 
-    state_path = get_state_path(config_path)
-    state_dir = get_state_dir(config_path)
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
     state = _load_state(state_path)
 
     had_error = False
@@ -213,9 +233,10 @@ def pull(
 @app.command()
 def status(
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
 ) -> None:
     """Show current mapping status."""
-    config = load_config(config_path)
+    config, config_path, prefix = _resolve(config_path, prefix)
 
     if not config.mappings:
         console.print("[yellow]No mappings configured.[/yellow] Add entries to markgate.yaml.")
@@ -231,6 +252,101 @@ def status(
         table.add_row(m.local, m.backend, m.remote_id, m.direction)
 
     console.print(table)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# config subcommand — central project registry (XDG)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_central(raw: dict) -> str:
+    import yaml as _yaml
+
+    from docspan.core.xdg import central_config_path
+    path = central_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
+    return str(path)
+
+
+def _read_central_raw() -> dict:
+    import yaml as _yaml
+
+    from docspan.core.xdg import central_config_path
+    path = central_config_path()
+    if path.exists():
+        return _yaml.safe_load(path.read_text()) or {}
+    return {}
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the central config (registered projects) and the active resolution."""
+    from docspan.core.xdg import central_config_path
+    central = load_central_config()
+    console.print(f"Central config: {central_config_path()}")
+    console.print(f"default_prefix: {central.default_prefix or '(none)'}")
+    if not central.projects:
+        console.print(
+            "No projects registered. Add one:\n"
+            "  docspan config add <prefix> <path-to-markgate.yaml>"
+        )
+        return
+    table = Table(title="docspan projects")
+    table.add_column("Prefix", style="cyan")
+    table.add_column("markgate.yaml")
+    for name, entry in central.projects.items():
+        table.add_row(name, entry.markgate)
+    console.print(table)
+
+
+@config_app.command("add")
+def config_add(
+    prefix: str = typer.Argument(..., help="Project prefix (name)"),
+    markgate: str = typer.Argument(..., help="Path to that project's markgate.yaml"),
+    default: bool = typer.Option(False, "--default", help="Also set as default_prefix"),
+) -> None:
+    """Register a project (prefix → markgate.yaml) in the central config."""
+    raw = _read_central_raw()
+    raw.setdefault("projects", {})[prefix] = {"markgate": markgate}
+    if default or not raw.get("default_prefix"):
+        raw["default_prefix"] = prefix
+    path = _write_central(raw)
+    console.print(f"✓ Registered '{prefix}' → {markgate} in {path}")
+
+
+@app.command("migrate-xdg")
+def migrate_xdg(
+    prefix: str = typer.Option(..., "--prefix", "-p", help="Prefix to migrate this project's storage into"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Move legacy in-repo storage (.markgate-state.json, .markgate-base/) to XDG and register the project."""
+    import shutil
+
+    from docspan.core.xdg import state_dir_for_prefix
+    legacy_dir = get_state_dir(config_path)  # cwd / dirname(config) — legacy location
+    dest = str(state_dir_for_prefix(prefix))
+    os.makedirs(dest, exist_ok=True)
+
+    moved = []
+    for name in (STATE_FILENAME, BASE_STORE_DIR):
+        src = os.path.join(legacy_dir, name)
+        if os.path.exists(src):
+            target = os.path.join(dest, name)
+            if os.path.exists(target):
+                err_console.print(f"Refusing to overwrite existing {target}")
+                raise typer.Exit(1)
+            shutil.move(src, target)
+            moved.append(name)
+
+    markgate_abs = os.path.abspath(os.path.expanduser(config_path or "markgate.yaml"))
+    raw = _read_central_raw()
+    raw.setdefault("projects", {})[prefix] = {"markgate": markgate_abs}
+    if not raw.get("default_prefix"):
+        raw["default_prefix"] = prefix
+    _write_central(raw)
+
+    console.print(f"✓ Moved {moved or '(nothing)'} → {dest}")
+    console.print(f"✓ Registered '{prefix}' → {markgate_abs}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

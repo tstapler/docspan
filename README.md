@@ -93,6 +93,38 @@ mappings:
 
 ---
 
+## Central config & XDG storage
+
+By default docspan stores its config, sync state, and credentials under the [XDG base directories](https://specifications.freedesktop.org/basedir-spec/latest/), and a **central config** lets you register multiple projects by *prefix* and run docspan from anywhere.
+
+```
+$XDG_CONFIG_HOME/docspan/config.yaml     # central config (project registry)
+$XDG_CONFIG_HOME/docspan/<prefix>/…      # cached OAuth token
+$XDG_STATE_HOME/docspan/<prefix>/…       # sync state + base store, per project
+```
+
+Central config (`~/.config/docspan/config.yaml`):
+
+```yaml
+default_prefix: design-docs
+projects:
+  design-docs:
+    markgate: ~/Documents/design-docs/markgate.yaml
+```
+
+Register and use projects:
+
+```bash
+docspan config add design-docs ~/Documents/design-docs/markgate.yaml   # register (prefix → markgate.yaml)
+docspan config show                                                    # list projects + active resolution
+docspan push --prefix design-docs                                      # or DOCSPAN_PREFIX, or default_prefix, or cwd match
+docspan migrate-xdg --prefix design-docs                               # move legacy in-repo state to XDG + register
+```
+
+**Prefix resolution order:** `--config PATH` (legacy — storage stays beside the file) → `--prefix` → `DOCSPAN_PREFIX` → cwd inside a registered project → `default_prefix`. If nothing matches, docspan falls back to a local `./markgate.yaml` with beside-the-file storage (fully backward-compatible).
+
+---
+
 ## Command Reference
 
 ### `docspan push`
