@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -26,10 +26,26 @@ class DocsParagraphNode:
     spans: List[TextSpan] = field(default_factory=list)
 
 
+@dataclass
+class DocsTableNode:
+    """Represents a table in a Google Docs document (plain-text cells)."""
+    rows: List[List[str]] = field(default_factory=list)
+    start_index: int = 0
+    end_index: int = 0
+
+    @property
+    def num_rows(self) -> int:
+        return len(self.rows)
+
+    @property
+    def num_cols(self) -> int:
+        return max((len(r) for r in self.rows), default=0)
+
+
 class DocsStructureParser:
     """Parse a Google Docs document dict into a list of DocsParagraphNode."""
 
-    def parse(self, doc: dict) -> List[DocsParagraphNode]:
+    def parse(self, doc: dict) -> List[Union[DocsParagraphNode, DocsTableNode]]:
         """
         Parse a Google Docs document dict.
 
@@ -54,16 +70,42 @@ class DocsStructureParser:
             raise KeyError("Document has neither 'tabs' nor 'body' key")
 
         content = body.get("content", [])
-        nodes: List[DocsParagraphNode] = []
+        nodes: List[Union[DocsParagraphNode, DocsTableNode]] = []
 
         for element in content:
             if "paragraph" in element:
                 node = self._parse_paragraph(element)
                 if node is not None:
                     nodes.append(node)
-            # table, sectionBreak, tableOfContents are silently skipped
+            elif "table" in element:
+                nodes.append(self._parse_table(element))
+            # sectionBreak, tableOfContents are silently skipped
 
         return nodes
+
+    def _parse_table(self, element: dict) -> DocsTableNode:
+        """Parse a structural element that contains a table into a DocsTableNode."""
+        table = element["table"]
+        rows: List[List[str]] = []
+        for table_row in table.get("tableRows", []):
+            cells: List[str] = []
+            for cell in table_row.get("tableCells", []):
+                parts: List[str] = []
+                for cell_element in cell.get("content", []):
+                    paragraph = cell_element.get("paragraph")
+                    if paragraph is None:
+                        continue
+                    for pe in paragraph.get("elements", []):
+                        text_run = pe.get("textRun")
+                        if text_run is not None:
+                            parts.append(text_run.get("content", ""))
+                cells.append("".join(parts).strip())
+            rows.append(cells)
+        return DocsTableNode(
+            rows=rows,
+            start_index=element.get("startIndex", 0),
+            end_index=element.get("endIndex", 0),
+        )
 
     def _parse_paragraph(self, element: dict) -> Optional[DocsParagraphNode]:
         """Parse a structural element that contains a paragraph."""

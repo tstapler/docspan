@@ -11,7 +11,11 @@ from docspan.backends.google_docs.auth import DualAccountAuth, GoogleAuthenticat
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.converter import DocumentConverter
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    DocsStructureParser,
+    DocsTableNode,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 
 if TYPE_CHECKING:
@@ -63,11 +67,26 @@ class GoogleDocsBackend(Backend):
                 body_content = doc.get("body", {}).get("content", [])
             doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
 
-            requests = DocsRequestBuilder().build(current_nodes, target_nodes, doc_end_index)
+            builder = DocsRequestBuilder()
+            requests = builder.build(current_nodes, target_nodes, doc_end_index)
             if not requests:
                 return PushResult(status="skipped", doc_id=doc_id, message="No changes detected")
 
             self._client.batch_update(doc_id, requests)
+
+            # Pass 2: tables are inserted empty and inline styling is deferred above; re-fetch
+            # to read real indices, then fill cells + apply link/bold/italic/monospace styling.
+            needs_pass2 = any(
+                isinstance(n, DocsTableNode)
+                or (isinstance(n, DocsParagraphNode) and n.spans)
+                for n in target_nodes
+            )
+            if needs_pass2:
+                refreshed = self._client.get_document(doc_id)
+                second = builder.build_second_pass_requests(refreshed, target_nodes)
+                if second:
+                    self._client.batch_update(doc_id, second)
+
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
             return PushResult(status="ok", doc_id=doc_id, url=url)
         except Exception as exc:
