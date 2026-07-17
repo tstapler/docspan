@@ -159,7 +159,16 @@ docspan auth setup BACKEND [--config PATH]
 
 Interactive authentication setup. `BACKEND` is one of `google_docs` or `confluence`.
 
-For Google Docs, prints step-by-step service account setup instructions. For Confluence, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
+Google Docs supports two auth modes:
+
+- **Per-user OAuth** (acts as you, like `gws` — no service account). Create an OAuth client (Desktop app), download its `client_secret.json`, then run the browser flow once; the token is cached at `token_path` and refreshed automatically:
+  ```
+  docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json
+  ```
+  (or set `oauth_client_secret_path` in `markgate.yaml` and run `docspan auth setup google_docs`.)
+- **Service account** (app / non-user). `docspan auth setup google_docs` prints step-by-step setup instructions; share your docs with the service-account email.
+
+For Confluence, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
 
 ### `docspan conflicts list`
 
@@ -191,10 +200,13 @@ Resolve a merge conflict in a tracked file.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `credentials_path` | string | null | Path to Google service account JSON key |
-| `token_path` | string | `.markgate/google_token.json` | OAuth token storage path |
+| `credentials_path` | string | null | Path to a Google **service account** JSON key |
+| `oauth_client_secret_path` | string | null | Path to an **OAuth client secret** JSON (Desktop app) for per-user auth |
+| `token_path` | string | `.markgate/google_token.json` | Where the cached OAuth user token is stored/refreshed |
 
-**Environment variable alternatives:**
+Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env → per-user OAuth (`oauth_client_secret_path`, or an already-cached `token_path`).
+
+**Environment variable alternatives (service account):**
 - `ACCOUNT_A_CREDENTIALS_PATH` — path to service account JSON
 - `ACCOUNT_A_CREDENTIALS` — inline service account JSON string
 

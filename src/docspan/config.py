@@ -13,7 +13,11 @@ CONFIG_FILENAME = "markgate.yaml"
 
 
 class GoogleDocsConfig(BaseModel):
+    # Service-account auth (app / non-user).
     credentials_path: Optional[str] = None
+    # Per-user OAuth auth: path to an OAuth client secret JSON (Desktop app).
+    oauth_client_secret_path: Optional[str] = None
+    # Where the cached OAuth user token is stored/refreshed.
     token_path: Optional[str] = ".markgate/google_token.json"
 
 

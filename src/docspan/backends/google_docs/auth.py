@@ -9,11 +9,16 @@ Handles authentication for two separate Google accounts:
 import json
 import logging
 import os
+import pathlib
 
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 
 logger = logging.getLogger(__name__)
+
+# Default cache location for the per-user OAuth token.
+DEFAULT_TOKEN_PATH = ".markgate/google_token.json"
 
 # Google Drive API scopes
 PULL_SCOPES = [
@@ -81,6 +86,93 @@ class GoogleAuthenticator:
             self.credentials.refresh(Request())
 
         return self.credentials
+
+
+class OAuthAuthenticator:
+    """
+    Per-user OAuth authentication (browser consent flow + cached refreshable token).
+
+    Mirrors how `gws` and the google-docs plugin authenticate: the user signs in once,
+    the token is cached on disk, and it refreshes silently thereafter. Acts as the user,
+    so it can reach their own Docs plus anything shared with them.
+    """
+
+    def __init__(self, client_secret_path=None, token_path=None, scopes=None):
+        """
+        Args:
+            client_secret_path: Path to an OAuth client secret JSON (Desktop app).
+                Only needed for the first (interactive) authorization.
+            token_path: Where the cached user token is stored/refreshed.
+            scopes: OAuth scopes (defaults to DEFAULT_SCOPES = read/write).
+        """
+        self.client_secret_path = client_secret_path
+        self.token_path = token_path or DEFAULT_TOKEN_PATH
+        self.scopes = scopes or DEFAULT_SCOPES
+        self.credentials = None
+
+    def _token_file(self) -> pathlib.Path:
+        return pathlib.Path(os.path.expanduser(self.token_path))
+
+    def _load_cached(self):
+        path = self._token_file()
+        if path.exists():
+            return UserCredentials.from_authorized_user_file(str(path), self.scopes)
+        return None
+
+    def _save(self, creds) -> None:
+        path = self._token_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(creds.to_json())
+        logger.info(f"Cached OAuth token at {path}")
+
+    def has_valid_credentials(self) -> bool:
+        """True if a usable (valid or refreshable) token is already cached — no browser needed."""
+        try:
+            creds = self.credentials or self._load_cached()
+        except Exception:
+            return False
+        return bool(creds and (creds.valid or (creds.expired and creds.refresh_token)))
+
+    def get_credentials(self, allow_interactive: bool = True):
+        """
+        Return valid OAuth credentials, refreshing or launching the consent flow as needed.
+
+        Args:
+            allow_interactive: if False, never open a browser — raise if no usable token exists.
+        """
+        creds = self.credentials or self._load_cached()
+
+        if creds and creds.valid:
+            self.credentials = creds
+            return creds
+
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            self._save(creds)
+            self.credentials = creds
+            return creds
+
+        if not allow_interactive:
+            raise ValueError(
+                f"No valid cached OAuth token at {self.token_path} and interactive auth is disabled. "
+                "Run: docspan auth setup google_docs --oauth --client-secret <path>"
+            )
+
+        if not self.client_secret_path:
+            raise ValueError(
+                "OAuth client secret not configured. Set oauth_client_secret_path in markgate.yaml "
+                "(backends.google_docs) or pass --client-secret to `docspan auth setup google_docs --oauth`."
+            )
+
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
+        flow = InstalledAppFlow.from_client_secrets_file(
+            os.path.expanduser(self.client_secret_path), self.scopes
+        )
+        creds = flow.run_local_server(port=0)
+        self._save(creds)
+        self.credentials = creds
+        return creds
 
 
 class DualAccountAuth:

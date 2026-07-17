@@ -7,7 +7,11 @@ import pathlib
 from typing import TYPE_CHECKING
 
 from docspan.backends.base import Backend, PullResult, PushResult
-from docspan.backends.google_docs.auth import DualAccountAuth, GoogleAuthenticator
+from docspan.backends.google_docs.auth import (
+    DualAccountAuth,
+    GoogleAuthenticator,
+    OAuthAuthenticator,
+)
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.converter import DocumentConverter
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
@@ -37,18 +41,33 @@ class GoogleDocsBackend(Backend):
     def _ensure_client(self) -> None:
         if self._client is not None:
             return
+        # 1. Explicit service-account file in config.
         if self.config.credentials_path:
             auth = GoogleAuthenticator(credentials_path=self.config.credentials_path)
             self._client = GoogleDocsClient(auth.get_credentials())
-        else:
+            return
+
+        # 2. Service-account via environment (Railway / CI).
+        if os.getenv("ACCOUNT_A_CREDENTIALS") or os.getenv("ACCOUNT_A_CREDENTIALS_PATH"):
             dual = DualAccountAuth()
-            if not dual.is_authenticated():
-                raise RuntimeError(
-                    "Google Docs credentials not found. "
-                    "Set credentials_path in markgate.yaml or ACCOUNT_A_CREDENTIALS_PATH env var. "
-                    "Run: docspan auth setup google_docs"
-                )
             self._client = GoogleDocsClient(dual.get_account_a_credentials())
+            return
+
+        # 3. Per-user OAuth (client secret configured, or a token is already cached).
+        oauth = OAuthAuthenticator(
+            client_secret_path=self.config.oauth_client_secret_path,
+            token_path=self.config.token_path,
+        )
+        if self.config.oauth_client_secret_path or oauth.has_valid_credentials():
+            self._client = GoogleDocsClient(oauth.get_credentials())
+            return
+
+        raise RuntimeError(
+            "Google Docs credentials not found. Configure one of:\n"
+            "  • service account: credentials_path in markgate.yaml (or ACCOUNT_A_CREDENTIALS_PATH)\n"
+            "  • per-user OAuth: oauth_client_secret_path in markgate.yaml\n"
+            "Run: docspan auth setup google_docs"
+        )
 
     def push(self, local_path: str, doc_id: str, **kwargs: object) -> PushResult:
         """Convert local markdown to Google Docs format using structural diff and batch update."""
@@ -113,7 +132,22 @@ class GoogleDocsBackend(Backend):
         return doc["revisionId"]
 
     def auth_setup(self) -> None:
-        """Print setup instructions for Google Docs service account credentials."""
+        """Set up Google Docs auth — run the OAuth flow if configured, else print instructions."""
+        # Per-user OAuth: run the browser consent flow now and cache the token.
+        if self.config.oauth_client_secret_path:
+            oauth = OAuthAuthenticator(
+                client_secret_path=self.config.oauth_client_secret_path,
+                token_path=self.config.token_path,
+            )
+            try:
+                oauth.get_credentials(allow_interactive=True)
+                print(f"✓ OAuth token cached at {self.config.token_path}")
+                self._ensure_client()
+                print("✓ Connection verified successfully.")
+            except Exception as exc:
+                print(f"✗ OAuth setup failed: {exc}")
+            return
+
         has_path = self.config.credentials_path or os.getenv("ACCOUNT_A_CREDENTIALS_PATH")
         has_json = os.getenv("ACCOUNT_A_CREDENTIALS")
 
@@ -144,6 +178,10 @@ class GoogleDocsBackend(Backend):
         print("    export ACCOUNT_A_CREDENTIALS_PATH=/path/to/service-account.json")
         print("  Option C — environment variable (inline JSON):")
         print("    export ACCOUNT_A_CREDENTIALS='{ ... service account JSON ... }'")
+        print("\nOr use per-user OAuth instead (acts as you, like gws — no service account):")
+        print("  1. Create an OAuth client (Desktop app) and download client_secret.json")
+        print("  2. Run: docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json")
+        print("     (or set backends.google_docs.oauth_client_secret_path in markgate.yaml)")
 
     def validate_config(self) -> None:
         has_credentials = (

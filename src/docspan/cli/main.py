@@ -357,6 +357,10 @@ def migrate_xdg(
 def auth_setup(
     backend: str = typer.Argument(..., help="Backend to authenticate: google_docs | confluence"),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    oauth: bool = typer.Option(False, "--oauth", help="Use per-user OAuth (google_docs)."),
+    client_secret: Optional[str] = typer.Option(
+        None, "--client-secret", help="Path to an OAuth client secret JSON (google_docs, with --oauth)."
+    ),
 ) -> None:
     """Interactive authentication setup for a backend."""
     config = load_config(config_path)
@@ -364,6 +368,19 @@ def auth_setup(
     if not cls:
         err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
         raise typer.Exit(1)
+
+    if oauth or client_secret:
+        from docspan.config import GoogleDocsConfig
+        gd = config.backends.google_docs or GoogleDocsConfig()
+        if client_secret:
+            gd.oauth_client_secret_path = client_secret
+        if not gd.oauth_client_secret_path:
+            err_console.print(
+                "--oauth requires --client-secret PATH (or oauth_client_secret_path in markgate.yaml)."
+            )
+            raise typer.Exit(1)
+        config.backends.google_docs = gd
+
     b = cls.from_config(config)
     b.auth_setup()
 

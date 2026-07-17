@@ -5,8 +5,13 @@
 
 backends:
   google_docs:
+    # Service-account auth (app / non-user):
     credentials_path: /path/to/service-account.json
     # or set ACCOUNT_A_CREDENTIALS_PATH env var
+    #
+    # Or per-user OAuth (acts as you, like gws — no service account):
+    # oauth_client_secret_path: /path/to/client_secret.json
+    # token_path: .markgate/google_token.json   # cached user token (default)
 
   confluence:
     base_url: https://yourorg.atlassian.net
