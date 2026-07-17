@@ -141,7 +141,7 @@ Push local markdown files to remote docs. Skips mappings with `direction = "pull
 docspan pull [FILES]... [--dry-run] [--config PATH]
 ```
 
-Pull remote documents into local markdown files with three-way merge. Writes conflict markers to the file if automatic merge fails.
+Pull remote documents into local markdown files with three-way merge. Writes conflict markers to the file if automatic merge fails. For Google Docs, also writes a `{file}.comments.md` sidecar of the doc's comments (open + resolved, with quoted selections and reply threads) unless `pull_comments: false`.
 
 ### `docspan status`
 
@@ -204,6 +204,7 @@ Resolve a merge conflict in a tracked file.
 | `credentials_path` | string | null | Path to a Google **service account** JSON key |
 | `oauth_client_secret_path` | string | null | Path to an **OAuth client secret** JSON (Desktop app) for per-user auth |
 | `token_path` | string | `$XDG_CONFIG_HOME/docspan/google_token.json` | Where the cached OAuth user token is stored/refreshed (out of the repo) |
+| `pull_comments` | bool | `true` | On pull, write a `{file}.comments.md` sidecar of the doc's comments |
 
 Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env → per-user OAuth (`oauth_client_secret_path`, or an already-cached `token_path`).
 
@@ -244,7 +245,7 @@ docspan generates these files in your project directory after first sync:
 | `.markgate-state.json` | Sync state tracking (content hashes, remote versions) |
 | `.markgate-base/` | Content-addressed store of merge bases |
 | `{file}.orig` | Backup of local file before merge; deleted after conflict resolution |
-| `{file}.comments.md` | Confluence comment sidecar; written during pull if comments exist |
+| `{file}.comments.md` | Comment sidecar (Google Docs + Confluence); written during pull if comments exist |
 
 ---
 

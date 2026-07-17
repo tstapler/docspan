@@ -203,6 +203,39 @@ class GoogleDocsClient:
         logger.error(f"Failed to retrieve doc {doc_id} after {MAX_RETRIES} attempts")
         raise last_error
 
+    def get_comments(self, doc_id: str) -> List[dict]:
+        """
+        List all (non-deleted) comments on a Google Doc via the Drive API.
+
+        Returns the raw comment dicts (content, author, resolved, quotedFileContent, replies,
+        createdTime). Requires a drive/drive.readonly scope. Paginates fully.
+        """
+        fields = (
+            "nextPageToken,comments(id,content,resolved,createdTime,modifiedTime,"
+            "author(displayName),quotedFileContent(value),"
+            "replies(content,createdTime,author(displayName)))"
+        )
+        comments: List[dict] = []
+        page_token: Optional[str] = None
+        while True:
+            token = page_token
+
+            def _list():
+                return self.drive_service.comments().list(
+                    fileId=doc_id,
+                    fields=fields,
+                    pageSize=100,
+                    pageToken=token,
+                    includeDeleted=False,
+                ).execute()
+
+            resp = self._with_backoff(_list)
+            comments.extend(resp.get("comments", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return comments
+
     def get_doc_plain_text(self, doc_id: str) -> str:
         """
         Get Google Doc content as plain text

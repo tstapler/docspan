@@ -20,6 +20,8 @@ class GoogleDocsConfig(BaseModel):
     # Where the cached OAuth user token is stored/refreshed.
     # None → XDG default ($XDG_CONFIG_HOME/docspan/google_token.json), kept out of the repo.
     token_path: Optional[str] = None
+    # On pull, also write a {file}.comments.md sidecar of the doc's comments.
+    pull_comments: bool = True
 
 
 class ConfluenceConfig(BaseModel):
