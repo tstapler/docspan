@@ -14,6 +14,7 @@ from docspan.backends.google_docs.auth import (
     default_token_path,
 )
 from docspan.backends.google_docs.client import GoogleDocsClient
+from docspan.backends.google_docs.comments import format_comments_markdown
 from docspan.backends.google_docs.converter import DocumentConverter
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -31,6 +32,7 @@ from docspan.backends.google_docs.onboarding import (
     validate_client_secret,
     validate_service_account,
 )
+from docspan.core.paths import COMMENTS_SUFFIX
 
 if TYPE_CHECKING:
     from docspan.config import GoogleDocsConfig, MarkgateConfig
@@ -130,9 +132,29 @@ class GoogleDocsBackend(Backend):
             markdown_content = DocumentConverter().html_to_markdown(html_content)
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
+            self._write_comment_sidecar(doc_id, local_path)
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
         except Exception as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
+
+    def _write_comment_sidecar(self, doc_id: str, local_path: str) -> None:
+        """Write a {file}.comments.md sidecar of the doc's comments (best-effort)."""
+        if not self.config.pull_comments:
+            return
+        assert self._client is not None
+        sidecar = pathlib.Path(str(local_path) + COMMENTS_SUFFIX)
+        try:
+            comments = self._client.get_comments(doc_id)
+        except Exception:
+            return  # comments are best-effort; never fail a pull over them
+        if comments:
+            try:
+                title = self._client.get_doc_info(doc_id).get("name", doc_id)
+            except Exception:
+                title = doc_id
+            sidecar.write_text(format_comments_markdown(title, comments))
+        elif sidecar.exists():
+            sidecar.unlink()  # no comments anymore — drop a stale sidecar
 
     def get_remote_version(self, doc_id: str) -> str:
         """Return the revisionId of the Google Doc (opaque, non-empty string)."""
