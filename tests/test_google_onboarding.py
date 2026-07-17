@@ -71,7 +71,7 @@ def test_persist_merges_and_preserves(tmp_path):
 
 class _StubOAuth:
     def __init__(self, **kwargs):
-        pass
+        self.token_path = kwargs.get("token_path") or "/tmp/docspan-test-token.json"
 
     def has_valid_credentials(self):
         return True

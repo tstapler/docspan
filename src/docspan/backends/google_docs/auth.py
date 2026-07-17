@@ -17,8 +17,11 @@ from google.oauth2.credentials import Credentials as UserCredentials
 
 logger = logging.getLogger(__name__)
 
-# Default cache location for the per-user OAuth token.
-DEFAULT_TOKEN_PATH = ".markgate/google_token.json"
+
+def default_token_path() -> str:
+    """Default cached-OAuth-token location — under XDG config home, not the repo."""
+    from docspan.core.xdg import config_home
+    return str(config_home() / "google_token.json")
 
 # Google Drive API scopes
 PULL_SCOPES = [
@@ -106,7 +109,7 @@ class OAuthAuthenticator:
             scopes: OAuth scopes (defaults to DEFAULT_SCOPES = read/write).
         """
         self.client_secret_path = client_secret_path
-        self.token_path = token_path or DEFAULT_TOKEN_PATH
+        self.token_path = token_path or default_token_path()  # resolved effective path
         self.scopes = scopes or DEFAULT_SCOPES
         self.credentials = None
 

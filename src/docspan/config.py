@@ -18,7 +18,8 @@ class GoogleDocsConfig(BaseModel):
     # Per-user OAuth auth: path to an OAuth client secret JSON (Desktop app).
     oauth_client_secret_path: Optional[str] = None
     # Where the cached OAuth user token is stored/refreshed.
-    token_path: Optional[str] = ".markgate/google_token.json"
+    # None → XDG default ($XDG_CONFIG_HOME/docspan/google_token.json), kept out of the repo.
+    token_path: Optional[str] = None
 
 
 class ConfluenceConfig(BaseModel):

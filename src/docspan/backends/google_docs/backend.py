@@ -11,6 +11,7 @@ from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
     OAuthAuthenticator,
+    default_token_path,
 )
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.converter import DocumentConverter
@@ -141,8 +142,8 @@ class GoogleDocsBackend(Backend):
         return doc["revisionId"]
 
     def _has_any_credentials(self) -> bool:
-        token = self.config.token_path
-        token_exists = bool(token and pathlib.Path(os.path.expanduser(token)).exists())
+        token = self.config.token_path or default_token_path()
+        token_exists = bool(pathlib.Path(os.path.expanduser(token)).exists())
         return bool(
             self.config.credentials_path
             or self.config.oauth_client_secret_path
@@ -210,7 +211,7 @@ class GoogleDocsBackend(Backend):
         except Exception as exc:
             print(f"✖ Sign-in didn't finish: {exc}")
             return
-        print(f"✔ Signed in. Token cached at {self.config.token_path}")
+        print(f"✔ Signed in. Token cached at {oauth.token_path}")
 
         self._client = None
         try:
@@ -226,7 +227,7 @@ class GoogleDocsBackend(Backend):
                 {"oauth_client_secret_path": path, "token_path": self.config.token_path},
             )
             print(f"✔ Saved to {saved}")
-            print(f"  (add {self.config.token_path} to .gitignore — it's a credential.)")
+            print(f"  (token stored at {oauth.token_path}, outside your repo)")
         print("\n✔ Done — docspan is connected to Google Docs.")
         print("→ Next:  docspan push   |   docspan pull")
 

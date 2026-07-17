@@ -203,7 +203,7 @@ Resolve a merge conflict in a tracked file.
 |---|---|---|---|
 | `credentials_path` | string | null | Path to a Google **service account** JSON key |
 | `oauth_client_secret_path` | string | null | Path to an **OAuth client secret** JSON (Desktop app) for per-user auth |
-| `token_path` | string | `.markgate/google_token.json` | Where the cached OAuth user token is stored/refreshed |
+| `token_path` | string | `$XDG_CONFIG_HOME/docspan/google_token.json` | Where the cached OAuth user token is stored/refreshed (out of the repo) |
 
 Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env → per-user OAuth (`oauth_client_secret_path`, or an already-cached `token_path`).
 
