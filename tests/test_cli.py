@@ -40,7 +40,7 @@ class FakeBackend(Backend):
     def get_remote_version(self, doc_id: str) -> str:
         return self.remote_version
 
-    def auth_setup(self) -> None:
+    def auth_setup(self, config_path=None) -> None:
         self.auth_setup_called = True
 
     def validate_config(self) -> None:

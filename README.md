@@ -159,16 +159,17 @@ docspan auth setup BACKEND [--config PATH]
 
 Interactive authentication setup. `BACKEND` is one of `google_docs` or `confluence`.
 
-Google Docs supports two auth modes:
+For **Google Docs**, run it with no flags for a guided flow:
 
-- **Per-user OAuth** (acts as you, like `gws` — no service account). Create an OAuth client (Desktop app), download its `client_secret.json`, then run the browser flow once; the token is cached at `token_path` and refreshed automatically:
-  ```
-  docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json
-  ```
-  (or set `oauth_client_secret_path` in `markgate.yaml` and run `docspan auth setup google_docs`.)
-- **Service account** (app / non-user). `docspan auth setup google_docs` prints step-by-step setup instructions; share your docs with the service-account email.
+```
+docspan auth setup google_docs
+```
 
-For Confluence, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
+It detects your current state, lets you pick **Personal (OAuth)** [recommended] or **Service account**, auto-detects a `client_secret.json` (scanning `.`, `.markgate/`, `~/Downloads`) or prompts for the path with validation, runs the browser sign-in, verifies the connection, and offers to persist the choice into `markgate.yaml` so you never repeat it. In a non-TTY/CI environment it prints manual instructions instead of prompting.
+
+Everything is scriptable — any answer can be supplied as a flag: `--oauth` / `--service-account`, `--client-secret PATH`, `--credentials PATH`. If a `docspan push`/`pull` runs without credentials in an interactive terminal, it offers to run setup inline and then continues.
+
+For **Confluence**, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
 
 ### `docspan conflicts list`
 

@@ -193,7 +193,7 @@ class ConfluenceBackend(Backend):
         page = self._client.get_page(doc_id)
         return str(page["version"]["number"])
 
-    def auth_setup(self) -> None:
+    def auth_setup(self, config_path: "Optional[str]" = None) -> None:
         """Interactive Confluence auth setup — prompts for credentials and prints YAML snippet."""
         print("\nConfluence auth setup")
         print("=" * 40)

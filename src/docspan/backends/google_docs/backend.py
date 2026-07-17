@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from docspan.backends.base import Backend, PullResult, PushResult
 from docspan.backends.google_docs.auth import (
@@ -21,6 +21,15 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.onboarding import (
+    OAUTH_HELP,
+    autodetect_client_secret,
+    confirm,
+    is_interactive,
+    persist_google_docs_config,
+    validate_client_secret,
+    validate_service_account,
+)
 
 if TYPE_CHECKING:
     from docspan.config import GoogleDocsConfig, MarkgateConfig
@@ -131,67 +140,145 @@ class GoogleDocsBackend(Backend):
         doc = self._client.get_document(doc_id)
         return doc["revisionId"]
 
-    def auth_setup(self) -> None:
-        """Set up Google Docs auth — run the OAuth flow if configured, else print instructions."""
-        # Per-user OAuth: run the browser consent flow now and cache the token.
-        if self.config.oauth_client_secret_path:
-            oauth = OAuthAuthenticator(
-                client_secret_path=self.config.oauth_client_secret_path,
-                token_path=self.config.token_path,
-            )
-            try:
-                oauth.get_credentials(allow_interactive=True)
-                print(f"✓ OAuth token cached at {self.config.token_path}")
-                self._ensure_client()
-                print("✓ Connection verified successfully.")
-            except Exception as exc:
-                print(f"✗ OAuth setup failed: {exc}")
-            return
-
-        has_path = self.config.credentials_path or os.getenv("ACCOUNT_A_CREDENTIALS_PATH")
-        has_json = os.getenv("ACCOUNT_A_CREDENTIALS")
-
-        if has_path or has_json:
-            print("Google Docs credentials are already configured.")
-            try:
-                self._ensure_client()
-                print("✓ Connection verified successfully.")
-            except Exception as exc:
-                print(f"✗ Connection test failed: {exc}")
-            return
-
-        print("\nGoogle Docs Auth Setup")
-        print("=" * 40)
-        print("docspan uses Google service account credentials for Google Docs access.")
-        print("\nSetup steps:")
-        print("  1. Create a service account at:")
-        print("     https://console.cloud.google.com/iam-admin/serviceaccounts")
-        print("  2. Enable Google Docs API and Google Drive API in your project")
-        print("  3. Download the service account JSON key file")
-        print("  4. Share your Google Docs with the service account email")
-        print("\nConfigure credentials via one of:")
-        print("  Option A — YAML config:")
-        print("    backends:")
-        print("      google_docs:")
-        print("        credentials_path: /path/to/service-account.json")
-        print("  Option B — environment variable (path):")
-        print("    export ACCOUNT_A_CREDENTIALS_PATH=/path/to/service-account.json")
-        print("  Option C — environment variable (inline JSON):")
-        print("    export ACCOUNT_A_CREDENTIALS='{ ... service account JSON ... }'")
-        print("\nOr use per-user OAuth instead (acts as you, like gws — no service account):")
-        print("  1. Create an OAuth client (Desktop app) and download client_secret.json")
-        print("  2. Run: docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json")
-        print("     (or set backends.google_docs.oauth_client_secret_path in markgate.yaml)")
-
-    def validate_config(self) -> None:
-        has_credentials = (
+    def _has_any_credentials(self) -> bool:
+        token = self.config.token_path
+        token_exists = bool(token and pathlib.Path(os.path.expanduser(token)).exists())
+        return bool(
             self.config.credentials_path
+            or self.config.oauth_client_secret_path
             or os.getenv("ACCOUNT_A_CREDENTIALS_PATH")
             or os.getenv("ACCOUNT_A_CREDENTIALS")
+            or token_exists
         )
-        if not has_credentials:
+
+    def auth_setup(self, config_path: "Optional[str]" = None) -> None:
+        """Guided, interactive Google Docs auth setup (falls back to instructions with no TTY)."""
+        # Already configured → verify and stop.
+        if self._has_any_credentials():
+            print("Google Docs is already configured.")
+            try:
+                self._ensure_client()
+                print("✔ Connection verified.")
+            except Exception as exc:
+                print(f"✖ Connection failed: {exc}\n  Re-run to reconfigure.")
+            return
+
+        # Non-interactive (CI, piped) → print instructions, never block.
+        if not is_interactive():
+            self._print_setup_instructions()
+            return
+
+        print("\nLet's connect docspan to Google Docs.\n")
+        print("How should docspan sign in?")
+        print("  1) Personal (OAuth)  — sign in as yourself in the browser. [recommended]")
+        print("  2) Service account   — a robot key, no browser. Best for CI / automation.")
+        choice = input("Method [1]: ").strip() or "1"
+        if choice.startswith("2"):
+            self._setup_service_account_interactive(config_path)
+        else:
+            self._setup_oauth_interactive(config_path)
+
+    def _setup_oauth_interactive(self, config_path: "Optional[str]") -> None:
+        path = self.config.oauth_client_secret_path
+        if path and not validate_client_secret(path)[0]:
+            path = None
+        if not path:
+            found = autodetect_client_secret()
+            if found and confirm(f"Found a client secret: {found}\nUse this file? [Y/n]: ", True):
+                path = found
+        attempts = 0
+        while not path:
+            entered = input("Path to client_secret.json (Enter for help creating one): ").strip()
+            if not entered:
+                print(OAUTH_HELP)
+                continue
+            ok, msg = validate_client_secret(entered)
+            if ok:
+                path = os.path.expanduser(entered)
+            else:
+                print(f"✖ {msg}")
+                attempts += 1
+                if attempts >= 3:
+                    print("Giving up after 3 tries. Re-run when you have the file.")
+                    return
+
+        self.config.oauth_client_secret_path = path
+        oauth = OAuthAuthenticator(client_secret_path=path, token_path=self.config.token_path)
+        try:
+            print("\nOpening your browser to sign in… (waiting for approval)")
+            oauth.get_credentials(allow_interactive=True)
+        except Exception as exc:
+            print(f"✖ Sign-in didn't finish: {exc}")
+            return
+        print(f"✔ Signed in. Token cached at {self.config.token_path}")
+
+        self._client = None
+        try:
+            self._ensure_client()
+            print("✔ Connection OK — docspan can read and write your Google Docs.")
+        except Exception as exc:
+            print(f"✖ Connection verify failed: {exc}")
+            return
+
+        if confirm("\nSave this to markgate.yaml so you won't set it up again? [Y/n]: ", True):
+            saved = persist_google_docs_config(
+                config_path,
+                {"oauth_client_secret_path": path, "token_path": self.config.token_path},
+            )
+            print(f"✔ Saved to {saved}")
+            print(f"  (add {self.config.token_path} to .gitignore — it's a credential.)")
+        print("\n✔ Done — docspan is connected to Google Docs.")
+        print("→ Next:  docspan push   |   docspan pull")
+
+    def _setup_service_account_interactive(self, config_path: "Optional[str]") -> None:
+        print("\nService accounts act as a robot (not you) and need no browser.")
+        attempts = 0
+        key_path = None
+        while not key_path:
+            entered = input("Path to the service-account key JSON: ").strip()
+            ok, msg = validate_service_account(entered) if entered else (False, "no path given.")
+            if ok:
+                key_path = os.path.expanduser(entered)
+                if msg:
+                    print(f"✔ Loaded service account: {msg}")
+                    print(f"→ Share the Docs/folders you want to sync with {msg} (Editor access).")
+            else:
+                print(f"✖ {msg}")
+                attempts += 1
+                if attempts >= 3:
+                    print("Giving up after 3 tries.")
+                    return
+
+        self.config.credentials_path = key_path
+        self._client = None
+        try:
+            self._ensure_client()
+            print("✔ Connection OK.")
+        except Exception as exc:
+            print(f"✖ Connection verify failed: {exc}")
+            return
+        if confirm("\nSave this to markgate.yaml? [Y/n]: ", True):
+            saved = persist_google_docs_config(config_path, {"credentials_path": key_path})
+            print(f"✔ Saved to {saved}")
+        print("\n✔ Done. → Next:  docspan push   |   docspan pull")
+
+    def _print_setup_instructions(self) -> None:
+        print("\nGoogle Docs Auth Setup")
+        print("=" * 40)
+        print("Run this in an interactive terminal for a guided setup, or configure manually:")
+        print("\n  Per-user OAuth (recommended — acts as you, like gws):")
+        print("    1. Create an OAuth client (Desktop app); download client_secret.json")
+        print("    2. docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json")
+        print("       (or set backends.google_docs.oauth_client_secret_path in markgate.yaml)")
+        print("\n  Service account (automation):")
+        print("    1. Create a service account + JSON key; enable the Docs & Drive APIs")
+        print("    2. Share your docs with the service-account email")
+        print("    3. Set credentials_path in markgate.yaml (or ACCOUNT_A_CREDENTIALS_PATH env)")
+
+    def validate_config(self) -> None:
+        if not self._has_any_credentials():
             raise ValueError(
-                "Missing Google Docs credentials. "
-                "Set credentials_path in markgate.yaml or ACCOUNT_A_CREDENTIALS_PATH env var. "
-                "Run: docspan auth setup google_docs"
+                "Missing Google Docs credentials. Configure a service account "
+                "(credentials_path / ACCOUNT_A_CREDENTIALS_PATH) or per-user OAuth "
+                "(oauth_client_secret_path). Run: docspan auth setup google_docs"
             )
