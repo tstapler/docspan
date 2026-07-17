@@ -68,8 +68,11 @@ class Backend(ABC):
         """Fetch the remote document and write it as local markdown."""
 
     @abstractmethod
-    def auth_setup(self) -> None:
-        """Interactive / instructional setup wizard for this backend."""
+    def auth_setup(self, config_path: Optional[str] = None) -> None:
+        """Interactive / instructional setup wizard for this backend.
+
+        `config_path` is the markgate.yaml path (if any) so setup can persist choices.
+        """
 
     @abstractmethod
     def get_remote_version(self, doc_id: str) -> str:

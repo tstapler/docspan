@@ -159,7 +159,17 @@ docspan auth setup BACKEND [--config PATH]
 
 Interactive authentication setup. `BACKEND` is one of `google_docs` or `confluence`.
 
-For Google Docs, prints step-by-step service account setup instructions. For Confluence, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
+For **Google Docs**, run it with no flags for a guided flow:
+
+```
+docspan auth setup google_docs
+```
+
+It detects your current state, lets you pick **Personal (OAuth)** [recommended] or **Service account**, auto-detects a `client_secret.json` (scanning `.`, `.markgate/`, `~/Downloads`) or prompts for the path with validation, runs the browser sign-in, verifies the connection, and offers to persist the choice into `markgate.yaml` so you never repeat it. In a non-TTY/CI environment it prints manual instructions instead of prompting.
+
+Everything is scriptable — any answer can be supplied as a flag: `--oauth` / `--service-account`, `--client-secret PATH`, `--credentials PATH`. If a `docspan push`/`pull` runs without credentials in an interactive terminal, it offers to run setup inline and then continues.
+
+For **Confluence**, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
 
 ### `docspan conflicts list`
 
@@ -191,10 +201,13 @@ Resolve a merge conflict in a tracked file.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `credentials_path` | string | null | Path to Google service account JSON key |
-| `token_path` | string | `.markgate/google_token.json` | OAuth token storage path |
+| `credentials_path` | string | null | Path to a Google **service account** JSON key |
+| `oauth_client_secret_path` | string | null | Path to an **OAuth client secret** JSON (Desktop app) for per-user auth |
+| `token_path` | string | `$XDG_CONFIG_HOME/docspan/google_token.json` | Where the cached OAuth user token is stored/refreshed (out of the repo) |
 
-**Environment variable alternatives:**
+Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env → per-user OAuth (`oauth_client_secret_path`, or an already-cached `token_path`).
+
+**Environment variable alternatives (service account):**
 - `ACCOUNT_A_CREDENTIALS_PATH` — path to service account JSON
 - `ACCOUNT_A_CREDENTIALS` — inline service account JSON string
 

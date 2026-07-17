@@ -53,7 +53,13 @@ err_console = Console(stderr=True, style="bold red")
 # Backend factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_backend(backend_name: str, config: MarkgateConfig):
+def _can_prompt() -> bool:
+    """True only when we can safely prompt the user (real TTY, not CI)."""
+    import sys
+    return sys.stdin.isatty() and sys.stdout.isatty() and not os.getenv("CI")
+
+
+def _get_backend(backend_name: str, config: MarkgateConfig, config_path: Optional[str] = None):
     cls = BACKENDS.get(backend_name)
     if not cls:
         err_console.print(
@@ -64,8 +70,18 @@ def _get_backend(backend_name: str, config: MarkgateConfig):
     try:
         backend.validate_config()
     except ValueError as exc:
-        err_console.print(f"Configuration error: {exc}")
-        raise typer.Exit(1)
+        # Auto-prompt the user to set up credentials inline (interactive only).
+        if _can_prompt() and typer.confirm(f"{exc}\n\nRun setup now?", default=True):
+            backend.auth_setup(config_path=config_path)
+            backend = cls.from_config(load_config(config_path))
+            try:
+                backend.validate_config()
+            except ValueError as exc2:
+                err_console.print(f"Still not configured: {exc2}")
+                raise typer.Exit(1)
+        else:
+            err_console.print(f"Configuration error: {exc}")
+            raise typer.Exit(1)
     return backend
 
 
@@ -129,7 +145,7 @@ def push(
             )
             continue
 
-        backend = _get_backend(mapping.backend, config)
+        backend = _get_backend(mapping.backend, config, config_path)
         outcome = orchestrate_push(mapping, backend, state, state_dir, state_path)
         result = outcome.result
 
@@ -186,7 +202,7 @@ def pull(
             )
             continue
 
-        backend = _get_backend(mapping.backend, config)
+        backend = _get_backend(mapping.backend, config, config_path)
         outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
 
         if outcome.action == "up-to-date":
@@ -357,6 +373,10 @@ def migrate_xdg(
 def auth_setup(
     backend: str = typer.Argument(..., help="Backend to authenticate: google_docs | confluence"),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    oauth: bool = typer.Option(False, "--oauth", help="Use per-user OAuth (google_docs)."),
+    client_secret: Optional[str] = typer.Option(
+        None, "--client-secret", help="Path to an OAuth client secret JSON (google_docs, with --oauth)."
+    ),
 ) -> None:
     """Interactive authentication setup for a backend."""
     config = load_config(config_path)
@@ -364,8 +384,21 @@ def auth_setup(
     if not cls:
         err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
         raise typer.Exit(1)
+
+    if oauth or client_secret:
+        from docspan.config import GoogleDocsConfig
+        gd = config.backends.google_docs or GoogleDocsConfig()
+        if client_secret:
+            gd.oauth_client_secret_path = client_secret
+        if not gd.oauth_client_secret_path:
+            err_console.print(
+                "--oauth requires --client-secret PATH (or oauth_client_secret_path in markgate.yaml)."
+            )
+            raise typer.Exit(1)
+        config.backends.google_docs = gd
+
     b = cls.from_config(config)
-    b.auth_setup()
+    b.auth_setup(config_path=config_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
