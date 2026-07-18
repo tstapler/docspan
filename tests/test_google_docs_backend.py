@@ -148,3 +148,136 @@ class TestPushRevisionGuard:
 
         assert result.status == "skipped"
         fake_client.batch_update.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# High-risk gate — PushPlan single-fetch invariant, blocked/force paths
+# (Epic 1.2, Story 1.2.3, plan.md Task 1.2.3d)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _checkbox_glyph_doc(revision_id: str = "rev-checkbox") -> dict:
+    """A doc with one paragraph that resolves as a native BULLET_CHECKBOX
+    glyph — GlyphShapeCheck must flag any change to it as high_risk, even
+    with zero open comments."""
+    return {
+        "revisionId": revision_id,
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 21,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "[ ] Whatsapp group\n"}}],
+                        "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                    },
+                }
+            ]
+        },
+        "lists": {
+            "kix.abc": {
+                "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+            }
+        },
+    }
+
+
+class TestPushHighRiskGate:
+    def _make_backend(self) -> tuple[GoogleDocsBackend, MagicMock]:
+        backend = GoogleDocsBackend(GoogleDocsConfig())
+        fake_client = MagicMock()
+        backend._client = fake_client
+        return backend, fake_client
+
+    def test_preview_push_never_calls_batch_update_even_when_high_risk(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = self._make_backend()
+        fake_client.get_document.return_value = _checkbox_glyph_doc()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("- [x] Whatsapp group\n", encoding="utf-8")
+
+        preview = backend.preview_push(str(local), "doc-1")
+
+        assert len(preview.high_risk) == 1
+        assert preview.high_risk[0].reasons == ["native_glyph"]
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_blocks_on_high_risk_using_exactly_one_fetch_it_performed_itself(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = self._make_backend()
+        fake_client.get_document.return_value = _checkbox_glyph_doc()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("- [x] Whatsapp group\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "blocked"
+        assert "NATIVE CHECKBOX GLYPH" in (result.message or "")
+        fake_client.batch_update.assert_not_called()
+        # Proves the block decision came from push()'s own single fetch —
+        # not a stale externally-supplied preview, and not a duplicate-fetch
+        # design (the backstop's second list_comments call never fires
+        # because batch_update was never reached).
+        assert fake_client.get_document.call_count == 1
+        assert fake_client.list_comments.call_count == 1
+
+    def test_push_force_true_proceeds_using_revision_id_from_its_own_fetch(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = self._make_backend()
+        fake_client.get_document.return_value = _checkbox_glyph_doc(revision_id="rev-force")
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("- [x] Whatsapp group\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", force=True)
+
+        assert result.status == "ok"
+        fake_client.batch_update.assert_called_once()
+        args, kwargs = fake_client.batch_update.call_args
+        assert kwargs["required_revision_id"] == "rev-force"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CommentCountBackstop (plan.md Task 1.2.3c/1.2.3d)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCommentCountBackstop:
+    def _make_backend(self) -> tuple[GoogleDocsBackend, MagicMock]:
+        backend = GoogleDocsBackend(GoogleDocsConfig())
+        fake_client = MagicMock()
+        backend._client = fake_client
+        return backend, fake_client
+
+    def test_push_appends_comment_count_dropped_warning_when_post_push_count_is_lower(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = self._make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.side_effect = [
+            [{"id": "c1"}, {"id": "c2"}, {"id": "c3"}],  # before batch_update (in PushPlan)
+            [{"id": "c1"}, {"id": "c2"}],  # after batch_update (backstop re-check)
+        ]
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "warning"
+        assert "⚠ open comment count dropped (3→2)" in (result.message or "")
+
+    def test_push_message_has_no_drop_warning_when_comment_count_unchanged(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = self._make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.side_effect = [
+            [{"id": "c1"}],
+            [{"id": "c1"}],
+        ]
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "ok"
+        assert "dropped" not in (result.message or "")

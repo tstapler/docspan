@@ -5,13 +5,14 @@ Tests verify exit codes and output text; no real backends or network calls.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
 from docspan.backends.base import Backend, PullResult, PushResult
-from docspan.cli.main import app
+from docspan.cli.main import LIVE_WEDDING_DOC_ID, SCRATCH_VERIFIED_MARKER, app
 from docspan.config import Mapping, MarkgateConfig
 from docspan.core.orchestrator import PullOutcome, PushOutcome
 from docspan.core.state import MappingState, SyncState, sha256_of_content
@@ -30,8 +31,10 @@ class FakeBackend(Backend):
     push_status: str = "ok"
     pull_status: str = "ok"
     auth_setup_called: bool = False
+    push_calls: list = field(default_factory=list)
 
-    def push(self, local_path: str, doc_id: str, **kwargs) -> PushResult:
+    def push(self, local_path: str, doc_id: str, force: bool = False, **kwargs) -> PushResult:
+        self.push_calls.append({"local_path": local_path, "doc_id": doc_id, "force": force})
         return PushResult(status=self.push_status, doc_id=doc_id, url="https://example.com/doc")  # type: ignore[arg-type]
 
     def pull(self, doc_id: str, local_path: str, **kwargs) -> PullResult:
@@ -45,6 +48,27 @@ class FakeBackend(Backend):
 
     def validate_config(self) -> None:
         pass
+
+
+@dataclass
+class FakePushPreview:
+    """Minimal stand-in for push_preview.PushPreview — just needs .render()."""
+    text: str = "Preview: 1 change(s), 0 addition(s), 0 removal(s), 0 unchanged\n  ~ [ ] Splitwise → [x] Splitwise"
+
+    def render(self) -> str:
+        return self.text
+
+
+@dataclass
+class FakeBackendWithPreview(FakeBackend):
+    """A FakeBackend that also supports preview_push(), for --dry-run tests."""
+    name: str = "fake"
+    preview_text: Optional[str] = None
+
+    def preview_push(self, local_path: str, doc_id: str) -> FakePushPreview:
+        if self.preview_text is not None:
+            return FakePushPreview(text=self.preview_text)
+        return FakePushPreview()
 
 
 def _config(*mappings: Mapping) -> MarkgateConfig:
@@ -90,10 +114,40 @@ def _fake_entry(local_path: str = "doc.md", remote_version: str = "v1") -> Mappi
 
 class TestPush:
     def test_dry_run_prints_preview_and_exits_zero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # Plain FakeBackend has no preview_push — this exercises the
+        # fallback stub message (see test_dry_run_falls_back_to_stub_when_
+        # backend_has_no_preview below for the same scenario, named per
+        # Task 1.2.4c).
         local = tmp_path / "doc.md"
         local.write_text("# Hello\n", encoding="utf-8")
         cfg = _cfg_file(tmp_path)
-        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))):
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()):
+            result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
+        assert result.exit_code == 0
+        assert "dry-run" in result.output
+
+    def test_dry_run_renders_preview_when_backend_supports_it(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("- [x] Splitwise\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview(
+            preview_text="Preview: 1 change(s), 0 addition(s), 0 removal(s), 12 unchanged\n"
+            "  ~ [ ] Splitwise → [x] Splitwise"
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
+        assert result.exit_code == 0
+        assert "~ [ ] Splitwise → [x] Splitwise" in result.output
+        # This call is purely informational — no real write occurs.
+
+    def test_dry_run_falls_back_to_stub_when_backend_has_no_preview(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()):
             result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
         assert result.exit_code == 0
         assert "dry-run" in result.output
@@ -175,6 +229,145 @@ class TestPush:
             result = runner.invoke(app, ["push", "--config", cfg])
         assert result.exit_code == 1
         assert "Unknown backend" in result.output
+
+    def test_push_reports_blocked_status_as_error_without_force(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="blocked", doc_id="doc-123", message="⚠ COMMENT AT RISK: ..."),
+            state_saved=False,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--config", cfg])
+        assert result.exit_code == 1
+        assert "✗" in result.output
+
+    def test_push_force_flag_reaches_backend_push_call(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["push", "--force", "--config", cfg])
+        assert result.exit_code == 0
+        assert len(backend.push_calls) == 1
+        assert backend.push_calls[0]["force"] is True
+
+    def test_push_without_force_flag_reaches_backend_push_call_as_false(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["push", "--config", cfg])
+        assert result.exit_code == 0
+        assert len(backend.push_calls) == 1
+        assert backend.push_calls[0]["force"] is False
+
+    def test_push_reports_warning_status_with_yellow_icon_and_nonzero_exit(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(
+                status="warning",
+                doc_id="doc-123",
+                message="⚠ open comment count dropped (2→1)",
+            ),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--config", cfg])
+        # CommentCountBackstop's finding must never render/exit like a clean
+        # "ok" (green ✓, exit 0) — it gets its own yellow ⚠ and nonzero exit.
+        assert result.exit_code == 1
+        assert "⚠" in result.output
+        assert "✓" not in result.output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# push — ScratchVerificationMarker (Story 1.2.5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPushScratchVerificationMarker:
+    def test_live_doc_push_prompts_when_marker_missing_and_aborts_on_no(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "wedding.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=LIVE_WEDDING_DOC_ID)
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push") as mock_orchestrate:
+            result = runner.invoke(app, ["push", "--config", cfg], input="n\n")
+        assert result.exit_code == 1
+        assert "Push cancelled." in result.output
+        mock_orchestrate.assert_not_called()
+        assert not (tmp_path / SCRATCH_VERIFIED_MARKER).exists()
+
+    def test_live_doc_push_prompts_and_proceeds_and_writes_marker_on_yes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "wedding.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=LIVE_WEDDING_DOC_ID)
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id=LIVE_WEDDING_DOC_ID, url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome) as mock_orchestrate:
+            result = runner.invoke(app, ["push", "--config", cfg], input="y\n")
+        assert result.exit_code == 0
+        mock_orchestrate.assert_called_once()
+        assert (tmp_path / SCRATCH_VERIFIED_MARKER).exists()
+
+    def test_live_doc_push_skips_prompt_when_marker_present(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "wedding.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        (tmp_path / SCRATCH_VERIFIED_MARKER).write_text("verified\n", encoding="utf-8")
+        mapping = _mapping(local=str(local), remote_id=LIVE_WEDDING_DOC_ID)
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id=LIVE_WEDDING_DOC_ID, url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome) as mock_orchestrate:
+            # No input provided — if the prompt fired, this would hang/fail.
+            result = runner.invoke(app, ["push", "--config", cfg], input="")
+        assert result.exit_code == 0
+        mock_orchestrate.assert_called_once()
+
+    def test_scratch_doc_push_never_prompts(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "wedding-scratch.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id="scratch-doc-id")
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id="scratch-doc-id", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome) as mock_orchestrate:
+            # No input provided — if the prompt fired, this would hang/fail.
+            result = runner.invoke(app, ["push", "--config", cfg], input="")
+        assert result.exit_code == 0
+        mock_orchestrate.assert_called_once()
+        assert not (tmp_path / SCRATCH_VERIFIED_MARKER).exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

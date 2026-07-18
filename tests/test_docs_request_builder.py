@@ -174,3 +174,113 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
         r.get("createParagraphBullets", {}).get("bulletPreset") == "BULLET_CHECKBOX"
         for r in requests
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# diff_summary() — human-oriented dry-run diff (plan.md Story 1.2.1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _para_ncb(
+    text: str,
+    is_native_checkbox: bool = False,
+    style: str = "NORMAL_TEXT",
+    start: int = 1,
+    end: int = 10,
+    is_list_item: bool = False,
+) -> DocsParagraphNode:
+    return DocsParagraphNode(
+        style=style,
+        text=text,
+        start_index=start,
+        end_index=end,
+        is_list_item=is_list_item,
+        is_native_checkbox=is_native_checkbox,
+    )
+
+
+def test_diff_summary_reports_unchanged_count_and_skips_equal_rows() -> None:
+    current = [
+        _para("Housing: Bekah has the lake house", start=1, end=10),
+        _para("Old text", start=10, end=20),
+    ]
+    target = [
+        _para("Housing: Bekah has the lake house", start=1, end=10),
+        _para("New text", start=10, end=20),
+    ]
+    entries, unchanged_count = builder.diff_summary(current, target)
+    assert unchanged_count == 1
+    assert len(entries) == 1
+    assert entries[0].kind == "change"
+
+
+def test_diff_summary_classifies_checklist_toggle_as_change() -> None:
+    current = [_para("[ ] Splitwise", is_list_item=True)]
+    target = [_para("[x] Splitwise", is_list_item=True)]
+    entries, unchanged_count = builder.diff_summary(current, target)
+    assert unchanged_count == 0
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "change"
+    assert entry.current_text == "[ ] Splitwise"
+    assert entry.target_text == "[x] Splitwise"
+    assert entry.style == "NORMAL_TEXT"
+    assert entry.current_is_native_checkbox is False
+
+
+def test_diff_summary_classifies_new_paragraph_as_add() -> None:
+    current: list = []
+    target = [_para("Brand new paragraph")]
+    entries, unchanged_count = builder.diff_summary(current, target)
+    assert unchanged_count == 0
+    assert len(entries) == 1
+    assert entries[0].kind == "add"
+    assert entries[0].current_text is None
+    assert entries[0].target_text == "Brand new paragraph"
+    assert entries[0].current_is_native_checkbox is False
+
+
+def test_diff_summary_classifies_removed_paragraph_as_remove() -> None:
+    current = [_para("Gone now")]
+    target: list = []
+    entries, unchanged_count = builder.diff_summary(current, target)
+    assert unchanged_count == 0
+    assert len(entries) == 1
+    assert entries[0].kind == "remove"
+    assert entries[0].current_text == "Gone now"
+    assert entries[0].target_text is None
+
+
+def test_diff_summary_copies_current_is_native_checkbox_from_current_side_only() -> None:
+    """current_is_native_checkbox is copied from the current-side node only —
+    an "add" entry (no current node) always stays False, and the target
+    side's own is_native_checkbox (if any) is never consulted."""
+    current = [_para_ncb("[ ] Whatsapp group", is_native_checkbox=True, is_list_item=True)]
+    target = [_para_ncb("[x] Whatsapp group", is_native_checkbox=False, is_list_item=True)]
+    entries, unchanged_count = builder.diff_summary(current, target)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "change"
+    assert entry.current_text == "[ ] Whatsapp group"
+    assert entry.target_text == "[x] Whatsapp group"
+    assert entry.current_is_native_checkbox is True
+
+
+def test_diff_summary_handles_empty_current_and_target_without_raising() -> None:
+    entries, unchanged_count = builder.diff_summary([], [])
+    assert entries == []
+    assert unchanged_count == 0
+
+
+def test_replace_with_unequal_current_and_target_length_does_not_raise() -> None:
+    """A 'replace' opcode where current/target paragraph-range lengths differ
+    (e.g. one checklist line split into two) is handled as extra add/remove
+    entries, not an IndexError/zip truncation bug."""
+    current = [_para("Only one paragraph here", start=1, end=25)]
+    target = [
+        _para("Split into", start=1, end=11),
+        _para("two paragraphs", start=11, end=25),
+    ]
+    entries, unchanged_count = builder.diff_summary(current, target)
+    kinds = sorted(e.kind for e in entries)
+    assert kinds == ["add", "change"]
+    assert unchanged_count == 0

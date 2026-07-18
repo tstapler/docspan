@@ -162,6 +162,33 @@ class GoogleDocsClient:
             ).execute()
         )
 
+    def list_comments(self, doc_id: str) -> List[dict]:
+        """
+        Return open (not resolved) comments on a Drive file, read-only.
+
+        Never mutates, resolves, or re-anchors a comment — used purely as a
+        read-only source for CommentCrossReference/CommentCountBackstop
+        (see ADR-002). Wrapped in the same _with_backoff helper as
+        get_document/batch_update.
+
+        Args:
+            doc_id: Google Doc / Drive file ID
+
+        Returns:
+            list[dict]: comment resources (id, content, quotedFileContent,
+            resolved, author.displayName) with resolved=True comments
+            excluded.
+        """
+        response = self._with_backoff(
+            lambda: self.drive_service.comments().list(
+                fileId=doc_id,
+                fields="comments(id,content,quotedFileContent,resolved,author(displayName))",
+                includeDeleted=False,
+            ).execute()
+        )
+        comments = response.get("comments", [])
+        return [c for c in comments if not c.get("resolved")]
+
     def get_doc_content(self, doc_id: str) -> str:
         """
         Get Google Doc content as HTML with retry mechanism

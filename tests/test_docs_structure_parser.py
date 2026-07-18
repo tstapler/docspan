@@ -212,3 +212,103 @@ def test_multiple_paragraphs_in_order() -> None:
     assert len(nodes) == 2
     assert nodes[0].text == "First"
     assert nodes[1].text == "Second"
+
+
+def test_parse_paragraph_handles_bullet_paragraph_missing_list_id_without_raising() -> None:
+    """A bullet-bearing structural element with no listId (malformed/partial
+    Docs JSON) must not raise — the parser degrades to is_list_item=True,
+    is_native_checkbox=False, rather than crashing the whole parse() pass."""
+    doc = _doc_with_content([
+        _make_para_element("Item with no listId", bullet={"nestingLevel": 0}, start=1, end=10)
+    ])
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_list_item is True
+    assert nodes[0].is_native_checkbox is False
+
+
+def test_parse_skips_table_and_toc_elements_without_raising() -> None:
+    """A table/tableOfContents structural element parses without error and
+    without corrupting adjacent paragraphs — confirms the documented feature
+    gap is a silent skip, not a crash."""
+    doc = _doc_with_content([
+        _make_para_element("Before", start=1, end=8),
+        {"startIndex": 8, "endIndex": 20, "table": {"rows": 1, "columns": 1}},
+        {"startIndex": 20, "endIndex": 25, "tableOfContents": {}},
+        _make_para_element("After", start=25, end=31),
+    ])
+    nodes = parser.parse(doc)
+    assert [n.text for n in nodes] == ["Before", "After"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# is_native_checkbox resolution (GlyphShapeCheck — plan.md Task 1.2.2d, ADR-001)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _doc_with_lists(content: list, lists: dict) -> dict:
+    return {"body": {"content": content}, "lists": lists}
+
+
+def test_parse_paragraph_sets_is_native_checkbox_true_for_checkbox_glyph_bullet() -> None:
+    """A bullet whose resolved glyph is GLYPH_TYPE_UNSPECIFIED is a native
+    BULLET_CHECKBOX glyph — confirmed checked/unchecked state is not readable
+    via documents.get() (ADR-001)."""
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "[ ] Whatsapp group",
+                bullet={"listId": "kix.abc", "nestingLevel": 0},
+                start=10,
+                end=30,
+            )
+        ],
+        {"kix.abc": {"listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}}},
+    )
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_native_checkbox is True
+
+
+def test_parse_paragraph_sets_is_native_checkbox_false_for_ordinary_bullet() -> None:
+    """An ordinary disc/circle/square bullet (non-checkbox glyphType) must
+    resolve to is_native_checkbox=False."""
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "Ordinary bullet item",
+                bullet={"listId": "kix.def", "nestingLevel": 0},
+                start=1,
+                end=25,
+            )
+        ],
+        {"kix.def": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}}},
+    )
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_native_checkbox is False
+
+
+def test_parse_paragraph_is_native_checkbox_false_when_list_id_missing_from_lists_map() -> None:
+    """A bullet referencing a listId absent from the document's `lists` map
+    (e.g. incomplete fixture/partial fetch) degrades to False, not a KeyError."""
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "Orphaned bullet",
+                bullet={"listId": "kix.unknown", "nestingLevel": 0},
+                start=1,
+                end=17,
+            )
+        ],
+        {},
+    )
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_native_checkbox is False
+
+
+def test_parse_paragraph_is_native_checkbox_false_for_non_bullet_paragraph() -> None:
+    doc = _doc_with_content([_make_para_element("Plain paragraph", start=1, end=17)])
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_native_checkbox is False

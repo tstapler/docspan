@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import difflib
-from typing import List, Tuple, Union
+from dataclasses import dataclass
+from typing import List, Literal, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -29,6 +30,50 @@ def _body_content(doc: dict) -> list:
     return body.get("content", [])
 
 
+def _node_text(node: Node) -> str:
+    """Human-readable text for a node, for DiffEntry/preview rendering.
+
+    Tables have no single "text" — render cells as a pipe-joined grid so a
+    table row that overlaps an open comment's quoted text can still be
+    caught by CommentCrossReference (push_preview.find_high_risk_paragraphs)
+    instead of being silently invisible to it.
+    """
+    if isinstance(node, DocsTableNode):
+        return "\n".join(" | ".join(row) for row in node.rows)
+    return node.text
+
+
+def _node_style(node: Node) -> str:
+    """Style label for a node, for DiffEntry/preview rendering."""
+    if isinstance(node, DocsTableNode):
+        return "TABLE"
+    return node.style
+
+
+def _node_is_native_checkbox(node: Node) -> bool:
+    """Whether a node is a native BULLET_CHECKBOX glyph (paragraphs only)."""
+    return isinstance(node, DocsParagraphNode) and node.is_native_checkbox
+
+
+@dataclass
+class DiffEntry:
+    """One row of a human-oriented paragraph/table diff (see plan.md Story 1.2.1).
+
+    Produced only for non-"unchanged" rows by DocsRequestBuilder.diff_summary().
+    `current_is_native_checkbox` is copied from the current-side
+    DocsParagraphNode.is_native_checkbox for "remove"/"change" entries only
+    (an "add" entry has no current node, so it stays at its default False;
+    a table entry is also always False, since checkboxes are a paragraph-only
+    concept) — it feeds GlyphShapeCheck (push_preview.find_high_risk_paragraphs),
+    never DocsRequestBuilder.build()'s equality/opcode logic.
+    """
+    kind: Literal["add", "remove", "change", "unchanged"]
+    current_text: Optional[str]
+    target_text: Optional[str]
+    style: str
+    current_is_native_checkbox: bool = False
+
+
 class DocsRequestBuilder:
     """Diff two node ASTs and produce minimal Google Docs batchUpdate requests."""
 
@@ -37,6 +82,118 @@ class DocsRequestBuilder:
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(row) for row in node.rows))
         return ("__para__", node.style, node.text, node.is_list_item)
+
+    def _opcodes(
+        self,
+        current: List[Node],
+        target: List[Node],
+    ) -> List[Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]]:
+        """Build the single difflib.SequenceMatcher opcode list shared by
+        build() and diff_summary().
+
+        Both methods interpret the same opcodes differently on purpose
+        (build() does whole-range replace, diff_summary() zips pairwise) —
+        but they must see identical opcodes, since push()'s safety gate
+        (high_risk, derived from diff_summary()'s classification) and the
+        actual write (derived from build()'s classification) must never
+        drift apart. This is the one place current_keys/target_keys/
+        SequenceMatcher get constructed.
+        """
+        current_keys = [self._node_key(n) for n in current]
+        target_keys = [self._node_key(n) for n in target]
+        matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
+        return matcher.get_opcodes()
+
+    def diff_summary(
+        self,
+        current: List[Node],
+        target: List[Node],
+    ) -> Tuple[List[DiffEntry], int]:
+        """
+        Produce a human-oriented diff summary of current vs. target nodes.
+
+        Reuses the same _opcodes() machinery build() uses (a second pass over
+        matcher.get_opcodes(), not a separate diff algorithm), per plan.md
+        Story 1.2.1. Table nodes are included (not skipped) so
+        CommentCrossReference/GlyphShapeCheck still see any paragraph *or*
+        table row about to be deleted/replaced.
+
+        Args:
+            current: Nodes parsed from the live Google Doc.
+            target:  Nodes parsed from the local markdown file.
+
+        Returns:
+            (entries, unchanged_count) — entries contains only non-"unchanged"
+            rows; unchanged_count is a plain int for the summary line.
+        """
+        entries: List[DiffEntry] = []
+        unchanged_count = 0
+
+        for tag, i1, i2, j1, j2 in self._opcodes(current, target):
+            if tag == "equal":
+                unchanged_count += i2 - i1
+
+            elif tag == "delete":
+                for node in current[i1:i2]:
+                    entries.append(
+                        DiffEntry(
+                            kind="remove",
+                            current_text=_node_text(node),
+                            target_text=None,
+                            style=_node_style(node),
+                            current_is_native_checkbox=_node_is_native_checkbox(node),
+                        )
+                    )
+
+            elif tag == "insert":
+                for node in target[j1:j2]:
+                    entries.append(
+                        DiffEntry(
+                            kind="add",
+                            current_text=None,
+                            target_text=_node_text(node),
+                            style=_node_style(node),
+                        )
+                    )
+
+            elif tag == "replace":
+                cur_slice = current[i1:i2]
+                tgt_slice = target[j1:j2]
+                common = min(len(cur_slice), len(tgt_slice))
+                for cur_node, tgt_node in zip(cur_slice[:common], tgt_slice[:common]):
+                    entries.append(
+                        DiffEntry(
+                            kind="change",
+                            current_text=_node_text(cur_node),
+                            target_text=_node_text(tgt_node),
+                            style=_node_style(cur_node),
+                            current_is_native_checkbox=_node_is_native_checkbox(cur_node),
+                        )
+                    )
+                # Length mismatch (e.g. one checklist line split into two) —
+                # treat the leftovers as plain adds/removes rather than
+                # raising or truncating silently.
+                for extra_cur in cur_slice[common:]:
+                    entries.append(
+                        DiffEntry(
+                            kind="remove",
+                            current_text=_node_text(extra_cur),
+                            target_text=None,
+                            style=_node_style(extra_cur),
+                            current_is_native_checkbox=_node_is_native_checkbox(extra_cur),
+                        )
+                    )
+                for extra_tgt in tgt_slice[common:]:
+                    entries.append(
+                        DiffEntry(
+                            kind="add",
+                            current_text=None,
+                            target_text=_node_text(extra_tgt),
+                            style=_node_style(extra_tgt),
+                        )
+                    )
+
+        return entries, unchanged_count
 
     def build(
         self,
@@ -59,11 +216,7 @@ class DocsRequestBuilder:
         Returns:
             List of request dicts sorted by descending startIndex (write-backwards).
         """
-        current_keys = [self._node_key(n) for n in current]
-        target_keys = [self._node_key(n) for n in target]
-
-        matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        opcodes = matcher.get_opcodes()
+        opcodes = self._opcodes(current, target)
 
         all_requests: List[dict] = []
 
