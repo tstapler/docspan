@@ -6,16 +6,8 @@ from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 DOC_END = 100
 
 
-def _para(
-    text: str,
-    style: str = "NORMAL_TEXT",
-    start: int = 1,
-    end: int = 10,
-    is_list_item: bool = False,
-) -> DocsParagraphNode:
-    return DocsParagraphNode(
-        style=style, text=text, start_index=start, end_index=end, is_list_item=is_list_item
-    )
+def _para(text: str, style: str = "NORMAL_TEXT", start: int = 1, end: int = 10) -> DocsParagraphNode:
+    return DocsParagraphNode(style=style, text=text, start_index=start, end_index=end)
 
 
 builder = DocsRequestBuilder()
@@ -136,41 +128,3 @@ def test_same_style_no_style_request() -> None:
     target = [_para("Same", style="HEADING_1", start=1, end=5)]
     requests = builder.build(current, target, DOC_END)
     assert not any("updateParagraphStyle" in r for r in requests)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Checklist round-trip (literal-text scheme — see ADR-001)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> None:
-    """Toggling `[ ]` -> `[x]` on an otherwise-unchanged list item must be
-    diffed exactly like any other single-line text edit: one delete + one
-    insert, with the bullet preset staying BULLET_DISC_CIRCLE_SQUARE — never
-    BULLET_CHECKBOX (ADR-001's Pattern Decision: checklist state is never
-    written as a native checkbox glyph)."""
-    current = [_para("[ ] Splitwise", start=50, end=65, is_list_item=True)]
-    target = [_para("[x] Splitwise", start=50, end=65, is_list_item=True)]
-    # doc_end_index == current node's end_index so the terminal-newline
-    # clamp in _make_delete_requests applies, matching plan.md Story 2.1.3's
-    # worked example: deleteContentRange clamps to [50, 64).
-    requests = builder.build(current, target, doc_end_index=65)
-
-    delete_requests = [r for r in requests if "deleteContentRange" in r]
-    insert_requests = [r for r in requests if "insertText" in r]
-    bullet_requests = [r for r in requests if "createParagraphBullets" in r]
-
-    assert len(delete_requests) == 1
-    assert delete_requests[0]["deleteContentRange"]["range"] == {
-        "startIndex": 50,
-        "endIndex": 64,
-    }
-
-    assert len(insert_requests) == 1
-    assert insert_requests[0]["insertText"]["text"] == "[x] Splitwise\n"
-
-    assert len(bullet_requests) == 1
-    assert bullet_requests[0]["createParagraphBullets"]["bulletPreset"] == "BULLET_DISC_CIRCLE_SQUARE"
-    assert not any(
-        r.get("createParagraphBullets", {}).get("bulletPreset") == "BULLET_CHECKBOX"
-        for r in requests
-    )

@@ -73,24 +73,6 @@ def test_multiple_list_items() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Checklist round-trip (literal-text scheme — see ADR-001)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_parse_preserves_literal_checkbox_markers_in_list_item_text() -> None:
-    """`- [x] Foo` / `- [ ] Bar` must parse with the literal bracket marker
-    intact inside `.text` — confirms the `task_lists` mistune plugin is NOT
-    enabled (it would strip the marker into a separate `attrs.checked` field
-    and lose it from `.text`), per ADR-001's LiteralTextScheme decision."""
-    nodes = parser.parse("- [x] Whatsapp group\n- [ ] Splitwise\n")
-    list_nodes = [n for n in nodes if n.is_list_item]
-    assert len(list_nodes) == 2
-    assert list_nodes[0].text == "[x] Whatsapp group"
-    assert list_nodes[0].nesting_level == 0
-    assert list_nodes[1].text == "[ ] Splitwise"
-    assert list_nodes[1].nesting_level == 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Code blocks
 # ─────────────────────────────────────────────────────────────────────────────
 

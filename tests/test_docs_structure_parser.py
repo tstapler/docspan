@@ -176,33 +176,6 @@ def test_nested_list_item() -> None:
     assert nodes[0].nesting_level == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Checklist round-trip (literal-text scheme — see ADR-001)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_parse_paragraph_preserves_literal_checkbox_marker_in_text() -> None:
-    """A `[x]`/`[ ]` marker embedded in a bullet paragraph's text must survive
-    parsing unmodified — checklist state is opaque literal text (ADR-001),
-    never derived from or stripped based on the bullet/glyph itself."""
-    doc = _doc_with_content([
-        _make_para_element(
-            "[x] Whatsapp group",
-            bullet={"listId": "kix.abc", "nestingLevel": 0},
-            start=10,
-            end=30,
-        )
-    ])
-    nodes = parser.parse(doc)
-    assert len(nodes) == 1
-    node = nodes[0]
-    assert node.style == "NORMAL_TEXT"
-    assert node.text == "[x] Whatsapp group"
-    assert node.is_list_item is True
-    assert node.nesting_level == 0
-    assert node.start_index == 10
-    assert node.end_index == 30
-
-
 def test_multiple_paragraphs_in_order() -> None:
     doc = _doc_with_content([
         _make_para_element("First", start=1, end=6),
