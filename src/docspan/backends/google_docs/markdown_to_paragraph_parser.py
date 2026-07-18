@@ -162,6 +162,10 @@ class MarkdownToParagraphParser:
         """Parse markdown content into a node list in document order."""
         import mistune
 
+        # mistune.create_markdown(renderer=None) returns AST tokens. "table" is
+        # enabled for table support; "task_lists" is deliberately NOT enabled —
+        # checklist state is kept as literal text (ADR-001); that plugin would
+        # strip the [ ]/[x] marker into attrs.checked and lose it from .text.
         md = mistune.create_markdown(renderer=None, plugins=["table"])
         tokens = md(content) or []
 

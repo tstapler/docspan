@@ -6,6 +6,8 @@ import os
 import pathlib
 from typing import TYPE_CHECKING, Optional
 
+from googleapiclient.errors import HttpError
+
 from docspan.backends.base import Backend, PullResult, PushResult
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
@@ -103,10 +105,15 @@ class GoogleDocsBackend(Backend):
             if not requests:
                 return PushResult(status="skipped", doc_id=doc_id, message="No changes detected")
 
-            self._client.batch_update(doc_id, requests)
+            self._client.batch_update(
+                doc_id, requests, required_revision_id=doc["revisionId"]
+            )
 
             # Pass 2: tables are inserted empty and inline styling is deferred above; re-fetch
             # to read real indices, then fill cells + apply link/bold/italic/monospace styling.
+            # The re-fetch's own revisionId guards this second batch_update the same way the
+            # first one is guarded above, so pass 2 can't silently overwrite an edit that landed
+            # in the (small) window between pass 1 and this re-fetch.
             needs_pass2 = any(
                 isinstance(n, DocsTableNode)
                 or (isinstance(n, DocsParagraphNode) and n.spans)
@@ -116,10 +123,20 @@ class GoogleDocsBackend(Backend):
                 refreshed = self._client.get_document(doc_id)
                 second = builder.build_second_pass_requests(refreshed, target_nodes)
                 if second:
-                    self._client.batch_update(doc_id, second)
+                    self._client.batch_update(
+                        doc_id, second, required_revision_id=refreshed["revisionId"]
+                    )
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
             return PushResult(status="ok", doc_id=doc_id, url=url)
+        except HttpError as exc:
+            if exc.resp.status == 400 and "requiredRevisionId" in str(exc):
+                return PushResult(
+                    status="conflict",
+                    doc_id=doc_id,
+                    message="The doc changed since your last pull — run `docspan pull` again",
+                )
+            return PushResult(status="error", doc_id=doc_id, message=str(exc))
         except Exception as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
 
