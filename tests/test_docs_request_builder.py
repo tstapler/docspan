@@ -1,7 +1,7 @@
 """Unit tests for DocsRequestBuilder — structural diff algorithm, no network."""
 
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode, TextSpan
 
 DOC_END = 100
 
@@ -174,6 +174,78 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
         r.get("createParagraphBullets", {}).get("bulletPreset") == "BULLET_CHECKBOX"
         for r in requests
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Known gap: link/style loss on edited paragraphs
+# (feature-gap-report.md item 4 — _make_text_style_requests is dead code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _para_spans(
+    text: str,
+    spans: list,
+    style: str = "NORMAL_TEXT",
+    start: int = 1,
+    end: int = 10,
+    is_list_item: bool = False,
+) -> DocsParagraphNode:
+    return DocsParagraphNode(
+        style=style,
+        text=text,
+        start_index=start,
+        end_index=end,
+        is_list_item=is_list_item,
+        spans=spans,
+    )
+
+
+def test_edited_paragraph_with_link_style_loses_text_style_request_confirming_gap() -> None:
+    """Pins the documented gap in feature-gap-report.md item 4:
+    `_make_text_style_requests` (docs_request_builder.py:287-323) is a fully
+    implemented method for emitting `updateTextStyle` requests, but it is
+    dead code — `_make_insert_requests` (the only method that writes new
+    paragraph content on a "replace"/"insert" diff opcode) never calls it.
+
+    This test asserts the CURRENT (broken) behavior on purpose: a "replace"
+    opcode on a paragraph whose target carries a link span and a bold span
+    produces `insertText` with the flattened plain text, but NO
+    `updateTextStyle` request for either span. Per validation.md's Requirement
+    -> Test Mapping (In-scope 3), this is a "pin the known gap" regression
+    test — not a bug fix. It is explicitly out of scope to wire
+    `_make_text_style_requests` into `_make_insert_requests` this cycle (see
+    requirements.md Out of Scope and feature-gap-report.md item 4).
+
+    This test is meant to start FAILING the moment someone fixes the
+    underlying dead-code issue in a future cycle — that's the point: it
+    should surface either a regression (formatting silently lost again after
+    being fixed) or a fix (formatting requests now emitted), never silently
+    pass either way."""
+    current = [_para("Check the schedule before Friday", start=1, end=34)]
+    target = [
+        _para_spans(
+            "See the day plan for details",
+            spans=[
+                TextSpan(text="day plan", link="https://example.com/day-plan"),
+                TextSpan(text="details", bold=True),
+            ],
+            start=1,
+            end=34,
+        )
+    ]
+
+    requests = builder.build(current, target, doc_end_index=31)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    style_requests = [r for r in requests if "updateTextStyle" in r]
+
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "See the day plan for details\n"
+
+    # The gap: no updateTextStyle request is emitted for the link/bold spans,
+    # even though the target node carries them. When this starts failing,
+    # someone has wired _make_text_style_requests into _make_insert_requests
+    # — update/remove this test and feature-gap-report.md item 4 accordingly.
+    assert style_requests == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
