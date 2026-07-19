@@ -54,7 +54,7 @@ def find_high_risk_paragraphs(
         if entry.kind not in ("remove", "change"):
             continue
 
-        reasons: List[str] = []
+        reasons: List[Literal["comment", "native_glyph"]] = []
         comment_quoted_text: Optional[str] = None
         comment_author: Optional[str] = None
 
@@ -76,7 +76,7 @@ def find_high_risk_paragraphs(
             high_risk.append(
                 HighRiskParagraph(
                     paragraph_text=entry.current_text or "",
-                    reasons=reasons,  # type: ignore[arg-type]
+                    reasons=reasons,
                     comment_quoted_text=comment_quoted_text,
                     comment_author=comment_author,
                 )
@@ -148,13 +148,24 @@ class PushPreview:
     Read-only and cosmetic only — never consulted by a real push() to decide
     whether to write. Staleness here is acceptable because it never gates a
     write.
+
+    `error` is set (with all other fields at their empty defaults) when
+    GoogleDocsBackend.preview_push() caught a failure (expired auth, network
+    error, malformed doc) while building the plan — mirroring push()'s
+    try/except HttpError/except Exception -> PushResult(status="error", ...)
+    convention, so a --dry-run failure renders as one clean line instead of
+    a raw traceback.
     """
     entries: List[DiffEntry]
     unchanged_count: int
     high_risk: List[HighRiskParagraph]
     request_count: int
+    error: Optional[str] = None
 
     def render(self) -> str:
+        if self.error is not None:
+            return f"✗ dry-run failed: {self.error}"
+
         additions = sum(1 for e in self.entries if e.kind == "add")
         removals = sum(1 for e in self.entries if e.kind == "remove")
         changes = sum(1 for e in self.entries if e.kind == "change")

@@ -1,10 +1,14 @@
 """Unit tests for push_preview.py — find_high_risk_paragraphs(), render_high_risk(),
 PushPreview.render(), and GoogleDocsClient.list_comments() (Epic 1.2, Story 1.2.2).
+
+Shared `make_client`/`make_http_error` factory fixtures live in tests/conftest.py
+(also used by tests/test_google_docs_backend.py).
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from typing import Callable
 
+import pytest
 from googleapiclient.errors import HttpError
 
 from docspan.backends.google_docs.client import GoogleDocsClient
@@ -16,27 +20,15 @@ from docspan.backends.google_docs.push_preview import (
     render_high_risk,
 )
 
-
-def _make_client() -> GoogleDocsClient:
-    client = GoogleDocsClient.__new__(GoogleDocsClient)
-    client.docs_service = MagicMock()
-    client.drive_service = MagicMock()
-    return client
-
-
-def _make_http_error(status: int, message: str) -> HttpError:
-    resp = MagicMock()
-    resp.status = status
-    return HttpError(resp, message.encode("utf-8"))
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.list_comments()
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestListComments:
-    def test_list_comments_excludes_resolved_comments(self) -> None:
-        client = _make_client()
+    def test_list_comments_excludes_resolved_comments(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
         execute_mock = client.drive_service.comments.return_value.list.return_value.execute
         execute_mock.return_value = {
             "comments": [
@@ -62,10 +54,12 @@ class TestListComments:
         assert len(comments) == 1
         assert comments[0]["id"] == "c1"
 
-    def test_list_comments_returns_open_comment_for_scratch_doc(self) -> None:
+    def test_list_comments_returns_open_comment_for_scratch_doc(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
         """Mirrors Story 1.2.2's acceptance criterion — one open comment with
         quotedFileContent.value == "inner", one resolved comment excluded."""
-        client = _make_client()
+        client = make_client()
         execute_mock = client.drive_service.comments.return_value.list.return_value.execute
         execute_mock.return_value = {
             "comments": [
@@ -89,23 +83,26 @@ class TestListComments:
         assert len(comments) == 1
         assert comments[0]["quotedFileContent"]["value"] == "inner"
 
-    def test_list_comments_propagates_http_error_from_drive_service(self) -> None:
+    def test_list_comments_propagates_http_error_from_drive_service(
+        self,
+        make_client: Callable[[], GoogleDocsClient],
+        make_http_error: Callable[[int, str], HttpError],
+    ) -> None:
         """A 403 scope-denial HttpError must not be swallowed silently — it
         must surface so push()'s outer except Exception can turn it into
         PushResult(status="error", ...) rather than a false 'no comments'."""
-        client = _make_client()
+        client = make_client()
         client.drive_service.comments.return_value.list.return_value.execute.side_effect = (
-            _make_http_error(403, "The user does not have sufficient permissions")
+            make_http_error(403, "The user does not have sufficient permissions")
         )
 
-        try:
+        with pytest.raises(HttpError):
             client.list_comments("doc-1")
-            assert False, "expected HttpError to propagate"
-        except HttpError:
-            pass
 
-    def test_list_comments_returns_empty_list_when_no_comments(self) -> None:
-        client = _make_client()
+    def test_list_comments_returns_empty_list_when_no_comments(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
         client.drive_service.comments.return_value.list.return_value.execute.return_value = {}
         assert client.list_comments("doc-1") == []
 

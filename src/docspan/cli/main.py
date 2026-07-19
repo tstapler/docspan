@@ -49,6 +49,25 @@ app.add_typer(config_app, name="config")
 console = Console()
 err_console = Console(stderr=True, style="bold red")
 
+# Status -> (icon, style) lookup for rendering PushResult/PullResult in the
+# CLI. PushResult.status has 6 literal values (ok, conflict, error, skipped,
+# blocked, warning); PullResult has a subset. Any status not explicitly
+# mapped falls back to _DEFAULT_STATUS_DISPLAY (✗, red) — this preserves the
+# old if/else behavior, where "ok"/"skipped" rendered green-check, "warning"
+# rendered yellow-warn, and everything else (conflict/error/blocked, or any
+# future status) rendered red-cross.
+STATUS_DISPLAY: dict[str, tuple[str, str]] = {
+    "ok": ("✓", "green"),
+    "skipped": ("✓", "green"),
+    "warning": ("⚠", "yellow"),
+}
+_DEFAULT_STATUS_DISPLAY: tuple[str, str] = ("✗", "red")
+
+
+def _status_display(status: str) -> tuple[str, str]:
+    """Look up the (icon, style) pair for a push/pull result status."""
+    return STATUS_DISPLAY.get(status, _DEFAULT_STATUS_DISPLAY)
+
 # The live wedding planning doc — Story 1.2.5's ScratchVerificationMarker
 # confirmation prompt is a targeted tripwire for this one doc_id specifically,
 # never for wedding-scratch.md or any other mapping. See
@@ -166,6 +185,8 @@ def push(
                 # markers, which Rich's console markup would otherwise parse
                 # as (and silently swallow) style tags.
                 console.print(escape(preview.render()))
+                if getattr(preview, "error", None):
+                    had_error = True
             else:
                 console.print(
                     f"[yellow]dry-run[/yellow]  {mapping.local} → [{mapping.backend}] {mapping.remote_id}"
@@ -194,10 +215,7 @@ def push(
         outcome = orchestrate_push(mapping, backend, state, state_dir, state_path, force=force)
         result = outcome.result
 
-        icon = "✓" if result.status in ("ok", "skipped") else "✗"
-        style = "green" if result.status in ("ok", "skipped") else "red"
-        if result.status == "warning":
-            icon, style = "⚠", "yellow"
+        icon, style = _status_display(result.status)
         console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
         if result.message:
             # escape(): a "blocked"/"warning" message can carry literal
@@ -282,8 +300,7 @@ def pull(
             # first-sync or fast-forward
             result = outcome.result
             if result:
-                icon = "✓" if result.status == "ok" else "✗"
-                style = "green" if result.status == "ok" else "red"
+                icon, style = _status_display(result.status)
                 console.print(f"[{style}]{icon}[/{style}]  {mapping.remote_id} → {mapping.local}")
                 if result.message:
                     console.print(f"   [dim]{result.message}[/dim]")

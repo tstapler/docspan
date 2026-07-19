@@ -52,8 +52,11 @@ class FakeBackend(Backend):
 
 @dataclass
 class FakePushPreview:
-    """Minimal stand-in for push_preview.PushPreview — just needs .render()."""
+    """Minimal stand-in for push_preview.PushPreview — just needs .render()
+    and (optionally) .error, mirroring the real dataclass's error field used
+    by the CLI's dry-run error handling (getattr(preview, "error", None))."""
     text: str = "Preview: 1 change(s), 0 addition(s), 0 removal(s), 0 unchanged\n  ~ [ ] Splitwise → [x] Splitwise"
+    error: Optional[str] = None
 
     def render(self) -> str:
         return self.text
@@ -64,8 +67,11 @@ class FakeBackendWithPreview(FakeBackend):
     """A FakeBackend that also supports preview_push(), for --dry-run tests."""
     name: str = "fake"
     preview_text: Optional[str] = None
+    preview_error: Optional[str] = None
 
     def preview_push(self, local_path: str, doc_id: str) -> FakePushPreview:
+        if self.preview_error is not None:
+            return FakePushPreview(text=f"✗ dry-run failed: {self.preview_error}", error=self.preview_error)
         if self.preview_text is not None:
             return FakePushPreview(text=self.preview_text)
         return FakePushPreview()
@@ -151,6 +157,22 @@ class TestPush:
             result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
         assert result.exit_code == 0
         assert "dry-run" in result.output
+
+    def test_dry_run_prints_clean_message_and_exits_nonzero_on_preview_failure(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Bug fix: preview_push() failures (expired auth, network error,
+        malformed doc) must render as one clean line — never a raw
+        traceback — and the CLI must still exit nonzero so a failed
+        --dry-run doesn't look like a clean success."""
+        local = tmp_path / "doc.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview(preview_error="<HttpError 401 Unauthorized>")
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
+        assert result.exit_code == 1
+        assert "dry-run failed" in result.output
+        assert "Traceback" not in result.output
 
     def test_pull_only_mapping_is_skipped(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
