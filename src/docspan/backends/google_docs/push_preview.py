@@ -12,8 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Literal, Optional
 
-from docspan.backends.google_docs.docs_request_builder import DiffEntry
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
 
 
 @dataclass
@@ -131,8 +130,8 @@ class PushPlan:
     preview_push() each call _build_push_plan() independently — they never
     share a plan computed by the other (see plan.md Story 1.2.3).
     """
-    current_nodes: List[DocsParagraphNode]
-    target_nodes: List[DocsParagraphNode]
+    current_nodes: List[Node]
+    target_nodes: List[Node]
     requests: List[dict]
     doc: dict
     entries: List[DiffEntry]

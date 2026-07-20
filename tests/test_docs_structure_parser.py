@@ -6,6 +6,7 @@ import pytest
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
+    DocsTableNode,
 )
 
 
@@ -227,10 +228,12 @@ def test_parse_paragraph_handles_bullet_paragraph_missing_list_id_without_raisin
     assert nodes[0].is_native_checkbox is False
 
 
-def test_parse_skips_table_and_toc_elements_without_raising() -> None:
-    """A table/tableOfContents structural element parses without error and
-    without corrupting adjacent paragraphs — confirms the documented feature
-    gap is a silent skip, not a crash."""
+def test_parse_produces_table_node_and_skips_toc_without_raising() -> None:
+    """A table structural element now parses into a DocsTableNode (table/
+    inline-style support merged from the bidirectional-comments epic — see
+    project_plans/gdocs-tables-inline-styles/plan.md), while a
+    tableOfContents element parses without error and without corrupting
+    adjacent paragraphs — confirmed still a silent skip, not a crash."""
     doc = _doc_with_content([
         _make_para_element("Before", start=1, end=8),
         {"startIndex": 8, "endIndex": 20, "table": {"rows": 1, "columns": 1}},
@@ -238,7 +241,13 @@ def test_parse_skips_table_and_toc_elements_without_raising() -> None:
         _make_para_element("After", start=25, end=31),
     ])
     nodes = parser.parse(doc)
-    assert [n.text for n in nodes] == ["Before", "After"]
+    assert [type(n).__name__ for n in nodes] == [
+        "DocsParagraphNode", "DocsTableNode", "DocsParagraphNode",
+    ]
+    assert nodes[0].text == "Before"
+    assert isinstance(nodes[1], DocsTableNode)
+    assert nodes[1].rows == []  # malformed/minimal table dict has no tableRows
+    assert nodes[2].text == "After"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
