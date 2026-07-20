@@ -262,6 +262,7 @@ docspan generates these files in your project directory after first sync:
 > - Checklist state (`- [ ]`/`- [x]`) round-trips as literal text — Google Docs' native checkbox glyph is intentionally not used because its checked/unchecked state cannot be read back via the API (see ADR-001)
 > - `push --dry-run` now shows a real structural diff and flags paragraphs with open comments at risk; `push` blocks by default on a flagged paragraph unless `--force` is passed
 > - If a push succeeds but a post-push check finds the open-comment count dropped, docspan reports this as a `⚠` warning — never a plain green success — so it's never mistaken for a clean push
+> - Google Docs OAuth requires each user to create their own GCP project (`docspan auth setup google_docs` → Personal/OAuth) and stays in Google's "Testing" publishing status — capped at 100 test users, with Google's "app isn't verified" warning shown on first sign-in. This avoids the annual CASA security assessment required to verify apps requesting Drive/Docs' restricted read-write scopes (a real recurring cost), at the price of a few extra manual setup minutes per user instead of a single embedded, zero-config client. Revisit if/when adoption outgrows a per-user-project model — options are paying for verification, or narrowing to the unrestricted `drive.file` scope via Google's Picker API (bigger rework: requires the user to explicitly select their doc through a picker rather than referencing it by ID in config)
 
 ---
 
