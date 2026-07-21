@@ -55,6 +55,26 @@ def test_insert_appended_paragraph() -> None:
     assert any("insertText" in r for r in requests)
 
 
+def test_mid_document_insert_does_not_merge_into_previous_paragraph() -> None:
+    """Regression: inserting a new paragraph between two unchanged paragraphs
+    used to target current[i1 - 1].end_index - 1 — the index of the PREVIOUS
+    paragraph's own trailing newline character, not the index right after it.
+    Inserting there splices the new text in before that newline, merging it
+    onto the end of the previous paragraph and leaving a spurious extra blank
+    paragraph behind (e.g. "A\\nC\\n" -> "AB\\n\\nC\\n" instead of "A\\nB\\nC\\n")."""
+    # "A\n" occupies [1, 3); "C\n" occupies [3, 5).
+    current = [_para("A", start=1, end=3), _para("C", start=3, end=5)]
+    target = [_para("A", start=1, end=3), _para("B", start=0, end=0), _para("C", start=3, end=5)]
+    requests = builder.build(current, target, doc_end_index=5)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    # Must insert at index 3 (right after "A\n", i.e. current[0].end_index),
+    # not index 2 (current[0].end_index - 1, the position of "A"'s own "\n").
+    assert insert_requests[0]["insertText"]["location"]["index"] == 3
+    assert insert_requests[0]["insertText"]["text"] == "B\n"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Delete
 # ─────────────────────────────────────────────────────────────────────────────
