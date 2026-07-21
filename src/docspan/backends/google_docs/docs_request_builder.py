@@ -294,33 +294,25 @@ class DocsRequestBuilder:
         """
         Emit updateTextStyle requests for inline styling (links/bold/italic/monospace).
 
-        Runs against the re-fetched document so ranges use real post-insert indices. Aligns
-        each styled target paragraph to the matching paragraph in ``doc`` by text (in order).
+        Runs against the re-fetched document so ranges use real post-insert indices.
+        build() (pass 1) guarantees the re-fetched doc's node sequence matches ``target``
+        node-for-node in order (every insert/delete/replace/equal opcode is applied so the
+        structural shapes line up) — so nodes are paired positionally by zip(), not by text
+        equality. A prior text-equality-based aligner drifted permanently out of sync after
+        the first paragraph whose current/target text didn't match byte-for-byte (e.g. a
+        duplicate line, or a text mismatch from an upstream parsing quirk), silently
+        misapplying every subsequent paragraph's styling to the wrong paragraph.
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
 
         current = DocsStructureParser().parse(doc)
         requests: List[dict] = []
-        j = 0
-        for tnode in target:
-            if isinstance(tnode, DocsTableNode):
-                while j < len(current) and not isinstance(current[j], DocsTableNode):
-                    j += 1
-                j += 1
-                continue
-            # Find the next current paragraph with matching text.
-            k = j
-            while k < len(current):
-                cnode = current[k]
-                if isinstance(cnode, DocsParagraphNode) and cnode.text == tnode.text:
-                    break
-                k += 1
-            if k >= len(current):
+        for cnode, tnode in zip(current, target):
+            if isinstance(tnode, DocsTableNode) or isinstance(cnode, DocsTableNode):
                 continue
             if tnode.spans:
-                requests.extend(self._span_style_requests(tnode, current[k].start_index))
-            j = k + 1
+                requests.extend(self._span_style_requests(tnode, cnode.start_index))
 
         return requests
 

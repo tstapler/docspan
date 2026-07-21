@@ -1,5 +1,7 @@
 """Unit tests for Google Docs table push + inline style/link push (no network)."""
 
+from typing import List
+
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -84,6 +86,53 @@ def test_link_style_range_matches_span_offset() -> None:
     rng = link_reqs[0]["updateTextStyle"]["range"]
     assert rng["startIndex"] == 1 + len("pre ")
     assert rng["endIndex"] == rng["startIndex"] + len("L")
+
+
+def _multi_para_doc(texts: List[str], start: int = 1) -> dict:
+    """A doc with several plain paragraphs in a row, as it looks after a pass-1 insert."""
+    content = []
+    idx = start
+    for text in texts:
+        end = idx + len(text) + 1
+        content.append({
+            "startIndex": idx, "endIndex": end,
+            "paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]},
+        })
+        idx = end
+    return {"body": {"content": content}}
+
+
+def test_duplicate_text_paragraphs_do_not_misalign_styling() -> None:
+    # Regression: a prior text-equality-based aligner matched the FIRST current
+    # paragraph with matching text, so when two unstyled paragraphs share the same
+    # text, the styled paragraph after them got matched to the wrong (earlier)
+    # index, permanently shifting every later paragraph's styling one slot off.
+    target = parser.parse("dup\n\ndup\n\n**bold** line")
+    doc = _multi_para_doc(["dup", "dup", "bold line"])
+    reqs = builder.build_span_style_requests(doc, target)
+    bold_reqs = [r for r in reqs if "updateTextStyle" in r and _text_style(r).get("bold")]
+    assert len(bold_reqs) == 1
+    rng = bold_reqs[0]["updateTextStyle"]["range"]
+    # The third paragraph starts right after "dup\n" + "dup\n" (each 4 UTF-16 units).
+    third_para_start = 1 + len("dup\n") + len("dup\n")
+    assert rng["startIndex"] == third_para_start
+    assert rng["endIndex"] == third_para_start + len("bold")
+
+
+def test_mismatched_text_does_not_desync_later_paragraphs() -> None:
+    # Regression: if a current paragraph's text doesn't byte-for-byte match its
+    # target counterpart (e.g. a stray whitespace difference from upstream
+    # parsing), the old aligner skipped forward searching for a match, which
+    # desynced every subsequent paragraph's styling. Positional pairing is
+    # immune to this since it never searches — it just zips index-for-index.
+    target = parser.parse("mismatch\n\n**bold** line")
+    doc = _multi_para_doc(["totally different text", "bold line"])
+    reqs = builder.build_span_style_requests(doc, target)
+    bold_reqs = [r for r in reqs if "updateTextStyle" in r and _text_style(r).get("bold")]
+    assert len(bold_reqs) == 1
+    rng = bold_reqs[0]["updateTextStyle"]["range"]
+    second_para_start = 1 + len("totally different text\n")
+    assert rng["startIndex"] == second_para_start
 
 
 # ─────────────────────────────────────────────────────────────────────────────
