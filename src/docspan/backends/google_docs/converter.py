@@ -7,8 +7,9 @@ Handles conversion between Google Docs and Markdown formats
 import logging
 import re
 import sys
+import urllib.parse
 
-from markdownify import markdownify as md
+from markdownify import MarkdownConverter, chomp
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,61 @@ sys.setrecursionlimit(10000)
 
 # Configuration for large documents
 MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
+
+_FONT_WEIGHT_RE = re.compile(r'font-weight:\s*(\d+)')
+_FONT_FAMILY_RE = re.compile(r'font-family:[^;]*(courier|consolas|monospace|mono)', re.IGNORECASE)
+_GOOGLE_REDIRECT_RE = re.compile(r'^https?://(?:www\.)?google\.com/url\?')
+
+
+def _unwrap_google_redirect(href: str) -> str:
+    """Extract the real target URL from Google's ?q=... link-redirect wrapper.
+
+    Docs' HTML export wraps every hyperlink as
+    https://www.google.com/url?q=<target>&sa=D&source=editors&ust=...&usg=...
+    Without unwrapping, pushed-back markdown links point at Google's redirector
+    instead of the original URL, breaking round-trip fidelity.
+    """
+    if not href or not _GOOGLE_REDIRECT_RE.match(href):
+        return href
+    query = urllib.parse.urlparse(href).query
+    target = urllib.parse.parse_qs(query).get('q')
+    return target[0] if target else href
+
+
+class _GoogleDocsMarkdownConverter(MarkdownConverter):
+    """markdownify converter aware of Google Docs' HTML export quirks.
+
+    The Drive API's HTML export represents bold/italic/monospace as inline
+    <span style="..."> attributes rather than semantic <strong>/<em>/<code>
+    tags, and wraps every link through a redirector. Vanilla markdownify has
+    no convert_span handler at all, so styled spans silently lose their
+    formatting on pull; this subclass restores it.
+    """
+
+    def convert_span(self, el, text, parent_tags):
+        if '_noformat' in parent_tags or not text:
+            return text
+        style = el.get('style') or ''
+        prefix, suffix, text = chomp(text)
+        if not text:
+            return ''
+        weight_match = _FONT_WEIGHT_RE.search(style)
+        is_bold = bool(weight_match) and int(weight_match.group(1)) >= 700
+        is_italic = 'font-style:italic' in style.replace(' ', '')
+        is_monospace = bool(_FONT_FAMILY_RE.search(style))
+        if is_monospace:
+            text = f'`{text}`'
+        if is_bold:
+            text = f'**{text}**'
+        if is_italic:
+            text = f'*{text}*'
+        return f'{prefix}{text}{suffix}'
+
+    def convert_a(self, el, text, parent_tags):
+        href = el.get('href')
+        if href:
+            el['href'] = _unwrap_google_redirect(href)
+        return super().convert_a(el, text, parent_tags)
 
 
 class DocumentConverter:
@@ -54,13 +110,12 @@ class DocumentConverter:
             html_content = DocumentConverter._reconstruct_nested_lists(html_content)
 
             # Convert HTML to Markdown
-            markdown = md(
-                html_content,
+            markdown = _GoogleDocsMarkdownConverter(
                 heading_style="ATX",  # Use # for headings
                 bullets="-",  # Use - for unordered lists
                 strong_em_symbol="**",  # Use ** for bold
                 strip=['style', 'script']  # Remove style and script tags
-            )
+            ).convert(html_content)
 
             # Keep tabs for nested lists (Obsidian uses tabs for list indentation)
             # Do NOT convert tabs to spaces
