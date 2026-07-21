@@ -154,8 +154,9 @@ def orchestrate_push(
     state: SyncState,
     state_dir: str,
     state_path: str,
+    force: bool = False,
 ) -> PushOutcome:
-    result = backend.push(mapping.local, mapping.remote_id)
+    result = backend.push(mapping.local, mapping.remote_id, force=force)
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
     if result.status == "ok" and os.path.exists(mapping.local):

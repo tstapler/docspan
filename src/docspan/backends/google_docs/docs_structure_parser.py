@@ -24,6 +24,14 @@ class DocsParagraphNode:
     start_index: int = 0
     end_index: int = 0
     spans: List[TextSpan] = field(default_factory=list)
+    # True when this paragraph's bullet resolves to a native BULLET_CHECKBOX
+    # glyph (glyphType == GLYPH_TYPE_UNSPECIFIED), resolved live by
+    # DocsStructureParser from the document's `lists` map. NOT part of the
+    # diff key (style, text, is_list_item) — feeds GlyphShapeCheck only
+    # (via DiffEntry.current_is_native_checkbox), never
+    # DocsRequestBuilder.build()'s equality/opcode logic. See ADR-001,
+    # plan.md Task 1.2.2d.
+    is_native_checkbox: bool = False
 
 
 @dataclass
@@ -63,9 +71,12 @@ class DocsStructureParser:
         """
         # Determine body content — handle tabs-based and legacy structure
         if "tabs" in doc and doc["tabs"]:
-            body = doc["tabs"][0].get("documentTab", doc).get("body", {})
+            tab_doc = doc["tabs"][0].get("documentTab", doc)
+            body = tab_doc.get("body", {})
+            lists = tab_doc.get("lists", {})
         elif "body" in doc:
             body = doc["body"]
+            lists = doc.get("lists", {})
         else:
             raise KeyError("Document has neither 'tabs' nor 'body' key")
 
@@ -74,7 +85,7 @@ class DocsStructureParser:
 
         for element in content:
             if "paragraph" in element:
-                node = self._parse_paragraph(element)
+                node = self._parse_paragraph(element, lists)
                 if node is not None:
                     nodes.append(node)
             elif "table" in element:
@@ -107,7 +118,9 @@ class DocsStructureParser:
             end_index=element.get("endIndex", 0),
         )
 
-    def _parse_paragraph(self, element: dict) -> Optional[DocsParagraphNode]:
+    def _parse_paragraph(
+        self, element: dict, lists: Optional[dict] = None
+    ) -> Optional[DocsParagraphNode]:
         """Parse a structural element that contains a paragraph."""
         paragraph = element["paragraph"]
         paragraph_style = paragraph.get("paragraphStyle", {})
@@ -150,6 +163,7 @@ class DocsStructureParser:
         bullet = paragraph.get("bullet")
         is_list_item = bullet is not None
         nesting_level = bullet.get("nestingLevel", 0) if bullet else 0
+        is_native_checkbox = self._resolve_is_native_checkbox(bullet, lists or {})
 
         return DocsParagraphNode(
             style=style,
@@ -159,4 +173,40 @@ class DocsStructureParser:
             start_index=start_index,
             end_index=end_index,
             spans=spans,
+            is_native_checkbox=is_native_checkbox,
         )
+
+    def _resolve_is_native_checkbox(self, bullet: Optional[dict], lists: dict) -> bool:
+        """Resolve whether a bullet paragraph is a native BULLET_CHECKBOX glyph.
+
+        Looks up bullet.listId -> lists[listId].listProperties.nestingLevels[n]
+        .glyphType and returns True only when it equals GLYPH_TYPE_UNSPECIFIED
+        (the confirmed, if counter-intuitive, signature Google Docs uses for a
+        checkbox bullet — see ADR-001's Verification Evidence). Defensively
+        returns False (never raises) on any missing/malformed piece — e.g. a
+        bullet paragraph with no listId, or a lists map that doesn't contain
+        the referenced list.
+        """
+        if not bullet:
+            return False
+        list_id = bullet.get("listId")
+        if not list_id:
+            return False
+        nesting_level = bullet.get("nestingLevel", 0)
+
+        list_entry = lists.get(list_id)
+        if not isinstance(list_entry, dict):
+            return False
+        list_properties = list_entry.get("listProperties")
+        if not isinstance(list_properties, dict):
+            return False
+        nesting_levels = list_properties.get("nestingLevels")
+        if not isinstance(nesting_levels, list):
+            return False
+        if not isinstance(nesting_level, int) or nesting_level < 0 or nesting_level >= len(nesting_levels):
+            return False
+        level_props = nesting_levels[nesting_level]
+        if not isinstance(level_props, dict):
+            return False
+
+        return level_props.get("glyphType") == "GLYPH_TYPE_UNSPECIFIED"

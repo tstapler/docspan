@@ -130,7 +130,12 @@ class GoogleDocsClient:
             lambda: self.docs_service.documents().get(documentId=doc_id).execute()
         )
 
-    def batch_update(self, doc_id: str, requests: list) -> dict:
+    def batch_update(
+        self,
+        doc_id: str,
+        requests: list,
+        required_revision_id: Optional[str] = None,
+    ) -> dict:
         """
         Submit a list of batchUpdate requests to a Google Doc.
 
@@ -139,16 +144,50 @@ class GoogleDocsClient:
         Args:
             doc_id: Google Doc ID
             requests: List of request dicts (e.g. insertText, deleteContentRange)
+            required_revision_id: If provided, sets `writeControl.requiredRevisionId`
+                so the batch fails atomically (HTTP 400) if the doc changed since
+                this revision was fetched. When None, behavior is unchanged.
 
         Returns:
             dict: batchUpdate response
         """
+        body: Dict[str, object] = {"requests": requests}
+        if required_revision_id is not None:
+            body["writeControl"] = {"requiredRevisionId": required_revision_id}
+
         return self._with_backoff(
             lambda: self.docs_service.documents().batchUpdate(
                 documentId=doc_id,
-                body={"requests": requests},
+                body=body,
             ).execute()
         )
+
+    def list_comments(self, doc_id: str) -> List[dict]:
+        """
+        Return open (not resolved) comments on a Drive file, read-only.
+
+        Never mutates, resolves, or re-anchors a comment — used purely as a
+        read-only source for CommentCrossReference/CommentCountBackstop
+        (see ADR-002). Wrapped in the same _with_backoff helper as
+        get_document/batch_update.
+
+        Args:
+            doc_id: Google Doc / Drive file ID
+
+        Returns:
+            list[dict]: comment resources (id, content, quotedFileContent,
+            resolved, author.displayName) with resolved=True comments
+            excluded.
+        """
+        response = self._with_backoff(
+            lambda: self.drive_service.comments().list(
+                fileId=doc_id,
+                fields="comments(id,content,quotedFileContent,resolved,author(displayName))",
+                includeDeleted=False,
+            ).execute()
+        )
+        comments = response.get("comments", [])
+        return [c for c in comments if not c.get("resolved")]
 
     def get_doc_content(self, doc_id: str) -> str:
         """

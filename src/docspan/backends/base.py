@@ -25,7 +25,7 @@ class RemoteDoc:
 
 @dataclass
 class PushResult:
-    status: Literal["ok", "conflict", "error", "skipped"]
+    status: Literal["ok", "conflict", "error", "skipped", "blocked", "warning"]
     doc_id: str
     message: Optional[str] = None
     url: Optional[str] = None
