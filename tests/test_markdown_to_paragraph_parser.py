@@ -108,6 +108,44 @@ def test_indented_code_block_produces_node() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Block quotes (regression: block_quote tokens used to be silently dropped,
+# losing the entire paragraph on push — see issue "push paragraph-loss bug")
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_block_quote_is_not_dropped() -> None:
+    nodes = parser.parse("> TL;DR: this is important")
+    assert len(nodes) == 1
+    assert nodes[0].text == "> TL;DR: this is important"
+
+
+def test_block_quote_survives_between_paragraphs() -> None:
+    nodes = parser.parse("Before.\n\n> Quoted line.\n\nAfter.")
+    texts = [n.text for n in nodes]
+    assert texts == ["Before.", "> Quoted line.", "After."]
+
+
+def test_nested_block_quote_uses_repeated_markers() -> None:
+    nodes = parser.parse("> outer\n>\n> > inner")
+    texts = [n.text for n in nodes]
+    assert "> outer" in texts
+    assert "> > inner" in texts
+
+
+def test_block_quote_preserves_inline_styling() -> None:
+    nodes = parser.parse("> **bold** and normal")
+    assert len(nodes) == 1
+    assert nodes[0].text == "> bold and normal"
+    bold_spans = [s for s in nodes[0].spans if s.bold]
+    assert bold_spans and bold_spans[0].text == "bold"
+
+
+def test_block_quote_containing_list() -> None:
+    nodes = parser.parse("> - item one\n> - item two")
+    assert [n.text for n in nodes] == ["> item one", "> item two"]
+    assert all(n.is_list_item for n in nodes)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Index values for push targets
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -126,6 +126,55 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
     return nodes
 
 
+def _prefix_node_text(node: DocsParagraphNode, prefix: str) -> DocsParagraphNode:
+    """Return a copy of node with prefix prepended to its text and first span.
+
+    Used to render block-quote lines as literal "> "-prefixed text (same
+    approach as ADR-001's literal checklist markers) so the quote survives
+    push→pull round-trips even though Google Docs has no native blockquote
+    paragraph style to map onto.
+    """
+    spans = list(node.spans)
+    if spans:
+        spans = [TextSpan(text=prefix)] + spans
+    return DocsParagraphNode(
+        style=node.style, text=prefix + node.text, is_list_item=node.is_list_item,
+        nesting_level=node.nesting_level, start_index=node.start_index,
+        end_index=node.end_index, spans=spans,
+    )
+
+
+def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNode]:
+    """Walk a block_quote token, prefixing each contained line with '> ' markers.
+
+    Nested block_quote tokens increase quote_depth (rendered as repeated
+    '> > ' markers), matching standard Markdown nesting syntax.
+    """
+    prefix = "> " * quote_depth
+    nodes: List[DocsParagraphNode] = []
+    for child in token.get("children", []):
+        ctype = child.get("type")
+        if ctype == "paragraph":
+            spans = _spans_from_inline(child.get("children", []))
+            nodes.append(_prefix_node_text(
+                DocsParagraphNode(style="NORMAL_TEXT", text=_text_of(spans).strip(),
+                                  start_index=0, end_index=0,
+                                  spans=spans if _has_styling(spans) else []),
+                prefix,
+            ))
+        elif ctype == "list":
+            nodes.extend(
+                _prefix_node_text(n, prefix) for n in _walk_list_items(child, nesting_level=0)
+            )
+        elif ctype == "block_quote":
+            nodes.extend(_walk_block_quote(child, quote_depth + 1))
+        elif ctype == "blank_line":
+            continue
+        # nested tables/code inside a block quote are rare; fall back to
+        # skipping rather than mis-rendering them.
+    return nodes
+
+
 def _table_from_token(token: dict) -> DocsTableNode:
     """Convert a mistune table token into a DocsTableNode (plain-text cells)."""
     rows: List[List[str]] = []
@@ -203,9 +252,12 @@ class MarkdownToParagraphParser:
             elif token_type == "table":
                 nodes.append(_table_from_token(token))
 
+            elif token_type == "block_quote":
+                nodes.extend(_walk_block_quote(token))
+
             elif token_type == "blank_line":
                 pass
 
-            # block_quote, thematic_break, html, etc. are silently skipped
+            # thematic_break, html, etc. are silently skipped
 
         return nodes
