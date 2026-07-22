@@ -275,6 +275,34 @@ class GoogleDocsClient:
                 break
         return comments
 
+    def create_reply(self, doc_id: str, comment_id: str, content: str = "", resolve: bool = False) -> dict:
+        """
+        Post a reply to a Drive comment, optionally resolving it in the same call.
+
+        Args:
+            doc_id: Google Doc / Drive file ID
+            comment_id: id of the comment to reply to (see get_comments()'s "id" field)
+            content: reply text; may be empty when resolve=True with no message
+            resolve: when True, sets the reply's action to "resolve", which also
+                marks the parent comment resolved
+
+        Returns:
+            dict: the created reply resource (id, content, action)
+        """
+        body: dict = {}
+        if content:
+            body["content"] = content
+        if resolve:
+            body["action"] = "resolve"
+        return self._with_backoff(
+            lambda: self.drive_service.replies().create(
+                fileId=doc_id,
+                commentId=comment_id,
+                body=body,
+                fields="id,content,action",
+            ).execute()
+        )
+
     def get_doc_plain_text(self, doc_id: str) -> str:
         """
         Get Google Doc content as plain text
