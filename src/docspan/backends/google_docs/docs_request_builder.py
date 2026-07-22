@@ -234,7 +234,7 @@ class DocsRequestBuilder:
 
             elif tag == "insert":
                 if i1 > 0:
-                    insert_at = current[i1 - 1].end_index - 1
+                    insert_at = current[i1 - 1].end_index
                 else:
                     insert_at = 1  # start of document body
                 all_requests.extend(
