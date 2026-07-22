@@ -16,7 +16,11 @@ from docspan.backends.google_docs.auth import (
     default_token_path,
 )
 from docspan.backends.google_docs.client import GoogleDocsClient
-from docspan.backends.google_docs.comments import format_comments_markdown
+from docspan.backends.google_docs.comments import (
+    RespondResult,
+    format_comments_markdown,
+    parse_reply_directives,
+)
 from docspan.backends.google_docs.converter import DocumentConverter
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -287,6 +291,36 @@ class GoogleDocsBackend(Backend):
             sidecar.write_text(format_comments_markdown(title, comments))
         elif sidecar.exists():
             sidecar.unlink()  # no comments anymore — drop a stale sidecar
+
+    def respond_to_comments(self, doc_id: str, local_path: str) -> RespondResult:
+        """
+        Post Reply:/Resolve: directives written into a `.comments.md` sidecar
+        back to the live Google Doc, then refresh the sidecar so posted
+        replies show up in-thread and resolved comments move to ## Resolved.
+
+        Directives are matched to comments by the `<!-- id:... -->` marker
+        format_comments_markdown() writes — editing that marker breaks the
+        match, so a stale/hand-written id silently posts nothing.
+        """
+        self._ensure_client()
+        assert self._client is not None
+        sidecar = pathlib.Path(str(local_path) + COMMENTS_SUFFIX)
+        if not sidecar.exists():
+            return RespondResult(posted=0, resolved=0)
+
+        directives = parse_reply_directives(sidecar.read_text())
+        posted = resolved = 0
+        for directive in directives:
+            self._client.create_reply(
+                doc_id, directive.comment_id, directive.reply, resolve=directive.resolve
+            )
+            if directive.reply:
+                posted += 1
+            if directive.resolve:
+                resolved += 1
+
+        self._write_comment_sidecar(doc_id, local_path)
+        return RespondResult(posted=posted, resolved=resolved)
 
     def get_remote_version(self, doc_id: str) -> str:
         """Return the revisionId of the Google Doc (opaque, non-empty string)."""

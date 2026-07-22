@@ -42,9 +42,11 @@ app = typer.Typer(
 auth_app = typer.Typer(help="Manage authentication for backends.")
 conflicts_app = typer.Typer(help="Manage merge conflicts.")
 config_app = typer.Typer(help="Manage the central docspan config (project registry).")
+comments_app = typer.Typer(help="Respond to and resolve comments pulled into .comments.md sidecars.")
 app.add_typer(auth_app, name="auth")
 app.add_typer(conflicts_app, name="conflicts")
 app.add_typer(config_app, name="config")
+app.add_typer(comments_app, name="comments")
 
 console = Console()
 err_console = Console(stderr=True, style="bold red")
@@ -335,6 +337,44 @@ def status(
         table.add_row(m.local, m.backend, m.remote_id, m.direction)
 
     console.print(table)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# comments subcommand — respond to / resolve pulled comments
+# ─────────────────────────────────────────────────────────────────────────────
+
+@comments_app.command("respond")
+def comments_respond(
+    file: str = typer.Argument(..., help="Local markdown file whose .comments.md sidecar to process"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Post Reply:/Resolve: directives from a .comments.md sidecar back to the remote doc.
+
+    Edit the sidecar's `Reply:` lines and/or flip `Resolve: no` to `Resolve: yes` under
+    an open comment, then run this to post those replies/resolutions and refresh the
+    sidecar with the result.
+    """
+    config, config_path, prefix = _resolve(config_path, prefix)
+
+    mapping = next((m for m in config.mappings if m.local == file), None)
+    if mapping is None:
+        err_console.print(f"No mapping found for: {file}")
+        raise typer.Exit(1)
+
+    backend = _get_backend(mapping.backend, config, config_path)
+    if not hasattr(backend, "respond_to_comments"):
+        err_console.print(f"Backend '{mapping.backend}' does not support comment replies.")
+        raise typer.Exit(1)
+
+    result = backend.respond_to_comments(mapping.remote_id, mapping.local)
+    if result.posted or result.resolved:
+        console.print(
+            f"[green]✓[/green]  Posted {result.posted} repl{'y' if result.posted == 1 else 'ies'}, "
+            f"resolved {result.resolved}."
+        )
+    else:
+        console.print("No pending Reply:/Resolve: directives found.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
