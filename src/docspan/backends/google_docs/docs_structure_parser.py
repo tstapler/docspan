@@ -5,6 +5,31 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
 
+def _person_display_text(person: dict) -> str:
+    """Return display text for a Docs API `person` structural element.
+
+    An @-mention "smart chip" (Insert > Smart chip > Person) is represented
+    in the Docs API v1 JSON model as a `person` structural element — a
+    sibling of `textRun` inside `paragraph.elements`, never a textRun
+    itself. Its `personProperties` dict carries `name` and/or `email`;
+    prefer the name, falling back to email when name is absent (e.g. the
+    person hasn't shared a display name with the doc's viewer/API caller).
+    Returns "" if neither is present so callers can skip emitting a span.
+    """
+    if not isinstance(person, dict):
+        return ""
+    person_properties = person.get("personProperties")
+    if not isinstance(person_properties, dict):
+        return ""
+    name = person_properties.get("name")
+    if isinstance(name, str) and name:
+        return name
+    email = person_properties.get("email")
+    if isinstance(email, str) and email:
+        return email
+    return ""
+
+
 @dataclass
 class TextSpan:
     text: str
@@ -110,6 +135,10 @@ class DocsStructureParser:
                         text_run = pe.get("textRun")
                         if text_run is not None:
                             parts.append(text_run.get("content", ""))
+                            continue
+                        person = pe.get("person")
+                        if person is not None:
+                            parts.append(_person_display_text(person))
                 cells.append("".join(parts).strip())
             rows.append(cells)
         return DocsTableNode(
@@ -136,6 +165,12 @@ class DocsStructureParser:
         for pe in paragraph.get("elements", []):
             text_run = pe.get("textRun")
             if text_run is None:
+                person = pe.get("person")
+                if person is not None:
+                    name = _person_display_text(person)
+                    if name:
+                        text_parts.append(name)
+                        spans.append(TextSpan(text=name))
                 continue
             run_content = text_run.get("content", "")
             text_style = text_run.get("textStyle", {})

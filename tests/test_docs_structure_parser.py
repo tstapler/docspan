@@ -157,6 +157,222 @@ def test_non_monospace_font_not_flagged() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# @-mention "person" smart chips
+#
+# The Docs API v1 represents an @-mention as a `person` structural element —
+# a sibling of `textRun` inside paragraph.elements, never a textRun itself.
+# Before this fix, the parser only checked `pe.get("textRun")`; a `person`
+# element has no textRun key, so it silently fell through `continue` and its
+# name never reached spans/text (see the reported bug: mentions of "Shivam
+# Malpani", "Andrew Williams", and "Will Myers" all rendered blank).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_person_element(
+    name: str | None = None,
+    email: str | None = None,
+    start: int = 1,
+    end: int = 10,
+) -> dict:
+    person_properties: dict = {}
+    if name is not None:
+        person_properties["name"] = name
+    if email is not None:
+        person_properties["email"] = email
+    return {
+        "startIndex": start,
+        "endIndex": end,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {
+                    "startIndex": start,
+                    "endIndex": start + 1,
+                    "person": {"personProperties": person_properties},
+                },
+                {
+                    "startIndex": start + 1,
+                    "endIndex": end,
+                    "textRun": {"content": "\n", "textStyle": {}},
+                },
+            ],
+        },
+    }
+
+
+def test_person_mention_with_name_and_email_uses_name() -> None:
+    doc = _doc_with_content([
+        _make_person_element(name="Will Myers", email="will@example.com", start=1, end=10)
+    ])
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].text == "Will Myers"
+    assert nodes[0].spans[0].text == "Will Myers"
+
+
+def test_person_mention_with_only_email_falls_back_to_email() -> None:
+    doc = _doc_with_content([
+        _make_person_element(email="shivam@example.com", start=1, end=10)
+    ])
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].text == "shivam@example.com"
+    assert nodes[0].spans[0].text == "shivam@example.com"
+
+
+def test_person_mention_inline_with_surrounding_text() -> None:
+    """A mention mid-sentence, e.g. "cc @Andrew Williams please", must not
+    drop the surrounding textRuns nor the person's name."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 30,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"textRun": {"content": "cc ", "textStyle": {}}},
+                {"person": {"personProperties": {"name": "Andrew Williams"}}},
+                {"textRun": {"content": " please\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "cc Andrew Williams please"
+
+
+def test_person_mention_inside_table_cell_renders_name() -> None:
+    """The table-cell text extraction loop (_parse_table) has its own
+    textRun-only walk, independent of _parse_paragraph — verify it also
+    handles a `person` element instead of silently dropping it."""
+    doc = _doc_with_content([{
+        "startIndex": 1, "endIndex": 20,
+        "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [{
+                "content": [{
+                    "startIndex": 2, "endIndex": 10,
+                    "paragraph": {"elements": [
+                        {"person": {"personProperties": {"name": "Shivam Malpani"}}},
+                        {"textRun": {"content": "\n"}},
+                    ]},
+                }],
+            }]},
+        ]},
+    }])
+    nodes = parser.parse(doc)
+    table = nodes[0]
+    assert isinstance(table, DocsTableNode)
+    assert table.rows == [["Shivam Malpani"]]
+
+
+def test_person_mention_with_no_name_or_email_is_skipped_not_raised() -> None:
+    """Defensive: an empty personProperties dict must not raise, and simply
+    contributes no text (there is nothing to render)."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
+def test_person_mention_with_malformed_person_properties_is_skipped_not_raised() -> None:
+    """Defensive: a non-dict personProperties (malformed API payload) must not
+    raise — it should be treated the same as "no name or email"."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": ["not", "a", "dict"]}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
+def test_person_mention_with_non_dict_person_is_skipped_not_raised() -> None:
+    """Defensive: a non-dict `person` value (malformed API payload) must not
+    raise — it should be treated the same as "no name or email"."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": "not-a-dict"},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
+def test_person_mention_with_non_string_name_and_no_email_is_skipped_not_raised() -> None:
+    """Defensive: a non-string `name` (malformed API payload, e.g. an int)
+    must not raise — with no valid email to fall back to, it should be
+    treated the same as "no name or email"."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": 12345}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
+def test_person_mention_with_non_string_name_falls_back_to_valid_email() -> None:
+    """Defensive: a non-string `name` alongside a valid string `email` must
+    not raise — the non-string name should be treated as absent and the
+    email used instead."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": 12345, "email": "shivam@example.com"}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "shivam@example.com"
+
+
+def test_person_mention_with_non_string_email_and_no_name_is_skipped_not_raised() -> None:
+    """Defensive: a non-string `email` (malformed API payload, e.g. an int)
+    with no name present must not raise — treated as "no name or email"."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"email": 42}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # List items
 # ─────────────────────────────────────────────────────────────────────────────
 
