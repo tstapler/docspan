@@ -427,6 +427,48 @@ class TestPullTabId:
         assert "Overview" in (result.message or "") and "Details" in (result.message or "")
         fake_client.get_doc_content.assert_called_once()
 
+    def test_pull_without_tab_id_ambiguity_check_runs_before_destructive_html_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Regression test: the multi-tab ambiguity check (get_document +
+        resolve_document_tab) must run BEFORE the destructive Drive HTML
+        export/write (get_doc_content), not after — otherwise the file gets
+        overwritten via a lossy markdown round trip before the ambiguity is
+        even detected. Asserting outcomes alone (status='warning') doesn't
+        prove ordering, since those pass identically either way — this
+        checks call order directly via mock_calls on the shared client mock.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = "<p>First tab content</p>"
+        fake_client.get_document.return_value = _multi_tab_doc()
+
+        local = tmp_path / "doc.md"
+        backend.pull("doc-1", str(local))
+
+        call_names = [c[0] for c in fake_client.mock_calls if c[0] in ("get_document", "get_doc_content")]
+        assert call_names == ["get_document", "get_doc_content"], (
+            f"expected get_document before get_doc_content, got {call_names}"
+        )
+
+    def test_pull_aborts_before_destructive_write_when_get_document_fails(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Regression test: if the ambiguity check's get_document() call raises,
+        pull() must return status='error' and must NOT have performed the
+        destructive Drive export/write — proving the safety-check-first
+        ordering actually protects the local file, not just that the
+        happy-path status looks right."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.side_effect = RuntimeError("boom")
+        fake_client.get_doc_content.return_value = "<p>Should never be written</p>"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "error"
+        assert not local.exists()
+        fake_client.get_doc_content.assert_not_called()
+
     def test_pull_without_tab_id_on_single_tab_legacy_doc_stays_ok(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]

@@ -159,7 +159,7 @@ def orchestrate_push(
     result = backend.push(mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id)
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
-    if result.status == "ok" and os.path.exists(mapping.local):
+    if result.status in ("ok", "warning") and os.path.exists(mapping.local):
         try:
             remote_version = backend.get_remote_version(mapping.remote_id)
         except Exception:

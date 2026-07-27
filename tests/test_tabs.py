@@ -72,6 +72,13 @@ def test_multi_tab_doc_with_explicit_tab_id_selects_that_tab_and_has_no_warning(
     assert resolved["body"]["content"][0]["paragraph"]["elements"][0]["textRun"]["content"] == "second tab content"
 
 
+def test_legacy_doc_with_explicit_tab_id_raises_tab_not_found_error() -> None:
+    with pytest.raises(TabNotFoundError) as exc_info:
+        resolve_document_tab(LEGACY_DOC, "some-tab-id")
+    message = str(exc_info.value)
+    assert "some-tab-id" in message
+
+
 def test_unknown_tab_id_raises_tab_not_found_error_listing_available_tabs() -> None:
     with pytest.raises(TabNotFoundError) as exc_info:
         resolve_document_tab(MULTI_TAB_DOC, "t.nonexistent")
