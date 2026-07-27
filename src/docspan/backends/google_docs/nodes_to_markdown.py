@@ -73,7 +73,18 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             lines.append(f"{'#' * level} {text}")
         elif node.is_list_item:
             indent = "  " * node.nesting_level
-            lines.append(f"{indent}- {text}")
+            if node.is_native_checkbox:
+                # The Docs API does not expose a native checkbox's
+                # checked/unchecked bit anywhere DocsStructureParser can read
+                # it (see push_preview.py's NATIVE CHECKBOX GLYPH warning) —
+                # DocsParagraphNode carries no checked-state field at all.
+                # Rendering unchecked is the only honest option here; this is
+                # a one-way, lossy render (never fed back through
+                # MarkdownToParagraphParser as this exact text), not a claim
+                # about the glyph's real state.
+                lines.append(f"{indent}- [ ] {text}")
+            else:
+                lines.append(f"{indent}- {text}")
         else:
             lines.append(text)
         lines.append("")

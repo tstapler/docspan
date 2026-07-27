@@ -249,7 +249,7 @@ def _first_sync_pull(
 ) -> PullOutcome:
     result = backend.pull(mapping.remote_id, mapping.local, tab_id=mapping.tab_id)
     outcome = PullOutcome(local_path=mapping.local, action="first-sync", result=result)
-    if result.status == "ok" and os.path.exists(mapping.local):
+    if result.status in ("ok", "warning") and os.path.exists(mapping.local):
         with open(mapping.local, encoding="utf-8") as fh:
             new_content = fh.read()
         _record_state(
@@ -269,7 +269,7 @@ def _fast_forward_pull(
 ) -> PullOutcome:
     result = backend.pull(mapping.remote_id, mapping.local, tab_id=mapping.tab_id)
     outcome = PullOutcome(local_path=mapping.local, action="fast-forward", result=result)
-    if result.status == "ok" and os.path.exists(mapping.local):
+    if result.status in ("ok", "warning") and os.path.exists(mapping.local):
         with open(mapping.local, encoding="utf-8") as fh:
             new_content = fh.read()
         _record_state(
@@ -297,7 +297,7 @@ def _merge_pull(
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
             tmp_path = tmp.name
         tmp_result = backend.pull(mapping.remote_id, tmp_path, tab_id=mapping.tab_id)
-        if tmp_result.status == "ok":
+        if tmp_result.status in ("ok", "warning"):
             with open(tmp_path, encoding="utf-8") as fh:
                 theirs_content = fh.read()
             os.unlink(tmp_path)
@@ -332,6 +332,7 @@ def _merge_pull(
     return PullOutcome(
         local_path=mapping.local,
         action="merged",
+        result=tmp_result,
         has_conflicts=merge_result.has_conflicts,
         conflict_count=merge_result.conflict_count,
     )

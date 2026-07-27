@@ -293,6 +293,10 @@ def pull(
                 )
             else:
                 console.print("   [green]Merged cleanly.[/green]")
+            if outcome.result and outcome.result.status == "warning":
+                had_error = True
+                if outcome.result.message:
+                    console.print(f"   [dim]{escape(outcome.result.message)}[/dim]")
         elif outcome.action == "error":
             had_error = True
             result = outcome.result
@@ -307,7 +311,9 @@ def pull(
                 icon, style = _status_display(result.status)
                 console.print(f"[{style}]{icon}[/{style}]  {mapping.remote_id} → {mapping.local}")
                 if result.message:
-                    console.print(f"   [dim]{result.message}[/dim]")
+                    console.print(f"   [dim]{escape(result.message)}[/dim]")
+                if result.status == "warning":
+                    had_error = True
 
     if had_error:
         raise typer.Exit(1)

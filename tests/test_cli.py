@@ -494,6 +494,30 @@ class TestPull:
         assert result.exit_code == 0
         assert "✓" in result.output
 
+    def test_pull_reports_warning_status_with_yellow_icon_and_nonzero_exit(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        cfg = _cfg_file(tmp_path)
+        outcome = PullOutcome(
+            local_path=str(local),
+            action="fast-forward",
+            result=PullResult(
+                status="warning",
+                doc_id="doc-123",
+                local_path=str(local),
+                message="Document has 2 tabs but no tab_id is configured",
+            ),
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_pull", return_value=outcome):
+            result = runner.invoke(app, ["pull", "--config", cfg])
+        # A multi-tab ambiguity warning must never render/exit like a clean
+        # "ok" (green ✓, exit 0) — it gets its own yellow ⚠ and nonzero exit,
+        # mirroring push's CommentCountBackstop warning handling.
+        assert result.exit_code == 1
+        assert "⚠" in result.output
+        assert "✓" not in result.output
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # status

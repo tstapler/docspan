@@ -331,14 +331,15 @@ class GoogleDocsBackend(Backend):
                 self._write_comment_sidecar(doc_id, local_path)
                 return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
 
+            doc = self._client.get_document(doc_id)
+            _doc, _resolved_tab_id, warning = resolve_document_tab(doc, None)
+
             html_content = self._client.get_doc_content(doc_id)
             markdown_content = DocumentConverter().html_to_markdown(html_content)
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
 
-            doc = self._client.get_document(doc_id)
-            _doc, _resolved_tab_id, warning = resolve_document_tab(doc, None)
             if warning:
                 return PullResult(
                     status="warning", doc_id=doc_id, local_path=local_path, message=warning

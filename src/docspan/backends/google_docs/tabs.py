@@ -83,6 +83,11 @@ def resolve_document_tab(
     """
     tabs = doc.get("tabs") or []
     if not tabs:
+        if tab_id is not None:
+            raise TabNotFoundError(
+                f"tab_id {tab_id!r} not found in document. Available tabs: none "
+                "(this document has no tabs)"
+            )
         return doc, None, None
 
     flat = flatten_tabs(tabs)
