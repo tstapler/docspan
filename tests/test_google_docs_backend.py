@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 from docspan.backends.base import PushResult
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
+from docspan.backends.google_docs.tabs import TabNotFoundError
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.batch_update — writeControl.requiredRevisionId
@@ -338,3 +339,197 @@ class TestCommentCountBackstop:
 
         assert result.status == "ok"
         assert "dropped" not in (result.message or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# tab_id (Mapping.tab_id) — pull()/push() targeting a specific tab of a
+# multi-tab doc, and the backward-compatible no-tab_id case.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tab(tab_id: str, title: str, text: str) -> dict:
+    return {
+        "tabProperties": {"tabId": tab_id, "title": title},
+        "documentTab": {
+            "body": {
+                "content": [
+                    {
+                        "startIndex": 1,
+                        "endIndex": 1 + len(text) + 1,
+                        "paragraph": {
+                            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                            "elements": [{"textRun": {"content": text + "\n"}}],
+                        },
+                    }
+                ]
+            },
+            "lists": {},
+        },
+        "childTabs": [],
+    }
+
+
+def _multi_tab_doc(revision_id: str = "rev-tabs") -> dict:
+    return {
+        "revisionId": revision_id,
+        "body": {"content": []},
+        "tabs": [
+            _tab("t.first", "Overview", "First tab content"),
+            _tab("t.second", "Details", "Second tab content"),
+        ],
+    }
+
+
+class TestPullTabId:
+    def test_pull_with_tab_id_uses_structural_path_and_writes_that_tabs_content(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local), tab_id="t.second")
+
+        assert result.status == "ok"
+        content = local.read_text(encoding="utf-8")
+        assert "Second tab content" in content
+        assert "First tab content" not in content
+        # Structural path (get_document), never Drive's HTML export, when
+        # tab_id is given — Drive export can't target a specific tab.
+        fake_client.get_doc_content.assert_not_called()
+
+    def test_pull_with_unknown_tab_id_returns_error_status(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local), tab_id="t.nonexistent")
+
+        assert result.status == "error"
+        assert "t.nonexistent" in (result.message or "")
+
+    def test_pull_without_tab_id_on_multi_tab_doc_uses_html_export_and_warns(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Backward-compatible no-tab_id case: default pull path (Drive HTML
+        export) is unchanged, but a multi-tab doc now escalates to
+        'warning' instead of silently claiming 'ok' on a doc where the
+        export always returns just the first tab."""
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = "<p>First tab content</p>"
+        fake_client.get_document.return_value = _multi_tab_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "warning"
+        assert "Overview" in (result.message or "") and "Details" in (result.message or "")
+        fake_client.get_doc_content.assert_called_once()
+
+    def test_pull_without_tab_id_on_single_tab_legacy_doc_stays_ok(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Backward-compatible no-tab_id case: a doc with no `tabs` field at
+        all (pre-tabs-support / single-tab doc) pulls exactly as before."""
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = "<p>Hello</p>"
+        fake_client.get_document.return_value = _empty_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok"
+        assert result.message is None
+
+
+class TestPushTabId:
+    def test_push_with_tab_id_targets_that_tab_in_batch_update_requests(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("Second tab content\n\nNew paragraph\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", tab_id="t.second")
+
+        assert result.status == "ok"
+        fake_client.batch_update.assert_called_once()
+        _args, kwargs = fake_client.batch_update.call_args
+        assert kwargs["required_revision_id"] == "rev-tabs"
+        requests = _args[1]
+        assert requests
+        for request in requests:
+            for inner in request.values():
+                if "location" in inner:
+                    assert inner["location"]["tabId"] == "t.second"
+                if "range" in inner:
+                    assert inner["range"]["tabId"] == "t.second"
+
+    def test_push_with_unknown_tab_id_returns_error_status(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("Anything\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", tab_id="t.nonexistent")
+
+        assert result.status == "error"
+        assert "t.nonexistent" in (result.message or "")
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_without_tab_id_on_multi_tab_doc_targets_first_tab_and_warns(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("First tab content\n\nNew paragraph\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "warning"
+        assert "Overview" in (result.message or "") and "Details" in (result.message or "")
+        fake_client.batch_update.assert_called_once()
+        _args, kwargs = fake_client.batch_update.call_args
+        requests = _args[1]
+        assert requests
+        # No explicit tab_id was configured, but the doc has tabs, so the
+        # implicit default (the first tab, per resolve_document_tab) is
+        # still stamped explicitly onto every request — an omitted tabId
+        # also defaults to the first tab per the Docs API, but being
+        # explicit here means the write always lands where the plan (and
+        # its warning) said it would.
+        for request in requests:
+            for inner in request.values():
+                if "location" in inner:
+                    assert inner["location"]["tabId"] == "t.first"
+                if "range" in inner:
+                    assert inner["range"]["tabId"] == "t.first"
+
+    def test_push_without_tab_id_on_single_tab_legacy_doc_stays_ok(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Backward-compatible no-tab_id case, mirroring
+        TestPushRevisionGuard.test_push_passes_fetched_revision_id_into_batch_update
+        but making the no-tab_id-kwarg call explicit."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", tab_id=None)
+
+        assert result.status == "ok"
+        fake_client.batch_update.assert_called_once()

@@ -69,7 +69,7 @@ class FakeBackendWithPreview(FakeBackend):
     preview_text: Optional[str] = None
     preview_error: Optional[str] = None
 
-    def preview_push(self, local_path: str, doc_id: str) -> FakePushPreview:
+    def preview_push(self, local_path: str, doc_id: str, tab_id: Optional[str] = None) -> FakePushPreview:
         if self.preview_error is not None:
             return FakePushPreview(text=f"✗ dry-run failed: {self.preview_error}", error=self.preview_error)
         if self.preview_text is not None:

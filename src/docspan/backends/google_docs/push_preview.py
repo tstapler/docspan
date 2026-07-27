@@ -138,6 +138,9 @@ class PushPlan:
     unchanged_count: int
     comments: List[dict]
     high_risk: List[HighRiskParagraph]
+    # Set when the doc has multiple tabs and no tab_id was configured — the
+    # plan silently defaulted to the first tab (tabs.resolve_document_tab).
+    tab_warning: Optional[str] = None
 
 
 @dataclass
@@ -160,6 +163,7 @@ class PushPreview:
     high_risk: List[HighRiskParagraph]
     request_count: int
     error: Optional[str] = None
+    tab_warning: Optional[str] = None
 
     def render(self) -> str:
         if self.error is not None:
@@ -197,5 +201,8 @@ class PushPreview:
 
         if self.high_risk:
             lines.append(render_high_risk(self.high_risk))
+
+        if self.tab_warning:
+            lines.append(f"⚠ {self.tab_warning}")
 
         return "\n".join(lines)

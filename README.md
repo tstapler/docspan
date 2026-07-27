@@ -233,6 +233,7 @@ Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env
 | `backend` | string | — | yes | `"google_docs"` or `"confluence"` |
 | `remote_id` | string | — | yes | Google Doc ID or Confluence page ID |
 | `direction` | enum | `"both"` | no | `"push"`, `"pull"`, or `"both"` |
+| `tab_id` | string | `null` | no | Google Docs tab id (e.g. `"t.moqlkhpwn82e"`) to target on a multi-tab doc. Ignored by the Confluence backend. If unset and the doc has more than one tab, push/pull still succeed but report a `"warning"` naming the tabs found, instead of silently syncing whichever tab is first. |
 
 ---
 
@@ -262,6 +263,7 @@ docspan generates these files in your project directory after first sync:
 > - Checklist state (`- [ ]`/`- [x]`) round-trips as literal text — Google Docs' native checkbox glyph is intentionally not used because its checked/unchecked state cannot be read back via the API (see ADR-001)
 > - `push --dry-run` now shows a real structural diff and flags paragraphs with open comments at risk; `push` blocks by default on a flagged paragraph unless `--force` is passed
 > - If a push succeeds but a post-push check finds the open-comment count dropped, docspan reports this as a `⚠` warning — never a plain green success — so it's never mistaken for a clean push
+> - Google Docs: multi-tab docs need `tab_id` set explicitly per mapping — find it in the doc's URL (`...#tab=t.XXXXXXXXXX` after clicking the tab) or from the warning message docspan prints when `tab_id` is left unset. Without it, pull/push default to the doc's first tab (`pull`'s default path additionally can't target a tab at all — it uses Drive's HTML export, which only ever returns the first tab; set `tab_id` to instead pull via the structural API, which can target any tab)
 > - Google Docs OAuth requires each user to create their own GCP project (`docspan auth setup google_docs` → Personal/OAuth) and stays in Google's "Testing" publishing status — capped at 100 test users, with Google's "app isn't verified" warning shown on first sign-in. This avoids the annual CASA security assessment required to verify apps requesting Drive/Docs' restricted read-write scopes (a real recurring cost), at the price of a few extra manual setup minutes per user instead of a single embedded, zero-config client. Revisit if/when adoption outgrows a per-user-project model — options are paying for verification, or narrowing to the unrestricted `drive.file` scope via Google's Picker API (bigger rework: requires the user to explicitly select their doc through a picker rather than referencing it by ID in config)
 
 ---

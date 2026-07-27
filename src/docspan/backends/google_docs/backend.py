@@ -29,6 +29,8 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.backends.google_docs.onboarding import (
     OAUTH_HELP,
     autodetect_client_secret,
@@ -93,7 +95,9 @@ class GoogleDocsBackend(Backend):
             "Run: docspan auth setup google_docs"
         )
 
-    def _build_push_plan(self, local_path: str, doc_id: str) -> PushPlan:
+    def _build_push_plan(
+        self, local_path: str, doc_id: str, tab_id: Optional[str] = None
+    ) -> PushPlan:
         """Fetch the doc + open comments exactly once and compute the diff/risk plan.
 
         Performs exactly one get_document() call and exactly one
@@ -105,22 +109,29 @@ class GoogleDocsBackend(Backend):
         independently — they never share a plan computed by the other, so
         push()'s write is always gated by data it fetched itself (see
         plan.md Story 1.2.3, architecture-review.md Blocker 1).
+
+        `tab_id` (from Mapping.tab_id) selects which tab of a multi-tab doc
+        to diff/write against (tabs.resolve_document_tab); None keeps the
+        pre-tabs-support default of the first tab. If the doc has more than
+        one tab, plan.tab_warning is set so callers can surface that the
+        choice was implicit. Raises TabNotFoundError if tab_id doesn't match
+        any tab.
         """
         assert self._client is not None
         content = pathlib.Path(local_path).read_text()
 
         target_nodes = MarkdownToParagraphParser().parse(content)
         doc = self._client.get_document(doc_id)
+        doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
         current_nodes = DocsStructureParser().parse(doc)
 
-        if "tabs" in doc and doc["tabs"]:
-            body_content = doc["tabs"][0].get("documentTab", doc).get("body", {}).get("content", [])
-        else:
-            body_content = doc.get("body", {}).get("content", [])
+        body_content = doc.get("body", {}).get("content", [])
         doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
 
         request_builder = DocsRequestBuilder()
-        requests = request_builder.build(current_nodes, target_nodes, doc_end_index)
+        requests = request_builder.build(
+            current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
+        )
         entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
 
         comments = self._client.list_comments(doc_id)
@@ -135,9 +146,12 @@ class GoogleDocsBackend(Backend):
             unchanged_count=unchanged_count,
             comments=comments,
             high_risk=high_risk,
+            tab_warning=tab_warning,
         )
 
-    def preview_push(self, local_path: str, doc_id: str) -> PushPreview:
+    def preview_push(
+        self, local_path: str, doc_id: str, tab_id: Optional[str] = None
+    ) -> PushPreview:
         """Build a read-only, cosmetic preview of what push() would do.
 
         Calls _build_push_plan() with its own, independent fetch — never a
@@ -154,7 +168,7 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         try:
-            plan = self._build_push_plan(local_path, doc_id)
+            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
         except HttpError as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
@@ -168,9 +182,17 @@ class GoogleDocsBackend(Backend):
             unchanged_count=plan.unchanged_count,
             high_risk=plan.high_risk,
             request_count=len(plan.requests),
+            tab_warning=plan.tab_warning,
         )
 
-    def push(self, local_path: str, doc_id: str, force: bool = False, **kwargs: object) -> PushResult:
+    def push(
+        self,
+        local_path: str,
+        doc_id: str,
+        force: bool = False,
+        tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> PushResult:
         """Convert local markdown to Google Docs format and batch-update the doc.
 
         Gates on a PushPlan built from THIS call's own single fetch (see
@@ -180,14 +202,25 @@ class GoogleDocsBackend(Backend):
         force=True. After a successful write, the CommentCountBackstop
         re-checks the open-comment count and escalates status to "warning"
         (never leaves it "ok") if the count dropped.
+
+        `tab_id` (from Mapping.tab_id) targets a specific tab of a multi-tab
+        doc; None keeps the pre-tabs-support default of the first tab. If the
+        doc has multiple tabs and tab_id is None, the successful result's
+        status is escalated to "warning" (message explains the doc is
+        multi-tab and the choice was implicit) rather than silently writing
+        to whichever tab happens to be first.
         """
         self._ensure_client()
         assert self._client is not None
         try:
-            plan = self._build_push_plan(local_path, doc_id)
+            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
             if not plan.requests:
-                return PushResult(status="skipped", doc_id=doc_id, message="No changes detected")
+                return PushResult(
+                    status="skipped",
+                    doc_id=doc_id,
+                    message=plan.tab_warning or "No changes detected",
+                )
 
             if plan.high_risk and not force:
                 return PushResult(
@@ -212,7 +245,10 @@ class GoogleDocsBackend(Backend):
             )
             if needs_pass2:
                 refreshed = self._client.get_document(doc_id)
-                second = DocsRequestBuilder().build_second_pass_requests(refreshed, plan.target_nodes)
+                refreshed, resolved_tab_id, _ = resolve_document_tab(refreshed, tab_id)
+                second = DocsRequestBuilder().build_second_pass_requests(
+                    refreshed, plan.target_nodes, tab_id=resolved_tab_id
+                )
                 if second:
                     self._client.batch_update(
                         doc_id, second, required_revision_id=refreshed["revisionId"]
@@ -223,7 +259,11 @@ class GoogleDocsBackend(Backend):
             backstop_result = self._comment_backstop_result(doc_id, len(plan.comments), url)
             if backstop_result is not None:
                 return backstop_result
+            if plan.tab_warning:
+                return PushResult(status="warning", doc_id=doc_id, url=url, message=plan.tab_warning)
             return PushResult(status="ok", doc_id=doc_id, url=url)
+        except TabNotFoundError as exc:
+            return PushResult(status="error", doc_id=doc_id, message=str(exc))
         except HttpError as exc:
             if exc.resp.status == 400 and "requiredRevisionId" in str(exc):
                 return PushResult(
@@ -259,17 +299,53 @@ class GoogleDocsBackend(Backend):
             )
         return None
 
-    def pull(self, doc_id: str, local_path: str, **kwargs: object) -> PullResult:
-        """Export Google Doc as HTML, convert to markdown, write locally."""
+    def pull(
+        self, doc_id: str, local_path: str, tab_id: Optional[str] = None, **kwargs: object
+    ) -> PullResult:
+        """Fetch the Google Doc, convert to markdown, write locally.
+
+        Default (tab_id=None): unchanged pre-tabs-support behavior — export
+        via Drive's HTML export (files.export) and run it through
+        DocumentConverter.html_to_markdown(). Drive export always returns the
+        doc's first/default tab and cannot target a specific tab; if the doc
+        has more than one tab, status is escalated to "warning" (not "ok")
+        so a silent wrong-tab pull (the bug this parameter exists to fix)
+        is surfaced instead of hidden.
+
+        Explicit tab_id: Drive export can't select a tab, so this instead
+        re-fetches structurally (get_document + resolve_document_tab +
+        DocsStructureParser.parse) and renders back to markdown with
+        render_nodes_to_markdown() — the same structural machinery push()
+        uses, run in reverse.
+        """
         self._ensure_client()
         assert self._client is not None
         try:
+            if tab_id is not None:
+                doc = self._client.get_document(doc_id)
+                doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
+                nodes = DocsStructureParser().parse(doc)
+                markdown_content = render_nodes_to_markdown(nodes)
+                pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+                pathlib.Path(local_path).write_text(markdown_content)
+                self._write_comment_sidecar(doc_id, local_path)
+                return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
+
             html_content = self._client.get_doc_content(doc_id)
             markdown_content = DocumentConverter().html_to_markdown(html_content)
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
+
+            doc = self._client.get_document(doc_id)
+            _doc, _resolved_tab_id, warning = resolve_document_tab(doc, None)
+            if warning:
+                return PullResult(
+                    status="warning", doc_id=doc_id, local_path=local_path, message=warning
+                )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
+        except TabNotFoundError as exc:
+            return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
         except Exception as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
 

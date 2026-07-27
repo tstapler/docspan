@@ -33,7 +33,7 @@ class PushResult:
 
 @dataclass
 class PullResult:
-    status: Literal["ok", "conflict", "error", "skipped"]
+    status: Literal["ok", "conflict", "error", "skipped", "warning"]
     doc_id: str
     local_path: str
     message: Optional[str] = None

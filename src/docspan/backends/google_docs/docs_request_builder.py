@@ -200,6 +200,7 @@ class DocsRequestBuilder:
         current: List[Node],
         target: List[Node],
         doc_end_index: int,
+        tab_id: Optional[str] = None,
     ) -> List[dict]:
         """
         Build a minimal list of batchUpdate request dicts (pass 1).
@@ -212,6 +213,10 @@ class DocsRequestBuilder:
             target:  Nodes parsed from the local markdown file.
             doc_end_index: endIndex of the last body element (used to protect the terminal
                 newline that Docs API requires).
+            tab_id: When the doc has tabs, the tabId every request's
+                location/range should target (from tabs.resolve_document_tab).
+                None for legacy (non-tabbed) docs — Location/Range's tabId
+                field is only meaningful on a tabbed doc.
 
         Returns:
             List of request dicts sorted by descending startIndex (write-backwards).
@@ -251,6 +256,7 @@ class DocsRequestBuilder:
                 )
 
         all_requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
+        self._inject_tab_id(all_requests, tab_id)
         return all_requests
 
     # ──────────────────────────────────────────────
@@ -316,16 +322,27 @@ class DocsRequestBuilder:
 
         return requests
 
-    def build_second_pass_requests(self, doc: dict, target: List[Node]) -> List[dict]:
+    def build_second_pass_requests(
+        self, doc: dict, target: List[Node], tab_id: Optional[str] = None
+    ) -> List[dict]:
         """
         Combined pass-2 requests: table cell fills + inline text styling.
 
         Both read indices from the re-fetched ``doc``; the combined list is applied
         highest-index-first so cell inserts don't invalidate other ranges.
+
+        Args:
+            tab_id: Same as build()'s tab_id — stamped onto every request's
+                location/range when the doc has tabs. ``doc`` here is expected
+                to already be tab-resolved (tabs.resolve_document_tab) so
+                build_table_fill_requests()/build_span_style_requests() read
+                the right tab's content; this parameter only affects which
+                tab the *requests* are addressed to.
         """
         requests = self.build_table_fill_requests(doc, target)
         requests += self.build_span_style_requests(doc, target)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
+        self._inject_tab_id(requests, tab_id)
         return requests
 
     @staticmethod
@@ -508,6 +525,25 @@ class DocsRequestBuilder:
     # ──────────────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _inject_tab_id(requests: List[dict], tab_id: Optional[str]) -> None:
+        """Stamp `tabId` onto every request's `location`/`range` dict, in place.
+
+        Per the Docs API, Location and Range messages each carry their own
+        optional `tabId`; omitting it defaults the request to the document's
+        first tab. A no-op when `tab_id` is None (legacy, non-tabbed docs).
+        """
+        if not tab_id:
+            return
+        for request in requests:
+            for inner in request.values():
+                if not isinstance(inner, dict):
+                    continue
+                if "location" in inner:
+                    inner["location"]["tabId"] = tab_id
+                if "range" in inner:
+                    inner["range"]["tabId"] = tab_id
 
     @staticmethod
     def _extract_start_index(request: dict) -> int:
