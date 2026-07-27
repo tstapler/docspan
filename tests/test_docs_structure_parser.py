@@ -316,6 +316,62 @@ def test_person_mention_with_non_dict_person_is_skipped_not_raised() -> None:
     assert nodes[0].text == ""
 
 
+def test_person_mention_with_non_string_name_and_no_email_is_skipped_not_raised() -> None:
+    """Defensive: a non-string `name` (malformed API payload, e.g. an int)
+    must not raise — with no valid email to fall back to, it should be
+    treated the same as "no name or email"."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": 12345}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
+def test_person_mention_with_non_string_name_falls_back_to_valid_email() -> None:
+    """Defensive: a non-string `name` alongside a valid string `email` must
+    not raise — the non-string name should be treated as absent and the
+    email used instead."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": 12345, "email": "shivam@example.com"}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "shivam@example.com"
+
+
+def test_person_mention_with_non_string_email_and_no_name_is_skipped_not_raised() -> None:
+    """Defensive: a non-string `email` (malformed API payload, e.g. an int)
+    with no name present must not raise — treated as "no name or email"."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 10,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"email": 42}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # List items
 # ─────────────────────────────────────────────────────────────────────────────

@@ -22,10 +22,10 @@ def _person_display_text(person: dict) -> str:
     if not isinstance(person_properties, dict):
         return ""
     name = person_properties.get("name")
-    if name:
+    if isinstance(name, str) and name:
         return name
     email = person_properties.get("email")
-    if email:
+    if isinstance(email, str) and email:
         return email
     return ""
 
