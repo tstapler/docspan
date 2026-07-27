@@ -30,7 +30,6 @@ from docspan.backends.google_docs.docs_structure_parser import (
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
-from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.backends.google_docs.onboarding import (
     OAUTH_HELP,
     autodetect_client_secret,
@@ -46,6 +45,7 @@ from docspan.backends.google_docs.push_preview import (
     find_high_risk_paragraphs,
     render_high_risk,
 )
+from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.core.paths import COMMENTS_SUFFIX
 
 if TYPE_CHECKING:

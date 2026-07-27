@@ -14,7 +14,6 @@ from unittest.mock import MagicMock
 from docspan.backends.base import PushResult
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
-from docspan.backends.google_docs.tabs import TabNotFoundError
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.batch_update — writeControl.requiredRevisionId
