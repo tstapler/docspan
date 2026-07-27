@@ -1,4 +1,5 @@
 """Unit tests for tabs.py — resolve_document_tab()/list_tabs() (no network)."""
+from __future__ import annotations
 
 import pytest
 
