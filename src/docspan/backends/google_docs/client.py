@@ -116,18 +116,32 @@ class GoogleDocsClient:
                     raise
         raise RuntimeError("Max retries exceeded after rate limit backoff")
 
-    def get_document(self, doc_id: str) -> dict:
+    def get_document(self, doc_id: str, include_tabs_content: bool = True) -> dict:
         """
         Get full Google Docs document JSON (including body structure).
 
         Args:
             doc_id: Google Doc ID
+            include_tabs_content: When True (default), passes
+                `includeTabsContent=True` so multi-tab docs populate
+                `document.tabs` (each tab's own body/lists). Per the Docs API,
+                when this is omitted/False, `document.tabs` is left empty and
+                the legacy `document.body`/`document.lists` fields are
+                populated from the *first tab only* — silently ignoring any
+                other tab. Defaulting to True here is what makes tab
+                selection (Mapping.tab_id) possible at all; single-tab docs
+                are unaffected (their one tab's content still lands in
+                `document.tabs[0]`, handled by the existing tabs-aware
+                parsing code).
 
         Returns:
-            dict: Full document resource including body.content
+            dict: Full document resource including body.content (legacy docs)
+                or tabs[].documentTab.body.content (multi-tab docs).
         """
         return self._with_backoff(
-            lambda: self.docs_service.documents().get(documentId=doc_id).execute()
+            lambda: self.docs_service.documents()
+            .get(documentId=doc_id, includeTabsContent=include_tabs_content)
+            .execute()
         )
 
     def batch_update(

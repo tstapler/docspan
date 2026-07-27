@@ -34,7 +34,7 @@ class FakeBackend(Backend):
         return PushResult(status=self.push_status, doc_id=doc_id, url="https://example.com")  # type: ignore[arg-type]
 
     def pull(self, doc_id: str, local_path: str, **kwargs: object) -> PullResult:
-        if self.pull_status == "ok":
+        if self.pull_status in ("ok", "warning"):
             with open(local_path, "w", encoding="utf-8") as fh:
                 fh.write(self.remote_content)
         return PullResult(status=self.pull_status, doc_id=doc_id, local_path=local_path)  # type: ignore[arg-type]
@@ -115,6 +115,29 @@ class TestOrchestratePush:
         assert outcome.result.status == "error"
         assert not outcome.state_saved
         assert state.get(str(local)) is None
+
+    def test_push_warning_records_state(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test: a push that succeeds with status='warning' (e.g. multi-tab
+        doc without a configured tab_id) must still record sync state, otherwise the
+        next pull sees stale state and does a spurious/lossy re-pull."""
+        local = tmp_path / "doc.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+
+        outcome = orchestrate_push(
+            _mapping(str(local)),
+            FakeBackend(push_status="warning"),
+            state,
+            str(tmp_path),
+            state_path,
+        )
+
+        assert outcome.result.status == "warning"
+        assert outcome.state_saved
+        entry = state.get(str(local))
+        assert entry is not None
+        assert entry.remote_version == "v1"
 
     def test_push_invokes_backend_with_correct_args(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
@@ -216,6 +239,63 @@ class TestOrchestratePull:
         assert outcome.has_conflicts
         assert outcome.conflict_count == 1
         assert "<<<<<<< ours" in local.read_text(encoding="utf-8")
+
+    def test_first_sync_warning_records_state(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test: pull_status='warning' (ambiguous multi-tab doc) must still
+        record sync state on first sync, not just 'ok'."""
+        local = tmp_path / "doc.md"
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+
+        outcome = orchestrate_pull(
+            _mapping(str(local)),
+            FakeBackend(remote_content="hello\n", pull_status="warning"),
+            state,
+            str(tmp_path),
+            state_path,
+        )
+
+        assert outcome.action == "first-sync"
+        assert outcome.result.status == "warning"
+        assert local.read_text(encoding="utf-8") == "hello\n"
+        assert state.get(str(local)) is not None
+
+    def test_fast_forward_warning_records_state(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test: pull_status='warning' during a fast-forward pull must still
+        record sync state, otherwise the next pull re-does the same fast-forward."""
+        content = "old\n"
+        local = tmp_path / "doc.md"
+        local.write_text(content, encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), content, remote_version="v1")
+        backend = FakeBackend(remote_version="v2", remote_content="new remote\n", pull_status="warning")
+
+        outcome = orchestrate_pull(_mapping(str(local)), backend, state, str(tmp_path), state_path)
+
+        assert outcome.action == "fast-forward"
+        assert outcome.result.status == "warning"
+        assert local.read_text(encoding="utf-8") == "new remote\n"
+        assert state.get(str(local)).remote_version == "v2"  # type: ignore[union-attr]
+
+    def test_merge_pull_warning_completes_merge_not_error(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test: a warning status on the 'theirs' pull inside a three-way
+        merge must still complete the merge (treated like 'ok'), not fall through to
+        the error branch."""
+        base = "line1\nline2\nline3\n"
+        local_content = "line1\nlocal edit\nline3\n"
+        remote_content = "line1\nline2\nline3\nremote addition\n"
+
+        local = tmp_path / "doc.md"
+        local.write_text(local_content, encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), base, remote_version="v1")
+        backend = FakeBackend(remote_version="v2", remote_content=remote_content, pull_status="warning")
+
+        outcome = orchestrate_pull(_mapping(str(local)), backend, state, str(tmp_path), state_path)
+
+        assert outcome.action == "merged"
+        assert not outcome.has_conflicts
+        merged = local.read_text(encoding="utf-8")
+        assert "local edit" in merged
+        assert "remote addition" in merged
 
     def test_orig_file_created_before_merge(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         base = "base\n"

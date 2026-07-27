@@ -182,7 +182,9 @@ def push(
 
         if dry_run:
             if hasattr(backend, "preview_push"):
-                preview = backend.preview_push(mapping.local, mapping.remote_id)
+                preview = backend.preview_push(
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                )
                 # escape(): preview text carries literal "[ ]"/"[x]" checklist
                 # markers, which Rich's console markup would otherwise parse
                 # as (and silently swallow) style tags.
@@ -291,6 +293,10 @@ def pull(
                 )
             else:
                 console.print("   [green]Merged cleanly.[/green]")
+            if outcome.result and outcome.result.status == "warning":
+                had_error = True
+                if outcome.result.message:
+                    console.print(f"   [dim]{escape(outcome.result.message)}[/dim]")
         elif outcome.action == "error":
             had_error = True
             result = outcome.result
@@ -305,7 +311,9 @@ def pull(
                 icon, style = _status_display(result.status)
                 console.print(f"[{style}]{icon}[/{style}]  {mapping.remote_id} → {mapping.local}")
                 if result.message:
-                    console.print(f"   [dim]{result.message}[/dim]")
+                    console.print(f"   [dim]{escape(result.message)}[/dim]")
+                if result.status == "warning":
+                    had_error = True
 
     if had_error:
         raise typer.Exit(1)
@@ -564,9 +572,15 @@ def conflicts_resolve(
 
     config = load_config(config_path)
     backend = _get_backend(entry.backend, config)
+    # MappingState (.markgate-state.json) has no tab_id field — look the
+    # mapping up in markgate.yaml by local path so a re-fetch of a tab-scoped
+    # mapping targets the right tab instead of silently falling back to the
+    # doc's first tab.
+    mapping = next((m for m in config.mappings if m.local == file), None)
+    tab_id = mapping.tab_id if mapping is not None else None
 
     if accept == "remote":
-        _resolve_remote(file, entry, backend, state, state_path, state_dir)
+        _resolve_remote(file, entry, backend, state, state_path, state_dir, tab_id=tab_id)
     elif accept == "local":
         _resolve_local(file, entry, state, state_path, state_dir)
     elif accept == "merged":
@@ -580,8 +594,9 @@ def _resolve_remote(
     state: SyncState,
     state_path: str,
     state_dir: str,
+    tab_id: Optional[str] = None,
 ) -> None:
-    result = backend.pull(entry.doc_id, file)
+    result = backend.pull(entry.doc_id, file, tab_id=tab_id)
     if result.status != "ok":
         err_console.print(f"Could not re-fetch remote: {result.message}")
         raise typer.Exit(1)

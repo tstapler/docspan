@@ -40,6 +40,10 @@ class Mapping(BaseModel):
     backend: str     # "google_docs" or "confluence"
     remote_id: str   # Google Doc ID or Confluence page ID
     direction: Literal["push", "pull", "both"] = "both"
+    # Google Docs tab id (e.g. "t.moqlkhpwn82e") to target on a multi-tab doc.
+    # None (default) targets the doc's first/default tab — preserves pre-tabs
+    # behavior. Ignored by backends that don't support tabs (e.g. Confluence).
+    tab_id: Optional[str] = None
 
 
 class MarkgateConfig(BaseModel):

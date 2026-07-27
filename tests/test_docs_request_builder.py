@@ -363,6 +363,45 @@ def test_diff_summary_handles_empty_current_and_target_without_raising() -> None
     assert unchanged_count == 0
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# tab_id stamping (build()/_inject_tab_id) — multi-tab doc support
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_without_tab_id_omits_tab_id_from_requests() -> None:
+    """Backward-compatible no-tab_id case: legacy (non-tabbed) docs must
+    produce requests identical to pre-tabs-support behavior — no tabId key
+    anywhere, since Location/Range's tabId is only meaningful on tabbed docs."""
+    current: list = []
+    target = [_para("New paragraph")]
+    requests = builder.build(current, target, DOC_END, tab_id=None)
+    assert requests
+    for request in requests:
+        for inner in request.values():
+            assert "tabId" not in inner.get("location", {})
+            assert "tabId" not in inner.get("range", {})
+
+
+def test_build_with_tab_id_stamps_tab_id_onto_every_location_and_range() -> None:
+    current: list = [_para("Existing", start=1, end=9)]
+    target = [
+        _para("Existing", start=1, end=9),
+        _para("Appended", start=9, end=18),
+    ]
+    requests = builder.build(current, target, DOC_END, tab_id="t.second")
+    assert requests
+    saw_location_or_range = False
+    for request in requests:
+        for inner in request.values():
+            if "location" in inner:
+                assert inner["location"]["tabId"] == "t.second"
+                saw_location_or_range = True
+            if "range" in inner:
+                assert inner["range"]["tabId"] == "t.second"
+                saw_location_or_range = True
+    assert saw_location_or_range
+
+
 def test_replace_with_unequal_current_and_target_length_does_not_raise() -> None:
     """A 'replace' opcode where current/target paragraph-range lengths differ
     (e.g. one checklist line split into two) is handled as extra add/remove
