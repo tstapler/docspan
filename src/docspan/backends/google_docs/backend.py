@@ -151,6 +151,7 @@ class GoogleDocsBackend(Backend):
             high_risk=high_risk,
             tab_warning=tab_warning,
             unappliable_removals=unappliable,
+            resolved_tab_id=resolved_tab_id,
         )
 
     def preview_push(
@@ -219,14 +220,81 @@ class GoogleDocsBackend(Backend):
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
-            if not plan.requests:
-                # An empty request list does NOT always mean "the doc already
-                # matches". A delete whose range trims to nothing is dropped
-                # (DocsRequestBuilder._make_delete_requests) — that happens to
+            if plan.requests and plan.high_risk and not force:
+                return PushResult(
+                    status="blocked",
+                    doc_id=doc_id,
+                    message=render_high_risk(plan.high_risk),
+                )
+
+            if plan.requests:
+                self._client.batch_update(
+                    doc_id, plan.requests, required_revision_id=plan.doc["revisionId"]
+                )
+
+            # Pass 2 — tables are inserted empty and inline styling
+            # (links/bold/italic/monospace) is deferred, so it needs real
+            # post-insert indices.
+            #
+            # Pass 1 being empty does NOT mean there is nothing to do, and this
+            # used to be checked in the wrong order. The diff key is
+            # (style, text, is_list_item) — it does not include marks — so
+            # adding a link to text that is otherwise unchanged produces zero
+            # diffs and zero pass-1 requests. When the "nothing to do" return
+            # sat above this block, that push wrote nothing and reported
+            # `status="skipped"` / "No changes detected", rendered as a green ✓.
+            # Bold, italic, monospace and an indentation-only change all fail
+            # the same way.
+            #
+            # `needs_pass2` still gates the work — a target with no tables and
+            # no styled spans has nothing for pass 2 to do, and re-reading the
+            # document to discover that would add a GET to every text-only push.
+            needs_pass2 = any(
+                isinstance(n, DocsTableNode)
+                or (isinstance(n, DocsParagraphNode) and n.spans)
+                for n in plan.target_nodes
+            )
+            second: list[dict] = []
+            unstyled: list[DocsParagraphNode] = []
+            if needs_pass2:
+                # When pass 1 wrote nothing the already-fetched plan.doc is
+                # still current, so pass 2 runs against it and skips a
+                # redundant GET; otherwise the document has moved and must be
+                # re-read. plan.doc is already narrowed to the resolved tab,
+                # which is why PushPlan carries resolved_tab_id.
+                if plan.requests:
+                    pass2_doc = self._client.get_document(doc_id)
+                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(pass2_doc, tab_id)
+                else:
+                    pass2_doc, pass2_tab_id = plan.doc, plan.resolved_tab_id
+
+                builder = DocsRequestBuilder()
+                second = builder.build_second_pass_requests(
+                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id
+                )
+                # Pass 2 aligns by content and refuses to guess (see
+                # DocsRequestBuilder._align_for_styling). Anything it couldn't
+                # place got no styling at all rather than styling aimed at the
+                # wrong paragraph — surface that instead of returning a clean
+                # "ok" over a doc whose links didn't land.
+                unstyled = builder.unaligned_span_targets(pass2_doc, plan.target_nodes)
+                if second:
+                    # The document's own revisionId guards this batch the same
+                    # way pass 1 is guarded, so pass 2 can't silently overwrite
+                    # an edit that landed since that document was read.
+                    self._client.batch_update(
+                        doc_id, second, required_revision_id=pass2_doc["revisionId"]
+                    )
+
+            if not plan.requests and not second and not unstyled:
+                # Now genuinely nothing was applied by either pass.
+                #
+                # Even here an empty request list is not proof the document
+                # matches: a delete whose range trims to nothing is dropped
+                # (DocsRequestBuilder._make_delete_requests), which happens to
                 # an already-empty paragraph pinned by the newline anchoring a
                 # Table/TableOfContents/SectionBreak. diff_summary() still
-                # reports it as a removal, and it really is still in the doc,
-                # so "No changes detected" here would be a false parity claim.
+                # reports it as a removal, and it really is still in the doc.
                 if plan.unappliable_removals:
                     count = len(plan.unappliable_removals)
                     return PushResult(
@@ -245,46 +313,6 @@ class GoogleDocsBackend(Backend):
                     doc_id=doc_id,
                     message=plan.tab_warning or "No changes detected",
                 )
-
-            if plan.high_risk and not force:
-                return PushResult(
-                    status="blocked",
-                    doc_id=doc_id,
-                    message=render_high_risk(plan.high_risk),
-                )
-
-            self._client.batch_update(
-                doc_id, plan.requests, required_revision_id=plan.doc["revisionId"]
-            )
-
-            # Pass 2: tables are inserted empty and inline styling is deferred above; re-fetch
-            # to read real indices, then fill cells + apply link/bold/italic/monospace styling.
-            # The re-fetch's own revisionId guards this second batch_update the same way the
-            # first one is guarded above, so pass 2 can't silently overwrite an edit that landed
-            # in the (small) window between pass 1 and this re-fetch.
-            needs_pass2 = any(
-                isinstance(n, DocsTableNode)
-                or (isinstance(n, DocsParagraphNode) and n.spans)
-                for n in plan.target_nodes
-            )
-            unstyled: list[DocsParagraphNode] = []
-            if needs_pass2:
-                refreshed = self._client.get_document(doc_id)
-                refreshed, resolved_tab_id, _ = resolve_document_tab(refreshed, tab_id)
-                builder = DocsRequestBuilder()
-                second = builder.build_second_pass_requests(
-                    refreshed, plan.target_nodes, tab_id=resolved_tab_id
-                )
-                # Pass 2 aligns by content and refuses to guess (see
-                # DocsRequestBuilder._align_for_styling). Anything it couldn't
-                # place got no styling at all rather than styling aimed at the
-                # wrong paragraph — surface that instead of returning a clean
-                # "ok" over a doc whose links didn't land.
-                unstyled = builder.unaligned_span_targets(refreshed, plan.target_nodes)
-                if second:
-                    self._client.batch_update(
-                        doc_id, second, required_revision_id=refreshed["revisionId"]
-                    )
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
 

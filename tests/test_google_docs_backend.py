@@ -685,3 +685,154 @@ class TestPushReportsWhatItCouldNotDo:
         assert result.status == "warning"
         assert "Gamma" in (result.message or "")
         assert "not applied" in (result.message or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pass 1 empty does not mean "nothing to do"
+#
+# The diff key is (style, text, is_list_item) — no marks — so a link-only edit
+# produces zero diffs and zero pass-1 requests. `push()` used to return
+# "No changes detected" before pass 2 ran, so adding a link wrote nothing and
+# reported success as a green ✓. Bold, italic, monospace and an
+# indentation-only change all failed the same way.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _doc_with_paragraph(text: str, revision_id: str = "rev-1") -> dict:
+    """A one-paragraph doc whose indices match what DocsStructureParser expects."""
+    return {
+        "revisionId": revision_id,
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 1 + len(text) + 1,
+                    "paragraph": {
+                        "elements": [{"textRun": {"content": text + "\n"}}],
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    },
+                }
+            ]
+        },
+    }
+
+
+class TestStylingOnlyPush:
+    def test_a_link_only_edit_is_applied_rather_than_reported_as_no_change(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The reported bug: the link is known, and used to be silently dropped."""
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](https://example.com)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "ok", result.message
+        assert client.batch_update.call_count == 1, "expected exactly the styling pass"
+        requests = client.batch_update.call_args[0][1]
+        links = [
+            r["updateTextStyle"]["textStyle"]["link"]
+            for r in requests
+            if "updateTextStyle" in r
+            and "link" in r["updateTextStyle"].get("textStyle", {})
+        ]
+        assert links == [{"url": "https://example.com"}]
+
+    def test_the_styling_pass_is_revision_guarded(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """A write with no pass 1 still may not clobber a concurrent edit."""
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](https://example.com)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta", revision_id="rev-9")
+        client.list_comments.return_value = []
+
+        backend.push(str(local), "doc-1")
+
+        assert client.batch_update.call_args.kwargs["required_revision_id"] == "rev-9"
+
+    def test_an_unchanged_document_still_reports_no_changes_and_writes_nothing(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The other direction — the fix must not make every push a write.
+
+        Without this, moving the "nothing to do" return below pass 2 could be
+        satisfied by simply always writing, which is worse than the bug.
+        """
+        local = tmp_path / "doc.md"
+        local.write_text("Beta\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        assert result.message == "No changes detected"
+        client.batch_update.assert_not_called()
+
+    def test_a_styling_only_push_does_not_re_fetch_the_document(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Pass 1 wrote nothing, so the document already in hand is still current."""
+        local = tmp_path / "doc.md"
+        local.write_text("**Beta**\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        backend.push(str(local), "doc-1")
+
+        assert client.get_document.call_count == 1
+
+    def test_a_text_only_push_does_not_issue_an_extra_fetch(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """`needs_pass2` still gates the work, so pass 2 costs nothing when idle.
+
+        Removing that gate to make pass 2 unconditional would add a GET to every
+        text-only push — an easy regression to ship while fixing the styling bug,
+        because no other assertion here would notice.
+        """
+        local = tmp_path / "doc.md"
+        local.write_text("Gamma\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "ok", result.message
+        assert client.batch_update.call_count == 1, "pass 1 only"
+        assert client.get_document.call_count == 1, "no styling work, so no re-read"
+
+    def test_a_text_edit_carrying_a_link_still_re_fetches_before_styling(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """When pass 1 writes, the indices have moved — pass 2 must re-read.
+
+        Reusing the pre-write document here would style stale positions. The
+        mock returns the *post-write* document on the second call, because a
+        static mock would make pass 2 fail to align and would pass this test
+        for the wrong reason.
+        """
+        local = tmp_path / "doc.md"
+        local.write_text("[Gamma](https://example.com)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta", revision_id="rev-before"),
+            _doc_with_paragraph("Gamma", revision_id="rev-after"),
+        ]
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "ok", result.message
+        assert client.get_document.call_count == 2
+        assert client.batch_update.call_count == 2
+        # Each pass is guarded by the revision it was built against.
+        guards = [c.kwargs["required_revision_id"] for c in client.batch_update.call_args_list]
+        assert guards == ["rev-before", "rev-after"]
