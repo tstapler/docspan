@@ -274,8 +274,32 @@ _STYLE_ONLY_KEYS = (
 
 
 def _check_insert(flat: str, index: int) -> None:
+    """Enforce where an insertText/insertTable index may point.
+
+    Two rules from InsertTextRequest:
+
+    * "Index N must be less than the end index of the referenced segment" — the
+      body's end index is ``len(flat) + 1``, so the last legal index is the
+      terminal newline at ``len(flat)``.
+    * "Text must be inserted inside the bounds of an existing Paragraph." The
+      index of a Table, TableOfContents or SectionBreak is that element's own
+      bound, not a paragraph's. #22 recorded the live consequence for a table:
+      the text lands in the first cell rather than in the body — silent
+      misplacement rather than an error. Modelled as invalid either way, since
+      both outcomes are the bug.
+    """
     if not 1 <= index <= len(flat):
-        raise InvalidDeleteRange(f"insert index {index} outside body [1, {len(flat)}]")
+        raise InvalidRange(
+            f"insert index {index} outside body [1, {len(flat)}] — the body's "
+            f"end index is {len(flat) + 1} and an insert must name a lower one"
+        )
+    kind = _unit_kind(flat[index - 1])
+    if kind is not None:
+        raise InvalidRange(
+            f"insert index {index} is the {kind}'s own index, not a position "
+            f"inside a paragraph — insert in front of the newline at {index - 1} "
+            f"instead"
+        )
 
 
 def _check_style_range(flat: str, key: str, rng: dict) -> None:
@@ -849,6 +873,74 @@ def test_a_mid_document_insert_still_lands_after_the_preceding_paragraph() -> No
         "Middle",
         "Omega",
     ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inserting directly before a boundary element (#22)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    ("_name", "units", "markdown"),
+    [
+        (
+            "table",
+            [Para("Alpha"), Table([["a", "b"]]), Para("")],
+            "Alpha\n\nInserted\n\n| a | b |\n| --- | --- |\n",
+        ),
+        (
+            "section break",
+            [Para("Alpha"), SectionBreak(), Para("Omega"), Para("")],
+            "Alpha\n\nInserted\n\nOmega\n",
+        ),
+        (
+            "table of contents",
+            [Para("Alpha"), TableOfContents(), Para("Omega"), Para("")],
+            "Alpha\n\nInserted\n\nOmega\n",
+        ),
+    ],
+    ids=["table", "section break", "table of contents"],
+)
+def test_insert_before_a_boundary_element_lands_in_the_body(
+    _name: str, units: List[object], markdown: str
+) -> None:
+    """Issue #22: the insert targeted the boundary element's own index.
+
+    ``current[i1 - 1].end_index`` is normally the first index of the following
+    paragraph. When a Table, TableOfContents or SectionBreak follows instead,
+    it is that element's own start index — not a position inside any paragraph,
+    which InsertTextRequest requires ("Text must be inserted inside the bounds
+    of an existing Paragraph"). For a table the text lands in the first cell
+    instead of the body.
+
+    The fix is the same one the tail append needed: step back onto the
+    preceding paragraph's newline and write in front of it.
+
+    DocsStructureParser drops section breaks and tables of contents entirely,
+    so ``precedes_structural_element`` is the only trace of them the builder
+    has — which is why all three variants are exercised rather than just the
+    table.
+    """
+    model = DocModel(units)  # type: ignore[arg-type]
+    current = structure.parse(model.doc())
+    target = parser.parse(markdown)
+
+    requests = builder.build(current, target, model.end_index())
+    after = model.apply(requests)  # raises if the insert names the boundary
+
+    texts = [
+        node.text for node in structure.parse(after.doc())
+        if isinstance(node, DocsParagraphNode)
+    ]
+    assert "Inserted" in texts
+    assert texts.index("Alpha") + 1 == texts.index("Inserted"), (
+        "the new paragraph must sit between Alpha and the boundary"
+    )
+    # And the boundary itself survives.
+    assert UNDELETABLE_BOUNDARY_KEYS  # named for the reader; the model asserts below
+    assert any(
+        any(key in element for key in UNDELETABLE_BOUNDARY_KEYS)
+        for element in after.doc()["body"]["content"]
+    ), "the boundary element must still be there"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
