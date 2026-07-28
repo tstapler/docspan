@@ -385,10 +385,39 @@ class DocsRequestBuilder:
     # ──────────────────────────────────────────────
 
     def _make_delete_requests(self, nodes: List[Node], doc_end_index: int) -> List[dict]:
+        """Emit one deleteContentRange per node, protecting undeletable newlines.
+
+        Two of the document's newlines can't be deleted on their own, and a
+        node's [start_index, end_index) range covers both cases:
+
+        1. The body's terminal newline (``doc_end_index - 1``).
+        2. The newline immediately before a Table, TableOfContents or
+           SectionBreak — the Docs API rejects deleting it "without deleting
+           the element" (DeleteContentRangeRequest reference) with "Invalid
+           deletion range. Cannot delete the requested range.", failing the
+           whole batch atomically. A paragraph's trailing newline IS that
+           newline whenever one of those elements follows it
+           (DocsParagraphNode.precedes_structural_element).
+
+        Both cases stop one index short rather than dropping the request, so
+        the paragraph's text still goes away and only an empty paragraph is
+        left behind holding the boundary open.
+
+        Case 2 trims unconditionally, even when the following element is a
+        Table that this same batch deletes. Co-deleting looks like it would
+        make the newline safe, but the deletes are separate requests applied
+        highest-index-first, so by the time the paragraph's request runs the
+        table is already gone and whatever followed the table — possibly
+        another boundary — has moved up against that newline. Keeping the
+        rule unconditional costs one leftover empty paragraph and removes the
+        need to reason about boundary chains at all.
+        """
         requests = []
         for node in nodes:
             start = node.start_index
             end = node.end_index
+            if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
+                end -= 1
             if end >= doc_end_index:
                 end = doc_end_index - 1
             if start >= end:

@@ -1,7 +1,11 @@
 """Unit tests for DocsRequestBuilder — structural diff algorithm, no network."""
 
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode, TextSpan
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    DocsTableNode,
+    TextSpan,
+)
 
 DOC_END = 100
 
@@ -12,9 +16,15 @@ def _para(
     start: int = 1,
     end: int = 10,
     is_list_item: bool = False,
+    precedes_structural_element: bool = False,
 ) -> DocsParagraphNode:
     return DocsParagraphNode(
-        style=style, text=text, start_index=start, end_index=end, is_list_item=is_list_item
+        style=style,
+        text=text,
+        start_index=start,
+        end_index=end,
+        is_list_item=is_list_item,
+        precedes_structural_element=precedes_structural_element,
     )
 
 
@@ -128,6 +138,63 @@ def test_requests_sorted_descending_by_start_index() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Terminal newline protection
 # ─────────────────────────────────────────────────────────────────────────────
+
+def test_delete_stops_short_of_newline_anchoring_a_following_structural_element() -> None:
+    """Regression: a paragraph directly followed by a Table, TableOfContents or
+    SectionBreak owns the newline that anchors that element, and the Docs API
+    rejects deleting it "without deleting the element" — batchUpdate fails
+    atomically with `Invalid requests[N].deleteContentRange: Invalid deletion
+    range. Cannot delete the requested range.`, so the whole push applies
+    nothing. SectionBreak/TableOfContents are not parsed into nodes at all, so
+    they can never be co-deleted; the delete must stop one index short."""
+    # "Keep\n" is [1, 6); "Doomed\n" is [6, 13) and is followed by a section
+    # break occupying [13, 14) — so index 12 is the anchoring newline.
+    current = [
+        _para("Keep", start=1, end=6),
+        _para("Doomed", start=6, end=13, precedes_structural_element=True),
+    ]
+    target = [_para("Keep", start=1, end=6)]
+    requests = builder.build(current, target, doc_end_index=40)
+
+    delete_requests = [r for r in requests if "deleteContentRange" in r]
+    assert len(delete_requests) == 1
+    assert delete_requests[0]["deleteContentRange"]["range"] == {
+        "startIndex": 6,
+        "endIndex": 12,
+    }
+
+
+def test_replace_before_structural_element_keeps_the_anchoring_newline() -> None:
+    """The same protection applies on a "replace" opcode, which is how an
+    edited (rather than removed) paragraph reaches _make_delete_requests."""
+    current = [_para("Old text", start=6, end=15, precedes_structural_element=True)]
+    target = [_para("New text", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=40)
+
+    delete_requests = [r for r in requests if "deleteContentRange" in r]
+    assert len(delete_requests) == 1
+    assert delete_requests[0]["deleteContentRange"]["range"]["endIndex"] == 14
+
+
+def test_delete_trims_the_anchoring_newline_even_when_the_table_is_deleted_too() -> None:
+    """Trimming stays unconditional when the following Table is deleted in the
+    same batch. Requests are applied highest-index-first, so the table is
+    already gone by the time the paragraph's delete runs and whatever followed
+    the table has moved up against that newline — which may be another
+    boundary. The table itself is still deleted whole."""
+    table = DocsTableNode(rows=[["a", "b"]], start_index=13, end_index=25)
+    current = [
+        _para("Keep", start=1, end=6),
+        _para("Doomed", start=6, end=13, precedes_structural_element=True),
+        table,
+    ]
+    target = [_para("Keep", start=1, end=6)]
+    requests = builder.build(current, target, doc_end_index=40)
+
+    ranges = [r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r]
+    assert {"startIndex": 6, "endIndex": 12} in ranges
+    assert {"startIndex": 13, "endIndex": 25} in ranges
+
 
 def test_delete_does_not_exceed_doc_end() -> None:
     doc_end = 10

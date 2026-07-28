@@ -4,6 +4,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
+# Structural elements whose leading newline the Docs API refuses to delete on
+# its own: "Deleting the newline character before a Table, TableOfContents or
+# SectionBreak without deleting the element" is an invalid deleteContentRange
+# (documents.request reference, DeleteContentRangeRequest). A paragraph's
+# trailing newline IS that newline when one of these follows it, so a delete
+# covering the paragraph's full [start_index, end_index) is rejected with
+# "Invalid deletion range. Cannot delete the requested range." — see
+# DocsRequestBuilder._make_delete_requests.
+UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
+
 
 def _person_display_text(person: dict) -> str:
     """Return display text for a Docs API `person` structural element.
@@ -57,6 +67,16 @@ class DocsParagraphNode:
     # DocsRequestBuilder.build()'s equality/opcode logic. See ADR-001,
     # plan.md Task 1.2.2d.
     is_native_checkbox: bool = False
+    # True when the very next structural element in the document body is a
+    # Table, TableOfContents or SectionBreak (UNDELETABLE_BOUNDARY_KEYS). This
+    # paragraph's trailing newline is then the newline that anchors that
+    # element, and the Docs API rejects any deleteContentRange covering it
+    # unless the element itself is deleted in the same range. Resolved live by
+    # DocsStructureParser from the raw body content (sectionBreak and
+    # tableOfContents elements are never turned into nodes, so this flag is the
+    # only trace of them). NOT part of the diff key — consumed solely by
+    # DocsRequestBuilder._make_delete_requests.
+    precedes_structural_element: bool = False
 
 
 @dataclass
@@ -108,16 +128,30 @@ class DocsStructureParser:
         content = body.get("content", [])
         nodes: List[Union[DocsParagraphNode, DocsTableNode]] = []
 
-        for element in content:
+        for position, element in enumerate(content):
             if "paragraph" in element:
                 node = self._parse_paragraph(element, lists)
-                if node is not None:
-                    nodes.append(node)
+                if node is None:
+                    continue
+                node.precedes_structural_element = self._precedes_structural_element(
+                    content, position
+                )
+                nodes.append(node)
             elif "table" in element:
                 nodes.append(self._parse_table(element))
-            # sectionBreak, tableOfContents are silently skipped
+            # sectionBreak, tableOfContents are silently skipped as nodes — a
+            # preceding paragraph still records them via
+            # precedes_structural_element so the delete path can see them.
 
         return nodes
+
+    @staticmethod
+    def _precedes_structural_element(content: List[dict], position: int) -> bool:
+        """Whether content[position] is directly followed by an undeletable boundary."""
+        following = content[position + 1] if position + 1 < len(content) else None
+        if not isinstance(following, dict):
+            return False
+        return any(key in following for key in UNDELETABLE_BOUNDARY_KEYS)
 
     def _parse_table(self, element: dict) -> DocsTableNode:
         """Parse a structural element that contains a table into a DocsTableNode."""
