@@ -652,3 +652,79 @@ class TestConflictsResolve:
         assert "Resolved" in result.output
         assert local.read_text(encoding="utf-8") == orig_content
         assert not orig.exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --config / --prefix accepted before the subcommand (#20)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGroupLevelOptions:
+    """`docspan --config X status` used to fail with "No such option: --config".
+
+    Both options are now accepted on either side of the subcommand name. The
+    group-level values live in a module-level `_GROUP`, so the interesting cases
+    are precedence and that a value cannot leak from one invocation into the
+    next (these tests share one process via CliRunner).
+    """
+
+    def test_config_before_the_subcommand_is_accepted(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()) as load:
+            result = runner.invoke(app, ["--config", cfg, "status"])
+        assert result.exit_code == 0, result.output
+        assert "No such option" not in result.output
+        # The path really reached config loading, rather than being ignored.
+        assert load.call_args[0][0] == cfg
+
+    def test_config_after_the_subcommand_still_works(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()) as load:
+            result = runner.invoke(app, ["status", "--config", cfg])
+        assert result.exit_code == 0, result.output
+        assert load.call_args[0][0] == cfg
+
+    def test_the_subcommand_position_wins_when_both_are_given(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """The more specific position takes effect."""
+        group_cfg = _cfg_file(tmp_path)
+        specific = tmp_path / "specific.yaml"
+        specific.write_text("mappings: []\n", encoding="utf-8")
+        with patch("docspan.cli.main.load_config", return_value=_config()) as load:
+            result = runner.invoke(
+                app, ["--config", group_cfg, "status", "--config", str(specific)]
+            )
+        assert result.exit_code == 0, result.output
+        assert load.call_args[0][0] == str(specific)
+
+    def test_a_group_level_value_does_not_leak_into_the_next_invocation(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Module-level state is only safe because the callback always resets it.
+
+        Without the reset, the second invocation below would silently reuse the
+        first one's config path — and every test in this file that relies on the
+        default resolution would depend on invocation order.
+        """
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()):
+            runner.invoke(app, ["--config", cfg, "status"])
+        with patch("docspan.cli.main.load_config", return_value=_config()) as load:
+            result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0, result.output
+        assert load.call_args[0][0] != cfg, "the previous invocation's --config leaked"
+
+    def test_prefix_before_the_subcommand_is_accepted(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main.resolve_active_project", return_value=(cfg, "myprefix")) as resolve:
+            result = runner.invoke(app, ["--prefix", "myprefix", "status"])
+        assert result.exit_code == 0, result.output
+        assert resolve.call_args.kwargs["prefix"] == "myprefix"
+
+    def test_both_options_are_listed_in_the_group_help(self) -> None:
+        """#20's actual complaint: `docspan --help` listed only `--help`."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "--config" in result.output
+        assert "--prefix" in result.output
+        # The group help text must survive adding a callback.
+        assert "Push and pull markdown" in result.output
