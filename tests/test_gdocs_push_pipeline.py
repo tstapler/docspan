@@ -1176,3 +1176,122 @@ def test_rule_2_is_idempotent() -> None:
     assert [n.style for n in twice] == [n.style for n in once] == ["HEADING_1", "HEADING_2"]
     assert [r.detail for r in first] == ["TITLE", "SUBTITLE"]
     assert second == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A restyle is an in-place edit, not a delete-and-retype
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _restyle(live: List[DocsParagraphNode], markdown: str, doc_end: int):
+    current, _ = project(live)
+    target, _ = project(parser.parse(markdown))
+    entries, unchanged = builder.diff_summary(current, target)
+    requests = builder.build(current, target, doc_end)
+    return entries, unchanged, requests, [next(iter(r)) for r in requests]
+
+
+def test_a_heading_level_change_does_not_retype_the_paragraph() -> None:
+    """`## Sec` -> `### Sec` used to delete the paragraph and type it again.
+
+    Paragraph style was part of the diff key, so a restyle looked like a
+    different paragraph: difflib said `replace`, build() answered
+    delete-then-insert — 5 requests — and any comment anchored to that paragraph
+    was destroyed along with the text. The preview said `change 'Sec' -> 'Sec'`,
+    identical on both sides, which tells the reader nothing.
+    """
+    live = [DocsParagraphNode(style="HEADING_2", text="Sec", start_index=1, end_index=5)]
+
+    entries, unchanged, requests, kinds = _restyle(live, "### Sec\n", 5)
+
+    assert kinds == ["updateParagraphStyle"]
+    assert requests[0]["updateParagraphStyle"]["paragraphStyle"] == {
+        "namedStyleType": "HEADING_3"
+    }
+    # The point of the change: the text is never touched.
+    assert not any("deleteContentRange" in r or "insertText" in r for r in requests)
+    assert (len(entries), unchanged) == (1, 0), "still reported, just not as a rewrite"
+
+
+def test_turning_a_paragraph_into_a_bullet_only_adds_bullets() -> None:
+    live = [DocsParagraphNode(style="NORMAL_TEXT", text="item", start_index=1, end_index=6)]
+
+    entries, unchanged, requests, kinds = _restyle(live, "- item\n", 6)
+
+    assert kinds == ["createParagraphBullets"]
+    assert not any("deleteContentRange" in r for r in requests)
+    # Reported as well as written. Asserting only the request would let the
+    # reporting predicate stop recognising a bullet change while push kept
+    # emitting one — a mutant that ignored is_list_item survived until this line.
+    assert (len(entries), unchanged) == (1, 0)
+
+
+def test_turning_a_bullet_into_a_paragraph_only_removes_bullets() -> None:
+    live = [
+        DocsParagraphNode(
+            style="NORMAL_TEXT", text="item", is_list_item=True, start_index=1, end_index=6
+        )
+    ]
+
+    entries, unchanged, requests, kinds = _restyle(live, "item\n", 6)
+
+    assert kinds == ["deleteParagraphBullets"]
+    assert (len(entries), unchanged) == (1, 0)
+
+
+def test_a_restyle_is_reported_rather_than_counted_as_unchanged() -> None:
+    """The preview and the write must agree about whether anything happens.
+
+    "equal" now means equal *text*, so a restyle arrives on an equal opcode. If
+    diff_summary counted those as unchanged, `--dry-run` would say nothing is
+    happening while push emitted updateParagraphStyle — the same
+    preview-disagrees-with-write problem, in the opposite direction.
+    """
+    live = [DocsParagraphNode(style="NORMAL_TEXT", text="Sec", start_index=1, end_index=5)]
+
+    entries, unchanged, requests, _kinds = _restyle(live, "## Sec\n", 5)
+
+    assert len(entries) == 1 and entries[0].kind == "change"
+    assert entries[0].style == "HEADING_1" or entries[0].style == "HEADING_2"
+    assert unchanged == 0
+    assert requests, "and it really is written"
+
+
+def test_an_unchanged_paragraph_is_still_unchanged() -> None:
+    """The other direction — text-only keys must not make everything a change."""
+    live = [DocsParagraphNode(style="HEADING_2", text="Sec", start_index=1, end_index=5)]
+
+    entries, unchanged, requests, _kinds = _restyle(live, "## Sec\n", 5)
+
+    assert (entries, unchanged, requests) == ([], 1, [])
+
+
+def test_a_nesting_only_difference_emits_nothing() -> None:
+    """Documented gap, asserted so nobody "fixes" it with a no-op request.
+
+    CreateParagraphBulletsRequest derives the level from leading tabs in the
+    paragraph's *text*, not from a paragraph attribute, so re-issuing the preset
+    cannot move a paragraph between levels. Emitting it here would be a request
+    that silently does nothing — worse than the current gap, because it would
+    look like the edit applied.
+    """
+    live = [
+        DocsParagraphNode(
+            style="NORMAL_TEXT", text="a", is_list_item=True, start_index=1, end_index=3
+        ),
+        DocsParagraphNode(
+            style="NORMAL_TEXT", text="b", is_list_item=True, start_index=3, end_index=5
+        ),
+    ]
+
+    entries, unchanged, requests, _kinds = _restyle(live, "- a\n  - b\n", 5)
+
+    assert (entries, unchanged, requests) == ([], 2, [])
+
+
+def test_a_text_change_still_goes_through_delete_and_insert() -> None:
+    """Restyling in place must not swallow the case that genuinely needs a rewrite."""
+    live = [DocsParagraphNode(style="NORMAL_TEXT", text="old", start_index=1, end_index=5)]
+
+    _entries, _unchanged, requests, kinds = _restyle(live, "## new\n", 5)
+
+    assert "insertText" in kinds and "deleteContentRange" in kinds

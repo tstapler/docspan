@@ -78,10 +78,30 @@ class DocsRequestBuilder:
     """Diff two node ASTs and produce minimal Google Docs batchUpdate requests."""
 
     def _node_key(self, node: Node) -> Tuple:
-        """Key used by SequenceMatcher for comparing nodes."""
+        """Identity used by SequenceMatcher to align the two node sequences.
+
+        **Text only.** Paragraph-level attributes — namedStyleType, bullet,
+        nesting level — deliberately do NOT participate, because they are
+        *editable in place*: `updateParagraphStyle`, `createParagraphBullets` and
+        `deleteParagraphBullets` change them without touching the text.
+
+        Including them made a restyle look like a different paragraph, so
+        difflib reported `replace` and build() answered with delete-then-insert.
+        Changing `## Sec` to `### Sec` therefore deleted the paragraph and
+        retyped it — 5 requests, and any comment anchored to it destroyed —
+        while the preview said `change 'Sec' -> 'Sec'`, identical text on both
+        sides, which tells the reader nothing about what is about to happen.
+
+        With text as the whole identity, a restyle is an `equal` opcode carrying
+        a paragraph-attribute difference, which _make_style_update_requests
+        turns into the two or three in-place requests it actually needs.
+
+        Two paragraphs with the same text and different styles now align with
+        each other. That is the point: they *are* the same paragraph, restyled.
+        """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(row) for row in node.rows))
-        return ("__para__", node.style, node.text, node.is_list_item)
+        return ("__para__", node.text)
 
     def _opcodes(
         self,
@@ -131,7 +151,27 @@ class DocsRequestBuilder:
 
         for tag, i1, i2, j1, j2 in self._opcodes(current, target):
             if tag == "equal":
-                unchanged_count += i2 - i1
+                # "equal" means equal *text* — _node_key is text-only, so a
+                # restyle (heading level, bullet on/off, nesting) lands here
+                # rather than as a replace. It is still a change the user asked
+                # for and push() will write, so it has to be reported; counting
+                # it as unchanged would make --dry-run claim nothing happens
+                # while push emits updateParagraphStyle.
+                for ci, ti in zip(range(i1, i2), range(j1, j2)):
+                    if self._restyles(current[ci], target[ti]):
+                        entries.append(
+                            DiffEntry(
+                                kind="change",
+                                current_text=_node_text(current[ci]),
+                                target_text=_node_text(target[ti]),
+                                style=_node_style(target[ti]),
+                                current_is_native_checkbox=_node_is_native_checkbox(
+                                    current[ci]
+                                ),
+                            )
+                        )
+                    else:
+                        unchanged_count += 1
 
             elif tag == "delete":
                 for node in current[i1:i2]:
@@ -820,22 +860,81 @@ class DocsRequestBuilder:
             offset += span_len
         return requests
 
+    @staticmethod
+    def _restyles(current_node: Node, target_node: Node) -> bool:
+        """Whether two same-text nodes differ in a paragraph attribute.
+
+        The single predicate shared by diff_summary (which must report a restyle)
+        and _make_style_update_requests (which must emit one). Keeping them on one
+        definition is what stops the preview and the write from disagreeing about
+        whether anything is happening.
+        """
+        if isinstance(current_node, DocsTableNode) or isinstance(target_node, DocsTableNode):
+            return False
+        # Deliberately NOT nesting_level. CreateParagraphBulletsRequest derives
+        # the level from leading tabs in the paragraph's *text*, not from any
+        # paragraph attribute, so re-issuing the preset cannot move a paragraph
+        # between levels — it would be a request that quietly does nothing.
+        # Changing nesting is therefore a text edit, not a restyle, and is left
+        # as a known gap rather than papered over with a no-op request.
+        return (
+            current_node.style != target_node.style
+            or current_node.is_list_item != target_node.is_list_item
+        )
+
     def _make_style_update_requests(self, current_node: Node, target_node: Node) -> List[dict]:
-        """Emit updateParagraphStyle when a paragraph's style differs (text is equal)."""
+        """Restyle a paragraph in place — same text, different paragraph attributes.
+
+        Emitted for `equal` opcodes, which since _node_key became text-only is
+        where every restyle now lands. Covers all three attributes the Docs API
+        can change without rewriting the text:
+
+        * namedStyleType, via updateParagraphStyle
+        * bullet on/off, via createParagraphBullets / deleteParagraphBullets
+
+        This is what makes those edits non-destructive. The alternative — the
+        delete-then-insert build() emits for a `replace` — retypes the paragraph,
+        which costs more requests and destroys any comment anchored to it.
+
+        List *nesting* is not here on purpose. CreateParagraphBulletsRequest
+        derives the level from leading tabs in the paragraph's text, so
+        re-issuing the preset cannot move a paragraph between levels; emitting it
+        for a nesting change would be a request that silently does nothing.
+        Changing nesting is a text edit, and it stays a known gap rather than a
+        no-op dressed up as a fix.
+        """
         if isinstance(current_node, DocsTableNode) or isinstance(target_node, DocsTableNode):
             return []
-        if current_node.style == target_node.style:
-            return []
-        return [{
-            "updateParagraphStyle": {
-                "range": {
-                    "startIndex": current_node.start_index,
-                    "endIndex": current_node.end_index,
-                },
-                "paragraphStyle": {"namedStyleType": target_node.style},
-                "fields": "namedStyleType",
-            }
-        }]
+
+        requests: List[dict] = []
+        paragraph_range = {
+            "startIndex": current_node.start_index,
+            "endIndex": current_node.end_index,
+        }
+
+        if current_node.style != target_node.style:
+            requests.append({
+                "updateParagraphStyle": {
+                    "range": dict(paragraph_range),
+                    "paragraphStyle": {"namedStyleType": target_node.style},
+                    "fields": "namedStyleType",
+                }
+            })
+
+        became_list = target_node.is_list_item and not current_node.is_list_item
+        stopped_being_list = current_node.is_list_item and not target_node.is_list_item
+
+        if stopped_being_list:
+            requests.append({"deleteParagraphBullets": {"range": dict(paragraph_range)}})
+        elif became_list:
+            requests.append({
+                "createParagraphBullets": {
+                    "range": dict(paragraph_range),
+                    "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
+                }
+            })
+
+        return requests
 
     def _make_text_style_requests(
         self, text: str, style_attrs: dict, range_dict: dict
