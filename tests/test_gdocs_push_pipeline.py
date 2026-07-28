@@ -52,9 +52,12 @@ from docspan.backends.google_docs.docs_structure_parser import (
     UNDELETABLE_BOUNDARY_KEYS,
     DocsParagraphNode,
     DocsStructureParser,
+    DocsTableNode,
     TextSpan,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+from docspan.backends.google_docs.projection import describe_residue, project
 
 parser = MarkdownToParagraphParser()
 structure = DocsStructureParser()
@@ -726,44 +729,6 @@ def test_an_unremovable_difference_is_still_reported_by_diff_summary() -> None:
     assert builder.build(current, target, model.end_index()) == []
 
 
-def test_unappliable_removals_names_the_pinned_paragraph_only() -> None:
-    """The bridge push() needs: which removals will survive this push.
-
-    diff_summary() over-reports on purpose (it gates the comment/checkbox
-    safety check), and it counts the body's own terminal paragraph, which
-    markdown can never express. Warning on that would fire for every push of
-    every document, so it has to be excluded by name rather than by luck.
-    """
-    model = DocModel([Para("Intro"), Para(""), SectionBreak(), Para("Alpha"), Para("")])
-    current = structure.parse(model.doc())
-    target = parser.parse("Intro\n\nAlpha\n")
-
-    entries, _unchanged = builder.diff_summary(current, target)
-    unappliable = builder.unappliable_removals(current, target, model.end_index())
-
-    assert len(entries) == 2  # the pinned paragraph and the body's last one
-    assert len(unappliable) == 1
-    # The pinned one is the empty paragraph at [7, 8), not the terminal one.
-    assert unappliable[0].start_index == 7
-
-
-def test_a_document_that_already_matches_has_no_unappliable_removals() -> None:
-    """A synced doc must stay silent — its terminal paragraph is not a diff."""
-    model = DocModel([Para("Intro"), Para("Alpha"), Para("")])
-    current = structure.parse(model.doc())
-    target = parser.parse("Intro\n\nAlpha\n")
-    assert builder.build(current, target, model.end_index()) == []
-    assert builder.unappliable_removals(current, target, model.end_index()) == []
-
-
-def test_a_removal_that_can_be_applied_is_not_reported_as_unappliable() -> None:
-    """The paragraph the trim is about to empty is still deletable text — it
-    only becomes unappliable on the *next* push, once it is empty."""
-    model = DocModel([Para("Intro"), Para("Doomed"), SectionBreak(),
-                      Para("Alpha"), Para("")])
-    current = structure.parse(model.doc())
-    target = parser.parse("Intro\n\nAlpha\n")
-    assert builder.unappliable_removals(current, target, model.end_index()) == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1069,3 +1034,67 @@ def test_pass1_leaves_nothing_but_empty_paragraphs_behind(
         if text in extra:
             extra.remove(text)
     assert all(text == "" for text in extra), f"unexpected leftover paragraphs: {extra!r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Empty paragraphs are projected out of the diff (#17)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_zero_edit_round_trip_over_a_blank_paragraph_emits_nothing() -> None:
+    """Issue #17's non-checkbox half, end to end.
+
+    A document with a blank paragraph renders to markdown whose blank lines are
+    *separators*, so re-parsing yields fewer nodes than the document has. The
+    diff read that asymmetry as a deletion the user asked for and emitted an
+    unflagged deleteContentRange against a live document, on a sync where the
+    user changed nothing.
+    """
+    model = DocModel([Para("Alpha"), Para(""), Para("Omega"), Para("")])
+    current, _ = project(structure.parse(model.doc()))
+    target, _ = project(parser.parse(render_nodes_to_markdown(structure.parse(model.doc()))))
+
+    assert builder.build(current, target, model.end_index()) == []
+    entries, _unchanged = builder.diff_summary(current, target)
+    assert entries == []
+
+
+def test_the_blank_paragraph_is_reported_rather_than_silently_ignored() -> None:
+    """Preserving it is only half the fix — a silent no-op is worse than the bug."""
+    nodes = structure.parse(DocModel([Para("Alpha"), Para(""), Para("Omega")]).doc())
+    kept, residue = project(nodes)
+
+    assert [n.text for n in kept] == ["Alpha", "Omega"]
+    assert [(r.kind, r.index) for r in residue] == [("empty_paragraph", 1)]
+    assert "blank paragraph" in describe_residue(residue)
+
+
+def test_projection_is_idempotent() -> None:
+    """Load-bearing: both sides of the diff pass through it, possibly twice."""
+    nodes = structure.parse(
+        DocModel([Para(""), Para("Alpha"), Para(""), Para(""), Para("Omega")]).doc()
+    )
+    once, _ = project(nodes)
+    twice, residue_of_projected = project(once)
+
+    assert [n.text for n in twice] == [n.text for n in once]
+    assert residue_of_projected == []
+
+
+def test_projection_does_not_disturb_the_indices_of_surviving_nodes() -> None:
+    """The builder does index arithmetic on these nodes, so dropping one must
+    not renumber its neighbours."""
+    nodes = structure.parse(DocModel([Para("Alpha"), Para(""), Para("Omega")]).doc())
+    kept, _ = project(nodes)
+
+    by_text = {n.text: (n.start_index, n.end_index) for n in nodes}
+    for node in kept:
+        assert (node.start_index, node.end_index) == by_text[node.text]
+
+
+def test_a_table_is_never_projected_out() -> None:
+    """Only empty *paragraphs* are unrepresentable; a table is not."""
+    nodes = structure.parse(DocModel([Para(""), Table([["a"]]), Para("x")]).doc())
+    kept, residue = project(nodes)
+
+    assert any(isinstance(n, DocsTableNode) for n in kept)
+    assert len(residue) == 1
