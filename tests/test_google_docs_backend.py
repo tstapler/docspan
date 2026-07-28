@@ -574,3 +574,114 @@ class TestPushTabId:
 
         assert result.status == "ok"
         fake_client.batch_update.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Honest reporting — push() must not claim parity it doesn't have
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _paragraph_element(index: int, text: str) -> tuple[dict, int]:
+    end = index + len(text) + 1
+    return (
+        {
+            "startIndex": index,
+            "endIndex": end,
+            "paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]},
+        },
+        end,
+    )
+
+
+def _doc_with_pinned_empty_paragraph(revision_id: str = "rev-pinned") -> dict:
+    """A doc holding an empty paragraph that no push can ever remove.
+
+    The empty paragraph's only character is the newline that anchors the
+    section break after it, so _make_delete_requests trims its range to
+    nothing and drops the request — while diff_summary still (correctly)
+    reports it as a removal.
+    """
+    content = []
+    index = 1
+    for text in ("Intro", ""):
+        element, index = _paragraph_element(index, text)
+        content.append(element)
+    content.append({"startIndex": index, "endIndex": index + 1, "sectionBreak": {}})
+    index += 1
+    for text in ("Alpha", ""):
+        element, index = _paragraph_element(index, text)
+        content.append(element)
+    return {"revisionId": revision_id, "body": {"content": content}}
+
+
+class TestPushReportsWhatItCouldNotDo:
+    def test_unappliable_difference_is_reported_instead_of_no_changes(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """"No changes detected" over a doc that provably differs is a false
+        parity claim — the user is told they are in sync and stops looking."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_pinned_empty_paragraph()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("Intro\n\nAlpha\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "warning"
+        assert "No changes detected" not in (result.message or "")
+        assert "still differs" in (result.message or "")
+        assert result.message.startswith("1 blank paragraph")
+        fake_client.batch_update.assert_not_called()
+
+    def test_the_bodys_own_terminal_paragraph_is_not_reported_as_a_difference(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Every Docs body ends with a paragraph markdown cannot express, and
+        diff_summary honestly calls it a removal. If push() treated that as an
+        unappliable difference, every push of every already-synced document
+        would warn — so the terminal paragraph must be excluded by name."""
+        backend, fake_client = make_backend()
+        content = []
+        index = 1
+        for text in ("Intro", "Alpha", ""):
+            element, index = _paragraph_element(index, text)
+            content.append(element)
+        fake_client.get_document.return_value = {"revisionId": "rev-y",
+                                                 "body": {"content": content}}
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("Intro\n\nAlpha\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        assert result.message == "No changes detected"
+        fake_client.batch_update.assert_not_called()
+
+    def test_styling_that_could_not_be_placed_is_reported(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Pass 2 declines to style a paragraph it can't find in the written
+        doc. Silence there would mean links vanishing under a green "ok"."""
+        backend, fake_client = make_backend()
+        content = []
+        index = 1
+        for text in ("Intro", "something else entirely", ""):
+            element, index = _paragraph_element(index, text)
+            content.append(element)
+        # The mocked client returns this same doc from the pass-2 re-fetch, so
+        # the doc pass 2 sees never gained the "Gamma" paragraph pass 1 asked for.
+        fake_client.get_document.return_value = {"revisionId": "rev-x",
+                                                 "body": {"content": content}}
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("Intro\n\n[Gamma](https://example.com/g)\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "warning"
+        assert "Gamma" in (result.message or "")
+        assert "not applied" in (result.message or "")

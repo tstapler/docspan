@@ -103,10 +103,13 @@ def _multi_para_doc(texts: List[str], start: int = 1) -> dict:
 
 
 def test_duplicate_text_paragraphs_do_not_misalign_styling() -> None:
-    # Regression: a prior text-equality-based aligner matched the FIRST current
-    # paragraph with matching text, so when two unstyled paragraphs share the same
-    # text, the styled paragraph after them got matched to the wrong (earlier)
-    # index, permanently shifting every later paragraph's styling one slot off.
+    # Regression: a prior text-equality aligner scanned forward for the FIRST
+    # current paragraph with matching text, so when two unstyled paragraphs share
+    # the same text, the styled paragraph after them got matched to the wrong
+    # (earlier) index, permanently shifting every later paragraph's styling one
+    # slot off. The alignment is order-preserving and global (difflib over the
+    # whole node sequence, DocsRequestBuilder._align_for_styling), so duplicates
+    # keep their relative order and cannot absorb a later paragraph's match.
     target = parser.parse("dup\n\ndup\n\n**bold** line")
     doc = _multi_para_doc(["dup", "dup", "bold line"])
     reqs = builder.build_span_style_requests(doc, target)
@@ -123,8 +126,9 @@ def test_mismatched_text_does_not_desync_later_paragraphs() -> None:
     # Regression: if a current paragraph's text doesn't byte-for-byte match its
     # target counterpart (e.g. a stray whitespace difference from upstream
     # parsing), the old aligner skipped forward searching for a match, which
-    # desynced every subsequent paragraph's styling. Positional pairing is
-    # immune to this since it never searches — it just zips index-for-index.
+    # desynced every subsequent paragraph's styling. difflib reports the
+    # mismatched pair as a "replace" and the rest as "equal", so the mismatch is
+    # contained to its own slot instead of shifting everything after it.
     target = parser.parse("mismatch\n\n**bold** line")
     doc = _multi_para_doc(["totally different text", "bold line"])
     reqs = builder.build_span_style_requests(doc, target)

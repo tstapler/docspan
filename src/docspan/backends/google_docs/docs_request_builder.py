@@ -259,6 +259,47 @@ class DocsRequestBuilder:
         self._inject_tab_id(all_requests, tab_id)
         return all_requests
 
+    def unappliable_removals(
+        self, current: List[Node], target: List[Node], doc_end_index: int
+    ) -> List[DocsParagraphNode]:
+        """Paragraphs the diff wants removed that no batchUpdate can remove.
+
+        An empty paragraph pinned by the newline anchoring a Table,
+        TableOfContents or SectionBreak has a delete range that trims to
+        nothing, so _make_delete_requests drops the request entirely (see its
+        `start >= end` branch). diff_summary() still reports the paragraph as a
+        removal — correctly, since the document really does still contain it —
+        and the two are therefore allowed to disagree. This is the bridge: it
+        names exactly the paragraphs behind that disagreement, so push() can
+        say so instead of reporting "No changes detected" about a document it
+        knows still differs.
+
+        The body's own final paragraph is deliberately excluded. Every Docs
+        body ends with one, the API refuses to delete its newline, and
+        MarkdownToParagraphParser can never emit a node for it — so it is a
+        permanent property of the model rather than a difference, and counting
+        it would make the warning fire on every push of every document.
+
+        Only pure "delete" opcodes are inspected. A "replace" also runs its
+        nodes through _make_delete_requests, but it always emits an insert as
+        well, so it can never be the reason build() returned nothing.
+        """
+        unappliable: List[DocsParagraphNode] = []
+        for tag, i1, i2, _j1, _j2 in self._opcodes(current, target):
+            if tag != "delete":
+                continue
+            for node in current[i1:i2]:
+                if not isinstance(node, DocsParagraphNode):
+                    continue
+                if node.end_index >= doc_end_index:
+                    continue  # the body's terminal paragraph, not a difference
+                end = node.end_index
+                if node.precedes_structural_element:
+                    end -= 1
+                if node.start_index >= end:
+                    unappliable.append(node)
+        return unappliable
+
     # ──────────────────────────────────────────────
     # Pass 2 — fill table cells from a re-fetched doc
     # ──────────────────────────────────────────────
@@ -301,26 +342,119 @@ class DocsRequestBuilder:
         Emit updateTextStyle requests for inline styling (links/bold/italic/monospace).
 
         Runs against the re-fetched document so ranges use real post-insert indices.
-        build() (pass 1) guarantees the re-fetched doc's node sequence matches ``target``
-        node-for-node in order (every insert/delete/replace/equal opcode is applied so the
-        structural shapes line up) — so nodes are paired positionally by zip(), not by text
-        equality. A prior text-equality-based aligner drifted permanently out of sync after
-        the first paragraph whose current/target text didn't match byte-for-byte (e.g. a
-        duplicate line, or a text mismatch from an upstream parsing quirk), silently
-        misapplying every subsequent paragraph's styling to the wrong paragraph.
+        Nodes are paired by an order-preserving *content* alignment of the re-fetched
+        document against ``target`` (see _align_for_styling), never by raw position.
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
 
-        current = DocsStructureParser().parse(doc)
+        pairs, _unaligned = self._align_for_styling(doc, target)
         requests: List[dict] = []
-        for cnode, tnode in zip(current, target):
-            if isinstance(tnode, DocsTableNode) or isinstance(cnode, DocsTableNode):
-                continue
-            if tnode.spans:
-                requests.extend(self._span_style_requests(tnode, cnode.start_index))
-
+        for cnode, tnode in pairs:
+            requests.extend(self._span_style_requests(tnode, cnode))
         return requests
+
+    def unaligned_span_targets(self, doc: dict, target: List[Node]) -> List[DocsParagraphNode]:
+        """Target paragraphs carrying inline styling that pass 2 could not place.
+
+        Pass 2 refuses to guess: a target paragraph whose text it cannot find,
+        in order, in the re-fetched document gets no updateTextStyle at all
+        rather than one aimed at whatever paragraph happened to sit at the same
+        ordinal. That is the safe half of the trade; this method is the loud
+        half — push() reports these so "your links silently didn't apply" can't
+        pass for success. Empty list is the normal case.
+        """
+        if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
+            return []
+        _pairs, unaligned = self._align_for_styling(doc, target)
+        return unaligned
+
+    @staticmethod
+    def _alignment_key(node: Node) -> Tuple:
+        """Identity used to align a re-fetched document against ``target`` in pass 2.
+
+        Deliberately coarser than _node_key():
+
+        * A table's *cells* are still empty at this point (pass 1 emits an
+          empty insertTable; pass 2 fills it), so tables can only align on
+          being-a-table.
+        * namedStyleType and bullet are excluded because pass 2 applies *text*
+          styling only — a paragraph whose paragraph-level style didn't land is
+          still the right paragraph to put a link on.
+
+        Text is therefore the whole identity of a paragraph here. That is what
+        makes the alignment safe against the residue nodes pass 1 leaves
+        behind: every one of them is an *empty* paragraph (a delete trimmed to
+        protect an anchoring newline, or the implicit newline insertTable
+        creates), and MarkdownToParagraphParser never emits an empty-text node,
+        so a residue can never collide with a real target paragraph.
+        """
+        if isinstance(node, DocsTableNode):
+            return ("__table__",)
+        return ("__para__", node.text)
+
+    def _align_for_styling(
+        self, doc: dict, target: List[Node]
+    ) -> Tuple[List[Tuple[DocsParagraphNode, DocsParagraphNode]], List[DocsParagraphNode]]:
+        """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
+
+        Returns ``(pairs, unaligned)`` — pairs of (document node, target node)
+        that are safe to style, and the target paragraphs with spans that could
+        not be paired.
+
+        Why not zip(): pass 1 does **not** guarantee the re-fetched document
+        matches ``target`` node-for-node. It leaves an empty paragraph behind
+        whenever a delete had to be trimmed to preserve the newline anchoring a
+        Table/TableOfContents/SectionBreak (_make_delete_requests), and
+        insertTable implicitly creates a newline of its own. Either one shifts
+        every later node by a slot, and positional pairing then applies each
+        paragraph's styling to its neighbour — silently, since a wrong range is
+        still a valid range. That converts an atomically-rejected batch into a
+        written-but-corrupted document, which is strictly worse.
+
+        Why difflib and not a search-forward matcher: an earlier
+        text-equality aligner scanned ahead for the first paragraph with
+        matching text and so drifted permanently once anything didn't match
+        byte-for-byte (a duplicated line matched the earlier copy; an unmatched
+        line consumed the wrong successor). difflib.SequenceMatcher instead
+        computes one global, order-preserving alignment over the whole
+        sequence, so duplicates stay in their original relative order and an
+        unmatched node is skipped rather than absorbed. Only nodes inside
+        "equal" runs are paired at all: an "equal" run means the document's
+        paragraph text is byte-identical to the target's, which is exactly the
+        precondition the span offsets in _span_style_requests assume. Anything
+        difflib reports as replace/insert/delete is ambiguous, so it is left
+        unstyled and reported by unaligned_span_targets().
+        """
+        current = DocsStructureParser().parse(doc)
+        matcher = difflib.SequenceMatcher(
+            None,
+            [self._alignment_key(n) for n in current],
+            [self._alignment_key(n) for n in target],
+            autojunk=False,
+        )
+
+        pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
+        aligned_target_indices = set()
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "equal":
+                continue
+            for ci, ti in zip(range(i1, i2), range(j1, j2)):
+                cnode, tnode = current[ci], target[ti]
+                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
+                    continue
+                aligned_target_indices.add(ti)
+                if tnode.spans:
+                    pairs.append((cnode, tnode))
+
+        unaligned = [
+            node
+            for index, node in enumerate(target)
+            if isinstance(node, DocsParagraphNode)
+            and node.spans
+            and index not in aligned_target_indices
+        ]
+        return pairs, unaligned
 
     def build_second_pass_requests(
         self, doc: dict, target: List[Node], tab_id: Optional[str] = None
@@ -411,22 +545,68 @@ class DocsRequestBuilder:
         another boundary — has moved up against that newline. Keeping the
         rule unconditional costs one leftover empty paragraph and removes the
         need to reason about boundary chains at all.
+
+        A trimmed delete is preceded by _residue_normalize_requests() so the
+        paragraph that survives is a plain empty one, not an empty heading or
+        an empty bullet.
         """
         requests = []
         for node in nodes:
             start = node.start_index
             end = node.end_index
+            trimmed = False
             if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
                 end -= 1
+                trimmed = True
             if end >= doc_end_index:
                 end = doc_end_index - 1
+                trimmed = True
             if start >= end:
+                # Nothing left to delete — an already-empty paragraph pinned by
+                # a boundary or by the body's terminal newline. Emitting the
+                # normalisation alone would make every push rewrite a paragraph
+                # it can never remove, so push would never be idempotent.
                 continue
+            if trimmed and isinstance(node, DocsParagraphNode):
+                requests.extend(self._residue_normalize_requests(node))
             requests.append({
                 "deleteContentRange": {
                     "range": {"startIndex": start, "endIndex": end}
                 }
             })
+        return requests
+
+    @staticmethod
+    def _residue_normalize_requests(node: DocsParagraphNode) -> List[dict]:
+        """Reset the paragraph a trimmed delete will leave behind to a plain empty one.
+
+        namedStyleType and bullet live on the *paragraph*, and a trimmed delete
+        removes only the paragraph's text — so without this the residue keeps
+        them. Deleting an HEADING_2 that sat above a table would leave an empty
+        HEADING_2 in the document outline, and deleting a bullet would leave an
+        empty bullet; a tab-scoped pull then renders either as a literal "## " /
+        "- " line that re-parses into a real node and leaks back into the
+        markdown.
+
+        Ranges use the paragraph's original, pre-delete coordinates and are
+        emitted *before* the deleteContentRange for the same paragraph. build()
+        sorts requests by descending startIndex with a stable sort, so requests
+        sharing this paragraph's startIndex keep their emission order, and
+        everything at a higher index has already been applied — the original
+        coordinates are therefore still valid when these run.
+        """
+        requests: List[dict] = []
+        paragraph_range = {"startIndex": node.start_index, "endIndex": node.end_index}
+        if node.style != "NORMAL_TEXT":
+            requests.append({
+                "updateParagraphStyle": {
+                    "range": dict(paragraph_range),
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "fields": "namedStyleType",
+                }
+            })
+        if node.is_list_item:
+            requests.append({"deleteParagraphBullets": {"range": dict(paragraph_range)}})
         return requests
 
     def _make_insert_requests(self, nodes: List[Node], insert_at_index: int) -> List[dict]:
@@ -478,14 +658,31 @@ class DocsRequestBuilder:
                 })
         return requests
 
-    def _span_style_requests(self, node: DocsParagraphNode, insert_at_index: int) -> List[dict]:
-        """Emit updateTextStyle for each styled span in a paragraph starting at insert_at_index."""
+    def _span_style_requests(
+        self, node: DocsParagraphNode, placement: DocsParagraphNode
+    ) -> List[dict]:
+        """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
+
+        ``placement`` is the live document paragraph _align_for_styling paired
+        ``node`` with; its [start_index, end_index) is the hard boundary. Span
+        offsets are derived from ``node``'s span *texts*, which is only exactly
+        right when the two texts agree — the alignment guarantees that, but the
+        bound is enforced here anyway rather than trusted, so a length
+        disagreement (a paragraph holding a smart chip, an inline object, or
+        trailing whitespace the markdown parser stripped from .text but kept in
+        .spans) can only ever cost styling inside this paragraph. It can never
+        spill a range into the next one.
+        """
         requests: List[dict] = []
-        offset = insert_at_index
+        offset = placement.start_index
+        # The paragraph's last index is its newline; text lives strictly before it.
+        limit = placement.end_index - 1 if placement.end_index else None
         for span in node.spans:
             span_len = _utf16_len(span.text)
             if span_len == 0:
                 continue
+            if limit is not None and offset + span_len > limit:
+                break  # offsets only grow — everything after this is out of bounds too
             attrs: dict = {}
             if span.bold:
                 attrs["bold"] = True
@@ -583,6 +780,7 @@ class DocsRequestBuilder:
             "insertTable",
             "updateParagraphStyle",
             "createParagraphBullets",
+            "deleteParagraphBullets",
             "updateTextStyle",
         ):
             if key in request:

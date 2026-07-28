@@ -133,6 +133,9 @@ class GoogleDocsBackend(Backend):
             current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
         )
         entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
+        unappliable = request_builder.unappliable_removals(
+            current_nodes, target_nodes, doc_end_index
+        )
 
         comments = self._client.list_comments(doc_id)
         high_risk = find_high_risk_paragraphs(entries, comments)
@@ -147,6 +150,7 @@ class GoogleDocsBackend(Backend):
             comments=comments,
             high_risk=high_risk,
             tab_warning=tab_warning,
+            unappliable_removals=unappliable,
         )
 
     def preview_push(
@@ -216,6 +220,26 @@ class GoogleDocsBackend(Backend):
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
             if not plan.requests:
+                # An empty request list does NOT always mean "the doc already
+                # matches". A delete whose range trims to nothing is dropped
+                # (DocsRequestBuilder._make_delete_requests) — that happens to
+                # an already-empty paragraph pinned by the newline anchoring a
+                # Table/TableOfContents/SectionBreak. diff_summary() still
+                # reports it as a removal, and it really is still in the doc,
+                # so "No changes detected" here would be a false parity claim.
+                if plan.unappliable_removals:
+                    count = len(plan.unappliable_removals)
+                    return PushResult(
+                        status="warning",
+                        doc_id=doc_id,
+                        message=(
+                            f"{count} blank paragraph(s) can't be deleted through the "
+                            "Google Docs API — each one holds open a table, table of "
+                            "contents or section break — so the doc still differs from "
+                            "the local file. Remove them by hand in Google Docs "
+                            "(backspace at the start of the blank line) to match."
+                        ),
+                    )
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
@@ -243,12 +267,20 @@ class GoogleDocsBackend(Backend):
                 or (isinstance(n, DocsParagraphNode) and n.spans)
                 for n in plan.target_nodes
             )
+            unstyled: list[DocsParagraphNode] = []
             if needs_pass2:
                 refreshed = self._client.get_document(doc_id)
                 refreshed, resolved_tab_id, _ = resolve_document_tab(refreshed, tab_id)
-                second = DocsRequestBuilder().build_second_pass_requests(
+                builder = DocsRequestBuilder()
+                second = builder.build_second_pass_requests(
                     refreshed, plan.target_nodes, tab_id=resolved_tab_id
                 )
+                # Pass 2 aligns by content and refuses to guess (see
+                # DocsRequestBuilder._align_for_styling). Anything it couldn't
+                # place got no styling at all rather than styling aimed at the
+                # wrong paragraph — surface that instead of returning a clean
+                # "ok" over a doc whose links didn't land.
+                unstyled = builder.unaligned_span_targets(refreshed, plan.target_nodes)
                 if second:
                     self._client.batch_update(
                         doc_id, second, required_revision_id=refreshed["revisionId"]
@@ -259,6 +291,13 @@ class GoogleDocsBackend(Backend):
             backstop_result = self._comment_backstop_result(doc_id, len(plan.comments), url)
             if backstop_result is not None:
                 return backstop_result
+            if unstyled:
+                return PushResult(
+                    status="warning",
+                    doc_id=doc_id,
+                    url=url,
+                    message=self._render_unstyled(unstyled),
+                )
             if plan.tab_warning:
                 return PushResult(status="warning", doc_id=doc_id, url=url, message=plan.tab_warning)
             return PushResult(status="ok", doc_id=doc_id, url=url)
@@ -274,6 +313,21 @@ class GoogleDocsBackend(Backend):
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
         except Exception as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
+
+    @staticmethod
+    def _render_unstyled(unstyled: list[DocsParagraphNode]) -> str:
+        """One-line-per-paragraph report of inline styling pass 2 declined to apply."""
+        preview = [(node.text[:60] or "(empty)") for node in unstyled[:5]]
+        more = len(unstyled) - len(preview)
+        lines = [
+            f"⚠ inline styling (links/bold/italic/code) was not applied to "
+            f"{len(unstyled)} paragraph(s) — docspan could not match them in the "
+            f"written doc and would not guess:",
+        ]
+        lines += [f"    • {text}" for text in preview]
+        if more > 0:
+            lines.append(f"    • …and {more} more")
+        return "\n".join(lines)
 
     def _comment_backstop_result(
         self, doc_id: str, before_count: int, url: str
