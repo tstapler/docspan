@@ -223,19 +223,35 @@ class DocsRequestBuilder:
         """
         opcodes = self._opcodes(current, target)
 
-        all_requests: List[dict] = []
+        # (anchor_index, requests) — the requests for one node or one insert
+        # group, and the document index they are all written against.
+        #
+        # Ordering rule, stated once here because getting it wrong is silent:
+        # groups are applied highest-anchor-first (so every edit runs against
+        # coordinates nothing has shifted yet), and within a group in emission
+        # order (so an insert precedes the styling of what it inserted).
+        #
+        # This used to be one flat sort over every request's own startIndex,
+        # which is only equivalent while every request in a group shares the
+        # anchor. The append-past-the-last-node case broke that: its paragraph
+        # sits one index *after* the insert point, so its updateParagraphStyle
+        # carried a higher startIndex than the insertText it depends on and
+        # sorted ahead of it — a style request against a range that did not
+        # exist yet. The anchor is now carried explicitly instead of inferred.
+        groups: List[Tuple[int, List[dict]]] = []
 
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
                 for ci, ti in zip(range(i1, i2), range(j1, j2)):
-                    all_requests.extend(
-                        self._make_style_update_requests(current[ci], target[ti])
-                    )
+                    requests = self._make_style_update_requests(current[ci], target[ti])
+                    if requests:
+                        groups.append((current[ci].start_index, requests))
 
             elif tag == "delete":
-                all_requests.extend(
-                    self._make_delete_requests(current[i1:i2], doc_end_index)
-                )
+                for node in current[i1:i2]:
+                    requests = self._make_delete_requests([node], doc_end_index)
+                    if requests:
+                        groups.append((node.start_index, requests))
 
             elif tag == "insert":
                 if i1 > 0:
@@ -252,22 +268,28 @@ class DocsRequestBuilder:
                 at_body_end = insert_at >= doc_end_index
                 if at_body_end:
                     insert_at = doc_end_index - 1
-                all_requests.extend(
-                    self._make_insert_requests(
-                        target[j1:j2], insert_at, at_body_end=at_body_end
-                    )
+                requests = self._make_insert_requests(
+                    target[j1:j2], insert_at, at_body_end=at_body_end
                 )
+                if requests:
+                    groups.append((insert_at, requests))
 
             elif tag == "replace":
                 delete_start = current[i1].start_index
-                all_requests.extend(
-                    self._make_delete_requests(current[i1:i2], doc_end_index)
-                )
-                all_requests.extend(
-                    self._make_insert_requests(target[j1:j2], delete_start)
-                )
+                for node in current[i1:i2]:
+                    requests = self._make_delete_requests([node], doc_end_index)
+                    if requests:
+                        groups.append((node.start_index, requests))
+                requests = self._make_insert_requests(target[j1:j2], delete_start)
+                if requests:
+                    # Same anchor as the first deleted node's group, and emitted
+                    # after it, so the delete runs before the insert that
+                    # replaces it.
+                    groups.append((delete_start, requests))
 
-        all_requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
+        # Stable, so groups sharing an anchor keep the order above.
+        groups.sort(key=lambda group: group[0], reverse=True)
+        all_requests = [request for _anchor, requests in groups for request in requests]
         self._inject_tab_id(all_requests, tab_id)
         return all_requests
 

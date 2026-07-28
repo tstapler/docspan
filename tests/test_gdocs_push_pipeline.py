@@ -94,6 +94,16 @@ class InvalidDeleteRange(AssertionError):
     """
 
 
+class InvalidRange(AssertionError):
+    """Raised when a request names a range the document does not contain.
+
+    Covers the non-delete requests: an insert index past the end of the body
+    ("Index N must be less than the end index of the referenced segment") and a
+    styling range applied before the insert that creates it exists. The real API
+    rejects the whole batch in both cases.
+    """
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Document units
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,8 +242,21 @@ class DocModel:
                 # table." (InsertTableRequest reference) — that newline is a
                 # whole extra paragraph the caller never asked for.
                 flat = flat[:index - 1] + "\n" + char + flat[index - 1:]
-            # updateParagraphStyle / createParagraphBullets / deleteParagraphBullets /
-            # updateTextStyle change no indices, so the model ignores them.
+            else:
+                # updateParagraphStyle / createParagraphBullets /
+                # deleteParagraphBullets / updateTextStyle move no indices, so
+                # the model does not apply them — but their range still has to
+                # exist at the moment they run. Checking that catches ordering
+                # bugs the index arithmetic alone cannot: a styling request
+                # sorted ahead of the insert it describes names a range that is
+                # not there yet, and the API rejects the batch. That is how the
+                # append-past-the-last-node fix first went wrong — its paragraph
+                # sits one index after the insert point, so its style request
+                # carried a higher startIndex and the old flat descending sort
+                # put it first.
+                for key in _STYLE_ONLY_KEYS:
+                    if key in request:
+                        _check_style_range(flat, key, request[key]["range"])
 
         return DocModel(_units_from_flat(flat, tables))
 
@@ -242,9 +265,30 @@ def _cell(text: str) -> dict:
     return {"content": [{"paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]}}]}
 
 
+_STYLE_ONLY_KEYS = (
+    "updateParagraphStyle",
+    "createParagraphBullets",
+    "deleteParagraphBullets",
+    "updateTextStyle",
+)
+
+
 def _check_insert(flat: str, index: int) -> None:
     if not 1 <= index <= len(flat):
         raise InvalidDeleteRange(f"insert index {index} outside body [1, {len(flat)}]")
+
+
+def _check_style_range(flat: str, key: str, rng: dict) -> None:
+    """A styling range must exist in the document at the moment it is applied."""
+    start, end = rng["startIndex"], rng["endIndex"]
+    if start < 1 or end <= start:
+        raise InvalidRange(f"{key}: degenerate range [{start}, {end})")
+    if end > len(flat) + 1:
+        raise InvalidRange(
+            f"{key}: range [{start}, {end}) is not in the document yet "
+            f"(body is [1, {len(flat) + 1})) — is it ordered before the insert "
+            f"that creates it?"
+        )
 
 
 def _check_delete(flat: str, start: int, end: int) -> None:
