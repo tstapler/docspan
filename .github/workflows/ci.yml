@@ -3,15 +3,52 @@ name: CI
 on:
   push:
     branches: ["main"]
+  # No `branches:` filter — every pull request runs CI regardless of its base.
+  # With the filter, a stacked PR (one based on another PR's branch rather than
+  # on main) got no checks at all, so the only branch in a stack that was ever
+  # tested was the bottom one.
   pull_request:
-    branches: ["main"]
+  workflow_dispatch:
+
+# A stack of PRs rebases repeatedly, and each push supersedes the run before it.
+# Cancel the outdated run rather than paying for the whole matrix on a commit
+# nobody will look at. `main` is excluded from cancellation so a push there
+# always produces a complete result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for hatch-vcs version detection
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # Runs once rather than once per Python version — ruff's result does not
+      # depend on the interpreter it runs under (`target-version` is pinned in
+      # pyproject.toml), so the other five runs were duplicate work.
+      - name: ruff check
+        run: uv run ruff check src tests
+
   test:
+    name: Test (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false  # one version failing shouldn't hide the others' results
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # pyproject declares requires-python = ">=3.9", so every version it
+        # claims to support gets tested. 3.13 and 3.14 were verified green
+        # before being added here.
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -27,8 +64,98 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
-      - name: Lint
-        run: uv run ruff check src tests
-
       - name: Test
         run: uv run pytest --tb=short -q
+
+  types:
+    name: Types (mypy ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # mypy cannot be a plain pass/fail gate here: `mypy src` currently reports
+      # 266 errors across 32 files, so adding it as one would leave CI
+      # permanently red, and `continue-on-error` would make it decorative.
+      #
+      # A ratchet is a real gate instead — it fails on any *new* error while
+      # tolerating the existing backlog, and the baseline only ever goes down.
+      # Delete this job and gate on mypy's exit code once the baseline reaches 0.
+      - name: mypy (must not exceed baseline)
+        run: |
+          set -uo pipefail
+          baseline=$(tr -dc '0-9' < .mypy-error-baseline)
+          if [ -z "$baseline" ]; then
+            echo "::error::.mypy-error-baseline does not contain a number"
+            exit 1
+          fi
+
+          output=$(uv run mypy src 2>&1 || true)
+          echo "$output" | tail -40
+
+          if printf '%s\n' "$output" | grep -q '^Success: no issues found'; then
+            count=0
+          else
+            count=$(printf '%s\n' "$output" \
+              | sed -n 's/^Found \([0-9]\{1,\}\) error.*/\1/p' | tail -1)
+          fi
+          if [ -z "$count" ]; then
+            echo "::error::could not parse an error count out of mypy's output"
+            exit 1
+          fi
+
+          echo "mypy errors: $count (baseline $baseline)"
+          if [ "$count" -gt "$baseline" ]; then
+            echo "::error::mypy errors rose from $baseline to $count." \
+              "Fix the new errors, or justify and raise .mypy-error-baseline."
+            exit 1
+          fi
+          if [ "$count" -lt "$baseline" ]; then
+            echo "::notice::mypy errors fell from $baseline to $count." \
+              "Please lower .mypy-error-baseline to $count to lock the gain in."
+          fi
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs derives the version from tags
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      # publish.yml only builds on `release: published`, so until now a change
+      # that broke packaging stayed invisible until release day.
+      - name: Build sdist and wheel
+        run: uv build
+
+      # Catches a dependency edited in pyproject.toml without re-locking, which
+      # would otherwise surface as `uv sync` resolving something the lockfile
+      # never pinned.
+      - name: Lockfile is in sync with pyproject
+        run: uv lock --check
+
+      # uv.lock records the index each package came from. Resolving it behind a
+      # private or corporate mirror rewrites every URL to that host, and
+      # committing the result both leaks the internal hostname into this public
+      # repo and breaks CI, which cannot reach it. `git add -A` will happily
+      # sweep that in, and the diff is thousands of near-identical lines that
+      # nobody reads.
+      - name: Lockfile references only the public index
+        run: |
+          set -uo pipefail
+          if grep -n 'registry = "' uv.lock | grep -v 'https://pypi.org/simple'; then
+            echo "::error file=uv.lock::uv.lock references a non-public index." \
+              "Re-resolve it with UV_INDEX_URL=https://pypi.org/simple uv lock."
+            exit 1
+          fi
+          echo "uv.lock: public index only"
