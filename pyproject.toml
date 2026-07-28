@@ -96,3 +96,18 @@ disallow_untyped_defs = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
+
+# Resolve against the public index explicitly, overriding whatever index the
+# machine is configured with. uv's precedence is CLI > env > this file > the
+# user's ~/.config/uv/uv.toml > system config, so a contributor whose machine
+# points uv at a private or corporate mirror still gets a lockfile with
+# pypi.org URLs.
+#
+# Without this, any `uv run`/`uv lock` on such a machine silently rewrites every
+# URL in uv.lock to that mirror. Committing the result leaks the internal
+# hostname into this public repo and breaks CI, which cannot reach it — and the
+# diff is thousands of near-identical lines nobody reads. In CI there is no user
+# config, so this is a no-op there. `ci.yml` greps uv.lock as the backstop.
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
