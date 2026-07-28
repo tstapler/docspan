@@ -50,7 +50,9 @@ import pytest
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     UNDELETABLE_BOUNDARY_KEYS,
+    DocsParagraphNode,
     DocsStructureParser,
+    TextSpan,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 
@@ -532,6 +534,49 @@ def test_pass2_never_writes_a_range_past_the_paragraph_it_targets() -> None:
             start <= rng["startIndex"] and rng["endIndex"] <= end - 1
             for start, end in paragraphs
         ), f"range {rng} is not contained in a single paragraph's text"
+
+
+def test_pass2_drops_a_span_longer_than_the_paragraph_it_was_matched_to() -> None:
+    """The bound above, exercised where it actually binds.
+
+    ``test_pass2_never_writes_a_range_past_the_paragraph_it_targets`` cannot
+    fail for the reason the clamp exists: it uses a document whose paragraph
+    text equals the target's, so the range is naturally contained and removing
+    the clamp changes nothing (verified by mutation — the whole suite still
+    passed with the clamp deleted).
+
+    The clamp is for the case the alignment is *supposed* to make unreachable:
+    a target paragraph whose spans are longer than its own ``text``. That is
+    reachable in principle — ``text`` is what the alignment matches on, while
+    the offsets come from the spans — so it is built by hand here rather than
+    through the markdown parser. Without the clamp the link range runs past
+    this paragraph's newline and lands on the next paragraph's first
+    characters, silently.
+
+    Both halves are asserted: the range is not written, *and* the paragraph is
+    reported. A clamp on its own would only convert corruption into a silent
+    no-op, which is the same trade this PR's second commit was written to undo.
+    """
+    after = DocModel([Para("Intro"), Para("Beta"), Para("Gamma"), Para("")])
+    target = [
+        DocsParagraphNode(style="NORMAL_TEXT", text="Intro"),
+        DocsParagraphNode(
+            style="NORMAL_TEXT",
+            text="Beta",  # aligns against the document's "Beta"
+            # ...but the spans claim more characters than the paragraph holds.
+            spans=[TextSpan(text="Beta and then some", link="https://example.com")],
+        ),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Gamma"),
+    ]
+
+    requests = builder.build_span_style_requests(after.doc(), target)
+
+    assert _link_ranges(requests) == [], (
+        "an over-long span must be dropped, not written past its paragraph"
+    )
+    assert [n.text for n in builder.unaligned_span_targets(after.doc(), target)] == [
+        "Beta"
+    ], "a dropped span must be reported, not silently skipped"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

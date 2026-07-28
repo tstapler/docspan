@@ -293,12 +293,35 @@ class DocsRequestBuilder:
                     continue
                 if node.end_index >= doc_end_index:
                     continue  # the body's terminal paragraph, not a difference
-                end = node.end_index
-                if node.precedes_structural_element:
-                    end -= 1
-                if node.start_index >= end:
+                start, end, _trimmed = self._delete_bounds(node, doc_end_index)
+                if start >= end:
                     unappliable.append(node)
         return unappliable
+
+    @staticmethod
+    def _delete_bounds(node: Node, doc_end_index: int) -> Tuple[int, int, bool]:
+        """The range a node's deleteContentRange may actually cover, and whether it was trimmed.
+
+        Single source of truth for the two undeletable-newline rules described
+        on _make_delete_requests. Both that method and unappliable_removals()
+        need the answer, and they have to agree: the first drops a request when
+        the range trims to nothing, and the second exists precisely to name the
+        paragraphs behind those dropped requests. Computing the arithmetic twice
+        let them disagree silently — an earlier version of unappliable_removals
+        omitted the terminal-newline clamp, which happened to reach the same
+        answer for the body's last paragraph and would have stopped doing so the
+        moment anyone "tidied up" the duplication.
+        """
+        start = node.start_index
+        end = node.end_index
+        trimmed = False
+        if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
+            end -= 1
+            trimmed = True
+        if end >= doc_end_index:
+            end = doc_end_index - 1
+            trimmed = True
+        return start, end, trimmed
 
     # ──────────────────────────────────────────────
     # Pass 2 — fill table cells from a re-fetched doc
@@ -363,11 +386,48 @@ class DocsRequestBuilder:
         ordinal. That is the safe half of the trade; this method is the loud
         half — push() reports these so "your links silently didn't apply" can't
         pass for success. Empty list is the normal case.
+
+        Two distinct causes, both reported here because they have the same
+        consequence for the reader of the document:
+
+        1. The paragraph could not be aligned at all (its text is not in the
+           written document, in order).
+        2. The paragraph aligned, but its spans do not fit inside it
+           (_spans_overflow) — so _span_style_requests clamps and drops them.
+           Reporting only case 1 would leave case 2 as a silent partial
+           application, which is the failure mode this whole pass exists to
+           remove.
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
-        _pairs, unaligned = self._align_for_styling(doc, target)
-        return unaligned
+        pairs, unaligned = self._align_for_styling(doc, target)
+        overflowed = [
+            tnode for cnode, tnode in pairs if self._spans_overflow(tnode, cnode)
+        ]
+        if not overflowed:
+            return unaligned
+        # Preserve target order; a node can only be in one of the two lists.
+        reported = {id(node) for node in unaligned} | {id(node) for node in overflowed}
+        return [
+            node
+            for node in target
+            if isinstance(node, DocsParagraphNode) and id(node) in reported
+        ]
+
+    @staticmethod
+    def _spans_overflow(node: DocsParagraphNode, placement: DocsParagraphNode) -> bool:
+        """True when ``node``'s spans cannot all fit inside ``placement``'s text.
+
+        _span_style_requests walks the spans with a cumulative offset and stops
+        at the first one that would cross ``placement``'s trailing newline, so
+        "some span gets dropped" is exactly "the spans are longer in total than
+        the paragraph can hold". Checked as a total here rather than by
+        re-walking, so the two can't drift.
+        """
+        if not node.spans or not placement.end_index:
+            return False
+        available = (placement.end_index - 1) - placement.start_index
+        return sum(_utf16_len(span.text) for span in node.spans) > available
 
     @staticmethod
     def _alignment_key(node: Node) -> Tuple:
@@ -552,15 +612,7 @@ class DocsRequestBuilder:
         """
         requests = []
         for node in nodes:
-            start = node.start_index
-            end = node.end_index
-            trimmed = False
-            if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
-                end -= 1
-                trimmed = True
-            if end >= doc_end_index:
-                end = doc_end_index - 1
-                trimmed = True
+            start, end, trimmed = self._delete_bounds(node, doc_end_index)
             if start >= end:
                 # Nothing left to delete — an already-empty paragraph pinned by
                 # a boundary or by the body's terminal newline. Emitting the
