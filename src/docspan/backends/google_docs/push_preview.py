@@ -9,10 +9,11 @@ itself — never by a separately-fetched CLI-layer preview.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
+from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 
 
 @dataclass
@@ -141,6 +142,11 @@ class PushPlan:
     # Set when the doc has multiple tabs and no tab_id was configured — the
     # plan silently defaulted to the first tab (tabs.resolve_document_tab).
     tab_warning: Optional[str] = None
+    # Paragraphs the diff wants gone that the Docs API will not let docspan
+    # delete (DocsRequestBuilder.unappliable_removals). Non-empty means the
+    # doc will still differ from the local file after this push, so push()
+    # must not answer "No changes detected".
+    unappliable_removals: List[DocsParagraphNode] = field(default_factory=list)
 
 
 @dataclass
