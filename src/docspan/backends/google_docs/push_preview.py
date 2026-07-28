@@ -142,6 +142,11 @@ class PushPlan:
     # Set when the doc has multiple tabs and no tab_id was configured — the
     # plan silently defaulted to the first tab (tabs.resolve_document_tab).
     tab_warning: Optional[str] = None
+    # The tabId every request must carry, as resolved by
+    # tabs.resolve_document_tab — None for a legacy (non-tabbed) doc. `doc`
+    # above is already narrowed to this tab, so pass 2 needs this to build
+    # requests against it without re-resolving.
+    resolved_tab_id: Optional[str] = None
     # Paragraphs the diff wants gone that the Docs API will not let docspan
     # delete (DocsRequestBuilder.unappliable_removals). Non-empty means the
     # doc will still differ from the local file after this push, so push()
