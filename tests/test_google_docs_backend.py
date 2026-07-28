@@ -863,3 +863,82 @@ class TestBlankParagraphIsPreserved:
             if "insertText" in r
         ]
         assert any("Gamma" in t for t in texts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pull() renders TITLE as a heading, so pull → push is a fixpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tabbed_doc_with_style(style: str, text: str = "My Doc") -> dict:
+    """A single-tab document whose one paragraph has the given named style."""
+    return {
+        "revisionId": "rev-1",
+        "tabs": [
+            {
+                "tabProperties": {"tabId": "t.0"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 1 + len(text) + 1,
+                                "paragraph": {
+                                    "elements": [{"textRun": {"content": text + "\n"}}],
+                                    "paragraphStyle": {"namedStyleType": style},
+                                },
+                            }
+                        ]
+                    }
+                },
+            }
+        ],
+    }
+
+
+class TestPullRendersUnwritableStyles:
+    def test_pull_renders_a_title_as_a_heading(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Markdown has no TITLE syntax, so the renderer used to emit bare text.
+
+        Bare text re-parses as NORMAL_TEXT, which made the very next push demote
+        the title. Rendering `#` instead makes pull → push a fixpoint. This goes
+        through pull() rather than calling project() directly, because the bug
+        was in what the file on disk ended up containing.
+        """
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_style("TITLE")
+        client.list_comments.return_value = []
+
+        result = backend.pull("doc-1", str(local), tab_id="t.0")
+
+        assert result.status == "ok", result.message
+        assert local.read_text().strip() == "# My Doc"
+
+    def test_pull_renders_a_subtitle_as_a_second_level_heading(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_style("SUBTITLE")
+        client.list_comments.return_value = []
+
+        backend.pull("doc-1", str(local), tab_id="t.0")
+
+        assert local.read_text().strip() == "## My Doc"
+
+    def test_pull_then_push_over_a_title_writes_nothing(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The whole point, end to end through both public methods."""
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_style("TITLE")
+        client.list_comments.return_value = []
+
+        backend.pull("doc-1", str(local), tab_id="t.0")
+        result = backend.push(str(local), "doc-1", tab_id="t.0")
+
+        assert result.status == "skipped", result.message
+        client.batch_update.assert_not_called()

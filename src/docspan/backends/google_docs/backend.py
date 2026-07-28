@@ -412,6 +412,12 @@ class GoogleDocsBackend(Backend):
                 doc = self._client.get_document(doc_id)
                 doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
                 nodes = DocsStructureParser().parse(doc)
+                # Render what markdown can represent, and nothing else. The
+                # renderer had no way to express a TITLE, so it emitted the bare
+                # text, which re-parsed as NORMAL_TEXT and made the next push
+                # demote the title. project() maps it to the nearest style
+                # markdown *does* have, so pull/push is a fixpoint.
+                nodes, _residue = project(nodes)
                 markdown_content = render_nodes_to_markdown(nodes)
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)

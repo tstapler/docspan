@@ -1098,3 +1098,81 @@ def test_a_table_is_never_projected_out() -> None:
 
     assert any(isinstance(n, DocsTableNode) for n in kept)
     assert len(residue) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TITLE / SUBTITLE have no markdown syntax (projection rule 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _round_trip(style: str) -> tuple[int, int, list[str]]:
+    """pull → push over a one-paragraph doc. Returns (diffs, requests, residue)."""
+    live = [DocsParagraphNode(style=style, text="My Doc", start_index=1, end_index=8)]
+    pulled, residue = project(live)
+    markdown = render_nodes_to_markdown(pulled)
+    current, _ = project(live)
+    target, _ = project(parser.parse(markdown))
+    entries, _unchanged = builder.diff_summary(current, target)
+    return len(entries), len(builder.build(current, target, 8)), [r.detail for r in residue]
+
+
+@pytest.mark.parametrize("style", ["TITLE", "SUBTITLE"])
+def test_a_title_survives_a_zero_edit_round_trip(style: str) -> None:
+    """Markdown has no syntax for either, so the renderer emitted bare text.
+
+    Bare text re-parses as NORMAL_TEXT, so the next push saw a style change it
+    had not been asked for and emitted five requests that deleted the paragraph
+    and reinserted it as body text — silently demoting the title, on a sync
+    where the user changed nothing.
+    """
+    diffs, requests, residue = _round_trip(style)
+
+    assert (diffs, requests) == (0, 0)
+    assert residue == [style], "the lost distinction must still be reported"
+
+
+def test_a_heading_is_untouched_and_produces_no_residue() -> None:
+    """HEADING_1 already round-tripped; rule 2 must not add residue for it."""
+    assert _round_trip("HEADING_1") == (0, 0, [])
+
+
+def test_an_intentional_demotion_of_a_title_still_applies() -> None:
+    """The capability is not surrendered — only the accidental demotion is.
+
+    Markdown that says plain `My Doc` genuinely differs from a heading, and the
+    user asked for that.
+    """
+    live = [DocsParagraphNode(style="TITLE", text="My Doc", start_index=1, end_index=8)]
+    current, _ = project(live)
+    target, _ = project(parser.parse("My Doc\n"))
+
+    assert builder.build(current, target, 8), "a real demotion must still be written"
+
+
+def test_projection_does_not_mutate_the_caller_s_nodes() -> None:
+    """Rule 2 substitutes rather than removes, so it must copy.
+
+    These nodes are also used for index arithmetic and for preview text, and the
+    caller parsed them — rewriting a shared object's style in place would change
+    what an unrelated consumer sees.
+    """
+    live = [DocsParagraphNode(style="TITLE", text="My Doc", start_index=1, end_index=8)]
+
+    projected, _ = project(live)
+
+    assert live[0].style == "TITLE", "the input must be left alone"
+    assert projected[0].style == "HEADING_1"
+    assert (projected[0].start_index, projected[0].end_index) == (1, 8)
+
+
+def test_rule_2_is_idempotent() -> None:
+    """HEADING_1 must not itself be a key of the map, or projecting twice drifts."""
+    live = [
+        DocsParagraphNode(style="TITLE", text="A", start_index=1, end_index=3),
+        DocsParagraphNode(style="SUBTITLE", text="B", start_index=3, end_index=5),
+    ]
+    once, first = project(live)
+    twice, second = project(once)
+
+    assert [n.style for n in twice] == [n.style for n in once] == ["HEADING_1", "HEADING_2"]
+    assert [r.detail for r in first] == ["TITLE", "SUBTITLE"]
+    assert second == []
