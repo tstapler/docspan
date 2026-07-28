@@ -852,6 +852,100 @@ def test_a_mid_document_insert_still_lands_after_the_preceding_paragraph() -> No
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bullet bleed onto inserted non-list paragraphs (#24)
+#
+# Asserted on the emitted requests, not on a rebuilt document. DocModel tracks
+# text and structure only — it has no paragraph properties, so it cannot show a
+# bullet being inherited across a split, and extending it to do so would be
+# modelling an assumption about the API rather than a rule from its reference.
+# The live behaviour is recorded in #24: an HEADING_1 and an HEADING_2 inserted
+# before a list both came back with `bullet` set. What is checkable here is that
+# every inserted non-list paragraph carries a bullet-clearing request over
+# exactly its own range, ordered after the insert that creates it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _requests_for(markdown: str, units: List[object]) -> List[dict]:
+    model = DocModel(units)  # type: ignore[arg-type]
+    current = structure.parse(model.doc())
+    target = parser.parse(markdown)
+    requests = builder.build(current, target, model.end_index())
+    model.apply(requests)  # every range must be legal at the point it runs
+    return requests
+
+
+def test_inserted_headings_before_a_list_clear_the_inherited_bullet() -> None:
+    """Issue #24: the heading above a list came back rendered as a list item.
+
+    Inserts run in reverse at a shared index, so each one splits the paragraph
+    in front of it. Splitting an already-bulleted paragraph gives the new one
+    the same bullet, and updateParagraphStyle writes only namedStyleType — it
+    never clears a bullet. The result is a paragraph that is a heading *and* a
+    list item.
+    """
+    requests = _requests_for(
+        "# Title\n\n## Section two\n\n- first item\n",
+        [Para("first item", bullet=True), Para("")],
+    )
+
+    cleared = [
+        r["deleteParagraphBullets"]["range"] for r in requests
+        if "deleteParagraphBullets" in r
+    ]
+    styled = {
+        r["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"]: r[
+            "updateParagraphStyle"
+        ]["range"]
+        for r in requests
+        if "updateParagraphStyle" in r
+    }
+
+    assert "HEADING_1" in styled and "HEADING_2" in styled
+    # Each heading's bullet is cleared over exactly the paragraph it styles.
+    assert styled["HEADING_1"] in cleared
+    assert styled["HEADING_2"] in cleared
+
+
+def test_an_inserted_list_item_keeps_its_bullet() -> None:
+    """The other direction: clearing must not fire on a node that wants a bullet."""
+    requests = _requests_for(
+        "Intro\n\n- an item\n",
+        [Para("Intro"), Para("")],
+    )
+
+    created = [
+        r["createParagraphBullets"]["range"] for r in requests
+        if "createParagraphBullets" in r
+    ]
+    cleared = [
+        r["deleteParagraphBullets"]["range"] for r in requests
+        if "deleteParagraphBullets" in r
+    ]
+
+    assert len(created) == 1, "the list item must still get its bullet"
+    assert created[0] not in cleared, "a list item must not have its bullet cleared"
+
+
+def test_a_bullet_clear_is_ordered_after_the_insert_it_applies_to() -> None:
+    """Ordering, because a request cannot style a paragraph that isn't there yet.
+
+    _requests_for already applies the batch through DocModel, which rejects a
+    styling range outside the document — this asserts the stronger property that
+    the clear follows *its own* insert rather than merely being in range.
+    """
+    requests = _requests_for(
+        "# Title\n\n- first item\n",
+        [Para("first item", bullet=True), Para("")],
+    )
+
+    kinds = [next(iter(r)) for r in requests]
+    for position, kind in enumerate(kinds):
+        if kind == "deleteParagraphBullets":
+            assert "insertText" in kinds[:position], (
+                "a bullet clear must come after the insert that created the paragraph"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Whole-pipeline shape
 # ─────────────────────────────────────────────────────────────────────────────
 

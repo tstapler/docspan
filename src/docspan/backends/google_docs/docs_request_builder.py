@@ -760,6 +760,28 @@ class DocsRequestBuilder:
                         "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
                     }
                 })
+            else:
+                # An inserted paragraph inherits the bullet of the paragraph it
+                # split. Inserts run in reverse at a shared index, so pushing
+                # markdown whose first list item follows a heading splits that
+                # already-bulleted paragraph and the heading comes back with a
+                # `bullet` set — styled as a heading *and* rendered as a list
+                # item, because updateParagraphStyle only writes
+                # namedStyleType and never clears a bullet.
+                #
+                # Unconditional, for two reasons. Nothing here knows what the
+                # live paragraph at insert_at_index looks like, so "only when
+                # needed" is not knowable at build time; and
+                # deleteParagraphBullets on a paragraph with no bullet is a
+                # no-op, so emitting it always keeps push idempotent.
+                #
+                # Emitted after the insert and inside the same group, so by the
+                # time the *next* node is inserted at this index the paragraph
+                # it splits is already clean — which is why one request per
+                # node is enough rather than needing to re-clear earlier ones.
+                requests.append({
+                    "deleteParagraphBullets": {"range": paragraph_range}
+                })
         return requests
 
     def _span_style_requests(
