@@ -254,22 +254,43 @@ class DocsRequestBuilder:
                         groups.append((node.start_index, requests))
 
             elif tag == "insert":
-                if i1 > 0:
-                    insert_at = current[i1 - 1].end_index
-                else:
-                    insert_at = 1  # start of document body
-                # Appending past the last node: current[i1 - 1] is the body's
-                # final paragraph, so its end_index IS doc_end_index — one past
-                # the last index an insert may name ("Index N must be less than
-                # the end index of the referenced segment"). Step back onto the
-                # body's terminal newline and write the new paragraph in front
-                # of it. See _make_insert_requests(at_body_end=...) for why the
-                # newline has to move to the front of the text.
+                previous = current[i1 - 1] if i1 > 0 else None
+                insert_at = previous.end_index if previous else 1
+                # `previous.end_index` is normally the first index of the
+                # following paragraph, which is exactly where a new paragraph
+                # belongs. Two cases have no following paragraph there, and in
+                # both the index one step back is an existing newline that the
+                # new paragraph has to be written in *front* of:
+                #
+                # 1. Appending past the last node. `previous` is the body's
+                #    final paragraph, so its end_index IS doc_end_index — one
+                #    past the last index an insert may name ("Index N must be
+                #    less than the end index of the referenced segment").
+                #
+                # 2. Inserting directly before a Table, TableOfContents or
+                #    SectionBreak (#22). `previous.end_index` is the boundary
+                #    element's own start index. An insert there is not inside
+                #    any paragraph — "Text must be inserted inside the bounds
+                #    of an existing Paragraph" (InsertTextRequest) — and for a
+                #    table it lands in the first cell instead of the body.
+                #    DocsStructureParser drops those elements, so
+                #    precedes_structural_element is the only trace of them.
+                #
+                # See _make_insert_requests(before_newline=...) for why the
+                # newline then has to move to the front of the inserted text.
                 at_body_end = insert_at >= doc_end_index
+                before_boundary = (
+                    isinstance(previous, DocsParagraphNode)
+                    and previous.precedes_structural_element
+                )
                 if at_body_end:
                     insert_at = doc_end_index - 1
+                elif before_boundary:
+                    insert_at -= 1
                 requests = self._make_insert_requests(
-                    target[j1:j2], insert_at, at_body_end=at_body_end
+                    target[j1:j2],
+                    insert_at,
+                    before_newline=at_body_end or before_boundary,
                 )
                 if requests:
                     groups.append((insert_at, requests))
@@ -696,7 +717,7 @@ class DocsRequestBuilder:
         return requests
 
     def _make_insert_requests(
-        self, nodes: List[Node], insert_at_index: int, at_body_end: bool = False
+        self, nodes: List[Node], insert_at_index: int, before_newline: bool = False
     ) -> List[dict]:
         """
         Emit insert requests per node.
@@ -706,21 +727,33 @@ class DocsRequestBuilder:
         against real post-insert indices.
         Tables: insertTable (empty; filled in pass 2).
 
-        All inserts share ``insert_at_index``; because the caller/build() sorts descending
-        later, ordering inside a single insert group is preserved.
+        All inserts share ``insert_at_index``; because the caller/build() orders
+        request groups rather than individual requests, emission order inside a
+        single insert group is preserved.
 
-        ``at_body_end`` marks an append past the last node, where
-        ``insert_at_index`` is the body's terminal newline rather than the start
-        of a following paragraph. A paragraph is normally written as
-        ``"text\\n"``, which relies on there being a paragraph boundary at the
-        insert point to terminate. At the body's terminal newline there is none:
-        the inserted text lands *inside* the final paragraph and
-        ``"text\\n"`` would run "Alpha" and "Appended" together into
-        ``"AlphaAppended"``, then leave a stray blank paragraph behind. Writing
-        ``"\\ntext"`` instead uses the leading newline to close the existing
-        final paragraph and the body's own terminal newline to close the new
-        one. The paragraph therefore starts one index later than the insert
-        point, which is what the ``+ 1`` below accounts for.
+        ``before_newline`` says ``insert_at_index`` points at an existing newline
+        that terminates the preceding paragraph, rather than at the first index
+        of a following paragraph. build() sets it for the two cases where there
+        is no following paragraph to insert in front of — appending past the last
+        node, and inserting directly before a Table/TableOfContents/SectionBreak.
+
+        It changes which side of the text carries the newline. A paragraph is
+        normally written ``"text\\n"``, which relies on a paragraph boundary at
+        the insert point to terminate it. Landing on an existing newline instead
+        puts the text *inside* the preceding paragraph, so ``"text\\n"`` would
+        run "Alpha" and "Appended" together into ``"AlphaAppended"`` and leave a
+        stray blank paragraph behind. Writing ``"\\ntext"`` uses the leading
+        newline to close the preceding paragraph and the newline already at
+        ``insert_at_index`` to close the new one:
+
+            body       'Intro\\nAlpha\\n'  + insert at 12
+            "text\\n"   -> 'Intro\\nAlphaAppended\\n\\n'
+            "\\ntext"   -> 'Intro\\nAlpha\\nAppended\\n'
+
+        The new paragraph therefore starts one index later than the insert point,
+        which is what the ``+ 1`` below accounts for. Without it the
+        updateParagraphStyle range begins on the preceding paragraph's newline
+        and Docs applies namedStyleType to both paragraphs.
         """
         requests: List[dict] = []
         for node in reversed(nodes):
@@ -736,11 +769,11 @@ class DocsRequestBuilder:
 
             # The paragraph's own text always ends up as node.text + "\n"; only
             # which side of it carries the newline in the insert differs.
-            text = "\n" + node.text if at_body_end else node.text + "\n"
+            text = "\n" + node.text if before_newline else node.text + "\n"
             requests.append({
                 "insertText": {"location": {"index": insert_at_index}, "text": text}
             })
-            paragraph_start = insert_at_index + 1 if at_body_end else insert_at_index
+            paragraph_start = insert_at_index + 1 if before_newline else insert_at_index
             text_len = _utf16_len(node.text + "\n")
             paragraph_range = {
                 "startIndex": paragraph_start,
