@@ -699,6 +699,115 @@ def test_a_removal_that_can_be_applied_is_not_reported_as_unappliable() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Appending past the last node (#21)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_appending_past_the_last_node_stays_inside_the_body() -> None:
+    """Issue #21: an append aimed one index too far, rejected by the API.
+
+    build()'s insert branch places an insert at ``current[i1 - 1].end_index``.
+    When the insert is *past the last node*, that node is the body's final
+    paragraph and its end_index IS ``doc_end_index`` — one past the last legal
+    insert position, so the API answers "Index N must be less than the end
+    index of the referenced segment" and rejects the whole batch.
+
+    It survived because it is masked whenever the document ends with an empty
+    paragraph: the diff then pairs the new text against that paragraph, so the
+    opcode is a *replace* (which inserts at a start_index, always in range)
+    rather than an insert. This document deliberately ends with a paragraph
+    that has text, which is the ordinary shape of a Google Doc body.
+
+    Asserted through DocModel so it is the API's rule that fails the test, not
+    an arithmetic expectation.
+    """
+    model = DocModel([Para("Intro"), Para("Alpha")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nAlpha\n\nAppended\n")
+
+    requests = builder.build(current, target, model.end_index())
+
+    after = model.apply(requests)  # raises if the insert index is out of range
+    assert [p.text for p in structure.parse(after.doc())] == [
+        "Intro",
+        "Alpha",
+        "Appended",
+    ]
+
+
+def test_an_appended_heading_does_not_restyle_the_paragraph_above_it() -> None:
+    """The tail insert's paragraph range must cover only the new paragraph.
+
+    Writing ``"\\ntext"`` puts the paragraph one index later than the insert
+    point. If the accompanying updateParagraphStyle keeps using the insert point
+    as its start, its range begins on the *previous* paragraph's terminal
+    newline — so Docs applies namedStyleType to both paragraphs and appending a
+    heading silently turns the paragraph above it into a heading too.
+
+    DocModel deliberately ignores styling requests (they move no indices), so
+    this is asserted against the emitted range rather than the rebuilt document.
+    """
+    model = DocModel([Para("Intro"), Para("Alpha")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nAlpha\n\n## Appended\n")
+
+    requests = builder.build(current, target, model.end_index())
+    after = model.apply(requests)
+
+    styles = [
+        r["updateParagraphStyle"] for r in requests if "updateParagraphStyle" in r
+    ]
+    assert len(styles) == 1
+    assert styles[0]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+
+    appended = [p for p in structure.parse(after.doc()) if p.text == "Appended"]
+    assert len(appended) == 1
+    assert (styles[0]["range"]["startIndex"], styles[0]["range"]["endIndex"]) == (
+        appended[0].start_index,
+        appended[0].end_index,
+    ), "the style range must be exactly the appended paragraph"
+
+
+def test_appending_to_a_document_that_ends_with_a_blank_paragraph_still_works() -> None:
+    """The masking case from #21 — must keep working, and must stay a replace.
+
+    The trailing "" is the body's own terminal paragraph. Every Docs body has
+    one and markdown cannot express it, so it is expected in the result rather
+    than a sign the append went wrong.
+    """
+    model = DocModel([Para("Intro"), Para("Alpha"), Para("")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nAlpha\n\nAppended\n")
+
+    after = model.apply(builder.build(current, target, model.end_index()))
+    assert [p.text for p in structure.parse(after.doc())] == [
+        "Intro",
+        "Alpha",
+        "Appended",
+        "",
+    ]
+
+
+def test_a_mid_document_insert_still_lands_after_the_preceding_paragraph() -> None:
+    """The clamp must not move a mid-document insert.
+
+    ``c74bea2`` removed a ``- 1`` here deliberately: for an insert in the
+    middle, ``current[i1 - 1].end_index`` is the first index of the *following*
+    paragraph, which is where the new paragraph belongs. Clamping that too
+    would put the new text inside the preceding paragraph.
+    """
+    model = DocModel([Para("Intro"), Para("Omega")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nMiddle\n\nOmega\n")
+
+    after = model.apply(builder.build(current, target, model.end_index()))
+    assert [p.text for p in structure.parse(after.doc())] == [
+        "Intro",
+        "Middle",
+        "Omega",
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Whole-pipeline shape
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -242,8 +242,20 @@ class DocsRequestBuilder:
                     insert_at = current[i1 - 1].end_index
                 else:
                     insert_at = 1  # start of document body
+                # Appending past the last node: current[i1 - 1] is the body's
+                # final paragraph, so its end_index IS doc_end_index — one past
+                # the last index an insert may name ("Index N must be less than
+                # the end index of the referenced segment"). Step back onto the
+                # body's terminal newline and write the new paragraph in front
+                # of it. See _make_insert_requests(at_body_end=...) for why the
+                # newline has to move to the front of the text.
+                at_body_end = insert_at >= doc_end_index
+                if at_body_end:
+                    insert_at = doc_end_index - 1
                 all_requests.extend(
-                    self._make_insert_requests(target[j1:j2], insert_at)
+                    self._make_insert_requests(
+                        target[j1:j2], insert_at, at_body_end=at_body_end
+                    )
                 )
 
             elif tag == "replace":
@@ -661,7 +673,9 @@ class DocsRequestBuilder:
             requests.append({"deleteParagraphBullets": {"range": dict(paragraph_range)}})
         return requests
 
-    def _make_insert_requests(self, nodes: List[Node], insert_at_index: int) -> List[dict]:
+    def _make_insert_requests(
+        self, nodes: List[Node], insert_at_index: int, at_body_end: bool = False
+    ) -> List[dict]:
         """
         Emit insert requests per node.
 
@@ -672,6 +686,19 @@ class DocsRequestBuilder:
 
         All inserts share ``insert_at_index``; because the caller/build() sorts descending
         later, ordering inside a single insert group is preserved.
+
+        ``at_body_end`` marks an append past the last node, where
+        ``insert_at_index`` is the body's terminal newline rather than the start
+        of a following paragraph. A paragraph is normally written as
+        ``"text\\n"``, which relies on there being a paragraph boundary at the
+        insert point to terminate. At the body's terminal newline there is none:
+        the inserted text lands *inside* the final paragraph and
+        ``"text\\n"`` would run "Alpha" and "Appended" together into
+        ``"AlphaAppended"``, then leave a stray blank paragraph behind. Writing
+        ``"\\ntext"`` instead uses the leading newline to close the existing
+        final paragraph and the body's own terminal newline to close the new
+        one. The paragraph therefore starts one index later than the insert
+        point, which is what the ``+ 1`` below accounts for.
         """
         requests: List[dict] = []
         for node in reversed(nodes):
@@ -685,14 +712,17 @@ class DocsRequestBuilder:
                 })
                 continue
 
-            text = node.text + "\n"
+            # The paragraph's own text always ends up as node.text + "\n"; only
+            # which side of it carries the newline in the insert differs.
+            text = "\n" + node.text if at_body_end else node.text + "\n"
             requests.append({
                 "insertText": {"location": {"index": insert_at_index}, "text": text}
             })
-            text_len = _utf16_len(text)
+            paragraph_start = insert_at_index + 1 if at_body_end else insert_at_index
+            text_len = _utf16_len(node.text + "\n")
             paragraph_range = {
-                "startIndex": insert_at_index,
-                "endIndex": insert_at_index + text_len,
+                "startIndex": paragraph_start,
+                "endIndex": paragraph_start + text_len,
             }
             requests.append({
                 "updateParagraphStyle": {
