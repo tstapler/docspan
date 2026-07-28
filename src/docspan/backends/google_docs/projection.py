@@ -20,8 +20,8 @@ special case at another call site.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Literal, Sequence, Tuple, Union
+from dataclasses import dataclass, replace
+from typing import Dict, List, Literal, Sequence, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -33,7 +33,16 @@ from docspan.backends.google_docs.docs_structure_parser import (
 # it, not the other way round.
 Node = Union[DocsParagraphNode, DocsTableNode]
 
-ResidueKind = Literal["empty_paragraph"]
+ResidueKind = Literal["empty_paragraph", "paragraph_style"]
+
+# Named styles markdown has no syntax for, mapped to the nearest style it does.
+# Google Docs' own outline treats TITLE/SUBTITLE as document-level headings, and
+# `#`/`##` is what a markdown reader will do with them, so the mapping loses the
+# distinction rather than the structure.
+_UNWRITABLE_STYLES: Dict[str, str] = {
+    "TITLE": "HEADING_1",
+    "SUBTITLE": "HEADING_2",
+}
 
 
 @dataclass(frozen=True)
@@ -81,9 +90,28 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     node's ``end_index`` lands in front of the dropped paragraph rather than
     inside it.
 
+    Rule 2 — ``TITLE`` and ``SUBTITLE`` become ``HEADING_1``/``HEADING_2``.
+
+    Markdown has no syntax for either, so ``nodes_to_markdown`` rendered them as
+    *bare text* — and re-parsing bare text gives ``NORMAL_TEXT``. A zero-edit
+    round trip over a document with a title therefore produced
+    ``change 'My Doc' -> 'My Doc'`` (identical text, which is also a useless
+    thing to show a user in a preview) and five requests that deleted the
+    paragraph and reinserted it as body text, silently demoting the title.
+
+    Mapping to the nearest style markdown *can* say makes the round trip a no-op:
+    ``HEADING_1`` renders as ``# My Doc``, re-parses as ``HEADING_1``, and
+    matches. An intentional demotion still works — markdown saying plain
+    ``My Doc`` differs from ``HEADING_1`` and is applied as the user asked.
+
+    The distinction between a title and a heading is lost, which is why it is
+    recorded as residue. Unlike rule 1 this is a *substitution*, not a removal,
+    so ``kept`` keeps the same length.
+
     Idempotent by construction — ``project(project(x)[0])[0] == project(x)[0]``
-    — because the predicate is a property of a single node, not of the sequence.
-    A test pins it anyway, since later rules will not have that for free.
+    — because both rules are properties of a single node, not of the sequence,
+    and ``HEADING_1``/``HEADING_2`` are not themselves keys of the map. A test
+    pins it anyway, since later rules will not have that for free.
     """
     kept: List[Node] = []
     residue: List[Residue] = []
@@ -97,6 +125,13 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
                 )
             )
             continue
+        if isinstance(node, DocsParagraphNode) and node.style in _UNWRITABLE_STYLES:
+            residue.append(
+                Residue(kind="paragraph_style", index=index, detail=node.style)
+            )
+            # `replace` rather than mutation: these nodes come from the caller's
+            # parse and are also used for index arithmetic and preview text.
+            node = replace(node, style=_UNWRITABLE_STYLES[node.style])
         kept.append(node)
     return kept, residue
 
@@ -114,11 +149,20 @@ def describe_residue(residue: List[Residue]) -> str:
     """One line summarising residue, for a push message. Empty string if none."""
     if not residue:
         return ""
+    parts: List[str] = []
     blanks = sum(1 for r in residue if r.kind == "empty_paragraph")
-    return (
-        f"{blanks} blank paragraph(s) in the doc are not represented in markdown, "
-        "so they were left alone. Add or remove them in Google Docs directly."
-    )
+    if blanks:
+        parts.append(
+            f"{blanks} blank paragraph(s) in the doc are not represented in markdown, "
+            "so they were left alone. Add or remove them in Google Docs directly."
+        )
+    styles = sorted({r.detail for r in residue if r.kind == "paragraph_style"})
+    if styles:
+        parts.append(
+            f"{'/'.join(styles)} has no markdown equivalent and is treated as a "
+            "heading, so docspan will not change it. Edit it in Google Docs directly."
+        )
+    return " ".join(parts)
 
 
 __all__ = ["DocsTableNode", "Residue", "ResidueKind", "describe_residue", "project"]
