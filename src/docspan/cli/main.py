@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -122,12 +123,58 @@ def _load_state(state_path: str) -> SyncState:
         return SyncState()
 
 
+@dataclass
+class _GroupOptions:
+    """``--config`` / ``--prefix`` as given before the subcommand name.
+
+    Both options are accepted in either position, because `docspan --config X
+    status` reads like it should work and used to fail with "No such option"
+    (#20). Typer parses group-level and subcommand-level options with separate
+    parsers, so the group-level values are stashed here for _resolve() to fall
+    back on.
+
+    Module-level state is safe here only because _group_callback() runs on every
+    invocation and overwrites both fields, so a value cannot leak from one
+    invocation into the next — which matters for tests using CliRunner in one
+    process. Nothing else may write to it.
+    """
+
+    config_path: Optional[str] = None
+    prefix: Optional[str] = None
+
+
+_GROUP = _GroupOptions()
+
+
+@app.callback()
+def _group_callback(
+    config_path: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Path to markgate.yaml (also accepted after the command)"
+    ),
+    prefix: Optional[str] = typer.Option(
+        None,
+        "--prefix",
+        "-p",
+        help="Central-config project prefix (also accepted after the command)",
+    ),
+) -> None:
+    # No docstring: Typer would use it as the group's help text and replace the
+    # `help=` given to typer.Typer() above.
+    _GROUP.config_path = config_path
+    _GROUP.prefix = prefix
+
+
 def _resolve(config_path: Optional[str], prefix: Optional[str]):
     """Resolve the active markgate config + storage prefix from flags / central config.
 
     Returns (config, markgate_path, prefix). Storage helpers take (markgate_path, prefix):
     a prefix routes state under XDG; no prefix keeps legacy beside-the-file storage.
+
+    A value given after the subcommand wins over the same option given before
+    it, so the more specific position is the one that takes effect.
     """
+    config_path = config_path or _GROUP.config_path
+    prefix = prefix or _GROUP.prefix
     markgate_path, resolved_prefix = resolve_active_project(prefix=prefix, config_path=config_path)
     config = load_config(markgate_path)
     return config, markgate_path, resolved_prefix
