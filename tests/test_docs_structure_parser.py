@@ -537,3 +537,50 @@ def test_parse_paragraph_is_native_checkbox_false_for_non_bullet_paragraph() -> 
     nodes = parser.parse(doc)
     assert len(nodes) == 1
     assert nodes[0].is_native_checkbox is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# precedes_structural_element — undeletable-newline detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_flags_paragraph_directly_before_a_section_break() -> None:
+    """A sectionBreak is never parsed into a node, so the flag on the preceding
+    paragraph is the only trace of it — and the only thing stopping
+    _make_delete_requests from emitting the newline delete the Docs API
+    rejects with "Cannot delete the requested range."."""
+    doc = _doc_with_content([
+        _make_para_element("Before the break", start=1, end=18),
+        {"startIndex": 18, "endIndex": 19, "sectionBreak": {}},
+        _make_para_element("After the break", start=19, end=35),
+    ])
+    nodes = parser.parse(doc)
+    assert [n.precedes_structural_element for n in nodes] == [True, False]
+
+
+def test_parse_flags_paragraph_directly_before_a_table() -> None:
+    doc = _doc_with_content([
+        _make_para_element("Before the table", start=1, end=18),
+        {"startIndex": 18, "endIndex": 30, "table": {"tableRows": []}},
+    ])
+    nodes = parser.parse(doc)
+    assert isinstance(nodes[1], DocsTableNode)
+    assert nodes[0].precedes_structural_element is True
+
+
+def test_parse_flags_paragraph_directly_before_a_table_of_contents() -> None:
+    doc = _doc_with_content([
+        _make_para_element("Contents", start=1, end=10),
+        {"startIndex": 10, "endIndex": 40, "tableOfContents": {"content": []}},
+        _make_para_element("Body", start=40, end=45),
+    ])
+    nodes = parser.parse(doc)
+    assert [n.precedes_structural_element for n in nodes] == [True, False]
+
+
+def test_parse_does_not_flag_ordinary_or_final_paragraphs() -> None:
+    doc = _doc_with_content([
+        _make_para_element("First", start=1, end=7),
+        _make_para_element("Last", start=7, end=12),
+    ])
+    nodes = parser.parse(doc)
+    assert [n.precedes_structural_element for n in nodes] == [False, False]
