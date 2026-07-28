@@ -5,6 +5,7 @@ Tests verify exit codes and output text; no real backends or network calls.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import MagicMock, patch
@@ -658,6 +659,33 @@ class TestConflictsResolve:
 # --config / --prefix accepted before the subcommand (#20)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _plain_help(*argv: str) -> str:
+    """`--help` output as plain text, with the renderer's environment pinned.
+
+    Rich decides independently of the test whether to emit colour and how wide to
+    wrap, and it interleaves escape sequences *inside* option names when colour is
+    on — so `"--config" in result.output` is false in an environment that forces
+    colour even though the help reads correctly on screen.
+
+    That is not hypothetical: this assertion passed locally and failed on all four
+    Python versions in CI, because GitHub Actions turns colour on. Pinning
+    NO_COLOR and a wide COLUMNS makes the rendering deterministic, and stripping
+    any residual escapes makes the assertion about the text rather than about the
+    terminal.
+    """
+    result = runner.invoke(
+        app,
+        [*argv, "--help"],
+        env={"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200", "FORCE_COLOR": ""},
+    )
+    assert result.exit_code == 0, result.output
+    # Collapse whitespace too: Rich wraps, so a phrase can span a line break.
+    return " ".join(_ANSI_ESCAPE.sub("", result.output).split())
+
+
 class TestGroupLevelOptions:
     """`docspan --config X status` used to fail with "No such option: --config".
 
@@ -721,10 +749,14 @@ class TestGroupLevelOptions:
         assert resolve.call_args.kwargs["prefix"] == "myprefix"
 
     def test_both_options_are_listed_in_the_group_help(self) -> None:
-        """#20's actual complaint: `docspan --help` listed only `--help`."""
-        result = runner.invoke(app, ["--help"])
-        assert result.exit_code == 0
-        assert "--config" in result.output
-        assert "--prefix" in result.output
+        """#20's actual complaint: `docspan --help` listed only `--help`.
+
+        The help is rendered by Rich (`rich_markup_mode="rich"`), so the
+        assertion has to be made against text, not against whatever Rich decided
+        to emit for this environment. See _plain_help.
+        """
+        output = _plain_help()
+        assert "--config" in output
+        assert "--prefix" in output
         # The group help text must survive adding a callback.
-        assert "Push and pull markdown" in result.output
+        assert "Push and pull markdown" in output
