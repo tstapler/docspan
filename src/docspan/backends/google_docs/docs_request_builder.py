@@ -314,58 +314,19 @@ class DocsRequestBuilder:
         self._inject_tab_id(all_requests, tab_id)
         return all_requests
 
-    def unappliable_removals(
-        self, current: List[Node], target: List[Node], doc_end_index: int
-    ) -> List[DocsParagraphNode]:
-        """Paragraphs the diff wants removed that no batchUpdate can remove.
-
-        An empty paragraph pinned by the newline anchoring a Table,
-        TableOfContents or SectionBreak has a delete range that trims to
-        nothing, so _make_delete_requests drops the request entirely (see its
-        `start >= end` branch). diff_summary() still reports the paragraph as a
-        removal — correctly, since the document really does still contain it —
-        and the two are therefore allowed to disagree. This is the bridge: it
-        names exactly the paragraphs behind that disagreement, so push() can
-        say so instead of reporting "No changes detected" about a document it
-        knows still differs.
-
-        The body's own final paragraph is deliberately excluded. Every Docs
-        body ends with one, the API refuses to delete its newline, and
-        MarkdownToParagraphParser can never emit a node for it — so it is a
-        permanent property of the model rather than a difference, and counting
-        it would make the warning fire on every push of every document.
-
-        Only pure "delete" opcodes are inspected. A "replace" also runs its
-        nodes through _make_delete_requests, but it always emits an insert as
-        well, so it can never be the reason build() returned nothing.
-        """
-        unappliable: List[DocsParagraphNode] = []
-        for tag, i1, i2, _j1, _j2 in self._opcodes(current, target):
-            if tag != "delete":
-                continue
-            for node in current[i1:i2]:
-                if not isinstance(node, DocsParagraphNode):
-                    continue
-                if node.end_index >= doc_end_index:
-                    continue  # the body's terminal paragraph, not a difference
-                start, end, _trimmed = self._delete_bounds(node, doc_end_index)
-                if start >= end:
-                    unappliable.append(node)
-        return unappliable
-
     @staticmethod
     def _delete_bounds(node: Node, doc_end_index: int) -> Tuple[int, int, bool]:
         """The range a node's deleteContentRange may actually cover, and whether it was trimmed.
 
         Single source of truth for the two undeletable-newline rules described
-        on _make_delete_requests. Both that method and unappliable_removals()
-        need the answer, and they have to agree: the first drops a request when
-        the range trims to nothing, and the second exists precisely to name the
-        paragraphs behind those dropped requests. Computing the arithmetic twice
-        let them disagree silently — an earlier version of unappliable_removals
-        omitted the terminal-newline clamp, which happened to reach the same
-        answer for the body's last paragraph and would have stopped doing so the
-        moment anyone "tidied up" the duplication.
+        on _make_delete_requests.
+
+        It briefly had a second caller, `unappliable_removals()`, which named the
+        paragraphs whose delete request this method drops. That method is gone:
+        `projection.project()` now removes empty paragraphs from both sides of
+        the diff, and an empty paragraph was the only node whose range could trim
+        to nothing (verified exhaustively over every document shape up to four
+        paragraphs), so nothing is left for it to report.
         """
         start = node.start_index
         end = node.end_index

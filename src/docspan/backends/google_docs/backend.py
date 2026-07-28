@@ -39,6 +39,7 @@ from docspan.backends.google_docs.onboarding import (
     validate_client_secret,
     validate_service_account,
 )
+from docspan.backends.google_docs.projection import describe_residue, project
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -125,6 +126,21 @@ class GoogleDocsBackend(Backend):
         doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
         current_nodes = DocsStructureParser().parse(doc)
 
+        # Both sides of the diff pass through the same projection, so the diff
+        # only ever sees what markdown can faithfully represent. Without this,
+        # an empty paragraph in the document has no counterpart on the markdown
+        # side (blank lines are separators, so the parser never emits one) and
+        # the diff read that asymmetry as "the user deleted this" — issue #17.
+        # See projection.project for the rule and the trade it makes.
+        current_nodes, current_residue = project(current_nodes)
+        # Projecting the target is a no-op today and no test can make it fail:
+        # MarkdownToParagraphParser cannot emit an empty-text node, so there is
+        # nothing on this side to drop. It is here so the two sides cannot drift
+        # apart if that ever changes — the whole bug was an asymmetry between
+        # these two parsers, and applying the projection to only one of them
+        # would be the same shape of mistake.
+        target_nodes, _target_residue = project(target_nodes)
+
         body_content = doc.get("body", {}).get("content", [])
         doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
 
@@ -133,9 +149,6 @@ class GoogleDocsBackend(Backend):
             current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
         )
         entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
-        unappliable = request_builder.unappliable_removals(
-            current_nodes, target_nodes, doc_end_index
-        )
 
         comments = self._client.list_comments(doc_id)
         high_risk = find_high_risk_paragraphs(entries, comments)
@@ -150,8 +163,8 @@ class GoogleDocsBackend(Backend):
             comments=comments,
             high_risk=high_risk,
             tab_warning=tab_warning,
-            unappliable_removals=unappliable,
             resolved_tab_id=resolved_tab_id,
+            residue=current_residue,
         )
 
     def preview_push(
@@ -287,31 +300,23 @@ class GoogleDocsBackend(Backend):
                     )
 
             if not plan.requests and not second and not unstyled:
-                # Now genuinely nothing was applied by either pass.
+                # Nothing was applied by either pass. That is now a true
+                # statement about the document rather than an inference from an
+                # empty request list: projection.project() removes the one class
+                # of node whose delete request used to be silently dropped, so
+                # the diff cannot ask for an edit the builder then declines to
+                # emit.
                 #
-                # Even here an empty request list is not proof the document
-                # matches: a delete whose range trims to nothing is dropped
-                # (DocsRequestBuilder._make_delete_requests), which happens to
-                # an already-empty paragraph pinned by the newline anchoring a
-                # Table/TableOfContents/SectionBreak. diff_summary() still
-                # reports it as a removal, and it really is still in the doc.
-                if plan.unappliable_removals:
-                    count = len(plan.unappliable_removals)
-                    return PushResult(
-                        status="warning",
-                        doc_id=doc_id,
-                        message=(
-                            f"{count} blank paragraph(s) can't be deleted through the "
-                            "Google Docs API — each one holds open a table, table of "
-                            "contents or section break — so the doc still differs from "
-                            "the local file. Remove them by hand in Google Docs "
-                            "(backspace at the start of the blank line) to match."
-                        ),
-                    )
+                # Residue is reported here rather than warned about, because it
+                # is not a failure — it is state markdown does not describe, and
+                # the document is as close to the local file as markdown can
+                # express.
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
-                    message=plan.tab_warning or "No changes detected",
+                    message=plan.tab_warning
+                    or describe_residue(plan.residue)
+                    or "No changes detected",
                 )
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"

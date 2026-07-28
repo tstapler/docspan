@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+from docspan.backends.google_docs.projection import Residue
 
 
 @dataclass
@@ -147,11 +147,10 @@ class PushPlan:
     # above is already narrowed to this tab, so pass 2 needs this to build
     # requests against it without re-resolving.
     resolved_tab_id: Optional[str] = None
-    # Paragraphs the diff wants gone that the Docs API will not let docspan
-    # delete (DocsRequestBuilder.unappliable_removals). Non-empty means the
-    # doc will still differ from the local file after this push, so push()
-    # must not answer "No changes detected".
-    unappliable_removals: List[DocsParagraphNode] = field(default_factory=list)
+    # State projection.project() removed from the current side because markdown
+    # cannot represent it (today: empty paragraphs). Never part of the diff —
+    # carried so a push can report what it deliberately left alone.
+    residue: List[Residue] = field(default_factory=list)
 
 
 @dataclass
