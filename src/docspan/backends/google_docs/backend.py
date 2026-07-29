@@ -28,6 +28,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
 )
+from docspan.backends.google_docs.heading_anchors import (
+    UnresolvedAnchorError,
+    heading_slugs,
+    unresolved_anchors,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
@@ -238,6 +243,29 @@ class GoogleDocsBackend(Backend):
                     status="blocked",
                     doc_id=doc_id,
                     message=render_high_risk(plan.high_risk),
+                )
+
+            # An internal anchor (`[A1](#a1-current-state)`) can only be written
+            # as a Docs `headingId` link, and pass 2 refuses to degrade one that
+            # resolves to nothing into a `url` link — that is the dead link the
+            # reader of the Doc clicks. Checked here, against this call's own
+            # fetch plus the markdown being pushed, so a renamed heading or a
+            # typo'd anchor costs a rejected push instead of a document written
+            # with a link to nowhere. `force` deliberately does not override it:
+            # force is about overwriting a human's work, not about writing
+            # something known to be broken.
+            missing = unresolved_anchors(plan.target_nodes, DocsStructureParser().parse(plan.doc))
+            if missing:
+                return PushResult(
+                    status="error",
+                    doc_id=doc_id,
+                    message=str(
+                        UnresolvedAnchorError(
+                            missing,
+                            heading_slugs(plan.target_nodes),
+                            source=local_path,
+                        )
+                    ),
                 )
 
             if plan.requests:

@@ -10,6 +10,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
 )
+from docspan.backends.google_docs.heading_anchors import (
+    UnresolvedAnchorError,
+    heading_slug_to_id,
+    link_payload,
+)
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -427,10 +432,12 @@ class DocsRequestBuilder:
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
 
-        pairs, _unaligned = self._align_for_styling(doc, target)
+        current, pairs, _unaligned = self._align_for_styling(doc, target)
+        slug_to_id = heading_slug_to_id(current)
+        known_ids = set(slug_to_id.values())
         requests: List[dict] = []
         for cnode, tnode in pairs:
-            requests.extend(self._span_style_requests(tnode, cnode))
+            requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
         return requests
 
     def unaligned_span_targets(self, doc: dict, target: List[Node]) -> List[DocsParagraphNode]:
@@ -456,7 +463,7 @@ class DocsRequestBuilder:
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
-        pairs, unaligned = self._align_for_styling(doc, target)
+        _current, pairs, unaligned = self._align_for_styling(doc, target)
         overflowed = [
             tnode for cnode, tnode in pairs if self._spans_overflow(tnode, cnode)
         ]
@@ -511,12 +518,15 @@ class DocsRequestBuilder:
 
     def _align_for_styling(
         self, doc: dict, target: List[Node]
-    ) -> Tuple[List[Tuple[DocsParagraphNode, DocsParagraphNode]], List[DocsParagraphNode]]:
+    ) -> Tuple[List[Node], List[Tuple[DocsParagraphNode, DocsParagraphNode]], List[DocsParagraphNode]]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(pairs, unaligned)`` — pairs of (document node, target node)
-        that are safe to style, and the target paragraphs with spans that could
-        not be paired.
+        Returns ``(current, pairs, unaligned)`` — the parsed document, pairs of
+        (document node, target node) that are safe to style, and the target
+        paragraphs with spans that could not be paired. ``current`` is returned
+        rather than re-parsed by callers because resolving internal anchors
+        needs the document's headings, and parsing a large document twice per
+        push to learn the same thing is pure cost.
 
         Why not zip(): pass 1 does **not** guarantee the re-fetched document
         matches ``target`` node-for-node. It leaves an empty paragraph behind
@@ -570,7 +580,7 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return pairs, unaligned
+        return current, pairs, unaligned
 
     def build_second_pass_requests(
         self, doc: dict, target: List[Node], tab_id: Optional[str] = None
@@ -819,7 +829,11 @@ class DocsRequestBuilder:
         return requests
 
     def _span_style_requests(
-        self, node: DocsParagraphNode, placement: DocsParagraphNode
+        self,
+        node: DocsParagraphNode,
+        placement: DocsParagraphNode,
+        slug_to_id: Optional[dict] = None,
+        known_ids: Optional[set] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -832,6 +846,15 @@ class DocsRequestBuilder:
         trailing whitespace the markdown parser stripped from .text but kept in
         .spans) can only ever cost styling inside this paragraph. It can never
         spill a range into the next one.
+
+        ``slug_to_id``/``known_ids`` resolve internal anchors against the
+        re-fetched document's headings — heading ids only exist once the
+        headings do, which is why this cannot happen in pass 1. An anchor that
+        resolves to nothing raises rather than degrading to a `url` link, which
+        would put a link in the document that a reader can click and land
+        nowhere. push() rejects unresolvable anchors before writing anything
+        (heading_anchors.unresolved_anchors), so reaching this raise means the
+        document disagrees with that check rather than that the author typo'd.
         """
         requests: List[dict] = []
         offset = placement.start_index
@@ -849,7 +872,10 @@ class DocsRequestBuilder:
             if span.italic:
                 attrs["italic"] = True
             if span.link:
-                attrs["link"] = span.link
+                payload = link_payload(span.link, slug_to_id, known_ids)
+                if payload is None:
+                    raise UnresolvedAnchorError([span.link], list(slug_to_id or {}))
+                attrs["link"] = payload
             if span.monospace:
                 attrs["monospace"] = True
             if attrs:
@@ -951,7 +977,11 @@ class DocsRequestBuilder:
             text_style["italic"] = style_attrs["italic"]
         if "link" in style_attrs:
             fields.append("link")
-            text_style["link"] = {"url": style_attrs["link"]}
+            link = style_attrs["link"]
+            # Callers may hand over a ready-made Link union member — the
+            # `headingId` form an internal anchor resolves to (heading_anchors)
+            # has no `url` at all. A bare string stays the URL case.
+            text_style["link"] = link if isinstance(link, dict) else {"url": link}
         if style_attrs.get("monospace"):
             fields.append("weightedFontFamily")
             text_style["weightedFontFamily"] = {"fontFamily": "Courier New", "weight": 400}
