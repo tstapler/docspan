@@ -1,7 +1,7 @@
 """Parse a Google Docs JSON document into a list of DocsParagraphNode objects."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Union
 
 # Structural elements whose leading newline the Docs API refuses to delete on
@@ -227,6 +227,7 @@ class DocsStructureParser:
         raw_text = "".join(text_parts)
         # Strip trailing newline (each paragraph ends with \n in the Docs model)
         text = raw_text.rstrip("\n")
+        spans = self._trim_spans_to_text(spans, len(text))
 
         # Check for bullet / list item
         bullet = paragraph.get("bullet")
@@ -244,6 +245,44 @@ class DocsStructureParser:
             spans=spans,
             is_native_checkbox=is_native_checkbox,
         )
+
+    @staticmethod
+    def _trim_spans_to_text(spans: List[TextSpan], keep: int) -> List[TextSpan]:
+        """Drop the paragraph-terminating newline from the spans, as .text already does.
+
+        Every Docs paragraph ends with "\\n", and it arrives inside the *last
+        textRun's* content — so it lands in that run's span while `.text`
+        rstrips it. Two things break on the resulting disagreement, both when
+        the run carrying the newline is also the run carrying a mark:
+
+        * `pull` renders the newline *inside* the markdown link, emitting
+          ``[it\\n](https://…)`` — which re-parses as a literal
+          ``](https://…)`` line rather than a link.
+        * The spans then total one code unit more than the paragraph can hold,
+          so DocsRequestBuilder._spans_overflow reports the paragraph and pass 2
+          drops its styling.
+
+        Trimming to `.text`'s length restores the invariant the rest of the
+        pipeline already assumes: the spans concatenate to exactly `.text`.
+
+        Empty spans are dropped on the way out. That is a separate concern from
+        the newline — a run whose whole content *is* the newline is removed by
+        the trim itself — and covers an empty textRun, which the API can send
+        and which the loop above would leave in place: a span with no text
+        styles nothing and renders as stray marks (``****``).
+        """
+        trimmed = list(spans)
+        total = sum(len(span.text) for span in trimmed)
+        while trimmed and total > keep:
+            excess = total - keep
+            last = trimmed[-1]
+            if len(last.text) <= excess:
+                trimmed.pop()
+                total -= len(last.text)
+            else:
+                trimmed[-1] = replace(last, text=last.text[: len(last.text) - excess])
+                total = keep
+        return [span for span in trimmed if span.text]
 
     def _resolve_is_native_checkbox(self, bullet: Optional[dict], lists: dict) -> bool:
         """Resolve whether a bullet paragraph is a native BULLET_CHECKBOX glyph.
