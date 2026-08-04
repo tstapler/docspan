@@ -1,6 +1,7 @@
 """Parse Markdown content into DocsParagraphNode/DocsTableNode list for Google Docs push."""
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -177,6 +178,38 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
     return nodes
 
 
+_CELL_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+
+def _decode_cell_breaks(spans: List[TextSpan]) -> List[TextSpan]:
+    """Turn the `<br>` a rendered cell carries back into the newline it stands for.
+
+    `nodes_to_markdown._render_cell` writes `<br>` for a cell's internal paragraph
+    break, because markdown's table syntax has none. Without the matching decode the
+    transform is one-way, and that is worse than not doing it at all:
+    `DocsTableNode`'s diff key includes cell text, so a pull followed by an
+    **unmodified** push saw `'line one\nline two'` against `'line one<br>line two'`,
+    reported a spurious change, and answered it by **deleting and re-creating the
+    table** — taking every comment anchored inside it, and writing the literal string
+    `<br>` where the second paragraph had been. It converged after one push, so the
+    damage was silent and permanent. Escaping without decoding turned a loud failure
+    (the table collapsing into a paragraph) into a quiet one.
+
+    A cell holding a *literal* `<br>` the author typed is indistinguishable from a
+    rendered break and becomes a newline. That is the cost of the round trip and it is
+    the smaller one: markdown cannot express the difference, and the alternative
+    corrupts every multi-paragraph cell.
+    """
+    out: List[TextSpan] = []
+    for span in spans:
+        decoded = _CELL_BREAK.sub("\n", span.text)
+        out.append(span if decoded == span.text else TextSpan(
+            text=decoded, bold=span.bold, italic=span.italic,
+            link=span.link, monospace=span.monospace,
+        ))
+    return out
+
+
 def _cell_from_token(token: dict) -> TableCell:
     """A table cell, with its inline styling kept.
 
@@ -185,7 +218,7 @@ def _cell_from_token(token: dict) -> TableCell:
     was silently reduced to its label. `_spans_from_inline` is the same walk the
     paragraph path already uses, and it keeps them.
     """
-    spans = _spans_from_inline(token.get("children", []))
+    spans = _decode_cell_breaks(_spans_from_inline(token.get("children", [])))
     text = _text_of(spans).strip()
     if not text:
         return TableCell(text="", spans=[])
@@ -215,9 +248,14 @@ def _table_from_token(token: dict) -> DocsTableNode:
             rows.append(cells_of(child))
     # Normalize ragged rows to a uniform column count.
     width = max((len(r) for r in rows), default=0)
-    # A comprehension, not `[TableCell()] * n`: `TableCell.spans` is a mutable
-    # default, so the repeated form aliases one object across every padded cell and
-    # styling one would style them all.
+    # A comprehension, not `[TableCell()] * n`. The repeated form puts *one* object at
+    # every padded position — nothing to do with a mutable default, which
+    # `field(default_factory=list)` already avoids; `[x] * n` aliases whatever `x` is.
+    #
+    # Unreachable through mistune today: it rejects a ragged GFM table outright rather
+    # than padding it, so `width` equals every row's length and the slice is empty.
+    # Kept because `cells_of` can still shorten a bare `table_row` token, and
+    # correct-but-unreached beats a latent alias.
     rows = [r + [TableCell() for _ in range(width - len(r))] for r in rows]
     return DocsTableNode(rows=rows, start_index=0, end_index=0)
 

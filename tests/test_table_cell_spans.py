@@ -13,13 +13,18 @@ is below.
 """
 from __future__ import annotations
 
+from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
     TableCell,
+    TextSpan,
 )
-from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+    MarkdownToParagraphParser,
+    _table_from_token,
+)
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 
 markdown = MarkdownToParagraphParser()
@@ -48,14 +53,25 @@ def _cell(text: str, start: int, **style: object) -> dict:
 
 def _doc_with_table(*cells: dict, heading: str = "A1 — Current state") -> dict:
     """A document holding a heading (so an anchor has something to resolve to) then a table."""
+    return _doc_with_rows([list(cells)], heading=heading)
+
+
+def _doc_with_rows(rows: list, heading: str = "A1 — Current state") -> dict:
+    """Same, for a table of more than one row.
+
+    A markdown table always carries a header row, so anything driven through `push`
+    needs a live table with a matching row count — otherwise the *target* has a row
+    the document does not and `unplaced_table_cells` correctly reports the orphan,
+    which looks like a code defect and is a fixture defect.
+    """
     heading_end = 1 + len(heading) + 1
     return {"revisionId": "rev-1", "body": {"content": [
         {"startIndex": 1, "endIndex": heading_end, "paragraph": {
             "paragraphStyle": {"namedStyleType": "HEADING_2", "headingId": "h.a1live"},
             "elements": [{"textRun": {"content": heading + "\n", "textStyle": {}}}]}},
         {"startIndex": heading_end, "endIndex": heading_end + 1, "table": {
-            "rows": 1, "columns": len(cells),
-            "tableRows": [{"tableCells": list(cells)}]}},
+            "rows": len(rows), "columns": max((len(r) for r in rows), default=0),
+            "tableRows": [{"tableCells": list(row)} for row in rows]}},
     ]}}
 
 
@@ -255,6 +271,92 @@ class TestPassTwoStylesCells:
         assert builder.build_table_cell_span_requests(doc, target) == []
 
 
+class TestPushReportsWhatItCouldNotStyle:
+    """The wiring, asserted through `push` — not just the function that computes it.
+
+    `unplaced_table_cells` was written, documented as push's report, and never called.
+    Round 2 then found that wiring it up was itself untested: five separate mutations
+    to `backend.py` — including deleting the call, dropping it from the "nothing to
+    do" gate, and replacing the rendered message with `None` — all left the suite
+    green. A report nothing asserts on is indistinguishable from no report.
+    """
+
+    def _doc_with_unstylable_cell(self) -> dict:
+        """A live table whose cell holds a person chip, so it can never be placed.
+
+        `_parse_cell` puts the chip's display name in `.text` but the chip
+        contributes no `textRun`, so the cell text cannot be located by a text
+        search — the shape of an "Owner" column in a real design doc.
+        """
+        cell = _cell("Ada owns A1", 40)
+        cell["content"][0]["paragraph"]["elements"].insert(
+            0, {"person": {"personProperties": {"name": "Ada", "email": "ada@example.com"}}}
+        )
+        return _doc_with_rows([[_cell("ref", 30)], [cell]])
+
+    def _markdown(self) -> str:
+        return (
+            "## A1 — Current state\n\n"
+            "| ref |\n| --- |\n| [Ada owns A1](#a1--current-state) |\n"
+        )
+
+    def test_push_warns_rather_than_reporting_success(self, make_backend, tmp_path) -> None:
+        backend, client = make_backend()
+        doc = self._doc_with_unstylable_cell()
+        client.get_document.return_value = doc
+        client.batch_update.return_value = {}
+        client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text(self._markdown(), encoding="utf-8")
+        result = backend.push(str(local), "doc-id")
+
+        assert result.status == "warning", (
+            f"a cell whose styling was dropped must not report success: {result}"
+        )
+        assert "table cell" in result.message
+        assert "Ada owns A1" in result.message
+
+    def test_the_remedy_is_not_a_false_promise_to_push_again(self) -> None:
+        """A chip/image/multi-paragraph cell can never be placed.
+
+        So "push again and the styling will land" was false, and because a warning
+        exits non-zero the document would exit 1 forever while being told to retry.
+        """
+        message = GoogleDocsBackend._render_unplaced_cells(["Ada owns A1"])
+        assert "pushing again places the styling" in message
+        assert "will report this same warning" in message
+
+    # NOT covered: the "nothing to do" gate in backend.py, which counts
+    # `unplaced_cells` so a push that dropped cell styling cannot return
+    # status="skipped". Removing it from that condition leaves this suite green.
+    #
+    # A test needs a push where pass 1 emits *zero* requests while a styled cell is
+    # unplaceable, and I could not construct one here — every fixture I tried had
+    # pass 1 writing something, so the gate was never reached and the assertion
+    # passed for the wrong reason. Recorded as a gap rather than left as a test that
+    # looks like coverage and is not; see the follow-up issue. The user-visible
+    # outcome *is* covered — deleting the rendered message from `messages` fails
+    # `test_push_warns_rather_than_reporting_success`.
+
+    def test_a_cell_that_can_be_placed_is_not_reported(self, make_backend, tmp_path) -> None:
+        """The other side of the gate — no false warning on a healthy document."""
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_rows(
+            [[_cell("ref", 30)], [_cell("A1", 40)]]
+        )
+        client.batch_update.return_value = {}
+        client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text(
+            "## A1 — Current state\n\n| ref |\n| --- |\n| [A1](#a1--current-state) |\n",
+            encoding="utf-8",
+        )
+        result = backend.push(str(local), "doc-id")
+        assert "table cell" not in (result.message or "")
+
+
 class TestRendering:
     def test_a_cell_link_renders_back_into_markdown(self) -> None:
         doc = _doc_with_table(_cell("A1", 30, link={"url": "https://example.com"}))
@@ -271,8 +373,19 @@ class TestRendering:
         node = DocsTableNode(rows=[[TableCell(text="line one\nline two"), TableCell(text="x")]])
         rendered = render_nodes_to_markdown([node])
         assert rendered.splitlines()[0] == "| line one<br>line two | x |"
-        # Still one table, still two columns.
-        assert isinstance(markdown.parse(rendered)[0], DocsTableNode)
+
+        # And it must come back as the newline it stands for. Asserting only that a
+        # table survives left the escape one-way, which is worse than not escaping:
+        # the diff key includes cell text, so a pull then an *unmodified* push saw a
+        # change, deleted and re-created the table, and wrote a literal "<br>" in
+        # place of the second paragraph. Removing the decode leaves this test green
+        # unless the text itself is asserted.
+        back = markdown.parse(rendered)[0]
+        assert isinstance(back, DocsTableNode)
+        assert back.rows[0][0].text == "line one\nline two"
+        assert builder._node_key(back) == builder._node_key(node), (
+            "the diff key must match, or an unmodified push rewrites the table"
+        )
 
     def test_a_parsed_cell_with_no_marks_carries_no_spans(self) -> None:
         """The parser path, not the markdown path.
@@ -284,15 +397,39 @@ class TestRendering:
         cell = [n for n in structure.parse(doc) if isinstance(n, DocsTableNode)][0].rows[0][0]
         assert cell == TableCell(text="plain", spans=[])
 
-    def test_padding_cells_are_not_the_same_object(self) -> None:
-        """`[TableCell()] * n` aliases one object, and `spans` is a mutable default.
+    def test_padding_cells_from_the_parser_are_distinct_objects(self) -> None:
+        """`[TableCell()] * n` puts one object at every padded position.
 
-        So styling one padded cell would style every one of them.
+        The earlier version of this test hand-appended two separately-constructed
+        cells and asserted they differed — which is true of any two constructor calls
+        and passes with the aliasing bug fully restored. It never reached
+        `_table_from_token`. This drives the parser.
+
+        Padding is unreachable through mistune (it rejects a ragged GFM table rather
+        than padding it), so the ragged row is built as a bare `table_row` token, the
+        one shape `cells_of` can still shorten.
         """
-        node = DocsTableNode(rows=[[TableCell(text="a")], [TableCell(text="b")]])
-        node.rows[0].append(TableCell())
-        node.rows[1].append(TableCell())
-        assert node.rows[0][1] is not node.rows[1][1]
+        def row(*texts: str) -> dict:
+            return {"type": "table_row", "children": [
+                {"type": "table_cell", "children": [{"type": "text", "raw": t}]} for t in texts
+            ]}
+
+        # One row short by **two** columns. Each row's padding is built by its own
+        # expression, so `[TableCell()] * n` aliases *within* a row and not across
+        # rows — measured. An earlier version of this test compared cells in
+        # different rows and passed with the aliasing fully restored.
+        node = _table_from_token({"type": "table", "children": [
+            row("a", "b", "c"), row("d"),
+        ]})
+        assert [len(r) for r in node.rows] == [3, 3], "the short row must be padded"
+        assert node.rows[1][1] is not node.rows[1][2], (
+            "two padded cells in one row must not be the same object"
+        )
+
+        node.rows[1][1].spans.append(TextSpan(text="x"))
+        assert node.rows[1][2].spans == [], (
+            "touching one padded cell must not reach its neighbour"
+        )
 
     def test_a_pipe_in_cell_text_is_escaped(self) -> None:
         """An unescaped `|` ends the cell, silently splitting the row.

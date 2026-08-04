@@ -494,10 +494,16 @@ class GoogleDocsBackend(Backend):
     def _render_unplaced_cells(cells: list[str]) -> str:
         """Styled table cells whose styling was not written.
 
-        Distinct from _render_unstyled, which is about paragraphs, and worth its own
-        message because the commonest cause is specific and actionable: a table this
-        push *created* is still empty when pass 2 computes the ranges, so pushing
-        again places the styling.
+        Distinct from _render_unstyled, which is about paragraphs.
+
+        Two causes with opposite remedies, so the message names both rather than
+        promising the wrong one. A table this push *created* is still empty when pass 2
+        computes its ranges, and pushing again places the styling. But a cell holding a
+        smart chip, an inline object, or more than one paragraph can never be placed,
+        so "push again" is false there — and because a warning exits non-zero, such a
+        document would exit 1 on every push forever while being told to retry.
+        Non-convergence is the same known open decision `unresolved_anchor_links`
+        documents; misdescribing the remedy is not, so that part is fixed here.
         """
         preview = [(text[:40] or "(empty)") for text in cells[:5]]
         more = len(cells) - len(preview)
@@ -505,8 +511,11 @@ class GoogleDocsBackend(Backend):
         return (
             f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
             f"— docspan could not locate them in the written document, so it wrote no "
-            f"styling rather than styling aimed at the wrong cell: {listed}. If this "
-            f"push created the table, push again and the styling will land."
+            f"styling rather than styling aimed at the wrong cell: {listed}. "
+            f"If this push created the table, pushing again places the styling. "
+            f"Otherwise the cell holds something docspan cannot measure around — a "
+            f"smart chip, an image, or more than one paragraph — and pushing again "
+            f"will report this same warning; style that cell in the document instead."
         )
 
     @staticmethod
