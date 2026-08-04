@@ -20,6 +20,7 @@ special case at another call site.
 """
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, replace
 from typing import Dict, List, Literal, Sequence, Tuple, Union
 
@@ -33,7 +34,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
 # it, not the other way round.
 Node = Union[DocsParagraphNode, DocsTableNode]
 
-ResidueKind = Literal["empty_paragraph", "paragraph_style"]
+ResidueKind = Literal["empty_paragraph", "paragraph_style", "private_use_glyph"]
 
 # Named styles markdown has no syntax for, mapped to the nearest style it does.
 # Google Docs' own outline treats TITLE/SUBTITLE as document-level headings, and
@@ -90,6 +91,30 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     node's ``end_index`` lands in front of the dropped paragraph rather than
     inside it.
 
+    Rule 1b — a paragraph holding only Private-Use-Area glyphs is dropped.
+
+    Exactly rule 1's situation with a different unrepresentable character. Google
+    Docs writes `U+E907` into a paragraph for constructs it renders itself, and
+    markdown has no syntax for one — so `MarkdownToParagraphParser` can never
+    produce a matching node, the diff reads the paragraph as "the user deleted
+    this", and push emits a delete for it.
+
+    Docs then **refuses that delete**, and because `batchUpdate` is atomic the
+    *entire push fails*:
+
+        Invalid requests[4].deleteContentRange: Invalid deletion range.
+        Cannot delete the requested range.
+
+    Measured on a real design doc — three such paragraphs, 56 requests, HTTP 400,
+    nothing written. Any document containing one could never be pushed at all,
+    which makes this the same self-inflicted trap rule 1 already describes: the
+    tool cannot represent the state, so it tries to delete it, and fails forever.
+
+    Only a paragraph whose text is *entirely* PUA (ignoring surrounding
+    whitespace) is dropped. One that also carries real text is kept, because
+    dropping it would lose the author's content — the glyph is then a cosmetic
+    wart on a paragraph that still round-trips.
+
     Rule 2 — ``TITLE`` and ``SUBTITLE`` become ``HEADING_1``/``HEADING_2``.
 
     Markdown has no syntax for either, so ``nodes_to_markdown`` rendered them as
@@ -125,6 +150,11 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
                 )
             )
             continue
+        if isinstance(node, DocsParagraphNode) and _is_only_private_use(node.text):
+            residue.append(
+                Residue(kind="private_use_glyph", index=index, detail=node.text.strip())
+            )
+            continue
         if isinstance(node, DocsParagraphNode) and node.style in _UNWRITABLE_STYLES:
             residue.append(
                 Residue(kind="paragraph_style", index=index, detail=node.style)
@@ -134,6 +164,18 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
             node = replace(node, style=_UNWRITABLE_STYLES[node.style])
         kept.append(node)
     return kept, residue
+
+
+def _is_only_private_use(text: str) -> bool:
+    """True when a paragraph holds nothing but Private-Use-Area glyphs.
+
+    `unicodedata.category(c) == "Co"` is the whole test — no hard-coded code
+    points, since which glyph Docs uses is its own business and has changed before.
+    Whitespace around them is ignored; a paragraph carrying *any* real character is
+    not a match, because dropping it would lose content.
+    """
+    stripped = text.strip()
+    return bool(stripped) and all(unicodedata.category(ch) == "Co" for ch in stripped)
 
 
 def _describe_empty(node: DocsParagraphNode) -> str:
@@ -176,6 +218,13 @@ def describe_residue(residue: List[Residue]) -> str:
         parts.append(
             f"{blanks} blank paragraph(s) in the doc are not represented in markdown, "
             "so they were left alone. Add or remove them in Google Docs directly."
+        )
+    glyphs = sum(1 for r in residue if r.kind == "private_use_glyph")
+    if glyphs:
+        parts.append(
+            f"{glyphs} paragraph(s) hold only a Google Docs private-use glyph, which "
+            "markdown cannot express, so they were left alone. Docs refuses to delete "
+            "them, and batchUpdate is atomic, so trying would fail the whole push."
         )
     styles = sorted({r.detail for r in residue if r.kind == "paragraph_style"})
     if styles:
