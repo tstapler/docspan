@@ -314,6 +314,7 @@ class GoogleDocsBackend(Backend):
             )
             second: list[dict] = []
             unstyled: list[DocsParagraphNode] = []
+            unplaced_cells: list[str] = []
             dead_anchors: list[str] = []
             if needs_pass2:
                 # When pass 1 wrote nothing the already-fetched plan.doc is
@@ -363,6 +364,17 @@ class GoogleDocsBackend(Backend):
                 dead_anchors = builder.unresolved_anchor_links(
                     pass2_doc, plan.target_nodes, alignment
                 )
+                # Styled table cells pass 2 could not place. Same trade as
+                # `unstyled` above and the same reason it has to be said out loud:
+                # the cell got no styling rather than styling aimed at whatever sat
+                # at that ordinal, and a silent drop is indistinguishable from
+                # success. Reachable when a table is created by this very push (its
+                # cells are still empty when the ranges are computed), when a
+                # concurrent edit changed a cell, or when the cell holds an inline
+                # object whose index width the text search cannot see.
+                unplaced_cells = builder.unplaced_table_cells(
+                    pass2_doc, plan.target_nodes, alignment
+                )
                 if second:
                     # The document's own revisionId guards this batch the same
                     # way pass 1 is guarded, so pass 2 can't silently overwrite
@@ -371,7 +383,8 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if not plan.requests and not second and not unstyled and not dead_anchors:
+            if (not plan.requests and not second and not unstyled
+                    and not dead_anchors and not unplaced_cells):
                 # Nothing was applied by either pass. That is now a true
                 # statement about the document rather than an inference from an
                 # empty request list: projection.project() removes the one class
@@ -412,6 +425,7 @@ class GoogleDocsBackend(Backend):
                     if (plan.requests or second)
                     else None,
                     self._render_unstyled(unstyled) if unstyled else None,
+                    self._render_unplaced_cells(unplaced_cells) if unplaced_cells else None,
                     # Offer the keys resolution actually consulted, so the list
                     # cannot name the anchor it just called dead.
                     self._render_dead_anchors(
@@ -475,6 +489,25 @@ class GoogleDocsBackend(Backend):
             lines.append(f"    • … and {more} more")
         lines.append(render_available_anchors(available))
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_unplaced_cells(cells: list[str]) -> str:
+        """Styled table cells whose styling was not written.
+
+        Distinct from _render_unstyled, which is about paragraphs, and worth its own
+        message because the commonest cause is specific and actionable: a table this
+        push *created* is still empty when pass 2 computes the ranges, so pushing
+        again places the styling.
+        """
+        preview = [(text[:40] or "(empty)") for text in cells[:5]]
+        more = len(cells) - len(preview)
+        listed = "; ".join(preview) + (f"; +{more} more" if more > 0 else "")
+        return (
+            f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
+            f"— docspan could not locate them in the written document, so it wrote no "
+            f"styling rather than styling aimed at the wrong cell: {listed}. If this "
+            f"push created the table, push again and the styling will land."
+        )
 
     @staticmethod
     def _render_unstyled(unstyled: list[DocsParagraphNode]) -> str:

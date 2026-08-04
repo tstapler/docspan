@@ -8,6 +8,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
     TableCell,
     TextSpan,
+    _trim_spans_to_cell_text,
 )
 
 Node = Union[DocsParagraphNode, DocsTableNode]
@@ -190,34 +191,8 @@ def _cell_from_token(token: dict) -> TableCell:
         return TableCell(text="", spans=[])
     # Re-derive the spans against the stripped text so they still concatenate to
     # it; pass 2 walks span widths to place ranges inside the cell.
-    spans = _trim_spans(spans, _text_of(spans), text)
+    spans = _trim_spans_to_cell_text(spans, _text_of(spans), text)
     return TableCell(text=text, spans=spans if _has_styling(spans) else [])
-
-
-def _trim_spans(spans: List[TextSpan], joined: str, text: str) -> List[TextSpan]:
-    """Trim leading/trailing whitespace off `spans` so they equal `text`."""
-    lead = len(joined) - len(joined.lstrip())
-    tail = len(joined) - len(joined.rstrip())
-    out = list(spans)
-    while lead > 0 and out:
-        head = out[0]
-        if len(head.text) <= lead:
-            lead -= len(head.text)
-            out.pop(0)
-        else:
-            out[0] = TextSpan(text=head.text[lead:], bold=head.bold, italic=head.italic,
-                              link=head.link, monospace=head.monospace)
-            lead = 0
-    while tail > 0 and out:
-        last = out[-1]
-        if len(last.text) <= tail:
-            tail -= len(last.text)
-            out.pop()
-        else:
-            out[-1] = TextSpan(text=last.text[: len(last.text) - tail], bold=last.bold,
-                               italic=last.italic, link=last.link, monospace=last.monospace)
-            tail = 0
-    return [span for span in out if span.text]
 
 
 def _table_from_token(token: dict) -> DocsTableNode:
@@ -240,7 +215,10 @@ def _table_from_token(token: dict) -> DocsTableNode:
             rows.append(cells_of(child))
     # Normalize ragged rows to a uniform column count.
     width = max((len(r) for r in rows), default=0)
-    rows = [r + [TableCell()] * (width - len(r)) for r in rows]
+    # A comprehension, not `[TableCell()] * n`: `TableCell.spans` is a mutable
+    # default, so the repeated form aliases one object across every padded cell and
+    # styling one would style them all.
+    rows = [r + [TableCell() for _ in range(width - len(r))] for r in rows]
     return DocsTableNode(rows=rows, start_index=0, end_index=0)
 
 

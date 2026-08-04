@@ -497,10 +497,25 @@ class DocsRequestBuilder:
         """
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         missed: List[str] = []
+        placed: set = set()
         for table, tnode in self._paired_tables(doc, target_tables):
             for live, cell in self._paired_cells(table, tnode):
-                if cell.styled and self._cell_placement(live, cell) is None:
+                if not cell.styled:
+                    continue
+                if self._cell_placement(live, cell) is None:
                     missed.append(cell.text)
+                else:
+                    placed.add(id(cell))
+        # Both generators stop when the *live* side runs out, so a target table,
+        # row or cell with no live counterpart is never yielded — and would
+        # otherwise be a silent partial application, the asymmetry
+        # unaligned_span_targets deliberately closed for paragraphs. Sweep the
+        # target side so nothing styled goes unaccounted for.
+        for tnode in target_tables:
+            for row in tnode.rows:
+                for cell in row:
+                    if cell.styled and id(cell) not in placed and cell.text not in missed:
+                        missed.append(cell.text)
         return missed
 
     @staticmethod
@@ -509,10 +524,21 @@ class DocsRequestBuilder:
     ) -> Iterator[Tuple[dict, DocsTableNode]]:
         """Live tables paired with target tables, in document order.
 
-        Order is the only correspondence available — a table has no id — and it is
-        the same pairing `build_table_fill_requests` already relies on. Unlike that
-        method this does *not* skip populated tables: by the time styling runs, pass
-        1 has filled them.
+        Order is the only correspondence available: a table has no id, and
+        `_align_for_styling` keys a table on its whole cell grid, so a table whose
+        cells changed does not align at all.
+
+        This is **not** the same pairing `build_table_fill_requests` uses — that one
+        advances only past *empty* live tables, so it pairs the Nth empty table with
+        the Nth target table. This pairs the Nth table outright, because by the time
+        styling runs pass 1 has filled them and "empty" no longer identifies them.
+
+        Raw body position is weaker than the content alignment
+        `build_span_style_requests` uses for paragraphs, and the gap is real: if a
+        concurrent edit adds a table between pass 1 and pass 2 the counts shift and a
+        stale table can be styled. `_cell_placement`'s text search catches that only
+        when the two tables' cell texts differ, and headers like "Status" or "Owner"
+        repeat constantly. Narrow, but the same window `_cell_placement` bails on.
         """
         index = 0
         for element in _body_content(doc):
@@ -559,11 +585,19 @@ class DocsRequestBuilder:
         end_index = content[0].get("endIndex")
         if paragraph is None or start_index is None or end_index is None:
             return None
-        text = "".join(
-            pe["textRun"].get("content", "")
-            for pe in paragraph.get("elements", [])
-            if pe.get("textRun") is not None
-        )
+        elements = paragraph.get("elements", [])
+        if any(pe.get("textRun") is None for pe in elements):
+            # An inlineObjectElement, footnoteReference, person chip, richLink,
+            # equation or page break carries index width but contributes nothing to
+            # the joined text, so `find`'s offset would no longer be the document
+            # distance from `startIndex`. Measured on an image followed by "A1\n":
+            # the range came out [30,32) where the text sits at [31,33), i.e. it
+            # styled the image plus the first character and reported nothing. Bail
+            # instead; the caller reports it. Taking the offset from the matching
+            # element's own `startIndex` would handle it properly and is the better
+            # fix, but it is index arithmetic that needs replay verification.
+            return None
+        text = "".join(pe["textRun"].get("content", "") for pe in elements)
         offset = text.find(cell.text)
         if offset < 0:
             return None
@@ -685,19 +719,41 @@ class DocsRequestBuilder:
         Reported rather than raised: aborting would discard every other
         paragraph's inline styling for one bad link, and the next push would
         abort identically.
+
+        **Table cells are walked too.** They hold spans now, so a dead anchor can
+        live in one — and it used to be reported by nothing at all: the guard below
+        tested only paragraphs, and `_align_for_styling` skips tables, so a cell
+        anchor never reached `pairs`. That left the exact condition this whole pass
+        exists to remove — a reference rendered as dead text in the document with a
+        green tick over it. Cells are read straight off the target rather than from
+        `pairs`, because a table aligns on its whole cell grid and so does not pair
+        at all once any cell changed; an anchor that names no heading is unresolved
+        whether or not its table could be located.
         """
-        if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
+        styled_paragraph = any(isinstance(n, DocsParagraphNode) and n.spans for n in target)
+        styled_cell = any(cell.styled for n in target if isinstance(n, DocsTableNode)
+                          for row in n.rows for cell in row)
+        if not styled_paragraph and not styled_cell:
             return []
         aligned = self._aligned(doc, target, alignment)
         pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         unresolved: List[str] = []
-        for _cnode, tnode in pairs:
-            for span in tnode.spans:
+
+        def collect(spans: List[TextSpan]) -> None:
+            for span in spans:
                 if not span.link or not is_anchor(span.link):
                     continue
                 if link_payload(span.link, slug_to_id, known_ids) is None:
                     if span.link not in unresolved:
                         unresolved.append(span.link)
+
+        for _cnode, tnode in pairs:
+            collect(tnode.spans)
+        for node in target:
+            if isinstance(node, DocsTableNode):
+                for row in node.rows:
+                    for cell in row:
+                        collect(cell.spans)
         return unresolved
 
     @staticmethod

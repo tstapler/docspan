@@ -58,5 +58,10 @@ mappings:
 !!! warning
     - **Comments destroyed on push for edited paragraphs**: The structural diff preserves comments on unchanged paragraphs, but any paragraph that is deleted and reinserted loses its comments. This is a known v0.1.0 limitation.
     - **No image push support**: Local image files cannot be pushed. Images require publicly accessible URLs and additional Drive upload scope.
-    - **No table push support**: Markdown tables are not converted when pushing to Google Docs.
+    - **Table cells hold one paragraph**: a markdown table cell is pushed as a single
+      paragraph, and inline formatting inside it (bold, monospace, links, internal
+      `#anchor` references) is applied on the second pass. Two limits follow: a cell
+      whose content spans more than one paragraph in the Doc cannot be styled, and a
+      table created by the current push gets its cell styling on the *next* push —
+      docspan reports both rather than failing silently.
     - **Rate limiting**: The Google Docs API allows 300 requests per minute per project. Large documents with many changed paragraphs may trigger rate limit errors.

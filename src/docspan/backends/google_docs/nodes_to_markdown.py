@@ -43,13 +43,29 @@ def _render_spans(spans: List[TextSpan]) -> str:
 
 
 def _render_cell(cell: TableCell) -> str:
-    """A cell's markdown — with its marks, and with `|` escaped.
+    """A cell's markdown — with its marks, and with `|` and newlines neutralised.
 
-    An unescaped pipe inside cell text ends the cell, so a link whose URL or label
-    contains one would silently split the row into extra columns.
+    A cell holds a *paragraph list*, not a string, and markdown's table syntax has
+    no cell-internal line break. Both characters that would end something early are
+    escaped, for the same reason and in ascending order of damage:
+
+    * an unescaped `|` ends the **cell**, so a link whose URL or label contains one
+      splits the row into extra columns;
+    * an unescaped newline ends the **row**, so a two-paragraph cell reparses as a
+      paragraph and the table is destroyed outright. `<br>` is the conventional
+      stand-in and is what GitHub-flavoured markdown renders.
+
+    Escaping the pipe alone was half of its own argument, and once spans are
+    rendered it was actively worse: `**line one\nline two**` emits a dangling `**`
+    across the break.
+
+    Not preserved: a `|` inside a link *URL* survives as a row but comes back
+    percent-encoded (`%7C`) on the next parse, so that link is rewritten once and
+    then stable. Spans are not in the table diff key, so it surfaces as a
+    non-idempotent `updateTextStyle` rather than a visible diff.
     """
     text = _render_spans(cell.spans) if cell.spans else cell.text
-    return text.replace("|", "\\|")
+    return text.replace("|", "\\|").replace("\n", "<br>")
 
 
 def _render_table(node: DocsTableNode) -> str:

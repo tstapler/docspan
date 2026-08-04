@@ -141,11 +141,17 @@ class TableCell:
     A reference written inside a table cell rendered as dead text in the Doc while
     the identical reference in a paragraph resolved, with nothing reported.
 
-    `text` and `spans` live on one object rather than in parallel structures
-    because they must not be able to disagree: pass 2 walks span widths against
-    `text` to place index ranges, so a character in one and not the other shifts
-    every range after it. Same invariant as `DocsParagraphNode` — `spans` is
-    either empty (unstyled) or concatenates to exactly `text`.
+    `text` and `spans` are co-located rather than kept in parallel structures so they
+    are easy to hold in agreement: pass 2 walks span widths against `text` to place
+    index ranges, so a character in one and not the other shifts every range after
+    it. Same intended invariant as `DocsParagraphNode` — `spans` is either empty
+    (unstyled) or concatenates to exactly `text`.
+
+    Nothing *enforces* it. `TableCell(text="a", spans=[TextSpan(text="bbbb")])` is
+    constructible, and `__post_init__` normalises a `str` cell without checking.
+    What actually protects the document is the `limit` in
+    `DocsRequestBuilder._span_requests_in`, which bounds a disagreement to inside the
+    cell instead of spilling a range into whatever follows it.
     """
     text: str = ""
     spans: List[TextSpan] = field(default_factory=list)
