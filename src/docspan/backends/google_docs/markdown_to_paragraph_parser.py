@@ -6,7 +6,9 @@ from typing import List, Optional, Union
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    TableCell,
     TextSpan,
+    _trim_spans_to_cell_text,
 )
 
 Node = Union[DocsParagraphNode, DocsTableNode]
@@ -175,27 +177,53 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
     return nodes
 
 
-def _table_from_token(token: dict) -> DocsTableNode:
-    """Convert a mistune table token into a DocsTableNode (plain-text cells)."""
-    rows: List[List[str]] = []
+def _cell_from_token(token: dict) -> TableCell:
+    """A table cell, with its inline styling kept.
 
-    def cells_of(row_token: dict) -> List[str]:
-        return [_extract_text_from_token(cell).strip()
+    Cells used to be flattened with `_extract_text_from_token`, which walks to the
+    leaf text and discards every mark on the way — so a link written inside a cell
+    was silently reduced to its label. `_spans_from_inline` is the same walk the
+    paragraph path already uses, and it keeps them.
+    """
+    spans = _spans_from_inline(token.get("children", []))
+    text = _text_of(spans).strip()
+    if not text:
+        return TableCell(text="", spans=[])
+    # Re-derive the spans against the stripped text so they still concatenate to
+    # it; pass 2 walks span widths to place ranges inside the cell.
+    spans = _trim_spans_to_cell_text(spans, _text_of(spans), text)
+    return TableCell(text=text, spans=spans if _has_styling(spans) else [])
+
+
+def _table_from_token(token: dict) -> DocsTableNode:
+    """Convert a mistune table token into a DocsTableNode."""
+    rows: List[List[TableCell]] = []
+
+    def cells_of(row_token: dict) -> List[TableCell]:
+        return [_cell_from_token(cell)
                 for cell in row_token.get("children", [])
                 if cell.get("type") in ("table_cell", "block_text") or "children" in cell]
 
     for child in token.get("children", []):
         ctype = child.get("type")
         if ctype == "table_head":
-            rows.append([_extract_text_from_token(c).strip() for c in child.get("children", [])])
+            rows.append([_cell_from_token(c) for c in child.get("children", [])])
         elif ctype == "table_body":
             for row in child.get("children", []):
-                rows.append([_extract_text_from_token(c).strip() for c in row.get("children", [])])
+                rows.append([_cell_from_token(c) for c in row.get("children", [])])
         elif ctype == "table_row":
             rows.append(cells_of(child))
     # Normalize ragged rows to a uniform column count.
     width = max((len(r) for r in rows), default=0)
-    rows = [r + [""] * (width - len(r)) for r in rows]
+    # A comprehension, not `[TableCell()] * n`. The repeated form puts *one* object at
+    # every padded position — nothing to do with a mutable default, which
+    # `field(default_factory=list)` already avoids; `[x] * n` aliases whatever `x` is.
+    #
+    # Unreachable through mistune today: it rejects a ragged GFM table outright rather
+    # than padding it, so `width` equals every row's length and the slice is empty.
+    # Kept because `cells_of` can still shorten a bare `table_row` token, and
+    # correct-but-unreached beats a latent alias.
+    rows = [r + [TableCell() for _ in range(width - len(r))] for r in rows]
     return DocsTableNode(rows=rows, start_index=0, end_index=0)
 
 

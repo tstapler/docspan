@@ -19,6 +19,7 @@ from typing import List, Union
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    TableCell,
     TextSpan,
 )
 
@@ -41,15 +42,49 @@ def _render_spans(spans: List[TextSpan]) -> str:
     return "".join(parts)
 
 
+def _render_cell(cell: TableCell) -> str:
+    """A cell's markdown — with its marks, and with `|` escaped.
+
+    An unescaped `|` ends the cell, so a link whose URL or label contains one would
+    split the row into extra columns. Not preserved: a `|` inside a *URL* keeps the
+    row intact but comes back percent-encoded (`%7C`) on the next parse, so such a
+    link is rewritten once and then stable.
+
+    **A newline is deliberately left alone**, and that is a decision rather than an
+    omission. A Docs cell holds a paragraph *list* and markdown's table syntax has no
+    cell-internal break, so a two-paragraph cell has no faithful rendering. Every
+    encoding tried is worse than the gap:
+
+    * emit the newline — the row ends early and the table reparses as a paragraph.
+      Loud: the next diff shows the table gone.
+    * emit `<br>` — the table survives, but nothing can decode it back, and the table
+      diff key includes cell text, so a pull then an *unmodified* push sees a change
+      and answers it by deleting and re-creating the table, taking every comment
+      anchored inside it. Silent and permanent, since it converges after one push.
+    * emit `<br>` and decode it on parse — closes that, and opens the identical hole
+      for a cell whose author *typed* `<br>`: it becomes a newline, the key stops
+      matching, and the table is destroyed the same way. A cell holding only `<br>`
+      comes back empty. Markdown cannot distinguish the two, so the decode cannot
+      either.
+
+    So the loud failure is kept over either quiet one. `_cell_placement` already
+    declines a multi-paragraph cell and `unplaced_table_cells` reports it, so the case
+    is announced rather than merely broken. See the follow-up issue for a real fix,
+    which needs something other than markdown's table syntax to carry the break.
+    """
+    text = _render_spans(cell.spans) if cell.spans else cell.text
+    return text.replace("|", "\\|")
+
+
 def _render_table(node: DocsTableNode) -> str:
     if not node.rows:
         return ""
     header, *body = node.rows
     lines = [
-        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(_render_cell(c) for c in header) + " |",
         "| " + " | ".join(["---"] * len(header)) + " |",
     ]
-    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    lines.extend("| " + " | ".join(_render_cell(c) for c in row) + " |" for row in body)
     return "\n".join(lines)
 
 

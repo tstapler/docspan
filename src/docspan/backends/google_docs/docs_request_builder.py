@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Iterator, List, Literal, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
     DocsTableNode,
+    TableCell,
+    TextSpan,
 )
 from docspan.backends.google_docs.heading_anchors import (
     _heading_texts_and_ids,
@@ -62,7 +64,7 @@ def _node_text(node: Node) -> str:
     instead of being silently invisible to it.
     """
     if isinstance(node, DocsTableNode):
-        return "\n".join(" | ".join(row) for row in node.rows)
+        return "\n".join(" | ".join(cell.text for cell in row) for row in node.rows)
     return node.text
 
 
@@ -123,7 +125,7 @@ class DocsRequestBuilder:
         each other. That is the point: they *are* the same paragraph, restyled.
         """
         if isinstance(node, DocsTableNode):
-            return ("__table__", tuple(tuple(row) for row in node.rows))
+            return ("__table__", tuple(tuple(c.text for c in row) for row in node.rows))
         return ("__para__", node.text)
 
     def _opcodes(
@@ -439,6 +441,222 @@ class DocsRequestBuilder:
             if text
         ]
 
+    def build_table_cell_span_requests(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
+        """Emit updateTextStyle for inline styling inside table cells.
+
+        Pass 2 only ever walked paragraphs, so every mark inside a cell was dropped
+        — and an internal `#anchor` cross-reference written in a cell rendered as
+        dead text while the identical reference in a paragraph resolved. Nothing
+        reported it, because the styling was lost one layer earlier, when cells were
+        plain `str`.
+
+        Runs against the re-fetched document, like the paragraph path, because a
+        cell's real indices only exist once pass 1 has written it and heading ids
+        only exist once the headings do.
+
+        Cells are located, not predicted: the target cell's text is searched for
+        inside the live cell's text and the offset taken from where it is found. A
+        cell whose text is not there gets no requests at all — see
+        `unplaced_table_cells` — rather than a range aimed at whatever happened to
+        sit at that ordinal.
+        """
+        target_tables = [n for n in target if isinstance(n, DocsTableNode)]
+        if not any(cell.styled for t in target_tables for row in t.rows for cell in row):
+            return []
+
+        aligned = self._aligned(doc, target, alignment)
+        requests: List[dict] = []
+        for table, tnode in self._paired_tables(doc, target_tables):
+            for live, cell in self._paired_cells(table, tnode):
+                if not cell.styled:
+                    continue
+                placed = self._cell_placement(live, cell)
+                if placed is None:
+                    continue
+                start, limit = placed
+                requests.extend(self._span_requests_in(
+                    cell.spans, start, limit, aligned.slug_to_id, aligned.known_ids,
+                ))
+        return requests
+
+    def unplaced_table_cells(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[str]:
+        """Styled cells pass 2 could not place, so push can say so out loud.
+
+        The loud half of the same trade `unaligned_span_targets` makes for
+        paragraphs: refusing to guess is only safe if the refusal is reported.
+
+        Walks the **target** grid outermost and looks the live cell up, rather than
+        walking the live side and reconciling afterwards. Every styled target cell is
+        then visited exactly once, so nothing needs deduplicating — and an earlier
+        version deduped on `cell.text`, collapsing two genuinely distinct affected
+        cells into one entry and understating the count in a message that prints it.
+
+        Scope of that, measured rather than assumed: the dedup guarded only the
+        orphan sweep, so it misreported only when the target and live *shapes*
+        differed. Two duplicate-text cells that both had live counterparts were
+        already counted exactly. So it was narrower than "the normal case", which is
+        how an earlier version of this docstring put it.
+
+        The inversion also removes a quadratic `text not in missed` scan from the
+        window between pass 2's `get_document` and its `batch_update`. Measured over
+        6400 styled unplaceable cells: 238 ms before, 10 ms after — but only with
+        *distinct* cell texts. With one repeated text the old scan was ~12 ms, since
+        the list it scanned never grew. Both numbers are real and they bound the win
+        from either side. That window is the one `align()` **narrows** by 43% (its
+        docstring calls itself a correctness lever wearing a performance hat), because
+        a concurrent edit inside it costs the user a revisionId conflict on a document
+        pass 1 has already changed.
+        """
+        target_tables = [n for n in target if isinstance(n, DocsTableNode)]
+        if not target_tables:
+            return []
+        live_tables = self._live_tables(doc, len(target_tables))
+        missed: List[str] = []
+        for position, tnode in enumerate(target_tables):
+            table = live_tables[position] if position < len(live_tables) else None
+            rows = table.get("tableRows", []) if table else []
+            for r, row in enumerate(tnode.rows):
+                live_cells = rows[r].get("tableCells", []) if r < len(rows) else []
+                for c, cell in enumerate(row):
+                    if not cell.styled:
+                        continue
+                    live = live_cells[c] if c < len(live_cells) else None
+                    placed = self._cell_placement(live, cell) if live is not None else None
+                    if placed is None:
+                        missed.append(cell.text)
+                        continue
+                    # A cell can place and still lose its styling: _span_requests_in
+                    # stops at the first span that would cross the cell's bound and
+                    # emits nothing for it or anything after. Reporting only the
+                    # placement failure would leave that a silent partial
+                    # application — the case unaligned_span_targets calls "the
+                    # failure mode this whole pass exists to remove" and closes for
+                    # paragraphs via _spans_overflow.
+                    start, limit = placed
+                    if limit is not None and start + sum(
+                        _utf16_len(span.text) for span in cell.spans
+                    ) > limit:
+                        missed.append(cell.text)
+        return missed
+
+    @staticmethod
+    def _live_tables(doc: dict, limit: int) -> List[dict]:
+        """The first `limit` tables in body order — the pairing both cell passes use."""
+        tables: List[dict] = []
+        if limit <= 0:
+            return tables
+        for element in _body_content(doc):
+            table = element.get("table")
+            if table is not None:
+                tables.append(table)
+                if len(tables) >= limit:
+                    break
+        return tables
+
+    @staticmethod
+    def _paired_tables(
+        doc: dict, target_tables: List[DocsTableNode]
+    ) -> Iterator[Tuple[dict, DocsTableNode]]:
+        """Live tables paired with target tables, in document order.
+
+        Order is the only correspondence available: a table has no id, and
+        `_align_for_styling` keys a table on its whole cell grid, so a table whose
+        cells changed does not align at all.
+
+        This is **not** the same pairing `build_table_fill_requests` uses — that one
+        advances only past *empty* live tables, so it pairs the Nth empty table with
+        the Nth target table. This pairs the Nth table outright, because by the time
+        styling runs pass 1 has filled them and "empty" no longer identifies them.
+
+        Raw body position is weaker than the content alignment
+        `build_span_style_requests` uses for paragraphs, and the gap is real: if a
+        concurrent edit adds a table between pass 1 and pass 2 the counts shift and a
+        stale table can be styled. `_cell_placement`'s text search catches that only
+        when the two tables' cell texts differ, and headers like "Status" or "Owner"
+        repeat constantly. Narrow, but the same window `_cell_placement` bails on.
+        """
+        index = 0
+        for element in _body_content(doc):
+            table = element.get("table")
+            if table is None:
+                continue
+            if index >= len(target_tables):
+                return
+            yield table, target_tables[index]
+            index += 1
+
+    @staticmethod
+    def _paired_cells(
+        table: dict, tnode: DocsTableNode
+    ) -> Iterator[Tuple[dict, TableCell]]:
+        """Live cell dicts paired with target cells, by row and column."""
+        for r, row in enumerate(table.get("tableRows", [])):
+            if r >= len(tnode.rows):
+                return
+            for c, cell in enumerate(row.get("tableCells", [])):
+                if c >= len(tnode.rows[r]):
+                    break
+                yield cell, tnode.rows[r][c]
+
+    @staticmethod
+    def _cell_placement(live: dict, cell: TableCell) -> Optional[Tuple[int, Optional[int]]]:
+        """Where `cell`'s text starts in the live document, and its hard upper bound.
+
+        Returns None when the text is not in the cell's first content paragraph, so
+        the caller emits nothing. Two reasons that happens and both are unsafe to
+        guess through: the cell holds different text (a concurrent edit between
+        pass 1 and pass 2), or its content is spread over more than one paragraph.
+
+        The offset is *searched for* rather than assumed to be the paragraph's
+        start, because `TableCell.text` is stripped on both sides while the live
+        paragraph keeps its whitespace — assuming the start would shift every range
+        in the cell by the width of the leading whitespace.
+        """
+        content = live.get("content", [])
+        if not content:
+            return None
+        paragraph = content[0].get("paragraph")
+        start_index = content[0].get("startIndex")
+        end_index = content[0].get("endIndex")
+        if paragraph is None or start_index is None or end_index is None:
+            return None
+        elements = paragraph.get("elements", [])
+        if any(pe.get("textRun") is None for pe in elements):
+            # An inlineObjectElement, footnoteReference, person chip, richLink,
+            # equation or page break carries index width but contributes nothing to
+            # the joined text, so `find`'s offset is no longer the document distance
+            # from `startIndex`. Measured on an image before "A1\n": the range came
+            # out [30,32) where the text sits at [31,33) — it styled the image plus
+            # the first character, and reported nothing.
+            #
+            # Deliberately unconditional on *position*, not just on a leading
+            # element. A trailing footnote leaves the offset correct and is declined
+            # anyway, because distinguishing the safe placements means computing the
+            # offset from each element's own `startIndex` — the proper fix, and index
+            # arithmetic that needs replay verification rather than reasoning.
+            #
+            # `_parse_cell` supports `person` chips, so an @-mention in an "Owner"
+            # column lands here. Its styling was already lost before this bail (the
+            # chip's display name is in `.text` but not in the joined runs, so `find`
+            # failed anyway); what the bail adds is that the caller now reports it.
+            return None
+        text = "".join(pe["textRun"].get("content", "") for pe in elements)
+        offset = text.find(cell.text)
+        if offset < 0:
+            return None
+        # end_index - 1 is the paragraph's newline; text lives strictly before it.
+        return start_index + _utf16_len(text[:offset]), end_index - 1
+
     def align(self, doc: dict, target: List[Node]) -> "Pass2Alignment":
         """Parse ``doc``, pair it with ``target``, and resolve anchors — once.
 
@@ -554,19 +772,41 @@ class DocsRequestBuilder:
         Reported rather than raised: aborting would discard every other
         paragraph's inline styling for one bad link, and the next push would
         abort identically.
+
+        **Table cells are walked too.** They hold spans now, so a dead anchor can
+        live in one — and it used to be reported by nothing at all: the guard below
+        tested only paragraphs, and `_align_for_styling` skips tables, so a cell
+        anchor never reached `pairs`. That left the exact condition this whole pass
+        exists to remove — a reference rendered as dead text in the document with a
+        green tick over it. Cells are read straight off the target rather than from
+        `pairs`, because a table aligns on its whole cell grid and so does not pair
+        at all once any cell changed; an anchor that names no heading is unresolved
+        whether or not its table could be located.
         """
-        if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
+        styled_paragraph = any(isinstance(n, DocsParagraphNode) and n.spans for n in target)
+        styled_cell = any(cell.styled for n in target if isinstance(n, DocsTableNode)
+                          for row in n.rows for cell in row)
+        if not styled_paragraph and not styled_cell:
             return []
         aligned = self._aligned(doc, target, alignment)
         pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         unresolved: List[str] = []
-        for _cnode, tnode in pairs:
-            for span in tnode.spans:
+
+        def collect(spans: List[TextSpan]) -> None:
+            for span in spans:
                 if not span.link or not is_anchor(span.link):
                     continue
                 if link_payload(span.link, slug_to_id, known_ids) is None:
                     if span.link not in unresolved:
                         unresolved.append(span.link)
+
+        for _cnode, tnode in pairs:
+            collect(tnode.spans)
+        for node in target:
+            if isinstance(node, DocsTableNode):
+                for row in node.rows:
+                    for cell in row:
+                        collect(cell.spans)
         return unresolved
 
     @staticmethod
@@ -861,6 +1101,16 @@ class DocsRequestBuilder:
         """
         requests = self.build_table_fill_requests(doc, target)
         requests += self.build_span_style_requests(doc, target, alignment)
+        # Cell styling reads indices from `doc`, i.e. from *before* the fills above
+        # are applied. A table that already holds its text — every table on a
+        # second or later push — is placed correctly. A table this push is
+        # *creating* is still empty here, so `_cell_placement` cannot find the
+        # cell's text and emits nothing; `unplaced_table_cells` reports those, so
+        # the gap is loud rather than a silent half-application. Styling a
+        # brand-new table's cells needs the post-fill index, which is predictable
+        # but is index arithmetic that has to be verified by replay, not reasoned
+        # about — left for its own change.
+        requests += self.build_table_cell_span_requests(doc, target, alignment)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
         return requests
@@ -895,7 +1145,7 @@ class DocsRequestBuilder:
                     continue
                 text = ""
                 if r < len(node.rows) and c < len(node.rows[r]):
-                    text = node.rows[r][c]
+                    text = node.rows[r][c].text
                 if text:
                     pairs.append((idx, text))
         return pairs
@@ -1117,11 +1367,34 @@ class DocsRequestBuilder:
         first — this and unresolved_anchor_links() are the only checks on the
         write path.
         """
-        requests: List[dict] = []
-        offset = placement.start_index
         # The paragraph's last index is its newline; text lives strictly before it.
-        limit = placement.end_index - 1 if placement.end_index else None
-        for span in node.spans:
+        return self._span_requests_in(
+            node.spans,
+            placement.start_index,
+            placement.end_index - 1 if placement.end_index else None,
+            slug_to_id,
+            known_ids,
+        )
+
+    def _span_requests_in(
+        self,
+        spans: List[TextSpan],
+        start: int,
+        limit: Optional[int],
+        slug_to_id: Optional[dict] = None,
+        known_ids: Optional[set] = None,
+    ) -> List[dict]:
+        """Place `spans` starting at `start`, never writing at or past `limit`.
+
+        Extracted so a table cell can reuse it. The two callers differ only in how
+        they locate the run of text — a paragraph's own index range, or a cell's
+        first content paragraph — and everything that matters is here: the bound is
+        enforced rather than trusted, and an anchor that resolves to nothing yields
+        no link rather than a `url` holding a `#fragment` a reader cannot follow.
+        """
+        requests: List[dict] = []
+        offset = start
+        for span in spans:
             span_len = _utf16_len(span.text)
             if span_len == 0:
                 continue

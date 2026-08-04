@@ -148,9 +148,9 @@ def test_markdown_table_parses_to_table_node() -> None:
     tables = [n for n in nodes if isinstance(n, DocsTableNode)]
     assert len(tables) == 1
     t = tables[0]
-    assert t.rows[0] == ["A", "B"]
-    assert t.rows[1] == ["1", "2"]
-    assert t.rows[2] == ["3", "4"]
+    assert [c.text for c in t.rows[0]] == ["A", "B"]
+    assert [c.text for c in t.rows[1]] == ["1", "2"]
+    assert [c.text for c in t.rows[2]] == ["3", "4"]
     assert t.num_rows == 3 and t.num_cols == 2
 
 
@@ -179,7 +179,9 @@ def test_live_table_parses_to_table_node() -> None:
     nodes = structure.parse(_populated_table_doc())
     tables = [n for n in nodes if isinstance(n, DocsTableNode)]
     assert len(tables) == 1
-    assert tables[0].rows == [["A", "B"], ["1", "2"], ["3", "4"]]
+    assert [[c.text for c in row] for row in tables[0].rows] == [
+        ["A", "B"], ["1", "2"], ["3", "4"],
+    ]
 
 
 def test_table_insert_emits_insert_table() -> None:
