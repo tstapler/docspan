@@ -764,20 +764,6 @@ class TestPercentEncodedAnchors:
         assert {"headingId": "h.cafe"} in links, links
         assert builder.unresolved_anchor_links(doc, target) == []
 
-    def test_the_two_normalization_forms_of_one_heading_agree(self) -> None:
-        """NFD heading text, NFC href — the case macOS produces."""
-        nfd = unicodedata.normalize("NFD", "Café notes")
-        assert nfd != "Café notes"
-        doc = _doc(
-            _paragraph(nfd, 1, "HEADING_2", "h.cafe"),
-            _paragraph("see x", 2 + len(nfd), runs=[
-                {"textRun": {"content": "see x\n", "textStyle": {}}}
-            ]),
-        )
-        target = markdown.parse(f"## {nfd}\n\nsee [x](#café-notes)\n")
-
-        assert builder.unresolved_anchor_links(doc, target) == []
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The tabs-aware Link union
@@ -867,26 +853,17 @@ class TestNormalizationAmbiguity:
         assert links == [{"headingId": "h.first"}, {"headingId": "h.second"}], links
         assert builder.unresolved_anchor_links(doc, target) == []
 
-    def test_an_ambiguous_fold_is_refused_rather_than_won(self) -> None:
-        """When the href matches neither form exactly, no winner is picked.
+    def test_a_cross_form_anchor_is_reported_not_guessed(self) -> None:
+        """An NFD heading and an NFC href no longer match — deliberately.
 
-        Both headings fold to one NFC key, so the folded layer cannot choose. It
-        must report rather than hand the anchor to whichever came last —
-        last-writer-wins overwrote a link that was already correct and returned
-        `ok`.
+        Two earlier versions folded to NFC so this would resolve, and each one
+        introduced a silent wrong link when two headings differed only by normal
+        form. Folding could only ever help a *hand-written* cross-form anchor: one
+        a pull wrote comes from the same source as the slug and matches byte for
+        byte. Paying for that with silent arbitration between headings that look
+        identical on screen is the wrong trade, so this is reported instead — and
+        the available-anchors list shows the spelling that works.
         """
-        nfd = unicodedata.normalize("NFD", "Café notes")
-        nfc = unicodedata.normalize("NFC", "Café notes")
-        # A third spelling: percent-encoded, so it decodes to NFC and matches the
-        # NFC heading exactly — layer 1 resolves it. Fold ambiguity is therefore
-        # tested at the unit that owns it.
-        from docspan.backends.google_docs.heading_anchors import _match_keyed
-
-        folded = _match_keyed({slugify(nfd): "h.first", slugify(nfc): "h.second"})
-        assert folded == {}, folded
-
-    def test_a_lone_nfd_heading_still_resolves_an_nfc_anchor(self) -> None:
-        """The case the normalization exists for must keep working."""
         nfd = unicodedata.normalize("NFD", "Café notes")
         doc = _doc(
             _paragraph(nfd, 1, "HEADING_2", "h.cafe"),
@@ -895,6 +872,21 @@ class TestNormalizationAmbiguity:
             ]),
         )
         target = markdown.parse(f"## {nfd}\n\nsee [x](#café-notes)\n")
+
+        assert builder.unresolved_anchor_links(doc, target) == ["#caf%C3%A9-notes"]
+        # And the remedy is offered in the form that actually resolves.
+        assert slugify(nfd) in available_anchor_slugs(target, structure.parse(doc))
+
+    def test_an_anchor_spelled_exactly_resolves(self) -> None:
+        """The case that must keep working: the slug as the heading produces it."""
+        nfd = unicodedata.normalize("NFD", "Café notes")
+        doc = _doc(
+            _paragraph(nfd, 1, "HEADING_2", "h.cafe"),
+            _paragraph("see x", 2 + len(nfd), runs=[
+                {"textRun": {"content": "see x\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse(f"## {nfd}\n\nsee [x](#{slugify(nfd)})\n")
 
         links = [
             request["updateTextStyle"]["textStyle"]["link"]

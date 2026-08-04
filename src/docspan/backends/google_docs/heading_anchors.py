@@ -302,42 +302,6 @@ def heading_slugs(nodes: Iterable[object]) -> List[str]:
 _UNWRITTEN_HEADING = "\0not-yet-written"
 
 
-def _match_keyed(slug_to_id: Dict[str, str]) -> Dict[str, str]:
-    """``slug_to_id`` re-keyed for comparison against an ``anchor_target``.
-
-    Only the *keys* are normalized. The values, and the slugs
-    ``heading_id_to_slug`` writes into pulled markdown, stay exactly as
-    ``slugify`` produced them, so github-slugger parity is unaffected.
-
-    **A key two different slugs both normalize to is dropped, not won.** Because
-    `slugify` keeps combining marks, two headings whose text differs only by
-    normal form — `Café notes` and `Caf\xe9 notes`, which is Korean typed
-    through a jamo IME versus composed, or Vietnamese, or anything macOS handed
-    over as NFD — produce two *distinct* slugs. `slugify_all` therefore sees no
-    duplicate and adds no `-1`, and a last-writer-wins mapping would point both
-    anchors at whichever heading came second, overwriting a correct link and
-    reporting `ok`.
-
-    That would be strictly worse than not normalizing at all: before this
-    module normalized anything, both anchors resolved to nothing and both were
-    **reported**. Turning a loud failure into a silent wrong link is a
-    regression even when it fixes the common case. So an ambiguous key resolves
-    to nothing and the anchor is reported, exactly as it was; the unambiguous
-    case — one heading, NFD in the document, NFC in the href — still resolves,
-    which is the whole point of normalizing.
-    """
-    keyed: Dict[str, str] = {}
-    ambiguous: set = set()
-    for slug, heading_id in slug_to_id.items():
-        key = unicodedata.normalize("NFC", slug)
-        if key in keyed and keyed[key] != heading_id:
-            ambiguous.add(key)
-        keyed[key] = heading_id
-    for key in ambiguous:
-        del keyed[key]
-    return keyed
-
-
 def is_anchor(href: Optional[str]) -> bool:
     """True for an internal anchor. No URL, absolute or relative, starts with `#`.
 
@@ -364,16 +328,12 @@ def anchor_target(href: str) -> str:
       The slug side is built from the heading's own text and is never encoded,
       so without decoding here the two can never meet and every accented anchor
       silently resolves to nothing. GitHub decodes for the same reason.
-    * **NFC-normalize.** The decoded href and the heading text can carry the
-      same characters in different normalization forms — macOS hands text over
-      in NFD, most editors write NFC — and `slugify` deliberately keeps
-      combining marks, so `café` in NFD and in NFC produce slugs that look
-      identical and compare unequal. Normalizing here rather than inside
-      `slugify` keeps the emitted slug byte-comparable with github-slugger,
-      which does not normalize; this is a divergence in the comparison key
-      only, never in the slug a pull writes into the markdown.
+    Deliberately *only* the decode. An earlier version also NFC-normalized, so an
+    NFD heading would match an NFC href — see `resolve_anchor` for why that was
+    removed: it could only help a hand-written cross-form anchor, and it bought
+    that by silently arbitrating between headings that look identical on screen.
     """
-    return unicodedata.normalize("NFC", unquote(href[1:]))
+    return unquote(href[1:])
 
 
 def resolve_anchor(
@@ -383,39 +343,32 @@ def resolve_anchor(
 ) -> Optional[str]:
     """Resolve an anchor to a headingId, or None when it names no heading.
 
-    Heading id first, then slug. The id branch is what closes the round trip:
-    a pull that could not name a slug for some heading emits the bare id, and
-    this resolves it back without either side inventing a syntax for "this is
-    an id, not a slug".
+    Percent-decoded (a CommonMark parser encodes the destination, so decoding
+    restores what the author typed), then matched **exactly** — heading id first,
+    then slug. The id branch closes the round trip: a pull that could not name a
+    slug emits the bare id and this takes it back, with no invented escape syntax.
 
-    Three layers, in this order, and the order is the point:
+    **No Unicode normalization.** Two earlier versions folded to NFC so an NFD
+    heading would match an NFC href, and each introduced a silent wrong link:
+    first by letting the fold pick a winner between two headings that differ only
+    by normal form, then — after that was refused — by letting an exact match
+    arbitrate the same collision one layer earlier. The second was the first bug
+    wearing a different hat, and the test written for it could not see it.
 
-    1. the **exact** decoded target, against ids then slugs. An author who wrote
-       the anchor in the same normal form as the heading gets that heading, full
-       stop. Skipping this layer and normalizing first threw the author's normal
-       form away: with one heading in NFC and one in NFD, each anchor named its
-       own heading unambiguously, and normalizing made them indistinguishable —
-       so an earlier version reported *both* dead, having given up two links it
-       did not need to give up.
-    2. the NFC-folded target against ids.
-    3. the NFC-folded target against an NFC-folded slug map, which is what lets
-       an NFD heading match an NFC href — the common case, since macOS hands text
-       over in NFD and editors write NFC. `_match_keyed` refuses a key two
-       distinct slugs both fold onto, so this layer can never pick a winner
-       between them; layer 1 has already resolved the case where it shouldn't
-       have to.
+    Folding is not worth that. It only ever helped a *hand-written* anchor in a
+    different normal form from its heading, because an anchor a pull wrote comes
+    from the same source as the slug and already matches byte for byte. The cost
+    was arbitrating, silently, between headings that look identical on screen.
+    Unmatched now means *reported*, with the available-anchors list showing the
+    spelling that works — which the author can copy. Loud over silent is the
+    principle the rest of this module is built on; this is that principle applied
+    to the module itself.
     """
-    exact = unquote(href[1:])
+    target = unquote(href[1:])
     ids = known_ids if isinstance(known_ids, (set, frozenset, dict)) else set(known_ids or ())
-    if exact in ids:
-        return exact
-    direct = slug_to_id.get(exact)
-    if direct is not None:
-        return direct
-    target = unicodedata.normalize("NFC", exact)
     if target in ids:
         return target
-    return _match_keyed(slug_to_id).get(target)
+    return slug_to_id.get(target)
 
 
 def link_payload(
@@ -517,11 +470,9 @@ def unresolved_anchors(
     # The markdown's own headings have no ids yet, so they are mapped to a
     # sentinel: only whether the anchor resolves matters here, never to what.
     #
-    # The sentinel is deliberately non-empty. `link_payload` treats a falsy id as
-    # "did not resolve", so an empty string would make this map silently produce
-    # no link if it ever reached that function — it does not today (both call
-    # sites use the real map from `align()`), but the failure would be a dropped
-    # link with no warning, which is the exact class this module exists to remove.
+    # Non-empty deliberately: `link_payload` treats a falsy id as "did not
+    # resolve", so an empty string would make this map silently produce no link if
+    # it ever reached that function.
     resolvable = {slug: _UNWRITTEN_HEADING for slug in heading_slugs(target_nodes)}
     resolvable.update(document_slugs)
     reachable_ids = known_ids | set(foreign_ids or ())
