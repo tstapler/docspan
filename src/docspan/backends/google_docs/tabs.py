@@ -51,18 +51,36 @@ def heading_ids_by_tab(doc: dict) -> Dict[str, str]:
     the moment a text edit makes pass 1 rewrite that paragraph.
 
     Needs the **unresolved** document, so callers must capture it before
-    narrowing. Returns {} for a single-tab document, where the question cannot
-    arise.
+    narrowing. Returns {} for a document with no `tabs` key at all (the legacy
+    shape) — note a *single-tab* document fetched with `includeTabsContent=True`
+    still has one entry per heading, which is harmless because `align()` then
+    filters out every id the current tab owns.
+
+    **An id that appears in more than one tab is dropped, not won.** Taking the
+    last writer made the tab a reader lands in depend on tab order, silently and
+    with a green `ok` — the same trade `heading_anchors._match_keyed` refuses in
+    the other direction. Whether Docs can actually mint a duplicate `headingId`
+    across tabs (Duplicate tab?) is unverified; the discipline is cheap either way.
+
+    Headings inside tables, and a tab with no `tabProperties`, are skipped. Both
+    degrade to the pre-existing dead-anchor report rather than a wrong link, and
+    the table case matches `known_ids`, whose parser skips tables too.
     """
     ids: Dict[str, str] = {}
+    ambiguous: set = set()
     for tab in flatten_tabs(doc.get("tabs") or []):
         tab_id = tab.get("tabProperties", {}).get("tabId", "")
         content = tab.get("documentTab", {}).get("body", {}).get("content", [])
         for element in content:
             style = (element.get("paragraph") or {}).get("paragraphStyle", {})
             heading_id = style.get("headingId")
-            if heading_id and tab_id:
-                ids[heading_id] = tab_id
+            if not (heading_id and tab_id):
+                continue
+            if heading_id in ids and ids[heading_id] != tab_id:
+                ambiguous.add(heading_id)
+            ids[heading_id] = tab_id
+    for heading_id in ambiguous:
+        del ids[heading_id]
     return ids
 
 

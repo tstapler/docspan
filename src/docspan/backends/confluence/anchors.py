@@ -24,15 +24,34 @@ from __future__ import annotations
 import re
 from typing import List
 
-# Inline markdown link whose destination is a fragment. Anchored on "](#" so a
-# bare "#foo" in prose or inside a code fence is not matched.
-_ANCHOR_LINK = re.compile(r"\]\(#(?P<target>[^)\s]+)\)")
+# Deliberately the *same shape* as InlineParser.PATTERNS["link"] — the pattern
+# that decides what actually becomes a link — narrowed to a `#` destination:
+#
+#     r'\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]+)")?\)'
+#
+# An earlier version omitted the optional title, so `[A1](#a1 "Some Title")`
+# reached Confluence as a dead `#fragment` href and was **not** reported: a false
+# negative in the one job this module has. The two patterns must not drift.
+_ANCHOR_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(#(?P<target>[^)\s]+)(?:\s+\"[^\"]+\")?\)")
+
+# Fenced blocks and inline code, which the block parser never runs the inline
+# parser over — so a link inside one is documentation, not a link.
+_FENCED = re.compile(r"^[ \t]*(?P<fence>```+|~~~+).*?^[ \t]*(?P=fence)[ \t]*$", re.S | re.M)
+_INLINE_CODE = re.compile(r"`[^`\n]+`")
 
 
 def internal_anchors_in_markdown(content: str) -> List[str]:
-    """Every distinct `#fragment` link destination in ``content``, in use order."""
+    """Every distinct `#fragment` link destination in ``content``, in use order.
+
+    Code is removed first. The regex is not block-aware, and a page documenting
+    anchor syntax inside a ```` ```markdown ```` fence had its own example
+    reported — a warning, and a non-zero exit, on a page containing no link at
+    all. `![alt](#f)` is excluded too: it becomes a `media` node, so "a reader
+    clicking one lands nowhere" would be the wrong thing to say about it.
+    """
+    prose = _INLINE_CODE.sub(" ", _FENCED.sub("\n", content))
     seen: List[str] = []
-    for match in _ANCHOR_LINK.finditer(content):
+    for match in _ANCHOR_LINK.finditer(prose):
         anchor = "#" + match.group("target")
         if anchor not in seen:
             seen.append(anchor)

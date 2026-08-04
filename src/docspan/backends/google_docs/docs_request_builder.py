@@ -483,6 +483,14 @@ class DocsRequestBuilder:
     def _aligned(
         self, doc: dict, target: List[Node], alignment: Optional["Pass2Alignment"]
     ) -> "Pass2Alignment":
+        """The caller's alignment, or one computed here.
+
+        The fallback cannot know about other tabs — it has only the tab-scoped
+        document — so cross-tab anchors do not resolve through it. `push()` always
+        passes an `alignment`; this path exists for callers that have a document
+        and a target and nothing else, which is every test. A caller that needs
+        cross-tab resolution must call `align()` with the unresolved document.
+        """
         return alignment if alignment is not None else self.align(doc, target)
 
     def build_span_style_requests(

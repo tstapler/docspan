@@ -50,3 +50,45 @@ class TestRendering:
     def test_more_than_five_are_truncated(self) -> None:
         message = render_dead_anchors([f"#a{n}" for n in range(8)])
         assert "… and 3 more" in message
+
+
+class TestCodeIsNotProse:
+    """A link inside code is documentation, not a link.
+
+    The regex is not block-aware, so a page documenting anchor syntax inside a
+    ```` ```markdown ```` fence had its own example reported — a warning, and a
+    non-zero exit, for a page containing no link at all.
+    """
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "```markdown\nsee [A1](#a1-current-state)\n```\n",
+            "~~~\n[A1](#x)\n~~~\n",
+            "write `[A1](#a1)` like so\n",
+            "````\n[a](#deep-fence)\n````\n",
+        ],
+    )
+    def test_a_link_in_code_is_not_reported(self, content: str) -> None:
+        assert internal_anchors_in_markdown(content) == []
+
+    def test_a_real_link_after_a_fence_is_still_found(self) -> None:
+        content = "```\n[a](#in-fence)\n```\n\nsee [b](#real)\n"
+        assert internal_anchors_in_markdown(content) == ["#real"]
+
+
+class TestMatchingTheParsersOwnPattern:
+    def test_a_link_with_a_title_is_reported(self) -> None:
+        """`InlineParser.PATTERNS["link"]` accepts a title; this must too.
+
+        Omitting it made a genuinely dead `#fragment` href reach Confluence
+        unreported — a false negative in the one job this module has.
+        """
+        assert internal_anchors_in_markdown('[A1](#a1-titled "Some Title")\n') == [
+            "#a1-titled"
+        ]
+
+    def test_an_image_is_not_reported_as_a_link(self) -> None:
+        """`![alt](#f)` becomes a media node, so "a reader clicking one lands
+        nowhere" would be the wrong thing to say about it."""
+        assert internal_anchors_in_markdown("![alt](#f)\n") == []
