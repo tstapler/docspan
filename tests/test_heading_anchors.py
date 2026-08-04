@@ -849,8 +849,14 @@ class TestNormalizationAmbiguity:
                 {"textRun": {"content": "see one and two\n", "textStyle": {}}}
             ]),
         )
+        # Each anchor spelled in the form of the heading it means. This is the
+        # case that must resolve, and the one normalizing-first destroyed: it
+        # folded both hrefs together, made them indistinguishable, and reported
+        # *both* dead — giving up two links that were unambiguous as written.
+        nfd_slug = nfd.lower().replace(" ", "-")
+        nfc_slug = nfc.lower().replace(" ", "-")
         target = markdown.parse(
-            f"## {nfd}\n\n## {nfc}\n\nsee [one](#café-notes) and [two](#café-notes)\n"
+            f"## {nfd}\n\n## {nfc}\n\nsee [one](#{nfd_slug}) and [two](#{nfc_slug})\n"
         )
 
         links = [
@@ -858,12 +864,26 @@ class TestNormalizationAmbiguity:
             for request in builder.build_span_style_requests(doc, target)
             if "link" in request["updateTextStyle"].get("textStyle", {})
         ]
-        # No link at all is the point: the collision used to write two, both
-        # aimed at the second heading, over one that was already correct.
-        assert links == [], links
-        # One entry, not two — both anchors spell the same href, and the report
-        # dedupes by href. What matters is that it is reported at all.
-        assert builder.unresolved_anchor_links(doc, target) == ["#caf%C3%A9-notes"]
+        assert links == [{"headingId": "h.first"}, {"headingId": "h.second"}], links
+        assert builder.unresolved_anchor_links(doc, target) == []
+
+    def test_an_ambiguous_fold_is_refused_rather_than_won(self) -> None:
+        """When the href matches neither form exactly, no winner is picked.
+
+        Both headings fold to one NFC key, so the folded layer cannot choose. It
+        must report rather than hand the anchor to whichever came last —
+        last-writer-wins overwrote a link that was already correct and returned
+        `ok`.
+        """
+        nfd = unicodedata.normalize("NFD", "Café notes")
+        nfc = unicodedata.normalize("NFC", "Café notes")
+        # A third spelling: percent-encoded, so it decodes to NFC and matches the
+        # NFC heading exactly — layer 1 resolves it. Fold ambiguity is therefore
+        # tested at the unit that owns it.
+        from docspan.backends.google_docs.heading_anchors import _match_keyed
+
+        folded = _match_keyed({slugify(nfd): "h.first", slugify(nfc): "h.second"})
+        assert folded == {}, folded
 
     def test_a_lone_nfd_heading_still_resolves_an_nfc_anchor(self) -> None:
         """The case the normalization exists for must keep working."""
@@ -994,12 +1014,23 @@ class TestWarningsAreCollectedNotRaced:
         target = markdown.parse("see [x](#typoo)\n")
         assert available_anchor_slugs(target, document) == ["doc-only"]
 
-        # A markdown heading the document reports without an id: not offerable.
+        # A markdown heading the document reports without an id cannot resolve,
+        # so it must NOT be offered. Offering it is the self-contradiction this
+        # function exists to remove: the same slug named as dead and as the fix.
         document2 = structure.parse(
             _doc(_paragraph("Current state", 1, "HEADING_2", heading_id=None))
         )
         target2 = markdown.parse("## Current state\n\nsee [x](#current-state)\n")
-        assert "current-state" in available_anchor_slugs(target2, document2)
+        assert available_anchor_slugs(target2, document2) == []
+
+    def test_a_bare_hash_is_never_offered(self) -> None:
+        """An empty heading slugs to "", which would render as a bare `#`.
+
+        `is_anchor` rejects it, so offering it would be advice that cannot work.
+        """
+        document = structure.parse(_doc(_paragraph("", 1, "HEADING_2", "h.empty")))
+        target = markdown.parse("see [x](#typo)\n")
+        assert "" not in available_anchor_slugs(target, document)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
