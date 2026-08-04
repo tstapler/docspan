@@ -1,6 +1,7 @@
 """Parse a Google Docs JSON document into a list of DocsParagraphNode objects."""
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Union
 
@@ -19,6 +20,18 @@ from docspan.backends.google_docs.heading_anchors import (
 # "Invalid deletion range. Cannot delete the requested range." — see
 # DocsRequestBuilder._make_delete_requests.
 UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
+
+# Private-Use-Area glyphs Docs writes at the start of a paragraph it renders itself
+# (a native code block uses U+E907). Enumerated by Unicode category rather than by
+# code point, since which glyph Docs picks is its own business — see _parse_paragraph.
+_RENDER_GLYPHS = "".join(
+    chr(cp) for cp in range(0xE000, 0xF900) if unicodedata.category(chr(cp)) == "Co"
+)
+
+
+def _utf16_len(text: str) -> int:
+    """UTF-16 code units in `text` — the unit Docs indices are measured in."""
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _person_display_text(person: dict) -> str:
@@ -277,6 +290,28 @@ class DocsStructureParser:
         raw_text = "".join(text_parts)
         # Strip trailing newline (each paragraph ends with \n in the Docs model)
         text = raw_text.rstrip("\n")
+
+        # Drop the Private-Use-Area glyph Docs puts at the front of a paragraph it
+        # renders itself — a native code block writes U+E907 there. It is a
+        # *rendering artifact*, not content: markdown has no syntax for one, so the
+        # two codecs `project()` exists to reconcile were drawing from different
+        # alphabets and the diff read the glyph as a difference the author asked for.
+        #
+        # That was not merely noisy. Docs **refuses** any deleteContentRange
+        # covering such a paragraph, and `batchUpdate` is atomic, so one refused
+        # delete failed the entire push — a document with a native code block could
+        # not be pushed at all, however unrelated the edit (issue #47).
+        #
+        # `start_index` advances with the strip. The API counted the glyph, so
+        # removing it from the text without moving the index would place every span
+        # in the paragraph one unit early — a link or a bold run landing off by one.
+        # U+E907 is BMP, one UTF-16 unit, but count properly rather than assume.
+        stripped = text.lstrip(_RENDER_GLYPHS)
+        if stripped != text:
+            start_index += _utf16_len(text[: len(text) - len(stripped)])
+            text = stripped
+            spans = self._strip_leading_glyphs(spans)
+
         spans = self._trim_spans_to_text(spans, len(text))
 
         # Check for bullet / list item
@@ -296,6 +331,26 @@ class DocsStructureParser:
             is_native_checkbox=is_native_checkbox,
             heading_id=paragraph_style.get("headingId"),
         )
+
+    @staticmethod
+    def _strip_leading_glyphs(spans: List[TextSpan]) -> List[TextSpan]:
+        """Remove leading render glyphs from the spans, keeping them equal to `.text`.
+
+        The spans must concatenate to exactly `.text` — pass 2 walks one against the
+        other to place styling, so a character in one and not the other shifts every
+        span after it. Marks on the remainder are preserved.
+        """
+        out = list(spans)
+        while out:
+            head = out[0]
+            trimmed = head.text.lstrip(_RENDER_GLYPHS)
+            if trimmed == head.text:
+                break
+            if trimmed:
+                out[0] = replace(head, text=trimmed)
+                break
+            out.pop(0)
+        return out
 
     @staticmethod
     def _trim_spans_to_text(spans: List[TextSpan], keep: int) -> List[TextSpan]:
