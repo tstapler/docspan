@@ -44,6 +44,7 @@ from docspan.backends.google_docs.heading_anchors import (
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+from docspan.backends.google_docs.tabs import heading_ids_by_tab
 
 structure = DocsStructureParser()
 builder = DocsRequestBuilder()
@@ -1103,3 +1104,90 @@ class TestUnreadableLinksAreReported:
         second = DocsStructureParser()
         second.parse(_doc(_paragraph("clean", 1)))
         assert second.unreadable_links == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-tab anchors
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCrossTabAnchors:
+    def _local(self, tmp_path, text: str) -> str:
+        path = tmp_path / "doc.md"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def _doc_with_heading_in_another_tab() -> dict:
+        tab0 = {
+            "tabProperties": {"tabId": "t.0", "title": "One"},
+            "documentTab": {"body": {"content": [
+                _paragraph("Here", 1, "HEADING_2", "h.here"),
+                _paragraph("see other", 7, runs=[
+                    {"textRun": {"content": "see other\n", "textStyle": {}}}
+                ]),
+            ]}},
+        }
+        tab1 = {
+            "tabProperties": {"tabId": "t.1", "title": "Two"},
+            "documentTab": {"body": {"content": [
+                _paragraph("Elsewhere", 1, "HEADING_2", "h.elsewhere"),
+            ]}},
+        }
+        return {"revisionId": "rev-1", "tabs": [tab0, tab1]}
+
+    def test_heading_ids_by_tab_spans_every_tab(self) -> None:
+        assert heading_ids_by_tab(self._doc_with_heading_in_another_tab()) == {
+            "h.here": "t.0",
+            "h.elsewhere": "t.1",
+        }
+        # A single-tab document cannot pose the question.
+        assert heading_ids_by_tab(_doc(_paragraph("X", 1, "HEADING_2", "h.x"))) == {}
+
+    def test_an_anchor_into_another_tab_resolves_instead_of_warning_forever(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """`known_ids` used to be tab-scoped, so this warned on every push.
+
+        The file is exactly what `pull` wrote (a cross-tab heading has no slug on
+        this side, so the bare id is all there is) and the Doc's link is fine —
+        yet every push reported a dead anchor, forever, and the link was lost the
+        moment a text edit made pass 1 rewrite the paragraph.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = self._doc_with_heading_in_another_tab()
+        local = self._local(tmp_path, "## Here\n\nsee [other](#h.elsewhere)\n")
+
+        result = backend.push(local, "doc-1", tab_id="t.0")
+
+        assert result.status == "ok", result.message
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for call in fake_client.batch_update.call_args_list
+            for request in call.args[1]
+            if "updateTextStyle" in request
+            and "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        # The tabs-aware member, not the flat one: Google resolves a bare
+        # `headingId` against "the tab specified in the request, defaulting to
+        # the first tab", so the flat form would point at the wrong tab.
+        assert links == [{"heading": {"id": "h.elsewhere", "tabId": "t.1"}}], links
+
+    def test_a_same_tab_heading_is_not_treated_as_foreign(self) -> None:
+        """`align()` filters the map, so a same-tab id keeps the flat form.
+
+        Asserting the filtering rather than calling `link_payload` with a
+        same-tab id in `foreign_ids` — that input cannot occur, so a test built
+        on it would pin a contract nothing upholds. The flat form is what the
+        document already carries; rewriting it as the object form would be a
+        diff for its own sake.
+        """
+        doc = self._doc_with_heading_in_another_tab()["tabs"][0]["documentTab"]
+        doc["revisionId"] = "rev-1"
+        target = markdown.parse("## Here\n\nsee [here](#here)\n")
+
+        alignment = builder.align(doc, target, {"h.here": "t.0", "h.elsewhere": "t.1"})
+
+        assert alignment.foreign_ids == {"h.elsewhere": "t.1"}
+        assert link_payload(
+            "#here", alignment.slug_to_id, alignment.known_ids, alignment.foreign_ids
+        ) == {"headingId": "h.here"}

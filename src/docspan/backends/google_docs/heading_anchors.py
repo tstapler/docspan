@@ -378,19 +378,39 @@ def link_payload(
     href: str,
     slug_to_id: Optional[Dict[str, str]] = None,
     known_ids: Optional[Iterable[str]] = None,
+    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     """The Docs `Link` union member for a markdown href.
 
-    Returns ``{"url": ...}`` for a URL, ``{"headingId": ...}`` for a resolvable
-    anchor, and None for an anchor that resolves to nothing — never a `url`
-    link holding a `#fragment`, which is the dead link this module exists to
-    stop writing. A None return is a caller's cue to write no link at all and
-    to report the anchor — never to fall back to a `url`.
+    Returns ``{"url": ...}`` for a URL, a heading member for a resolvable anchor,
+    and None for an anchor that resolves to nothing — never a `url` link holding
+    a `#fragment`, which is the dead link this module exists to stop writing. A
+    None return is a caller's cue to write no link at all and to report the
+    anchor, never to fall back to a `url`.
+
+    ``foreign_ids`` maps a heading id to the tab that owns it, for ids that live
+    in a *different* tab of the same document (`tabs.heading_ids_by_tab`). Those
+    must be written as the modern ``{"heading": {"id", "tabId"}}`` member, not the
+    flat ``headingId``: Google documents the flat form as resolving against "the
+    tab ID specified in the request, defaulting to the first tab", so using it
+    for a cross-tab target silently points at the wrong tab's heading — or at
+    nothing. Same-tab links keep the flat form, which is what the document
+    already contains and what avoids a needless diff.
     """
     if not is_anchor(href):
         return {"url": href}
     heading_id = resolve_anchor(href, slug_to_id or {}, known_ids)
-    return {"headingId": heading_id} if heading_id else None
+    if not heading_id:
+        # Not in this tab. It may still be a heading in a sibling tab, in which
+        # case the id is enough — a cross-tab anchor has no slug on this side.
+        tab_id = (foreign_ids or {}).get(anchor_target(href))
+        if tab_id:
+            return {"heading": {"id": anchor_target(href), "tabId": tab_id}}
+        return None
+    tab_id = (foreign_ids or {}).get(heading_id)
+    if tab_id:
+        return {"heading": {"id": heading_id, "tabId": tab_id}}
+    return {"headingId": heading_id}
 
 
 def anchors_in(nodes: Iterable[object]) -> List[str]:

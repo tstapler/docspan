@@ -170,6 +170,12 @@ class PushPlan:
     # cannot represent it (today: empty paragraphs). Never part of the diff —
     # carried so a push can report what it deliberately left alone.
     residue: List[Residue] = field(default_factory=list)
+    # `doc` is narrowed to one tab; this is the same fetch *before*
+    # tabs.resolve_document_tab. Kept because a cross-tab anchor can only be
+    # resolved against every tab's headings, and narrowing throws the others
+    # away. Empty for a single-tab document and for a plan built by hand, where
+    # the question cannot arise.
+    whole_doc: dict = field(default_factory=dict)
 
 
 @dataclass
