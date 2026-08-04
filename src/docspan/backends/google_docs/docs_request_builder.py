@@ -35,9 +35,6 @@ class Pass2Alignment:
     unaligned: List[DocsParagraphNode]
     slug_to_id: dict
     known_ids: set
-    # heading id -> owning tabId, for headings in *other* tabs of the same
-    # document. Empty for a single-tab doc. See tabs.heading_ids_by_tab.
-    foreign_ids: dict
 
 
 def _utf16_len(text: str) -> int:
@@ -442,12 +439,7 @@ class DocsRequestBuilder:
             if text
         ]
 
-    def align(
-        self,
-        doc: dict,
-        target: List[Node],
-        foreign_ids: Optional[dict] = None,
-    ) -> "Pass2Alignment":
+    def align(self, doc: dict, target: List[Node]) -> "Pass2Alignment":
         """Parse ``doc``, pair it with ``target``, and resolve anchors — once.
 
         The three pass-2 consumers below each need the same alignment, and each
@@ -465,33 +457,17 @@ class DocsRequestBuilder:
         """
         current, pairs, unaligned, heading_pairs = self._align_for_styling(doc, target)
         slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
-        # Only ids this tab does not already own are "foreign"; a same-tab id
-        # keeps the flat headingId form the document already carries.
-        same_tab = set(known_ids)
         return Pass2Alignment(
             current=current,
             pairs=pairs,
             unaligned=unaligned,
             slug_to_id=slug_to_id,
             known_ids=known_ids,
-            foreign_ids={
-                heading_id: tab_id
-                for heading_id, tab_id in (foreign_ids or {}).items()
-                if heading_id not in same_tab
-            },
         )
 
     def _aligned(
         self, doc: dict, target: List[Node], alignment: Optional["Pass2Alignment"]
     ) -> "Pass2Alignment":
-        """The caller's alignment, or one computed here.
-
-        The fallback cannot know about other tabs — it has only the tab-scoped
-        document — so cross-tab anchors do not resolve through it. `push()` always
-        passes an `alignment`; this path exists for callers that have a document
-        and a target and nothing else, which is every test. A caller that needs
-        cross-tab resolution must call `align()` with the unresolved document.
-        """
         return alignment if alignment is not None else self.align(doc, target)
 
     def build_span_style_requests(
@@ -514,11 +490,7 @@ class DocsRequestBuilder:
         pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         requests: List[dict] = []
         for cnode, tnode in pairs:
-            requests.extend(
-                self._span_style_requests(
-                    tnode, cnode, slug_to_id, known_ids, aligned.foreign_ids
-                )
-            )
+            requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
         return requests
 
     def unaligned_span_targets(
@@ -592,7 +564,7 @@ class DocsRequestBuilder:
             for span in tnode.spans:
                 if not span.link or not is_anchor(span.link):
                     continue
-                if link_payload(span.link, slug_to_id, known_ids, aligned.foreign_ids) is None:
+                if link_payload(span.link, slug_to_id, known_ids) is None:
                     if span.link not in unresolved:
                         unresolved.append(span.link)
         return unresolved
@@ -1107,7 +1079,6 @@ class DocsRequestBuilder:
         placement: DocsParagraphNode,
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
-        foreign_ids: Optional[dict] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -1147,7 +1118,7 @@ class DocsRequestBuilder:
             if span.italic:
                 attrs["italic"] = True
             if span.link:
-                payload = link_payload(span.link, slug_to_id, known_ids, foreign_ids)
+                payload = link_payload(span.link, slug_to_id, known_ids)
                 if payload is not None:
                     attrs["link"] = payload
                 # else: the anchor names no heading in the written document, so

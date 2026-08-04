@@ -15,11 +15,10 @@ to a plain string, so a heading inside a cell is not an anchor target and a
 heading link inside a cell is dropped on read — pre-existing for `url` links
 too, and out of scope here, but the invariant above is about paragraphs only.
 
-* write — markdown `#target` -> a heading member (`link_payload`): the flat
-  ``{"headingId": ...}`` for a heading in this tab, and the tabs-aware
-  ``{"heading": {"id", "tabId"}}`` for one in a sibling tab, which the flat form
-  cannot express (Google resolves it against "the tab specified in the request").
-* read  — either member -> markdown `#slug` (`heading_id_to_slug`)
+* write — markdown `#target` -> ``{"headingId": ...}`` (`link_payload`)
+* read  — either the flat `headingId` or the tabs-aware `heading: {id, tabId}`
+  -> markdown `#slug` (`heading_id_to_slug`). Which one a read returns depends on
+  the request flag, so both are accepted.
 
 `#target` is resolved in layers (`resolve_anchor`): the exact decoded target
 against ids then slugs, then an NFC fold of it against the same. Exact-first
@@ -33,13 +32,16 @@ A leading `#` is the only discriminator needed between an anchor and a URL — n
 absolute or relative URL begins with one — so `TextSpan.link` keeps carrying a
 single string rather than growing a parallel "is this an anchor" field.
 
-Out of scope, deliberately: bookmarks (both `bookmark` and the legacy
-`bookmarkId`), links to a whole tab (`tabId`), cross-*document* anchors, and
-resolving anchors on the Confluence backend — which reports them instead, since
-Confluence's anchor format could not be verified without a live instance
-(`backends/confluence/anchors.py`). A link this module cannot express is recorded
-by `DocsStructureParser.unreadable_links` so a pull reports it rather than
-deleting it from the author's file in silence.
+Out of scope, and each tracked as its own follow-up rather than half-done here:
+bookmarks (both `bookmark` and the legacy `bookmarkId`), links to a whole tab
+(`tabId`), an anchor into a *different tab* of the same document (the flat
+`headingId` resolves against the tab named in the request, so it cannot express
+one — such an anchor is reported unresolved), cross-*document* anchors, and the
+Confluence backend, which still writes a literal `#fragment` href.
+
+A link this module cannot express reads back as no link at all, so a pull drops it
+from the author's file. That is pre-existing for every member except the two
+handled here, and reporting it is a follow-up.
 """
 from __future__ import annotations
 
@@ -375,39 +377,23 @@ def link_payload(
     href: str,
     slug_to_id: Optional[Dict[str, str]] = None,
     known_ids: Optional[Iterable[str]] = None,
-    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     """The Docs `Link` union member for a markdown href.
 
-    Returns ``{"url": ...}`` for a URL, a heading member for a resolvable anchor,
-    and None for an anchor that resolves to nothing — never a `url` link holding
-    a `#fragment`, which is the dead link this module exists to stop writing. A
-    None return is a caller's cue to write no link at all and to report the
-    anchor, never to fall back to a `url`.
+    Returns ``{"url": ...}`` for a URL, ``{"headingId": ...}`` for a resolvable
+    anchor, and None for an anchor that resolves to nothing — never a `url` link
+    holding a `#fragment`, which is the dead link this module exists to stop
+    writing. A None return is a caller's cue to write no link at all and to report
+    the anchor, never to fall back to a `url`.
 
-    ``foreign_ids`` maps a heading id to the tab that owns it, for ids that live
-    in a *different* tab of the same document (`tabs.heading_ids_by_tab`). Those
-    must be written as the modern ``{"heading": {"id", "tabId"}}`` member, not the
-    flat ``headingId``: Google documents the flat form as resolving against "the
-    tab ID specified in the request, defaulting to the first tab", so using it
-    for a cross-tab target silently points at the wrong tab's heading — or at
-    nothing. Same-tab links keep the flat form, which is what the document
-    already contains and what avoids a needless diff.
+    Only the flat `headingId` member is written. It resolves against the tab named
+    in the request, so it cannot express a link into a *different* tab of the same
+    document; such an anchor is reported unresolved. See the cross-tab follow-up.
     """
     if not is_anchor(href):
         return {"url": href}
     heading_id = resolve_anchor(href, slug_to_id or {}, known_ids)
-    if not heading_id:
-        # Not in this tab. It may still be a heading in a sibling tab, in which
-        # case the id is enough — a cross-tab anchor has no slug on this side.
-        tab_id = (foreign_ids or {}).get(anchor_target(href))
-        if tab_id:
-            return {"heading": {"id": anchor_target(href), "tabId": tab_id}}
-        return None
-    tab_id = (foreign_ids or {}).get(heading_id)
-    if tab_id:
-        return {"heading": {"id": heading_id, "tabId": tab_id}}
-    return {"headingId": heading_id}
+    return {"headingId": heading_id} if heading_id else None
 
 
 def anchors_in(nodes: Iterable[object]) -> List[str]:
@@ -424,7 +410,6 @@ def anchors_in(nodes: Iterable[object]) -> List[str]:
 def unresolved_anchors(
     target_nodes: Sequence[object],
     document_nodes: Sequence[object] = (),
-    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Anchors in ``target_nodes`` that no heading can satisfy, in use order.
 
@@ -449,11 +434,6 @@ def unresolved_anchors(
 
     Do not restate this as "only" one cause. Each of the three was measured.
 
-    ``foreign_ids`` must be passed whatever `push()` passes to `align()`
-    (`tabs.heading_ids_by_tab` of the *unresolved* document). Without it this
-    function sees one tab, and a cross-tab anchor that `push()` resolves cleanly
-    was reported dead — an over-report, which is the one direction the paragraph
-    above says cannot happen.
     """
     document_slugs = dict(heading_slug_to_id(document_nodes))
     known_ids = {
@@ -475,9 +455,8 @@ def unresolved_anchors(
     # it ever reached that function.
     resolvable = {slug: _UNWRITTEN_HEADING for slug in heading_slugs(target_nodes)}
     resolvable.update(document_slugs)
-    reachable_ids = known_ids | set(foreign_ids or ())
     return [
         href
         for href in anchors_in(target_nodes)
-        if resolve_anchor(href, resolvable, reachable_ids) is None
+        if resolve_anchor(href, resolvable, known_ids) is None
     ]

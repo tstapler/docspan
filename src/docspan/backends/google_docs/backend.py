@@ -53,11 +53,7 @@ from docspan.backends.google_docs.push_preview import (
     render_available_anchors,
     render_high_risk,
 )
-from docspan.backends.google_docs.tabs import (
-    TabNotFoundError,
-    heading_ids_by_tab,
-    resolve_document_tab,
-)
+from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.core.paths import COMMENTS_SUFFIX
 
 if TYPE_CHECKING:
@@ -133,8 +129,8 @@ class GoogleDocsBackend(Backend):
         content = pathlib.Path(local_path).read_text()
 
         target_nodes = MarkdownToParagraphParser().parse(content)
-        whole_doc = self._client.get_document(doc_id)
-        doc, resolved_tab_id, tab_warning = resolve_document_tab(whole_doc, tab_id)
+        doc = self._client.get_document(doc_id)
+        doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
         current_nodes = DocsStructureParser().parse(doc)
 
         # Both sides of the diff pass through the same projection, so the diff
@@ -176,7 +172,6 @@ class GoogleDocsBackend(Backend):
             tab_warning=tab_warning,
             resolved_tab_id=resolved_tab_id,
             residue=current_residue,
-            whole_doc=whole_doc,
         )
 
     def preview_push(
@@ -212,12 +207,7 @@ class GoogleDocsBackend(Backend):
             # then wrote correctly, which is the one direction this advisory must
             # never fail in.
             document_nodes = DocsStructureParser().parse(plan.doc)
-            # Same foreign-tab map push() gives align(), or the dry-run reports a
-            # cross-tab anchor the push then resolves — an over-report, which is
-            # the direction unresolved_anchors' own contract forbids.
-            unresolved = unresolved_anchors(
-                plan.target_nodes, document_nodes, heading_ids_by_tab(plan.whole_doc)
-            )
+            unresolved = unresolved_anchors(plan.target_nodes, document_nodes)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
         except HttpError as exc:
             return PushPreview(
@@ -316,10 +306,9 @@ class GoogleDocsBackend(Backend):
                 # re-read. plan.doc is already narrowed to the resolved tab,
                 # which is why PushPlan carries resolved_tab_id.
                 if plan.requests:
-                    whole_doc = self._client.get_document(doc_id)
-                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
+                    pass2_doc = self._client.get_document(doc_id)
+                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(pass2_doc, tab_id)
                 else:
-                    whole_doc = plan.whole_doc
                     pass2_doc, pass2_tab_id = plan.doc, plan.resolved_tab_id
 
                 builder = DocsRequestBuilder()
@@ -331,14 +320,7 @@ class GoogleDocsBackend(Backend):
                 # batch_update below, where a concurrent edit costs a conflict on
                 # a document pass 1 has already changed. Measured at +43% on that
                 # window for a 5000-paragraph document.
-                # Heading ids from *every* tab, so an anchor into a sibling tab
-                # resolves instead of being reported dead on every push forever —
-                # on a file that is exactly what `pull` wrote, against a Doc whose
-                # link is fine. Needs the unresolved document, since
-                # resolve_document_tab narrows away the other tabs.
-                alignment = builder.align(
-                    pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
-                )
+                alignment = builder.align(pass2_doc, plan.target_nodes)
                 second = builder.build_second_pass_requests(
                     pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
                 )
@@ -478,25 +460,6 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_unreadable_links(kinds: list[str]) -> Optional[str]:
-        """Report link kinds a pull could not express in markdown.
-
-        These are dropped from the file, and until now dropped in silence — the
-        same failure heading anchors were fixed for, on sibling members of the
-        same `Link` union plus table cells. The Doc keeps them, so nothing is lost
-        yet; what the warning buys is that the author finds out *now* rather than
-        after a later push rewrites the paragraph and takes the link with it.
-        """
-        if not kinds:
-            return None
-        lines = [
-            f"⚠ {len(kinds)} kind(s) of link could not be represented in markdown and "
-            f"are absent from the pulled file (the Doc still has them):"
-        ]
-        lines += [f"    • {kind}" for kind in kinds]
-        return "\n".join(lines)
-
-    @staticmethod
     def _render_unstyled(unstyled: list[DocsParagraphNode]) -> str:
         """One-line-per-paragraph report of inline styling pass 2 declined to apply."""
         preview = [(node.text[:60] or "(empty)") for node in unstyled[:5]]
@@ -556,8 +519,7 @@ class GoogleDocsBackend(Backend):
             if tab_id is not None:
                 doc = self._client.get_document(doc_id)
                 doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
-                parser = DocsStructureParser()
-                nodes = parser.parse(doc)
+                nodes = DocsStructureParser().parse(doc)
                 # Render what markdown can represent, and nothing else. The
                 # renderer had no way to express a TITLE, so it emitted the bare
                 # text, which re-parsed as NORMAL_TEXT and made the next push
@@ -568,14 +530,6 @@ class GoogleDocsBackend(Backend):
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
                 self._write_comment_sidecar(doc_id, local_path)
-                dropped = self._render_unreadable_links(parser.unreadable_links)
-                if dropped:
-                    return PullResult(
-                        status="warning",
-                        doc_id=doc_id,
-                        local_path=local_path,
-                        message=dropped,
-                    )
                 return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
 
             doc = self._client.get_document(doc_id)
@@ -591,25 +545,20 @@ class GoogleDocsBackend(Backend):
             # emits the slug; this gives the default path the same upgrade, using
             # the document fetched just above for the tab check. Ids the document
             # does not know are left exactly as they are.
-            parser = DocsStructureParser()
             markdown_content = upgrade_heading_id_anchors(
                 markdown_content,
-                heading_id_to_slug(project(parser.parse(resolved_doc))[0]),
+                heading_id_to_slug(project(DocsStructureParser().parse(resolved_doc))[0]),
             )
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
 
-            # NOT reporting parser.unreadable_links here. On this path the file
-            # comes from Drive's HTML export, and that exporter *does* write a
-            # bookmark href and a table-cell link — the structural parse above is
-            # used only for the id->slug map and then thrown away. Reporting it
-            # claimed those links were "absent from the pulled file" while they sat
-            # in the file just written, and exited 1 for every document containing
-            # one. The claim only holds on the structural path, where the parser's
-            # output *is* the file.
-            #
-            # Collected, not raced — same reason as push()'s warnings.
+            # Note for the link-reporting follow-up: a report built from a
+            # structural parse would be *false* on this path. The file here comes
+            # from Drive's HTML export, and that exporter does write a bookmark
+            # href and a table-cell link — the parse above serves only the
+            # id->slug map. Only the tab-scoped path can report what the file
+            # lacks, because there the parser's output *is* the file.
             messages = [
                 message
                 for message in (f"⚠ {warning}" if warning else None,)

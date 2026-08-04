@@ -15,7 +15,7 @@ wrong tab's content in a multi-tab doc).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 class TabNotFoundError(Exception):
@@ -37,51 +37,6 @@ def flatten_tabs(tabs: List[dict]) -> List[dict]:
         if child_tabs:
             flat.extend(flatten_tabs(child_tabs))
     return flat
-
-
-def heading_ids_by_tab(doc: dict) -> Dict[str, str]:
-    """headingId -> tabId, for every heading in *every* tab of ``doc``.
-
-    Anchor resolution otherwise only ever sees one tab, because
-    `resolve_document_tab` narrows the document before it is parsed. A link into
-    a heading in a sibling tab is then unresolvable: `pull` keeps the bare id
-    (there is no slug for it in this tab), and every subsequent push reports it
-    as a dead anchor — forever, on a file that is exactly what `pull` produced
-    and a Doc whose link is perfectly fine. Worse, the link is lost from the Doc
-    the moment a text edit makes pass 1 rewrite that paragraph.
-
-    Needs the **unresolved** document, so callers must capture it before
-    narrowing. Returns {} for a document with no `tabs` key at all (the legacy
-    shape) — note a *single-tab* document fetched with `includeTabsContent=True`
-    still has one entry per heading, which is harmless because `align()` then
-    filters out every id the current tab owns.
-
-    **An id that appears in more than one tab is dropped, not won.** Taking the
-    last writer made the tab a reader lands in depend on tab order, silently and
-    with a green `ok` — the same trade `heading_anchors._match_keyed` refuses in
-    the other direction. Whether Docs can actually mint a duplicate `headingId`
-    across tabs (Duplicate tab?) is unverified; the discipline is cheap either way.
-
-    Headings inside tables, and a tab with no `tabProperties`, are skipped. Both
-    degrade to the pre-existing dead-anchor report rather than a wrong link, and
-    the table case matches `known_ids`, whose parser skips tables too.
-    """
-    ids: Dict[str, str] = {}
-    ambiguous: set = set()
-    for tab in flatten_tabs(doc.get("tabs") or []):
-        tab_id = tab.get("tabProperties", {}).get("tabId", "")
-        content = tab.get("documentTab", {}).get("body", {}).get("content", [])
-        for element in content:
-            style = (element.get("paragraph") or {}).get("paragraphStyle", {})
-            heading_id = style.get("headingId")
-            if not (heading_id and tab_id):
-                continue
-            if heading_id in ids and ids[heading_id] != tab_id:
-                ambiguous.add(heading_id)
-            ids[heading_id] = tab_id
-    for heading_id in ambiguous:
-        del ids[heading_id]
-    return ids
 
 
 def list_tabs(doc: dict) -> List[TabInfo]:

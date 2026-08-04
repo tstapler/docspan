@@ -50,9 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reported — `docspan push --dry-run` lists it, `docspan push` exits non-zero with a
   warning naming the anchor and the heading anchors that *are* available. It is never
   written as a link a reader can click and land nowhere, and never reported as a clean ✓.
-- **google-docs:** an anchor into a heading in a *different* tab of the same document
-  resolves, written as the tabs-aware `Link.heading` member. The legacy `headingId` resolves
-  against "the tab specified in the request", so it cannot express a cross-tab target.
 - **google-docs:** both pull paths now emit the heading's slug. A default (no `tab_id`) pull
   goes through Drive's HTML export, which carries the Doc's opaque `#h.abc123` through
   verbatim; it is upgraded to the slug, so the pulled markdown works as markdown.
@@ -63,12 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a concurrent edit costs a conflict on a document pass 1 has already changed.
 
 ### Known limitations
+Each of these is tracked as a follow-up rather than half-addressed here.
+- An anchor into a heading in a *different tab* of the same document cannot be resolved and
+  is reported unresolved. The flat `headingId` member resolves against the tab named in the
+  request, so expressing one needs the tabs-aware `Link.heading` member.
 - A pull cannot express a `bookmark`/`bookmarkId` link, a link to a tab, or any link inside
-  a table cell, so those are absent from the pulled file. They are now **reported** rather
-  than dropped silently; the Doc keeps them.
+  a table cell, so those are dropped from the pulled file without a report.
 - Confluence writes an internal anchor as a literal `#fragment` href, which it does not
-  resolve. Also now reported rather than silent — resolving it needs Confluence's own
-  page-scoped anchor format, which was not verifiable without a live instance.
+  resolve.
 - An anchor that resolves to nothing is written as plain text, so a later pull replaces the
   author's `[text](#anchor)` with `text`. The push reports it; nothing does afterwards.
 - Such a push exits non-zero on every run, with no flag to suppress it.
