@@ -15,7 +15,11 @@ ends up wrong; it is:
   line of code was destroyed on a sync that changed nothing;
 * pass 2 reported the block `unaligned` and emitted **zero** span requests, so the
   monospace styling was never applied at all — measured 0 span requests before the
-  fix, 2 after.
+  fix, 2 after, *for a block with no render glyph*. A native Google Docs code block
+  does carry one, and `_align_for_styling` parses the document **unprojected** and
+  keys on `node.text`, so the glyph is present on one side and absent on the other
+  and pass 2 still emits zero. That is a third consumer of `.text` needing the
+  projected view; it is open, and this claim is scoped accordingly.
 
 The preview reported N removals, which reads as content deletion and is
 indistinguishable from content the author removed deliberately. That is what made

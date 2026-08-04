@@ -25,9 +25,13 @@ UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 # (U+E907 for a code block). It arrives as its **own leading textRun**, which is what
 # makes it identifiable; see `_render_prefix_of`.
 #
-# U+E000–U+F8FF is the BMP Private Use Area by definition, so a `unicodedata.category`
-# filter over it would return every codepoint. Matching the range directly says the
-# same thing and costs ~1% of what building a 6400-character class per parse did.
+# U+E000-U+F8FF is the BMP Private Use Area by definition, so a `unicodedata.category`
+# filter over it returned every codepoint — the filter was a no-op. Matching the range
+# directly says the same thing without building a 6400-character class on every parse.
+#
+# Only the BMP range, so a supplementary-plane Private Use glyph (planes 15 and 16) is
+# not recognised. No observed document uses one; if one appears the result is the old
+# loud failure, not corruption.
 _PRIVATE_USE = range(0xE000, 0xF900)
 
 
@@ -94,9 +98,10 @@ class DocsParagraphNode:
     # The Private-Use glyph Docs writes in front of a paragraph it renders itself
     # (a native code block writes U+E907). Non-empty means the paragraph belongs to
     # a Docs-rendered block: `.text` still contains it, `projection.project()` drops
-    # it so the diff never sees it, and DocsRequestBuilder must not emit a
-    # deleteContentRange over the paragraph — the API refuses a range covering the
-    # glyph and silently orphans it onto the next paragraph if the range skips it.
+    # it so the diff never sees it, and DocsRequestBuilder deletes only the
+    # paragraph's *text*, never the paragraph: the API refuses a range covering the
+    # glyph, and a range that skips it silently orphans the glyph onto the next
+    # paragraph. Both verified against the live API.
     render_prefix: str = ""
     # True when this paragraph's bullet resolves to a native BULLET_CHECKBOX
     # glyph (glyphType == GLYPH_TYPE_UNSPECIFIED), resolved live by
