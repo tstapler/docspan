@@ -19,6 +19,7 @@ from typing import List, Union
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    TableCell,
     TextSpan,
 )
 
@@ -41,15 +42,25 @@ def _render_spans(spans: List[TextSpan]) -> str:
     return "".join(parts)
 
 
+def _render_cell(cell: TableCell) -> str:
+    """A cell's markdown — with its marks, and with `|` escaped.
+
+    An unescaped pipe inside cell text ends the cell, so a link whose URL or label
+    contains one would silently split the row into extra columns.
+    """
+    text = _render_spans(cell.spans) if cell.spans else cell.text
+    return text.replace("|", "\\|")
+
+
 def _render_table(node: DocsTableNode) -> str:
     if not node.rows:
         return ""
     header, *body = node.rows
     lines = [
-        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(_render_cell(c) for c in header) + " |",
         "| " + " | ".join(["---"] * len(header)) + " |",
     ]
-    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    lines.extend("| " + " | ".join(_render_cell(c) for c in row) + " |" for row in body)
     return "\n".join(lines)
 
 

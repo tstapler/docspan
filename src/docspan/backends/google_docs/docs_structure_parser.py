@@ -21,6 +21,42 @@ from docspan.backends.google_docs.heading_anchors import (
 UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 
 
+def _trim_spans_to_cell_text(
+    spans: List["TextSpan"], joined: str, text: str
+) -> List["TextSpan"]:
+    """Trim `spans` at both ends so they concatenate to exactly `text`.
+
+    `text` is `joined.strip()`, so the amount to remove is the leading and
+    trailing whitespace width. Marks on what survives are preserved; a span left
+    holding nothing is dropped, because a bold span with no text renders as
+    `****`.
+    """
+    lead = len(joined) - len(joined.lstrip())
+    tail = len(joined) - len(joined.rstrip())
+    out: List["TextSpan"] = []
+    for span in spans:
+        out.append(span)
+    # Front.
+    while lead > 0 and out:
+        head = out[0]
+        if len(head.text) <= lead:
+            lead -= len(head.text)
+            out.pop(0)
+        else:
+            out[0] = replace(head, text=head.text[lead:])
+            lead = 0
+    # Back.
+    while tail > 0 and out:
+        last = out[-1]
+        if len(last.text) <= tail:
+            tail -= len(last.text)
+            out.pop()
+        else:
+            out[-1] = replace(last, text=last.text[: len(last.text) - tail])
+            tail = 0
+    return [span for span in out if span.text]
+
+
 def _person_display_text(person: dict) -> str:
     """Return display text for a Docs API `person` structural element.
 
@@ -97,11 +133,48 @@ class DocsParagraphNode:
 
 
 @dataclass
+class TableCell:
+    """One table cell: its text, and the inline styling on that text.
+
+    Cells were plain `str`, so every mark inside one was dropped on both sides —
+    bold, monospace, and **links, including internal `#anchor` cross-references**.
+    A reference written inside a table cell rendered as dead text in the Doc while
+    the identical reference in a paragraph resolved, with nothing reported.
+
+    `text` and `spans` live on one object rather than in parallel structures
+    because they must not be able to disagree: pass 2 walks span widths against
+    `text` to place index ranges, so a character in one and not the other shifts
+    every range after it. Same invariant as `DocsParagraphNode` — `spans` is
+    either empty (unstyled) or concatenates to exactly `text`.
+    """
+    text: str = ""
+    spans: List[TextSpan] = field(default_factory=list)
+
+    @property
+    def styled(self) -> bool:
+        return bool(self.spans)
+
+
+@dataclass
 class DocsTableNode:
-    """Represents a table in a Google Docs document (plain-text cells)."""
-    rows: List[List[str]] = field(default_factory=list)
+    """Represents a table in a Google Docs document."""
+    rows: List[List[TableCell]] = field(default_factory=list)
     start_index: int = 0
     end_index: int = 0
+
+    def __post_init__(self) -> None:
+        """Accept plain strings for cells and normalise them to `TableCell`.
+
+        Cells were `str` before they had to carry inline styling. Callers that pass
+        strings are normalised here rather than left to fail later on
+        `cell.text` — an `AttributeError` several frames deep inside request
+        building, which says nothing about the actual mistake. After this, `rows`
+        is uniformly `List[List[TableCell]]` everywhere downstream.
+        """
+        self.rows = [
+            [TableCell(text=cell) if isinstance(cell, str) else cell for cell in row]
+            for row in self.rows
+        ]
 
     @property
     def num_rows(self) -> int:
@@ -206,30 +279,62 @@ class DocsStructureParser:
     def _parse_table(self, element: dict) -> DocsTableNode:
         """Parse a structural element that contains a table into a DocsTableNode."""
         table = element["table"]
-        rows: List[List[str]] = []
+        rows: List[List[TableCell]] = []
         for table_row in table.get("tableRows", []):
-            cells: List[str] = []
+            cells: List[TableCell] = []
             for cell in table_row.get("tableCells", []):
-                parts: List[str] = []
-                for cell_element in cell.get("content", []):
-                    paragraph = cell_element.get("paragraph")
-                    if paragraph is None:
-                        continue
-                    for pe in paragraph.get("elements", []):
-                        text_run = pe.get("textRun")
-                        if text_run is not None:
-                            parts.append(text_run.get("content", ""))
-                            continue
-                        person = pe.get("person")
-                        if person is not None:
-                            parts.append(_person_display_text(person))
-                cells.append("".join(parts).strip())
+                cells.append(self._parse_cell(cell))
             rows.append(cells)
         return DocsTableNode(
             rows=rows,
             start_index=element.get("startIndex", 0),
             end_index=element.get("endIndex", 0),
         )
+
+    def _parse_cell(self, cell: dict) -> TableCell:
+        """Collect a cell's runs into text plus matching spans.
+
+        The joined text is `strip()`ped — a Docs cell paragraph ends in "\n" and
+        cells are conventionally compared without surrounding whitespace — so the
+        spans are trimmed by the same amount at each end. Letting them keep the
+        whitespace would break the spans-concatenate-to-text invariant, and pass 2
+        would then place every range in the cell off by the width of the trim.
+        """
+        spans: List[TextSpan] = []
+        for cell_element in cell.get("content", []):
+            paragraph = cell_element.get("paragraph")
+            if paragraph is None:
+                continue
+            for pe in paragraph.get("elements", []):
+                text_run = pe.get("textRun")
+                if text_run is not None:
+                    content = text_run.get("content", "")
+                    if not content:
+                        continue
+                    text_style = text_run.get("textStyle", {})
+                    font = text_style.get("weightedFontFamily", {}).get("fontFamily", "")
+                    spans.append(TextSpan(
+                        text=content,
+                        bold=bool(text_style.get("bold", False)),
+                        italic=bool(text_style.get("italic", False)),
+                        link=self._parse_link(text_style.get("link")),
+                        monospace="Courier" in font or "mono" in font.lower(),
+                    ))
+                    continue
+                person = pe.get("person")
+                if person is not None:
+                    name = _person_display_text(person)
+                    if name:
+                        spans.append(TextSpan(text=name))
+
+        joined = "".join(span.text for span in spans)
+        text = joined.strip()
+        spans = _trim_spans_to_cell_text(spans, joined, text)
+        # An unstyled cell carries no spans, matching DocsParagraphNode: it keeps
+        # the diff key and the renderer on the plain-text path.
+        if not any(s.bold or s.italic or s.link or s.monospace for s in spans):
+            spans = []
+        return TableCell(text=text, spans=spans)
 
     def _parse_paragraph(
         self, element: dict, lists: Optional[dict] = None
