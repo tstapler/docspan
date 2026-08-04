@@ -1191,3 +1191,65 @@ class TestCrossTabAnchors:
         assert link_payload(
             "#here", alignment.slug_to_id, alignment.known_ids, alignment.foreign_ids
         ) == {"headingId": "h.here"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slug the rendered heading, not the markdown source
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRenderedHeadingText:
+    """GitHub slugs the *rendered* heading. Taking mistune's `raw` verbatim
+    slugged the source, which shifts the duplicate numbering and lands an anchor
+    on the neighbouring heading — silently, and reported as a clean ✓.
+    """
+
+    @pytest.mark.parametrize(
+        "source, slugs",
+        [
+            # Entity reference: CommonMark decodes it, so this is one `&`.
+            ("## Team &amp; process\n\n## Team  process\n",
+             ["team--process", "team--process-1"]),
+            # Inline HTML contributes no text to the rendered heading.
+            ("## <code>push()</code> behaviour\n\n## push behaviour\n",
+             ["push-behaviour", "push-behaviour-1"]),
+            ("## Caf&eacute; notes\n", ["café-notes"]),
+            ("## A &rarr; B\n", ["a--b"]),
+        ],
+    )
+    def test_slugs_match_github(self, source: str, slugs: list[str]) -> None:
+        headings = [
+            node.text
+            for node in markdown.parse(source)
+            if isinstance(node, DocsParagraphNode) and node.style.startswith("HEADING_")
+        ]
+        assert slugify_all(headings) == slugs
+
+    def test_the_entity_reaches_the_document_decoded(self) -> None:
+        """Also wrong in the Doc, not only in the slug: the paragraph itself
+        carried the literal `&amp;` for every reader."""
+        node = markdown.parse("## Team &amp; process\n")[0]
+        assert node.text == "Team & process"
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "See **bold** and &amp; here\n",
+            "A &amp; B with [link](https://x.com) after\n",
+            "See <b>tag</b> and **bold** together\n",
+        ],
+    )
+    def test_span_text_still_equals_node_text(self, source: str) -> None:
+        """The invariant this change could most easily have broken.
+
+        Pass 2 derives span ranges by walking span texts against the paragraph's
+        text, so a token counted by one and not the other desyncs every span
+        after it — placing styling, and links, on the wrong characters.
+        """
+        for node in markdown.parse(source):
+            if isinstance(node, DocsParagraphNode) and node.spans:
+                assert "".join(span.text for span in node.spans) == node.text
+
+    def test_a_codespan_is_left_literal(self) -> None:
+        """Inside backticks an entity is not a reference — it is content."""
+        node = markdown.parse("`a &amp; b` code\n")[0]
+        assert node.text == "a &amp; b code"
