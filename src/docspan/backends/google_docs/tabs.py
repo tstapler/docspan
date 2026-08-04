@@ -15,7 +15,7 @@ wrong tab's content in a multi-tab doc).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class TabNotFoundError(Exception):
@@ -37,6 +37,33 @@ def flatten_tabs(tabs: List[dict]) -> List[dict]:
         if child_tabs:
             flat.extend(flatten_tabs(child_tabs))
     return flat
+
+
+def heading_ids_by_tab(doc: dict) -> Dict[str, str]:
+    """headingId -> tabId, for every heading in *every* tab of ``doc``.
+
+    Anchor resolution otherwise only ever sees one tab, because
+    `resolve_document_tab` narrows the document before it is parsed. A link into
+    a heading in a sibling tab is then unresolvable: `pull` keeps the bare id
+    (there is no slug for it in this tab), and every subsequent push reports it
+    as a dead anchor — forever, on a file that is exactly what `pull` produced
+    and a Doc whose link is perfectly fine. Worse, the link is lost from the Doc
+    the moment a text edit makes pass 1 rewrite that paragraph.
+
+    Needs the **unresolved** document, so callers must capture it before
+    narrowing. Returns {} for a single-tab document, where the question cannot
+    arise.
+    """
+    ids: Dict[str, str] = {}
+    for tab in flatten_tabs(doc.get("tabs") or []):
+        tab_id = tab.get("tabProperties", {}).get("tabId", "")
+        content = tab.get("documentTab", {}).get("body", {}).get("content", [])
+        for element in content:
+            style = (element.get("paragraph") or {}).get("paragraphStyle", {})
+            heading_id = style.get("headingId")
+            if heading_id and tab_id:
+                ids[heading_id] = tab_id
+    return ids
 
 
 def list_tabs(doc: dict) -> List[TabInfo]:
