@@ -13,6 +13,8 @@ the Doc could click and land nowhere.
 """
 from __future__ import annotations
 
+import json
+import pathlib
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -26,7 +28,6 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TextSpan,
 )
 from docspan.backends.google_docs.heading_anchors import (
-    UnresolvedAnchorError,
     heading_id_to_slug,
     heading_slug_to_id,
     link_payload,
@@ -116,6 +117,51 @@ class TestSlugify:
 
     def test_slug_order_depends_on_position_not_text(self) -> None:
         assert slugify_all(["A", "B", "A"]) == ["a", "b", "a-1"]
+
+    def test_nfd_combining_marks_survive(self) -> None:
+        # "café" decomposed — an `e` followed by U+0301, which is how macOS
+        # often hands text over. `str.isalnum()` is False for a combining mark,
+        # so a rule built on it silently produced "cafe" and the anchor missed.
+        assert slugify("café measurements") == "café-measurements"
+        assert slugify("café") != slugify("cafe")
+
+
+class TestGithubSluggerParity:
+    """Check slugify against output from the real github-slugger.
+
+    Every other test in TestSlugify asserts a hand-picked literal, which pins
+    the behaviour this implementation *has* rather than parity with the thing it
+    claims parity with. These cases came out of running the npm package; the
+    two known divergences are enumerated in the fixture rather than omitted, so
+    this cannot quietly become a test of the code against itself.
+    """
+
+    VECTORS = json.loads(
+        (pathlib.Path(__file__).parent / "fixtures" / "github_slugger_vectors.json")
+        .read_text(encoding="utf-8")
+    )
+
+    def test_the_fixture_records_its_provenance_and_its_deviations(self) -> None:
+        assert "github-slugger" in self.VECTORS["_provenance"]
+        assert self.VECTORS["_deviations"]
+        assert self.VECTORS["cases"]
+
+    @pytest.mark.parametrize("case", VECTORS["cases"], ids=lambda c: repr(c["input"])[:48])
+    def test_matches_the_real_implementation(self, case: dict) -> None:
+        deviations = self.VECTORS["_deviations"]
+        if any(heading in deviations for heading in case["input"]):
+            pytest.skip(f"documented divergence: {deviations[case['input'][0]][:60]}…")
+        assert slugify_all(case["input"]) == case["slugs"]
+
+    @pytest.mark.parametrize("heading", sorted(VECTORS["_deviations"]))
+    def test_each_documented_divergence_still_diverges(self, heading: str) -> None:
+        # If one of these starts agreeing, the fixture is stale and the skip
+        # above is hiding a passing case — which would make the parity claim
+        # weaker than it needs to be.
+        truth = next(
+            case["slugs"] for case in self.VECTORS["cases"] if heading in case["input"]
+        )
+        assert slugify_all([heading]) != truth
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,7 +264,85 @@ class TestWriteDirection:
         ]
         assert links == [{"url": "https://example.com"}, {"headingId": "h.intro"}]
 
-    def test_pass_two_raises_rather_than_writing_a_link_to_nowhere(self) -> None:
+    def test_pass_two_writes_no_link_rather_than_one_to_nowhere(self) -> None:
+        doc, target = self._dangling_anchor_case()
+
+        requests = builder.build_span_style_requests(doc, target)
+
+        assert not any(
+            "link" in request["updateTextStyle"]["textStyle"] for request in requests
+        )
+
+    def test_an_unresolvable_anchor_keeps_the_spans_other_marks(self) -> None:
+        # Dropping the link must not cost the bold as well — and must not cost
+        # any *other* paragraph's styling either, which is why pass 2 reports
+        # rather than aborting.
+        doc = _doc(
+            _paragraph("Intro", 1, "HEADING_1", "h.intro"),
+            _paragraph("dangling", 8, runs=[
+                {"textRun": {"content": "dangling\n", "textStyle": {}}}
+            ]),
+            _paragraph("elsewhere", 17, runs=[
+                {"textRun": {"content": "elsewhere\n", "textStyle": {}}}
+            ]),
+        )
+        target = [
+            DocsParagraphNode(style="HEADING_1", text="Intro"),
+            DocsParagraphNode(style="NORMAL_TEXT", text="dangling", spans=[
+                TextSpan(text="dangling", link="#missing-section", bold=True),
+            ]),
+            DocsParagraphNode(style="NORMAL_TEXT", text="elsewhere", spans=[
+                TextSpan(text="elsewhere", italic=True),
+            ]),
+        ]
+
+        styles = [
+            request["updateTextStyle"]["textStyle"]
+            for request in builder.build_span_style_requests(doc, target)
+        ]
+
+        assert {"bold": True} in styles       # the dangling span keeps its bold
+        assert {"italic": True} in styles     # and the unrelated paragraph is untouched
+        assert not any("link" in style for style in styles)
+
+    def test_the_unresolvable_anchor_is_reported(self) -> None:
+        doc, target = self._dangling_anchor_case()
+        assert builder.unresolved_anchor_links(doc, target) == ["#missing-section"]
+
+    def test_a_resolvable_anchor_is_not_reported(self) -> None:
+        doc = _doc(
+            _paragraph("Intro", 1, "HEADING_1", "h.intro"),
+            _paragraph("see it", 8, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        target = [
+            DocsParagraphNode(style="HEADING_1", text="Intro"),
+            DocsParagraphNode(style="NORMAL_TEXT", text="see it", spans=[
+                TextSpan(text="see it", link="#intro"),
+            ]),
+        ]
+        assert builder.unresolved_anchor_links(doc, target) == []
+
+    def test_a_heading_the_document_reports_without_an_id_is_reported(self) -> None:
+        # The residue the pre-write check cannot see: the heading exists, in the
+        # markdown and in the document, but the document gives it no headingId.
+        doc = _doc(
+            _paragraph("Intro", 1, "HEADING_1", heading_id=None),
+            _paragraph("see it", 8, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        target = [
+            DocsParagraphNode(style="HEADING_1", text="Intro"),
+            DocsParagraphNode(style="NORMAL_TEXT", text="see it", spans=[
+                TextSpan(text="see it", link="#intro"),
+            ]),
+        ]
+        assert builder.unresolved_anchor_links(doc, target) == ["#intro"]
+
+    @staticmethod
+    def _dangling_anchor_case() -> tuple[dict, list]:
         doc = _doc(
             _paragraph("Intro", 1, "HEADING_1", "h.intro"),
             _paragraph("dangling", 8, runs=[
@@ -231,12 +355,7 @@ class TestWriteDirection:
                 TextSpan(text="dangling", link="#missing-section"),
             ]),
         ]
-
-        with pytest.raises(UnresolvedAnchorError) as caught:
-            builder.build_span_style_requests(doc, target)
-
-        assert "#missing-section" in str(caught.value)
-        assert "#intro" in str(caught.value)  # names what was available
+        return doc, target
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,39 +507,56 @@ class TestUnresolvedAnchorsCheck:
         assert unresolved_anchors(target, []) == ["#zz", "#yy"]
 
 
-class TestPushGate:
+class TestPushReporting:
     def _local(self, tmp_path, text: str) -> str:
         path = tmp_path / "doc.md"
         path.write_text(text, encoding="utf-8")
         return str(path)
 
-    def test_push_refuses_and_writes_nothing_when_an_anchor_names_no_heading(
+    def test_a_typo_does_not_block_the_content_but_is_never_reported_as_ok(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:
+        # The content changes are correct and wanted; only the link has no
+        # target. So the push proceeds and the anchor is named — what must never
+        # happen is a green "ok" over a cross-reference that did not land.
         backend, fake_client = make_backend()
-        fake_client.get_document.return_value = _doc(revision_id="rev-1")
-        local = self._local(tmp_path, "## Current state\n\nsee [it](#typo)\n")
+        fake_client.get_document.return_value = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+            revision_id="rev-1",
+        )
+        local = self._local(tmp_path, "## Current state\n\n[see it](#typo)\n")
 
         result = backend.push(local, "doc-1")
 
-        assert result.status == "error"
+        assert result.status == "warning"
         assert "#typo" in result.message
-        assert local in result.message  # names the file, per the report
-        fake_client.batch_update.assert_not_called()
 
-    def test_force_does_not_buy_a_broken_link(
+    def test_push_warns_when_the_written_heading_has_no_id_to_link_to(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:
-        # force exists to overwrite a human's work, not to write something
-        # already known to be broken.
+        # The document already holds the content, so pass 1 writes nothing and
+        # pass 2 runs against this same doc — whose heading has no headingId.
+        # push must not report a green "ok" over a cross-reference that did not
+        # land, and must not report it as "styling was not applied" either: the
+        # paragraph is styled, only the link is missing.
         backend, fake_client = make_backend()
-        fake_client.get_document.return_value = _doc(revision_id="rev-1")
-        local = self._local(tmp_path, "## Current state\n\nsee [it](#typo)\n")
+        fake_client.get_document.return_value = _doc(
+            _paragraph("Current state", 1, "HEADING_2", heading_id=None),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+            revision_id="rev-1",
+        )
+        local = self._local(tmp_path, "## Current state\n\n[see it](#current-state)\n")
 
-        result = backend.push(local, "doc-1", force=True)
+        result = backend.push(local, "doc-1")
 
-        assert result.status == "error"
-        fake_client.batch_update.assert_not_called()
+        assert result.status == "warning"
+        assert "#current-state" in result.message
+        assert "nothing to point at" in result.message
 
     def test_a_good_anchor_is_not_blocked(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]

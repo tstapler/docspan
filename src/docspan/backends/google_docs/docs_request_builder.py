@@ -11,9 +11,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
 )
 from docspan.backends.google_docs.heading_anchors import (
-    UnresolvedAnchorError,
     heading_slug_to_id,
+    is_anchor,
+    is_heading_style,
     link_payload,
+    slugify_all,
 )
 
 Node = Union[DocsParagraphNode, DocsTableNode]
@@ -432,9 +434,8 @@ class DocsRequestBuilder:
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
 
-        current, pairs, _unaligned = self._align_for_styling(doc, target)
-        slug_to_id = heading_slug_to_id(current)
-        known_ids = set(slug_to_id.values())
+        current, pairs, _unaligned, heading_pairs = self._align_for_styling(doc, target)
+        slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
         requests: List[dict] = []
         for cnode, tnode in pairs:
             requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
@@ -463,7 +464,7 @@ class DocsRequestBuilder:
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
-        _current, pairs, unaligned = self._align_for_styling(doc, target)
+        _current, pairs, unaligned, _heading_pairs = self._align_for_styling(doc, target)
         overflowed = [
             tnode for cnode, tnode in pairs if self._spans_overflow(tnode, cnode)
         ]
@@ -476,6 +477,34 @@ class DocsRequestBuilder:
             for node in target
             if isinstance(node, DocsParagraphNode) and id(node) in reported
         ]
+
+    def unresolved_anchor_links(self, doc: dict, target: List[Node]) -> List[str]:
+        """Internal anchors pass 2 could not point at a heading, in use order.
+
+        The loud half of _span_style_requests' refusal to write a link with no
+        target. push() rejects an anchor that names no heading *before* writing
+        anything (heading_anchors.unresolved_anchors), so this normally returns
+        empty; it catches the residue that check cannot see — an anchor whose
+        heading exists in the markdown and in the written document but which the
+        document reports without a `headingId`, so there is no id to link to.
+
+        Reported rather than raised because the cause is the document, not the
+        author: aborting would discard every other paragraph's inline styling
+        for one bad link, and the next push would abort identically.
+        """
+        if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
+            return []
+        current, pairs, _unaligned, heading_pairs = self._align_for_styling(doc, target)
+        slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
+        unresolved: List[str] = []
+        for _cnode, tnode in pairs:
+            for span in tnode.spans:
+                if not span.link or not is_anchor(span.link):
+                    continue
+                if link_payload(span.link, slug_to_id, known_ids) is None:
+                    if span.link not in unresolved:
+                        unresolved.append(span.link)
+        return unresolved
 
     @staticmethod
     def _spans_overflow(node: DocsParagraphNode, placement: DocsParagraphNode) -> bool:
@@ -518,15 +547,32 @@ class DocsRequestBuilder:
 
     def _align_for_styling(
         self, doc: dict, target: List[Node]
-    ) -> Tuple[List[Node], List[Tuple[DocsParagraphNode, DocsParagraphNode]], List[DocsParagraphNode]]:
+    ) -> Tuple[
+        List[Node],
+        List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+        List[DocsParagraphNode],
+        List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+    ]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(current, pairs, unaligned)`` — the parsed document, pairs of
-        (document node, target node) that are safe to style, and the target
-        paragraphs with spans that could not be paired. ``current`` is returned
-        rather than re-parsed by callers because resolving internal anchors
-        needs the document's headings, and parsing a large document twice per
-        push to learn the same thing is pure cost.
+        Returns ``(current, pairs, unaligned, heading_pairs)`` — the parsed
+        document, pairs of (document node, target node) that are safe to style,
+        the target paragraphs with spans that could not be paired, and the same
+        pairing restricted to target paragraphs that are headings.
+
+        ``current`` is returned rather than re-parsed by callers because parsing
+        a large document twice per push to learn the same thing is pure cost.
+
+        ``heading_pairs`` is what lets an anchor be resolved correctly. The slug
+        an author wrote `#foo` against is a fact about *their markdown* — its
+        duplicate suffix depends on the headings before it **in the markdown** —
+        while the `headingId` to link to is a fact about the *document*. Pairing
+        the two here is the only place both are known. Deriving slugs from the
+        document instead goes wrong in two ways that produce a wrong link rather
+        than an error: a heading the document holds but the markdown does not
+        shifts every later duplicate suffix, and a Docs `TITLE`/`SUBTITLE` is not
+        a `HEADING_*` at all, so a doc title could never be an anchor target
+        even though `projection.project()` and `#`/`##` both treat it as one.
 
         Why not zip(): pass 1 does **not** guarantee the re-fetched document
         matches ``target`` node-for-node. It leaves an empty paragraph behind
@@ -561,6 +607,7 @@ class DocsRequestBuilder:
         )
 
         pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
+        heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         aligned_target_indices = set()
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != "equal":
@@ -572,6 +619,8 @@ class DocsRequestBuilder:
                 aligned_target_indices.add(ti)
                 if tnode.spans:
                     pairs.append((cnode, tnode))
+                if is_heading_style(tnode.style):
+                    heading_pairs.append((cnode, tnode))
 
         unaligned = [
             node
@@ -580,7 +629,40 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return current, pairs, unaligned
+        return current, pairs, unaligned, heading_pairs
+
+    def _anchor_resolution(
+        self, current: List[Node], target: List[Node],
+        heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+    ) -> Tuple[dict, set]:
+        """(slug -> headingId, every headingId the document reports).
+
+        Slugs are computed over the **target's** headings in target order, so a
+        duplicate suffix means what it means in the author's markdown, and each
+        is mapped to the id of the document paragraph it aligned with. The
+        document's own headings are folded in underneath for anchors that point
+        at a heading this push does not contain (a partial push), and the id set
+        makes a bare `#h.abc123` from an earlier pull resolve verbatim.
+        """
+        slug_to_id = dict(heading_slug_to_id(current))  # document-only headings
+        paired_document_node = {id(tnode): cnode for cnode, tnode in heading_pairs}
+        target_headings = [
+            node for node in target
+            if isinstance(node, DocsParagraphNode) and is_heading_style(node.style)
+        ]
+        for slug, tnode in zip(
+            slugify_all(node.text for node in target_headings), target_headings
+        ):
+            cnode = paired_document_node.get(id(tnode))
+            heading_id = getattr(cnode, "heading_id", None) if cnode is not None else None
+            if heading_id:
+                slug_to_id[slug] = heading_id
+        known_ids = {
+            node.heading_id
+            for node in current
+            if isinstance(node, DocsParagraphNode) and node.heading_id
+        }
+        return slug_to_id, known_ids
 
     def build_second_pass_requests(
         self, doc: dict, target: List[Node], tab_id: Optional[str] = None
@@ -873,9 +955,14 @@ class DocsRequestBuilder:
                 attrs["italic"] = True
             if span.link:
                 payload = link_payload(span.link, slug_to_id, known_ids)
-                if payload is None:
-                    raise UnresolvedAnchorError([span.link], list(slug_to_id or {}))
-                attrs["link"] = payload
+                if payload is not None:
+                    attrs["link"] = payload
+                # else: the anchor names no heading in the written document, so
+                # there is nothing to point at. The span keeps its other marks
+                # and unresolved_anchor_links() reports the anchor, rather than
+                # this either writing a `url` link to a "#fragment" the Doc
+                # cannot follow or aborting the whole pass and discarding every
+                # other paragraph's styling.
             if span.monospace:
                 attrs["monospace"] = True
             if attrs:
