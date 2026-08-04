@@ -16,6 +16,7 @@ from docspan.backends.google_docs.heading_anchors import (
     is_anchor,
     is_heading_style,
     link_payload,
+    slugify,
     slugify_all,
 )
 
@@ -789,8 +790,14 @@ class DocsRequestBuilder:
         # slug -> the text of the document heading that produced it, so an
         # inherited entry can be checked against what the author actually wrote.
         document_pairs = _heading_texts_and_ids(current)
-        document_slug_text = {
-            slug: text
+        # slug -> the *base* slug of the document heading that produced it. Base,
+        # not raw text: the key is a slug, so what matters is whether the two
+        # headings slug the same, not whether they are spelled the same. Comparing
+        # raw text dropped every slug-preserving edit — `Rollout Plan` renamed to
+        # `Rollout plan`, a trailing space in the Doc, added punctuation — and a
+        # fuzz put that at 24 links lost against 0 gained.
+        document_slug_base = {
+            slug: slugify(text)
             for slug, (text, heading_id) in zip(
                 slugify_all(text for text, _ in document_pairs), document_pairs
             )
@@ -819,15 +826,19 @@ class DocsRequestBuilder:
             inherited = slug_to_id.get(slug)
             if inherited is None:
                 continue
-            # 1. It must name a heading with the *same text*. Otherwise it is a
-            #    different heading — markdown `## Intro 1` inheriting the
-            #    document's `intro-1`, which belongs to the second of its two
-            #    `Intro` headings.
-            if document_slug_text.get(slug) != tnode_text:
+            # 1. It must name a heading with the same *base* slug. Otherwise the
+            #    suffix means something different on each side — markdown
+            #    `## Intro 1` (base `intro-1`) inheriting the document's `intro-1`,
+            #    which is the second of its two `Intro` headings (base `intro`).
+            if document_slug_base.get(slug) != slugify(tnode_text):
                 del slug_to_id[slug]
                 continue
             # 2. Its id must not already be claimed by a heading this push paired.
-            #    Two slugs naming different headings must never resolve to one id:
+            #    This narrows one shape of that collision; it does not establish
+            #    the general invariant, because a *stale document-only* entry
+            #    colliding with a paired id is never inspected here. Reachable
+            #    today: a doc with two identical headings and markdown with one
+            #    sends both `#intro` and `#intro-1` to the second.
             #    markdown `## Overview / ## Overview` against a document holding
             #    one `Overview` leaves the first unpaired with matching text, and
             #    without this both `#overview` and `#overview-1` land on it.
