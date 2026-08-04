@@ -85,19 +85,23 @@ def slugify(text: str) -> str:
       into `"--intro--"`; the `.strip()` here yields `"intro"`, which is parity
       with **GitHub end to end**, because a markdown parser trims ATX heading
       text before the slugger ever sees it.
-    * Circled letters, and roughly 150 other exotic code points across the BMP.
-      This keeps whole Unicode *categories* (`_KEPT_CATEGORIES`) where
-      github-slugger ships an 8 KB generated character class. The exact count is
-      deliberately not stated: it moves with both the slugger's version and
-      Python's Unicode tables, and two independent measurements of it disagreed
-      by a handful. What is stable is the shape — 52 circled letters
-      (U+24B6–U+24E9) that the slugger keeps and this drops, plus letters from
-      scripts added to Unicode after that class was generated, which this keeps
-      and the slugger drops. Embedding the blob would trade those for a frozen
-      Unicode version, so the categories win; the residue is exotic enough
-      (Glagolitic, Old Polish, medievalist Latin) that no real heading is
-      expected to hit it, and one that does gets a reported unresolvable anchor
-      rather than a silently wrong link.
+    * Circled letters, plus a residue of other code points across the BMP. This
+      keeps whole Unicode *categories* (`_KEPT_CATEGORIES`) where github-slugger
+      ships an 8 KB generated character class. **No total is stated on purpose:**
+      it moves with both the slugger's version and Python's Unicode tables, and
+      three independent measurements of it came back 145, 147 and 148. Quoting
+      any one of them would be quoting a coincidence.
+
+      What is stable is the shape, in two directions:
+      52 circled letters (U+24B6–U+24E9) that the slugger keeps and this drops,
+      and — the larger half — letters and marks from blocks added to Unicode
+      after that class was generated, which this keeps and the slugger drops.
+      Those are dominated by **Arabic Extended-A/B**, not by the antique Latin
+      scripts an earlier version of this comment named.
+
+      Embedding the blob would trade the divergence for a frozen Unicode
+      version, so the categories win. A heading that lands in the residue gets a
+      *reported* unresolvable anchor, never a silently wrong link.
     """
     lowered = text.strip().lower()
     kept = "".join(
@@ -143,11 +147,13 @@ def is_heading_style(style: object) -> bool:
     anchor to a document's title has a real target and a
     `startswith("HEADING_")` test silently refuses it.
 
-    This matters on the **read** side. Markdown `#` parses to `HEADING_1`, *not*
-    to `TITLE` — so the push path never consults a TITLE style, and a test there
-    cannot detect this branch. What produces a TITLE paragraph is Google Docs
-    itself, for every document whose title was typed into the title bar.
-    Confirmed against a live Doc that such a paragraph does carry a `headingId`.
+    What produces a TITLE paragraph is Google Docs itself, for any document whose
+    title was typed into the title bar — markdown `#` parses to `HEADING_1`, so
+    the *target* side never carries one. Both directions still reach this branch:
+    `pull` maps the id back to a slug, and on push `_align_for_styling` parses the
+    document **unprojected**, so `heading_slug_to_id(current)` asks this question
+    about document nodes. A partial push of one section against a doc whose title
+    is a TITLE resolves `#the-title` through exactly that path.
     """
     return isinstance(style, str) and (
         style.startswith("HEADING_") or style in ("TITLE", "SUBTITLE")
@@ -225,6 +231,36 @@ def upgrade_heading_id_anchors(markdown: str, id_to_slug: Dict[str, str]) -> str
 _ANCHOR_DESTINATION = re.compile(r"\]\(#(?P<target>[^)\s]+)\)")
 
 
+def available_anchor_slugs(
+    target_nodes: Sequence[object], document_nodes: Sequence[object] = ()
+) -> List[str]:
+    """Anchors that would actually resolve, for the "did you mean" tail.
+
+    Must be derived from the same sets resolution consults, not from the
+    markdown's headings alone. Feeding it `heading_slugs(target_nodes)` produced
+    a report that named the very anchor it had just called dead — the markdown
+    heading is there, so its slug was listed, while resolution had discarded the
+    mapping because the document reported that heading without a `headingId`. It
+    also denied any anchors existed for a document-only heading that resolves
+    perfectly well.
+
+    A list that disagrees with resolution is worse than no list: it tells the
+    author their correct spelling is both wrong and right.
+    """
+    resolvable = set(heading_slug_to_id(document_nodes))
+    resolvable |= {
+        slug
+        for slug, (_text, heading_id) in zip(
+            slugify_all(text for text, _ in _heading_texts_and_ids(target_nodes)),
+            _heading_texts_and_ids(target_nodes),
+        )
+        # A markdown heading this push creates gets an id from Docs, so its slug
+        # is offerable even though nothing carries an id yet.
+        if heading_id is None or heading_id
+    }
+    return sorted(resolvable)
+
+
 def heading_slugs(nodes: Iterable[object]) -> List[str]:
     """Every heading's slug in document order, linkable or not.
 
@@ -240,8 +276,34 @@ def _match_keyed(slug_to_id: Dict[str, str]) -> Dict[str, str]:
     Only the *keys* are normalized. The values, and the slugs
     ``heading_id_to_slug`` writes into pulled markdown, stay exactly as
     ``slugify`` produced them, so github-slugger parity is unaffected.
+
+    **A key two different slugs both normalize to is dropped, not won.** Because
+    `slugify` keeps combining marks, two headings whose text differs only by
+    normal form — `Café notes` and `Caf\xe9 notes`, which is Korean typed
+    through a jamo IME versus composed, or Vietnamese, or anything macOS handed
+    over as NFD — produce two *distinct* slugs. `slugify_all` therefore sees no
+    duplicate and adds no `-1`, and a last-writer-wins mapping would point both
+    anchors at whichever heading came second, overwriting a correct link and
+    reporting `ok`.
+
+    That would be strictly worse than not normalizing at all: before this
+    module normalized anything, both anchors resolved to nothing and both were
+    **reported**. Turning a loud failure into a silent wrong link is a
+    regression even when it fixes the common case. So an ambiguous key resolves
+    to nothing and the anchor is reported, exactly as it was; the unambiguous
+    case — one heading, NFD in the document, NFC in the href — still resolves,
+    which is the whole point of normalizing.
     """
-    return {unicodedata.normalize("NFC", slug): heading_id for slug, heading_id in slug_to_id.items()}
+    keyed: Dict[str, str] = {}
+    ambiguous: set = set()
+    for slug, heading_id in slug_to_id.items():
+        key = unicodedata.normalize("NFC", slug)
+        if key in keyed and keyed[key] != heading_id:
+            ambiguous.add(key)
+        keyed[key] = heading_id
+    for key in ambiguous:
+        del keyed[key]
+    return keyed
 
 
 def is_anchor(href: Optional[str]) -> bool:
@@ -302,6 +364,13 @@ def resolve_anchor(
     ids = known_ids if isinstance(known_ids, (set, frozenset, dict)) else set(known_ids or ())
     if target in ids:
         return target
+    # Deliberately NOT short-circuited on `slug_to_id.get(target)` first. That
+    # "fast path" looks free and silently reintroduces the collision _match_keyed
+    # exists to refuse: when one heading's slug is already NFC, the raw key hits
+    # directly and its NFD twin never gets a say. Measured — it returned the
+    # second heading's id for *both* anchors. The re-keyed map is the only lookup,
+    # so ambiguity is always seen. It costs O(headings) per anchored span; if that
+    # ever matters, hoist it into _anchor_resolution rather than adding a bypass.
     return _match_keyed(slug_to_id).get(target)
 
 

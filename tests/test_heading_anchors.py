@@ -34,6 +34,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TextSpan,
 )
 from docspan.backends.google_docs.heading_anchors import (
+    available_anchor_slugs,
     heading_id_to_slug,
     heading_slug_to_id,
     link_payload,
@@ -565,8 +566,13 @@ class TestPushReporting:
         # Cause-neutral wording: three different causes reach this report, and
         # an earlier version asserted the rarest of them.
         assert "nothing in the document matches what they name" in result.message
-        # The "did you mean" tail the deleted exception used to carry.
-        assert "available heading anchors" in result.message
+        # The "did you mean" tail must not offer the anchor it just called dead.
+        # It did: the markdown heading is present, so its slug was listed as
+        # available, while resolution had discarded the mapping because the
+        # document reports that heading with no `headingId`. Here nothing
+        # resolves, and saying so is the honest answer.
+        assert "the document has no headings to anchor to" in result.message
+        assert "available heading anchors" not in result.message
 
     def test_a_good_anchor_writes_the_heading_id_link(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
@@ -812,3 +818,184 @@ class TestTabsAwareLinkUnion:
             ]),
         )
         assert "[it](#current-state)" in render_nodes_to_markdown(structure.parse(doc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Normalization must not silently pick a winner
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNormalizationAmbiguity:
+    def test_two_headings_differing_only_by_normal_form_report_rather_than_collide(
+        self,
+    ) -> None:
+        """The regression the NFC comparison key introduced, now pinned.
+
+        `slugify` keeps combining marks, so NFD and NFC forms of one heading
+        produce two *distinct* slugs — `slugify_all` adds no `-1` — and a
+        last-writer-wins NFC map pointed both anchors at whichever came second,
+        overwriting a correct link and reporting `ok`. Before any normalization
+        both were dead and both were reported, so that trade was strictly worse.
+        Reachable through docspan's own round trip, and not exotic: Korean typed
+        through a jamo IME, Vietnamese, anything macOS handed over as NFD.
+        """
+        nfd = unicodedata.normalize("NFD", "Café notes")
+        nfc = unicodedata.normalize("NFC", "Café notes")
+        assert nfd != nfc
+        doc = _doc(
+            _paragraph(nfd, 1, "HEADING_2", "h.first"),
+            _paragraph(nfc, 2 + len(nfd), "HEADING_2", "h.second"),
+            _paragraph("see one and two", 3 + len(nfd) + len(nfc), runs=[
+                {"textRun": {"content": "see one and two\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse(
+            f"## {nfd}\n\n## {nfc}\n\nsee [one](#café-notes) and [two](#café-notes)\n"
+        )
+
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for request in builder.build_span_style_requests(doc, target)
+            if "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        # No link at all is the point: the collision used to write two, both
+        # aimed at the second heading, over one that was already correct.
+        assert links == [], links
+        # One entry, not two — both anchors spell the same href, and the report
+        # dedupes by href. What matters is that it is reported at all.
+        assert builder.unresolved_anchor_links(doc, target) == ["#caf%C3%A9-notes"]
+
+    def test_a_lone_nfd_heading_still_resolves_an_nfc_anchor(self) -> None:
+        """The case the normalization exists for must keep working."""
+        nfd = unicodedata.normalize("NFD", "Café notes")
+        doc = _doc(
+            _paragraph(nfd, 1, "HEADING_2", "h.cafe"),
+            _paragraph("see x", 2 + len(nfd), runs=[
+                {"textRun": {"content": "see x\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse(f"## {nfd}\n\nsee [x](#café-notes)\n")
+
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for request in builder.build_span_style_requests(doc, target)
+            if "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert links == [{"headingId": "h.cafe"}], links
+
+    def test_an_unpaired_heading_with_a_unique_slug_keeps_its_link(self) -> None:
+        """The narrowing on the pop, pinned.
+
+        A document with one `Intro` and markdown with one `## Intro`: `#intro`
+        can only mean `h.intro`, even when difflib leaves the heading out of
+        every `equal` run because it moved past a body paragraph. Deleting the
+        mapping there replaced a correct link with a dead-anchor warning for a
+        heading plainly present — and `unaligned_span_targets` cannot even
+        explain it, since it filters on `node.spans` and a heading has none.
+        """
+        doc = _doc(
+            _paragraph("body first", 1),
+            _paragraph("Intro", 12, "HEADING_2", "h.intro"),
+            _paragraph("see it", 18, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse("## Intro\n\nbody first\n\nsee [it](#intro)\n")
+
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for request in builder.build_span_style_requests(doc, target)
+            if "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert links == [{"headingId": "h.intro"}], links
+        assert builder.unresolved_anchor_links(doc, target) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Every warning reaches the user, and the report agrees with resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWarningsAreCollectedNotRaced:
+    def _local(self, tmp_path, text: str) -> str:
+        path = tmp_path / "doc.md"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def _two_tab_doc() -> dict:
+        one = {
+            "tabProperties": {"tabId": "t.0", "title": "Tab 1"},
+            "documentTab": _doc(
+                _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+                _paragraph("see it", 16, runs=[
+                    {"textRun": {"content": "see it\n", "textStyle": {}}}
+                ]),
+            ),
+        }
+        two = {"tabProperties": {"tabId": "t.1", "title": "Tab 2"}, "documentTab": _doc()}
+        return {"revisionId": "rev-1", "tabs": [one, two]}
+
+    def test_a_dead_anchor_does_not_suppress_the_multi_tab_warning(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """One typo'd anchor used to hide the multi-tab warning completely.
+
+        Both are facts about the same push and they are independent. Returning on
+        the first meant docspan kept writing to a possibly-wrong tab — the thing
+        the tab warning exists to prevent — while the user read a message about a
+        link.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = self._two_tab_doc()
+        local = self._local(tmp_path, "## Current state\n\n[see it](#typo)\n")
+
+        result = backend.push(local, "doc-1")
+
+        assert result.status == "warning"
+        assert "#typo" in result.message
+        assert "tab_id" in result.message, result.message
+
+    def test_the_comment_backstop_is_not_consulted_when_nothing_was_written(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """Its contract is "re-check the count after a successful batch_update".
+
+        A push that only reports a dead anchor writes nothing, and no longer
+        short-circuits to "skipped" — so without the gate it would run the
+        backstop, spend an extra list_comments call, and be able to blame docspan
+        for a comment a human resolved mid-run.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        local = self._local(tmp_path, "## Current state\n\nsee [it](#typo)\n")
+
+        result = backend.push(local, "doc-1")
+
+        assert result.status == "warning"
+        assert "#typo" in result.message
+        assert fake_client.batch_update.call_count == 0
+        assert fake_client.list_comments.call_count == 1  # the plan's own fetch only
+
+    def test_the_available_list_never_offers_the_anchor_it_called_dead(self) -> None:
+        """The tail must come from what resolution consults, not the markdown.
+
+        Fed `heading_slugs(target_nodes)` it listed a slug whose mapping
+        resolution had discarded, telling the author their spelling was both
+        wrong and right. It also denied any anchors existed for a document-only
+        heading that resolves perfectly well.
+        """
+        # Document-only heading: resolvable, and must be offered.
+        document = structure.parse(_doc(_paragraph("Doc only", 1, "HEADING_2", "h.a")))
+        target = markdown.parse("see [x](#typoo)\n")
+        assert available_anchor_slugs(target, document) == ["doc-only"]
+
+        # A markdown heading the document reports without an id: not offerable.
+        document2 = structure.parse(
+            _doc(_paragraph("Current state", 1, "HEADING_2", heading_id=None))
+        )
+        target2 = markdown.parse("## Current state\n\nsee [x](#current-state)\n")
+        assert "current-state" in available_anchor_slugs(target2, document2)

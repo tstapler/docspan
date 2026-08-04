@@ -15,6 +15,7 @@ from docspan.backends.google_docs.heading_anchors import (
     is_anchor,
     is_heading_style,
     link_payload,
+    slugify,
     slugify_all,
 )
 
@@ -711,20 +712,36 @@ class DocsRequestBuilder:
         wrong-heading case is reachable two ways:
 
         * the target heading landed outside a difflib `equal` run, so it has no
-          pair — and the alignment failed precisely *because* the two heading
-          sequences differ, which is also what makes the document's duplicate
-          suffixes mean something else. `## Overview / ## Overview / ## Details`
-          against a document holding `Overview, Details` paired markdown heading
-          #2 with document heading #1, and `#overview-1` — the author's *second*
-          Overview — resolved to the *first* one's id;
-        * the paired document paragraph reports no `headingId`, so a document
-          heading whose own literal text happens to slug to `intro-1` captured
-          an anchor that meant "my second `## Intro`".
+          pair. `## Overview / ## Overview / ## Details` against a document
+          holding only `Overview, Details`: difflib pairs the markdown's *second*
+          Overview with the document's only one, leaving the *first* unpaired.
+          The seed's `overview -> h.first` therefore survives — so `#overview`
+          (the author's first) and `#overview-1` (the second, correctly paired to
+          the same paragraph) both resolved to `h.first`, and two anchors that
+          name different headings pointed at one. Measured pre-fix:
+          `{'overview': 'h.first', 'details': 'h.details', 'overview-1':
+          'h.first'}`. It is the *unpaired* anchor whose entry is stale, not the
+          suffixed one; the seed can never produce the key `overview-1` at all,
+          since the document's lone Overview slugs without a suffix;
+        * the paired document paragraph reports no `headingId`, so a *different*
+          document heading whose own literal text slugs to `intro-1` keeps that
+          key and captures an anchor that meant "my second `## Intro`".
 
         Neither was reported: `unaligned_span_targets` filters on `node.spans`
         and a plain heading has none, and `unresolved_anchor_links` only sees
         anchors that resolve to *nothing* — a wrong resolution is still a
         resolution. Both now surface as dead anchors.
+
+        **The deletion is narrowed to the ambiguous case**, which is the only one
+        it can help. An unpaired heading whose base slug is unique in the markdown
+        has exactly one meaning, and the document's entry for it is that same
+        heading — a doc holding one `Intro` and markdown holding one `## Intro`
+        can only mean `h.intro`, even when difflib leaves the heading out of every
+        `equal` run because it moved past a body paragraph. Popping there replaced
+        a correct link with a dead-anchor warning for a heading plainly present,
+        and `unaligned_span_targets` cannot even explain it (no spans on a
+        heading). Only a *duplicated* base slug makes the document's numbering
+        mean something else, and that is the case both reproductions above share.
         """
         slug_to_id = dict(heading_slug_to_id(current))  # document-only headings
         paired_document_node = {id(tnode): cnode for cnode, tnode in heading_pairs}
@@ -732,6 +749,13 @@ class DocsRequestBuilder:
             node for node in target
             if isinstance(node, DocsParagraphNode) and is_heading_style(node.style)
         ]
+        # A base slug more than one of the markdown's headings shares is what
+        # makes the document's duplicate numbering mean something other than the
+        # author's. Only those keys are unsafe to inherit from the document.
+        base_counts: dict = {}
+        for node in target_headings:
+            base = slugify(node.text)
+            base_counts[base] = base_counts.get(base, 0) + 1
         for slug, tnode in zip(
             slugify_all(node.text for node in target_headings), target_headings
         ):
@@ -739,7 +763,7 @@ class DocsRequestBuilder:
             heading_id = getattr(cnode, "heading_id", None) if cnode is not None else None
             if heading_id:
                 slug_to_id[slug] = heading_id
-            else:
+            elif base_counts.get(slugify(tnode.text), 0) > 1:
                 slug_to_id.pop(slug, None)
         known_ids = {
             node.heading_id
