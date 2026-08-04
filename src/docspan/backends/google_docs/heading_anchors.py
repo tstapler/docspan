@@ -15,21 +15,31 @@ to a plain string, so a heading inside a cell is not an anchor target and a
 heading link inside a cell is dropped on read — pre-existing for `url` links
 too, and out of scope here, but the invariant above is about paragraphs only.
 
-* write — markdown `#target` -> ``{"headingId": ...}`` (`link_payload`)
-* read  — ``{"headingId": ...}`` -> markdown `#slug` (`heading_id_to_slug`)
+* write — markdown `#target` -> a heading member (`link_payload`): the flat
+  ``{"headingId": ...}`` for a heading in this tab, and the tabs-aware
+  ``{"heading": {"id", "tabId"}}`` for one in a sibling tab, which the flat form
+  cannot express (Google resolves it against "the tab specified in the request").
+* read  — either member -> markdown `#slug` (`heading_id_to_slug`)
 
-`#target` is resolved against the document by **exact heading id first, then
-slug** (`resolve_anchor`). Matching ids by set membership rather than by a
-`h.xxxx` shape guess means the read direction can emit a bare id when a slug is
-unavailable and the write direction will still resolve it, with no invented
-escape syntax and no assumption about how Docs formats an id.
+`#target` is resolved in layers (`resolve_anchor`): the exact decoded target
+against ids then slugs, then an NFC fold of it against the same. Exact-first
+matters — folding first threw away the author's normal form and made an NFC and
+an NFD anchor that each named their own heading indistinguishable. Matching ids by
+set membership rather than by an `h.xxxx` shape guess means the read direction can
+emit a bare id when a slug is unavailable and the write direction still resolves
+it, with no invented escape syntax and no assumption about how Docs formats an id.
 
 A leading `#` is the only discriminator needed between an anchor and a URL — no
 absolute or relative URL begins with one — so `TextSpan.link` keeps carrying a
 single string rather than growing a parallel "is this an anchor" field.
 
-Out of scope, deliberately: bookmarks (`bookmarkId`), cross-document anchors,
-and the Confluence backend.
+Out of scope, deliberately: bookmarks (both `bookmark` and the legacy
+`bookmarkId`), links to a whole tab (`tabId`), cross-*document* anchors, and
+resolving anchors on the Confluence backend — which reports them instead, since
+Confluence's anchor format could not be verified without a live instance
+(`backends/confluence/anchors.py`). A link this module cannot express is recorded
+by `DocsStructureParser.unreadable_links` so a pull reports it rather than
+deleting it from the author's file in silence.
 """
 from __future__ import annotations
 
@@ -286,6 +296,12 @@ def heading_slugs(nodes: Iterable[object]) -> List[str]:
     return slugify_all(text for text, _ in _heading_texts_and_ids(nodes))
 
 
+# Stands in for the id Docs will assign to a heading this push has not written
+# yet. Truthy, and shaped so it could never be mistaken for a real `h.xxxx` id if
+# it ever escapes unresolved_anchors().
+_UNWRITTEN_HEADING = "\0not-yet-written"
+
+
 def _match_keyed(slug_to_id: Dict[str, str]) -> Dict[str, str]:
     """``slug_to_id`` re-keyed for comparison against an ``anchor_target``.
 
@@ -493,7 +509,13 @@ def unresolved_anchors(
     #
     # The markdown's own headings have no ids yet, so they are mapped to a
     # sentinel: only whether the anchor resolves matters here, never to what.
-    resolvable = {slug: "" for slug in heading_slugs(target_nodes)}
+    #
+    # The sentinel is deliberately non-empty. `link_payload` treats a falsy id as
+    # "did not resolve", so an empty string would make this map silently produce
+    # no link if it ever reached that function — it does not today (both call
+    # sites use the real map from `align()`), but the failure would be a dropped
+    # link with no warning, which is the exact class this module exists to remove.
+    resolvable = {slug: _UNWRITTEN_HEADING for slug in heading_slugs(target_nodes)}
     resolvable.update(document_slugs)
     return [
         href
