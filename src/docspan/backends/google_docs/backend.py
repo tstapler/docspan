@@ -45,7 +45,11 @@ from docspan.backends.google_docs.onboarding import (
     validate_client_secret,
     validate_service_account,
 )
-from docspan.backends.google_docs.projection import describe_residue, project
+from docspan.backends.google_docs.projection import (
+    describe_residue,
+    describe_target_residue,
+    project,
+)
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -140,13 +144,22 @@ class GoogleDocsBackend(Backend):
         # the diff read that asymmetry as "the user deleted this" — issue #17.
         # See projection.project for the rule and the trade it makes.
         current_nodes, current_residue = project(current_nodes)
-        # Projecting the target is a no-op today and no test can make it fail:
-        # MarkdownToParagraphParser cannot emit an empty-text node, so there is
-        # nothing on this side to drop. It is here so the two sides cannot drift
-        # apart if that ever changes — the whole bug was an asymmetry between
-        # these two parsers, and applying the projection to only one of them
-        # would be the same shape of mistake.
-        target_nodes, _target_residue = project(target_nodes)
+        # Projecting the target is NOT a no-op any more. This comment used to say
+        # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
+        # nothing on this side to drop" — splitting fenced code blocks per line
+        # falsified that: a blank line inside a block, an empty fence and a
+        # blank-only fence all produce `text=""`.
+        #
+        # So this drops author content — not the #17 trade, which *preserves* a
+        # blank paragraph the Doc already has. A blank code line exists only in the
+        # markdown and is never written.
+        #
+        # Reported rather than fixed, deliberately. Writing it needs projection to
+        # tell a blank *code* line (content) from a stray empty *prose* paragraph
+        # (not content), and the node model cannot express that distinction — a
+        # design change, not a patch. Until then the author is told, which is the
+        # difference between a known limitation and silent data loss.
+        target_nodes, target_residue = project(target_nodes)
 
         body_content = doc.get("body", {}).get("content", [])
         doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
@@ -169,6 +182,7 @@ class GoogleDocsBackend(Backend):
             unchanged_count=unchanged_count,
             comments=comments,
             high_risk=high_risk,
+            target_residue=target_residue,
             tab_warning=tab_warning,
             resolved_tab_id=resolved_tab_id,
             residue=current_residue,
@@ -208,6 +222,7 @@ class GoogleDocsBackend(Backend):
             # never fail in.
             document_nodes = DocsStructureParser().parse(plan.doc)
             unresolved = unresolved_anchors(plan.target_nodes, document_nodes)
+            target_residue_note = describe_target_residue(plan.target_residue)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
         except HttpError as exc:
             return PushPreview(
@@ -230,6 +245,7 @@ class GoogleDocsBackend(Backend):
             # causes it cannot see.
             unresolved_anchors=unresolved,
             available_anchors=available,
+            target_residue_note=target_residue_note,
         )
 
     def push(
@@ -403,6 +419,7 @@ class GoogleDocsBackend(Backend):
                     )
                     if dead_anchors
                     else None,
+                    describe_target_residue(plan.target_residue) or None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation

@@ -243,11 +243,28 @@ class MarkdownToParagraphParser:
                 nodes.extend(_walk_list_items(token, nesting_level=0))
 
             elif token_type in ("block_code", "code"):
-                raw = token.get("raw", "").strip()
-                nodes.append(DocsParagraphNode(
-                    style="NORMAL_TEXT", text=raw, start_index=0, end_index=0,
-                    spans=[TextSpan(text=raw, monospace=True)],
-                ))
+                # One node per line, because a Google Doc has no multi-line
+                # paragraph. Emitting the whole block as a single node with
+                # embedded newlines meant `insertText` wrote "\nline one\nline
+                # two", which Docs splits into N paragraphs — so every later diff
+                # saw N document paragraphs against 1 markdown node and
+                # delete-and-reinserted the whole block, on every push, forever.
+                # The text survived that; what did not was idempotence, any comment
+                # anchored to a line of code, and the monospace styling (pass 2
+                # reported the block unaligned and emitted no span requests at
+                # all). See issue #40.
+                #
+                # `strip("\n")` rather than `strip()`: the fence's own blank edges
+                # go, indentation does not. Leading whitespace is meaning in code.
+                raw = token.get("raw", "").strip("\n")
+                for line in raw.split("\n"):
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=line, start_index=0, end_index=0,
+                        # A blank line inside a block carries no span to style.
+                        # projection.project() drops it from *both* sides, so the
+                        # diff never sees it and never tries to delete it.
+                        spans=[TextSpan(text=line, monospace=True)] if line else [],
+                    ))
 
             elif token_type == "table":
                 nodes.append(_table_from_token(token))
