@@ -85,6 +85,25 @@ def find_high_risk_paragraphs(
     return high_risk
 
 
+def render_available_anchors(slugs: List[str]) -> str:
+    """The "did you mean" tail for an unresolvable-anchor warning.
+
+    Naming the bad anchor and stopping tells the author they are wrong without
+    telling them what is right — and the slug of a heading is not something they
+    can reliably derive by eye (an em dash leaves *two* hyphens). Shared by the
+    dry-run and the push so the two reports cannot drift apart.
+    """
+    if not slugs:
+        return "  the document has no headings to anchor to."
+    shown = slugs[:10]
+    more = len(slugs) - len(shown)
+    lines = ["  available heading anchors:"]
+    lines += [f"    • #{slug}" for slug in shown]
+    if more:
+        lines.append(f"    • … and {more} more")
+    return "\n".join(lines)
+
+
 def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
     """Render the ⚠ warning block(s) for a list of HighRiskParagraph.
 
@@ -176,9 +195,15 @@ class PushPreview:
     tab_warning: Optional[str] = None
     # Internal anchors (`[A1](#a1-foo)`) that name no heading in either the
     # markdown or the document, so push() will write the text without a link and
-    # report them. Surfaced here so --dry-run does not read clean for a file the
-    # real push will warn about.
+    # is expected to report them. Surfaced here so --dry-run does not read clean
+    # for a file the real push will warn about — but the two can differ: this
+    # list under-reports, never over-reports. See unresolved_anchors' docstring
+    # for the three causes only pass 2 can see.
     unresolved_anchors: List[str] = field(default_factory=list)
+    # Every anchor the markdown *does* offer, for the "did you mean" tail. The
+    # exception this replaced listed these; dropping it left the user told their
+    # anchor is wrong and not what would be right.
+    available_anchors: List[str] = field(default_factory=list)
 
     def render(self) -> str:
         if self.error is not None:
@@ -221,12 +246,13 @@ class PushPreview:
             shown = self.unresolved_anchors[:5]
             more = len(self.unresolved_anchors) - len(shown)
             lines.append(
-                f"⚠ {len(self.unresolved_anchors)} internal anchor(s) name no heading, "
-                "so they will be written as plain text with no link:"
+                f"⚠ {len(self.unresolved_anchors)} internal anchor(s) have no link — "
+                "nothing in the document matches what they name:"
             )
             lines += [f"    • {anchor}" for anchor in shown]
             if more:
                 lines.append(f"    • … and {more} more")
+            lines.append(render_available_anchors(self.available_anchors))
 
         if self.tab_warning:
             lines.append(f"⚠ {self.tab_warning}")

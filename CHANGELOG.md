@@ -39,6 +39,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **google-docs:** internal markdown anchors (`[A1](#a1-current-state)`) now resolve to
+  Google Docs heading links instead of being written as a `#fragment` URL the Doc cannot
+  follow. Slugs follow `github-slugger`, checked against vectors generated from the real
+  implementation. `TITLE`/`SUBTITLE` paragraphs count as anchor targets, and both the
+  modern `Link.heading` and the legacy `Link.headingId` union members are read, so an
+  anchor survives a pull whether or not the fetch used `includeTabsContent`.
+- **google-docs:** an anchor that names no heading is written as plain text with no link
+  and reported — `docspan push --dry-run` lists it, `docspan push` exits non-zero with a
+  warning naming the anchor and the heading anchors that *are* available. It is never
+  written as a link a reader can click and land nowhere, and never reported as a clean ✓.
+
+### Known limitations
+- The read half applies to mappings that set `tab_id`. A default pull goes through Drive's
+  HTML export and emits the Doc's opaque `#h.abc123` id rather than the heading's slug —
+  which pushes back correctly but is not a working anchor in GitHub or another markdown
+  renderer.
+- An anchor into a heading in a *different* tab of the same document cannot be resolved and
+  is reported on every push.
+- `bookmark`/`bookmarkId` links are still dropped on pull, and Confluence still writes
+  `#fragment` hrefs verbatim.
+
 ## [0.1.0] - 2026-06-07
 
 ### Added

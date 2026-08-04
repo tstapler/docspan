@@ -2,11 +2,18 @@
 
 A Google Doc has no URL fragment, so a link whose href is `#a1-current-state`
 is stored verbatim and is a **dead link** for every reader of the Doc. The Docs
-API's `Link` is a union — `url` | `bookmarkId` | `headingId` — and every heading
-paragraph already carries a `headingId` in its `paragraphStyle`, so the target
-exists; the anchor just has to be resolved to it.
+API's `Link` is a union of six members — `url`, `tabId`, `bookmark`, `heading`,
+and the legacy `bookmarkId`/`headingId` — and every heading paragraph already
+carries a `headingId` in its `paragraphStyle`, so the target exists; the anchor
+just has to be resolved to it. Which of `heading` / `headingId` a *read* returns
+depends on `includeTabsContent`, not on the document; see
+`DocsStructureParser._parse_link`.
 
-Both directions go through this module so they cannot drift:
+Both directions go through this module for the document body, so they cannot
+drift there. They do **not** cover table cells: `_parse_table` flattens a cell
+to a plain string, so a heading inside a cell is not an anchor target and a
+heading link inside a cell is dropped on read — pre-existing for `url` links
+too, and out of scope here, but the invariant above is about paragraphs only.
 
 * write — markdown `#target` -> ``{"headingId": ...}`` (`link_payload`)
 * read  — ``{"headingId": ...}`` -> markdown `#slug` (`heading_id_to_slug`)
@@ -28,6 +35,7 @@ from __future__ import annotations
 
 import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote
 
 # Characters github-slugger keeps besides the categories below. Space is kept
 # here and turned into "-" afterwards, which is what makes the double-hyphen
@@ -76,14 +84,19 @@ def slugify(text: str) -> str:
       into `"--intro--"`; the `.strip()` here yields `"intro"`, which is parity
       with **GitHub end to end**, because a markdown parser trims ATX heading
       text before the slugger ever sees it.
-    * Circled letters and a few hundred other exotic code points. This keeps
-      whole Unicode *categories* (`_KEPT_CATEGORIES`) where github-slugger ships
-      an 8 KB generated character class. Over the BMP the two disagree on 154
-      code points — 52 circled letters plus scripts added to Unicode after that
-      class was generated. Embedding the blob would trade those 154 for a frozen
-      Unicode version, so the categories win; the residue is exotic enough that
-      no real heading is expected to hit it, and a heading that does gets a
-      reported unresolvable anchor rather than a silently wrong link.
+    * Circled letters, and roughly 150 other exotic code points across the BMP.
+      This keeps whole Unicode *categories* (`_KEPT_CATEGORIES`) where
+      github-slugger ships an 8 KB generated character class. The exact count is
+      deliberately not stated: it moves with both the slugger's version and
+      Python's Unicode tables, and two independent measurements of it disagreed
+      by a handful. What is stable is the shape — 52 circled letters
+      (U+24B6–U+24E9) that the slugger keeps and this drops, plus letters from
+      scripts added to Unicode after that class was generated, which this keeps
+      and the slugger drops. Embedding the blob would trade those for a frozen
+      Unicode version, so the categories win; the residue is exotic enough
+      (Glagolitic, Old Polish, medievalist Latin) that no real heading is
+      expected to hit it, and one that does gets a reported unresolvable anchor
+      rather than a silently wrong link.
     """
     lowered = text.strip().lower()
     kept = "".join(
@@ -124,10 +137,16 @@ def is_heading_style(style: object) -> bool:
     """Whether a paragraph's namedStyleType is an anchor target.
 
     `TITLE` and `SUBTITLE` count. Google Docs' own outline treats them as
-    document-level headings, `projection.project()` maps them to
-    `HEADING_1`/`HEADING_2` because that is what markdown can express, and `#` /
-    `##` in the markdown produce them — so an anchor to a document's title has a
-    real target and a `startswith("HEADING_")` test would silently refuse it.
+    document-level headings and `projection.project()` maps them to
+    `HEADING_1`/`HEADING_2` because that is what markdown can express — so an
+    anchor to a document's title has a real target and a
+    `startswith("HEADING_")` test silently refuses it.
+
+    This matters on the **read** side. Markdown `#` parses to `HEADING_1`, *not*
+    to `TITLE` — so the push path never consults a TITLE style, and a test there
+    cannot detect this branch. What produces a TITLE paragraph is Google Docs
+    itself, for every document whose title was typed into the title bar.
+    Confirmed against a live Doc that such a paragraph does carry a `headingId`.
     """
     return isinstance(style, str) and (
         style.startswith("HEADING_") or style in ("TITLE", "SUBTITLE")
@@ -175,6 +194,16 @@ def heading_slugs(nodes: Iterable[object]) -> List[str]:
     return slugify_all(text for text, _ in _heading_texts_and_ids(nodes))
 
 
+def _match_keyed(slug_to_id: Dict[str, str]) -> Dict[str, str]:
+    """``slug_to_id`` re-keyed for comparison against an ``anchor_target``.
+
+    Only the *keys* are normalized. The values, and the slugs
+    ``heading_id_to_slug`` writes into pulled markdown, stay exactly as
+    ``slugify`` produced them, so github-slugger parity is unaffected.
+    """
+    return {unicodedata.normalize("NFC", slug): heading_id for slug, heading_id in slug_to_id.items()}
+
+
 def is_anchor(href: Optional[str]) -> bool:
     """True for an internal anchor. No URL, absolute or relative, starts with `#`.
 
@@ -187,8 +216,30 @@ def is_anchor(href: Optional[str]) -> bool:
 
 
 def anchor_target(href: str) -> str:
-    """The part of an anchor after the `#`."""
-    return href[1:]
+    """The part of an anchor after the `#`, as a key comparable with a slug.
+
+    Two transformations, both required for a non-ASCII anchor to resolve at all:
+
+    * **Percent-decode.** A CommonMark parser normalizes link destinations by
+      percent-encoding them, so `[Café](#café-notes)` reaches this module as
+      `#caf%C3%A9-notes` — measured, not assumed::
+
+          >>> mistune.create_markdown(renderer=None)('[Café](#café-notes)')
+          ... {'type': 'link', 'attrs': {'url': '#caf%C3%A9-notes'}}
+
+      The slug side is built from the heading's own text and is never encoded,
+      so without decoding here the two can never meet and every accented anchor
+      silently resolves to nothing. GitHub decodes for the same reason.
+    * **NFC-normalize.** The decoded href and the heading text can carry the
+      same characters in different normalization forms — macOS hands text over
+      in NFD, most editors write NFC — and `slugify` deliberately keeps
+      combining marks, so `café` in NFD and in NFC produce slugs that look
+      identical and compare unequal. Normalizing here rather than inside
+      `slugify` keeps the emitted slug byte-comparable with github-slugger,
+      which does not normalize; this is a divergence in the comparison key
+      only, never in the slug a pull writes into the markdown.
+    """
+    return unicodedata.normalize("NFC", unquote(href[1:]))
 
 
 def resolve_anchor(
@@ -202,11 +253,16 @@ def resolve_anchor(
     a pull that could not name a slug for some heading emits the bare id, and
     this resolves it back without either side inventing a syntax for "this is
     an id, not a slug".
+
+    Both sides are compared on ``anchor_target``'s key, so a slug built from
+    NFD heading text still matches an href the markdown parser handed over in
+    NFC — see ``anchor_target``.
     """
     target = anchor_target(href)
-    if known_ids is not None and target in set(known_ids):
+    ids = known_ids if isinstance(known_ids, (set, frozenset, dict)) else set(known_ids or ())
+    if target in ids:
         return target
-    return slug_to_id.get(target)
+    return _match_keyed(slug_to_id).get(target)
 
 
 def link_payload(
@@ -219,7 +275,8 @@ def link_payload(
     Returns ``{"url": ...}`` for a URL, ``{"headingId": ...}`` for a resolvable
     anchor, and None for an anchor that resolves to nothing — never a `url`
     link holding a `#fragment`, which is the dead link this module exists to
-    stop writing. A None return is a caller's cue to fail, not to skip.
+    stop writing. A None return is a caller's cue to write no link at all and
+    to report the anchor — never to fall back to a `url`.
     """
     if not is_anchor(href):
         return {"url": href}
@@ -250,14 +307,26 @@ def unresolved_anchors(
     emitted by an earlier pull is only in the document.
 
     This is the ``--dry-run`` view, computed before anything is written and
-    therefore an approximation: the authoritative answer is
+    therefore an approximation. The authoritative answer is
     DocsRequestBuilder.unresolved_anchor_links(), which runs in pass 2 against
-    the document as actually written. It can only differ for a heading this push
-    creates — whose slug is already in the markdown and so counts as resolvable
-    here — which is the safe direction for an advisory.
+    the document as actually written.
+
+    It **under-reports and never over-reports** — the direction that matters,
+    since a dry-run that invented a problem would be worse than one that misses
+    it. Three causes, all of which count as resolvable here and are caught only
+    by pass 2:
+
+    * a heading this push *creates* — its slug is already in the markdown;
+    * a heading this push *deletes*, whose id is still in the document;
+    * a heading present in both that the document reports with no `headingId`.
+
+    Do not restate this as "only" one cause. Each of the three was measured.
     """
     slug_to_id = dict(heading_slug_to_id(document_nodes))
-    resolvable = set(heading_slugs(target_nodes)) | set(slug_to_id)
+    resolvable = {
+        unicodedata.normalize("NFC", slug)
+        for slug in list(heading_slugs(target_nodes)) + list(slug_to_id)
+    }
     known_ids = {
         heading_id
         for _text, heading_id in _heading_texts_and_ids(document_nodes)
