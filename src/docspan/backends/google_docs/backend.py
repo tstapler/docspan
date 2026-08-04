@@ -458,6 +458,25 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
+    def _render_unreadable_links(kinds: list[str]) -> Optional[str]:
+        """Report link kinds a pull could not express in markdown.
+
+        These are dropped from the file, and until now dropped in silence — the
+        same failure heading anchors were fixed for, on sibling members of the
+        same `Link` union plus table cells. The Doc keeps them, so nothing is lost
+        yet; what the warning buys is that the author finds out *now* rather than
+        after a later push rewrites the paragraph and takes the link with it.
+        """
+        if not kinds:
+            return None
+        lines = [
+            f"⚠ {len(kinds)} kind(s) of link could not be represented in markdown and "
+            f"are absent from the pulled file (the Doc still has them):"
+        ]
+        lines += [f"    • {kind}" for kind in kinds]
+        return "\n".join(lines)
+
+    @staticmethod
     def _render_unstyled(unstyled: list[DocsParagraphNode]) -> str:
         """One-line-per-paragraph report of inline styling pass 2 declined to apply."""
         preview = [(node.text[:60] or "(empty)") for node in unstyled[:5]]
@@ -517,7 +536,8 @@ class GoogleDocsBackend(Backend):
             if tab_id is not None:
                 doc = self._client.get_document(doc_id)
                 doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
-                nodes = DocsStructureParser().parse(doc)
+                parser = DocsStructureParser()
+                nodes = parser.parse(doc)
                 # Render what markdown can represent, and nothing else. The
                 # renderer had no way to express a TITLE, so it emitted the bare
                 # text, which re-parsed as NORMAL_TEXT and made the next push
@@ -528,6 +548,14 @@ class GoogleDocsBackend(Backend):
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
                 self._write_comment_sidecar(doc_id, local_path)
+                dropped = self._render_unreadable_links(parser.unreadable_links)
+                if dropped:
+                    return PullResult(
+                        status="warning",
+                        doc_id=doc_id,
+                        local_path=local_path,
+                        message=dropped,
+                    )
                 return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
 
             doc = self._client.get_document(doc_id)
@@ -543,17 +571,27 @@ class GoogleDocsBackend(Backend):
             # emits the slug; this gives the default path the same upgrade, using
             # the document fetched just above for the tab check. Ids the document
             # does not know are left exactly as they are.
+            parser = DocsStructureParser()
             markdown_content = upgrade_heading_id_anchors(
                 markdown_content,
-                heading_id_to_slug(project(DocsStructureParser().parse(resolved_doc))[0]),
+                heading_id_to_slug(project(parser.parse(resolved_doc))[0]),
             )
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
 
-            if warning:
+            # Collected, not raced — same reason as push()'s warnings.
+            messages = [
+                message
+                for message in (warning, self._render_unreadable_links(parser.unreadable_links))
+                if message
+            ]
+            if messages:
                 return PullResult(
-                    status="warning", doc_id=doc_id, local_path=local_path, message=warning
+                    status="warning",
+                    doc_id=doc_id,
+                    local_path=local_path,
+                    message="\n".join(messages),
                 )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
         except TabNotFoundError as exc:
