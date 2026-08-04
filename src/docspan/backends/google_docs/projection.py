@@ -20,13 +20,14 @@ special case at another call site.
 """
 from __future__ import annotations
 
-import unicodedata
 from dataclasses import dataclass, replace
 from typing import Dict, List, Literal, Sequence, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    _is_all_private_use,
+    _utf16_len,
 )
 
 # The same alias DocsRequestBuilder uses. Declared here rather than imported
@@ -150,10 +151,18 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
                 )
             )
             continue
-        if isinstance(node, DocsParagraphNode) and _is_only_private_use(node.text):
+        if isinstance(node, DocsParagraphNode) and _is_all_private_use(node.text):
             residue.append(
                 Residue(kind="private_use_glyph", index=index, detail=node.text.strip())
             )
+            continue
+        if isinstance(node, DocsParagraphNode) and node.render_prefix:
+            # A paragraph *inside* a Docs-rendered block: the glyph goes, the
+            # author's content stays. Not residue — nothing is lost, and the
+            # paragraph still participates in the diff and can be restyled or
+            # have its text changed. Only deleting it is off limits, which
+            # DocsRequestBuilder enforces from `render_prefix`.
+            kept.append(_without_render_prefix(node))
             continue
         if isinstance(node, DocsParagraphNode) and node.style in _UNWRITABLE_STYLES:
             residue.append(
@@ -166,16 +175,35 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     return kept, residue
 
 
-def _is_only_private_use(text: str) -> bool:
-    """True when a paragraph holds nothing but Private-Use-Area glyphs.
+def _without_render_prefix(node: DocsParagraphNode) -> DocsParagraphNode:
+    """The same paragraph as the markdown would describe it — prefix removed.
 
-    `unicodedata.category(c) == "Co"` is the whole test — no hard-coded code
-    points, since which glyph Docs uses is its own business and has changed before.
-    Whitespace around them is ignored; a paragraph carrying *any* real character is
-    not a match, because dropping it would lose content.
+    `start_index` advances by the prefix's width and the spans lose it, so pass 2
+    still places styling correctly: the API counted those units, and removing them
+    from the text without moving the index puts every span in the paragraph one
+    unit early.
+
+    `render_prefix` is *kept* on the result. It is what tells
+    `DocsRequestBuilder` the paragraph belongs to a block Docs renders and must
+    not be taken apart — the whole reason the prefix is recorded rather than
+    discarded at parse time.
     """
-    stripped = text.strip()
-    return bool(stripped) and all(unicodedata.category(ch) == "Co" for ch in stripped)
+    width = _utf16_len(node.render_prefix)
+    remaining, spans = width, list(node.spans)
+    while remaining > 0 and spans:
+        head = _utf16_len(spans[0].text)
+        if head <= remaining:
+            remaining -= head
+            spans.pop(0)
+        else:
+            spans[0] = replace(spans[0], text=spans[0].text[remaining:])
+            remaining = 0
+    return replace(
+        node,
+        text=node.text[len(node.render_prefix):],
+        start_index=node.start_index + width,
+        spans=spans,
+    )
 
 
 def _describe_empty(node: DocsParagraphNode) -> str:

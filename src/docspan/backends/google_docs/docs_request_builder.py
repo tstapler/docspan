@@ -397,6 +397,27 @@ class DocsRequestBuilder:
         if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
             end -= 1
             trimmed = True
+        if isinstance(node, DocsParagraphNode) and node.render_prefix:
+            # A paragraph inside a block Docs renders itself. Neither whole-paragraph
+            # range works, verified against the live API on a copy of a real document:
+            #
+            #   [34052,34069)  covers the glyph  -> "Invalid deletion range. Cannot
+            #                                       delete the requested range."
+            #   [34053,34069)  skips the glyph   -> accepted, and the orphaned glyph
+            #                                       merges into the *next* paragraph,
+            #                                       which came back "mappings:"
+            #
+            # The first fails the whole atomic batch (#47); the second corrupts a
+            # paragraph the author never touched, invisibly. So delete the text and
+            # leave the paragraph: the author's line goes, the block keeps its shape,
+            # and what remains is a glyph-only paragraph — the same shape Docs writes
+            # for the block's own chrome, which `project()` rule 1b drops from both
+            # sides of the diff. That is what keeps push idempotent rather than
+            # retrying a delete it can never complete.
+            #
+            # `start` already skips the prefix: project() advanced it.
+            end -= 1
+            trimmed = True
         if end >= doc_end_index:
             end = doc_end_index - 1
             trimmed = True

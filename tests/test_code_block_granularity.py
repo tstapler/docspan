@@ -140,73 +140,159 @@ class TestPushIsIdempotent:
 # The render glyph Docs puts in front of a native code block
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRenderGlyphIsNormalizedAway:
-    """U+E907 is a rendering artifact, not content.
+class TestRenderPrefix:
+    """The glyph Docs writes in front of a paragraph it renders itself.
 
-    Docs writes it at the start of a paragraph it renders itself. Markdown has no
-    syntax for one, so the two codecs `project()` exists to reconcile were drawing
-    from different alphabets and the diff read the glyph as an authored difference.
+    Recorded, not stripped. `.text` stays faithful to the document because two
+    groups of consumers read it — the index arithmetic needs what the document
+    contains, the diff and renderer need what the markdown says — and an earlier
+    attempt to strip it at parse time made the parser lie to the first group.
 
-    Docs then **refuses** any `deleteContentRange` covering such a paragraph, and
-    `batchUpdate` is atomic — so one refused delete failed the whole push and a
-    document containing a native code block could not be pushed at all, however
-    unrelated the edit. Measured on a real design doc: 56 requests, HTTP 400,
-    nothing written. See issue #47.
+    Both whole-paragraph delete ranges are wrong, verified against the live API on
+    a throwaway copy of a real document:
+
+    * `[34052,34069)` covers the glyph -> `Invalid deletion range. Cannot delete the
+      requested range.` `batchUpdate` is atomic, so one such delete fails the whole
+      push and the document cannot be synced at all (#47).
+    * `[34053,34069)` skips the glyph -> **accepted**, and the orphaned glyph merges
+      into the following paragraph, which came back reading `\ue907mappings:`. The
+      next pull strips it and reports zero requests, so it is permanent and silent.
     """
 
-    GLYPH = ""
+    def _code_block_doc(self) -> tuple[dict, int]:
+        """The shape a live document actually reports for a native code block.
 
-    def _para(self, runs: list[dict], start: int = 1) -> dict:
-        text = "".join(r["textRun"]["content"] for r in runs)
-        return {
-            "startIndex": start,
-            "endIndex": start + len(text),
-            "paragraph": {"paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
-                          "elements": runs},
-        }
+        Taken from a real document: the glyph is its **own** leading textRun with an
+        empty textStyle, content follows in monospace runs, and the block's chrome is
+        a glyph-only paragraph carrying the border/shading style.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
+        paragraphs = [
+            [("Intro\n", {})],
+            [("\ue907", {}), ("# cfg\n", mono)],
+            [("\ue907\n", {})],
+            [("Tail\n", {})],
+        ]
+        content, index = [], 1
+        for runs in paragraphs:
+            text = "".join(c for c, _ in runs)
+            end = index + len(text.encode("utf-16-le")) // 2
+            content.append({"startIndex": index, "endIndex": end, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": c, "textStyle": st}} for c, st in runs],
+            }})
+            index = end
+        return {"revisionId": "rev-1", "body": {"content": content}}, index
 
-    def test_a_leading_glyph_is_stripped_from_text_and_spans(self) -> None:
-        doc = {"revisionId": "r", "body": {"content": [self._para([
-            {"textRun": {"content": f"{self.GLYPH}# markgate.yaml\n", "textStyle": {}}},
-        ])]}}
+    def test_the_parser_keeps_the_glyph_and_records_it(self) -> None:
+        doc, _ = self._code_block_doc()
+        node = structure.parse(doc)[1]
+        assert node.render_prefix == "\ue907"
+        assert node.text == "\ue907# cfg", "text must stay faithful to the document"
+        assert "".join(span.text for span in node.spans) == node.text
+        assert node.start_index == 7, "the index must not move; the API counted the glyph"
+
+    def test_an_empty_leading_run_cannot_hide_the_glyph(self) -> None:
+        """The shape that destroyed a character.
+
+        Matching `lstrip` against the concatenated text and then walking spans
+        stopped at the empty run, read it as "no glyph here", and reconciled the
+        resulting length mismatch by trimming from the *end* — so `code line` came
+        back as `code lin` with the glyph still attached. Matching per run cannot
+        reach that state: an empty run is skipped, not treated as a terminator.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 12, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "\ue907", "textStyle": {}}},
+                    {"textRun": {"content": "code line\n", "textStyle": {}}},
+                ]}}]}}
         node = structure.parse(doc)[0]
-        assert node.text == "# markgate.yaml"
-        assert "".join(s.text for s in node.spans) == node.text
+        assert node.render_prefix == "\ue907"
+        assert node.text == "\ue907code line"
+        assert "".join(span.text for span in node.spans) == node.text
 
-    def test_start_index_advances_with_the_strip(self) -> None:
-        """The index risk. The API counted the glyph; if `start_index` does not move
-        with it, every span in the paragraph is placed one unit early."""
-        doc = {"revisionId": "r", "body": {"content": [self._para([
-            {"textRun": {"content": f"{self.GLYPH}see ", "textStyle": {}}},
-            {"textRun": {"content": "bold", "textStyle": {"bold": True}}},
-            {"textRun": {"content": " now\n", "textStyle": {}}},
-        ])]}}
+    def test_an_authors_own_private_use_character_is_left_alone(self) -> None:
+        """U+F8FF is the Apple logo. Nerd Fonts live in the PUA too.
+
+        Treating any leading PUA as an artifact silently altered legitimate content:
+        the character was eaten on read, so it never matched the markdown and push
+        emitted a delete-and-reinsert that dropped it. An author types such a
+        character *inside* a run with their text, so the run is not entirely PUA.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": "\uf8ff macOS notes\n", "textStyle": {}}}],
+            }}]}}
         node = structure.parse(doc)[0]
-        assert node.text == "see bold now"
-        assert node.start_index == 2, "the glyph occupied index 1"
-        # 'bold' sits at [6,10) in the document; the offset must agree.
-        assert node.start_index + len("see ") == 6
+        assert node.render_prefix == ""
+        assert node.text == "\uf8ff macOS notes"
 
-    def test_a_glyph_only_paragraph_becomes_empty_and_is_projected_away(self) -> None:
-        """Then rule 1 drops it from *both* sides, so the diff never sees it."""
-        doc = {"revisionId": "r", "body": {"content": [self._para([
-            {"textRun": {"content": f"{self.GLYPH}\n", "textStyle": {}}},
-        ])]}}
-        node = structure.parse(doc)[0]
-        assert node.text == ""
-        kept, residue = project([node])
-        assert kept == []
-        assert [r.kind for r in residue] == ["empty_paragraph"]
+    def test_projection_hides_the_prefix_from_the_diff_but_keeps_the_flag(self) -> None:
+        doc, _ = self._code_block_doc()
+        kept, residue = project(structure.parse(doc))
+        code = [n for n in kept if getattr(n, "render_prefix", "")]
+        assert len(code) == 1
+        assert code[0].text == "# cfg", "the diff must see what the markdown says"
+        assert code[0].start_index == 8, "start_index advances so pass 2 still lands"
+        assert "".join(s.text for s in code[0].spans) == "# cfg"
+        assert code[0].render_prefix == "\ue907", "the builder needs this to spare the block"
+        # The block's own chrome paragraph is unrepresentable and is dropped.
+        assert [r.kind for r in residue] == ["private_use_glyph"]
 
-    def test_no_delete_is_emitted_for_a_glyph_paragraph(self) -> None:
-        """The property that was broken: the push must not ask Docs to delete it."""
-        doc = {"revisionId": "r", "body": {"content": [
-            self._para([{"textRun": {"content": "intro\n", "textStyle": {}}}], start=1),
-            self._para([{"textRun": {"content": f"{self.GLYPH}# cfg\n",
-                                     "textStyle": {}}}], start=7),
-        ]}}
-        target, _ = project(markdown.parse("intro\n\n```yaml\n# cfg\n```\n"))
+    def test_an_unchanged_code_block_emits_nothing(self) -> None:
+        """The #47 path: a document with a native code block must be pushable."""
+        doc, end = self._code_block_doc()
         current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\n# cfg\n```\n\nTail\n"))
+        assert builder.build(current, target, end) == []
 
-        requests = builder.build(current, target, 14)
-        assert not [r for r in requests if "deleteContentRange" in r], requests
+    def test_removing_the_code_line_deletes_its_text_and_spares_the_paragraph(self) -> None:
+        """Neither whole-paragraph range is emitted — see the class docstring.
+
+        The delete must start past the glyph, so the API accepts it, and stop before
+        the newline, so the glyph is not orphaned onto the next paragraph.
+        """
+        doc, end = self._code_block_doc()
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\nTail\n"))
+        deletes = [r["deleteContentRange"]["range"]
+                   for r in builder.build(current, target, end)
+                   if "deleteContentRange" in r]
+
+        assert deletes == [{"startIndex": 8, "endIndex": 13}], (
+            "8 skips the glyph at 7, which the API refuses to delete; 13 stops before "
+            "the newline at 13, which would otherwise merge the glyph into 'Tail'"
+        )
+
+    def test_the_leftover_glyph_paragraph_does_not_make_push_repeat_itself(self) -> None:
+        """What makes sparing the paragraph safe rather than merely non-destructive.
+
+        The delete leaves a glyph-only paragraph. `project()` rule 1b drops that from
+        both sides, so the next diff does not see it and does not try again — which is
+        what a whole-paragraph delete could never achieve, the API having refused it.
+        """
+        doc, end = self._code_block_doc()
+        after = {"revisionId": "rev-2", "body": {"content": [
+            dict(el) for el in doc["body"]["content"]
+        ]}}
+        # The document as it stands once the delete above has been applied.
+        after["body"]["content"][1] = {
+            "startIndex": 7, "endIndex": 8, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": "\ue907\n", "textStyle": {}}}]}}
+        # Recompute every index rather than patching the shift piecemeal.
+        index = 1
+        for element in after["body"]["content"]:
+            text = "".join(r["textRun"]["content"] for r in element["paragraph"]["elements"])
+            element["startIndex"] = index
+            index += len(text.encode("utf-16-le")) // 2
+            element["endIndex"] = index
+
+        current, _ = project(structure.parse(after))
+        target, _ = project(markdown.parse("Intro\n\nTail\n"))
+        assert builder.build(current, target, index) == []

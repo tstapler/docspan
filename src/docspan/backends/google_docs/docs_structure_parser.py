@@ -1,7 +1,6 @@
 """Parse a Google Docs JSON document into a list of DocsParagraphNode objects."""
 from __future__ import annotations
 
-import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import List, Optional, Union
 
@@ -21,12 +20,21 @@ from docspan.backends.google_docs.heading_anchors import (
 # DocsRequestBuilder._make_delete_requests.
 UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 
-# Private-Use-Area glyphs Docs writes at the start of a paragraph it renders itself
-# (a native code block uses U+E907). Enumerated by Unicode category rather than by
-# code point, since which glyph Docs picks is its own business — see _parse_paragraph.
-_RENDER_GLYPHS = "".join(
-    chr(cp) for cp in range(0xE000, 0xF900) if unicodedata.category(chr(cp)) == "Co"
-)
+# Google Docs renders some blocks itself — a native code block, for one — and marks
+# each paragraph of such a block by writing a Private-Use-Area glyph in front of it
+# (U+E907 for a code block). It arrives as its **own leading textRun**, which is what
+# makes it identifiable; see `_render_prefix_of`.
+#
+# U+E000–U+F8FF is the BMP Private Use Area by definition, so a `unicodedata.category`
+# filter over it would return every codepoint. Matching the range directly says the
+# same thing and costs ~1% of what building a 6400-character class per parse did.
+_PRIVATE_USE = range(0xE000, 0xF900)
+
+
+def _is_all_private_use(text: str) -> bool:
+    """True when `text` is non-empty and holds nothing but PUA (bar the newline)."""
+    stripped = text.strip("\n")
+    return bool(stripped) and all(ord(ch) in _PRIVATE_USE for ch in stripped)
 
 
 def _utf16_len(text: str) -> int:
@@ -83,6 +91,13 @@ class DocsParagraphNode:
     start_index: int = 0
     end_index: int = 0
     spans: List[TextSpan] = field(default_factory=list)
+    # The Private-Use glyph Docs writes in front of a paragraph it renders itself
+    # (a native code block writes U+E907). Non-empty means the paragraph belongs to
+    # a Docs-rendered block: `.text` still contains it, `projection.project()` drops
+    # it so the diff never sees it, and DocsRequestBuilder must not emit a
+    # deleteContentRange over the paragraph — the API refuses a range covering the
+    # glyph and silently orphans it onto the next paragraph if the range skips it.
+    render_prefix: str = ""
     # True when this paragraph's bullet resolves to a native BULLET_CHECKBOX
     # glyph (glyphType == GLYPH_TYPE_UNSPECIFIED), resolved live by
     # DocsStructureParser from the document's `lists` map. NOT part of the
@@ -291,26 +306,24 @@ class DocsStructureParser:
         # Strip trailing newline (each paragraph ends with \n in the Docs model)
         text = raw_text.rstrip("\n")
 
-        # Drop the Private-Use-Area glyph Docs puts at the front of a paragraph it
-        # renders itself — a native code block writes U+E907 there. It is a
-        # *rendering artifact*, not content: markdown has no syntax for one, so the
-        # two codecs `project()` exists to reconcile were drawing from different
-        # alphabets and the diff read the glyph as a difference the author asked for.
+        # A glyph Docs writes to mark a paragraph it renders itself is a *rendering
+        # artifact*, not content — markdown has no syntax for one, so the diff read it
+        # as a difference the author had asked for and rewrote the block on every push.
         #
-        # That was not merely noisy. Docs **refuses** any deleteContentRange
-        # covering such a paragraph, and `batchUpdate` is atomic, so one refused
-        # delete failed the entire push — a document with a native code block could
-        # not be pushed at all, however unrelated the edit (issue #47).
+        # It is recorded rather than removed. `text` stays faithful to the document,
+        # because two different consumers read it: the index arithmetic (delete bounds,
+        # span ranges) needs what the document actually contains, and the diff and
+        # renderer need what the markdown should say. Stripping it here made the parser
+        # lie to the first group — a delete then either covered the glyph, which the
+        # API refuses outright (#47), or skipped it, which the API accepts and which
+        # orphans the glyph onto the following paragraph. Verified against the live API:
+        # `[34052,34069)` → "Invalid deletion range"; `[34053,34069)` → accepted, and
+        # the next paragraph came back reading "\ue907mappings:".
         #
-        # `start_index` advances with the strip. The API counted the glyph, so
-        # removing it from the text without moving the index would place every span
-        # in the paragraph one unit early — a link or a bold run landing off by one.
-        # U+E907 is BMP, one UTF-16 unit, but count properly rather than assume.
-        stripped = text.lstrip(_RENDER_GLYPHS)
-        if stripped != text:
-            start_index += _utf16_len(text[: len(text) - len(stripped)])
-            text = stripped
-            spans = self._strip_leading_glyphs(spans)
+        # `projection.project()` is the layer that drops it for the diff, and
+        # `render_prefix` is how `DocsRequestBuilder` knows the paragraph belongs to a
+        # block it must not take apart.
+        render_prefix = self._render_prefix_of(paragraph.get("elements", []))
 
         spans = self._trim_spans_to_text(spans, len(text))
 
@@ -328,29 +341,43 @@ class DocsStructureParser:
             start_index=start_index,
             end_index=end_index,
             spans=spans,
+            render_prefix=render_prefix,
             is_native_checkbox=is_native_checkbox,
             heading_id=paragraph_style.get("headingId"),
         )
 
     @staticmethod
-    def _strip_leading_glyphs(spans: List[TextSpan]) -> List[TextSpan]:
-        """Remove leading render glyphs from the spans, keeping them equal to `.text`.
+    def _render_prefix_of(elements: List[dict]) -> str:
+        """The leading run(s) Docs writes to mark a paragraph it renders itself.
 
-        The spans must concatenate to exactly `.text` — pass 2 walks one against the
-        other to place styling, so a character in one and not the other shifts every
-        span after it. Marks on the remainder are preserved.
+        Matched **per run**, not against the concatenated text, and that is the whole
+        point of the signature:
+
+        * An empty `textRun` — which the API does send — cannot hide the glyph behind
+          it. Testing `lstrip` on the joined text and walking spans to match stopped at
+          the empty run, read it as "no glyph here", and then reconciled the
+          length mismatch by trimming from the *end*, destroying a real character.
+        * An author's own Private-Use character is left alone. Someone typing an Apple
+          logo or a Nerd Font glyph types it inside a run with their text, so the run
+          is not *entirely* PUA and this returns "". Treating any leading PUA as an
+          artifact silently altered legitimate content.
+
+        Both shapes are what the live document shows: `run0 = "\ue907"` with
+        `textStyle {}`, content following in its own runs. `textStyle` is deliberately
+        not part of the test — Docs is free to put a `fontSize` on it.
         """
-        out = list(spans)
-        while out:
-            head = out[0]
-            trimmed = head.text.lstrip(_RENDER_GLYPHS)
-            if trimmed == head.text:
+        prefix: List[str] = []
+        for element in elements:
+            text_run = element.get("textRun")
+            if text_run is None:
                 break
-            if trimmed:
-                out[0] = replace(head, text=trimmed)
+            content = text_run.get("content", "")
+            if not content:
+                continue  # an empty run neither is nor conceals a prefix
+            if not _is_all_private_use(content):
                 break
-            out.pop(0)
-        return out
+            prefix.append(content.strip("\n"))
+        return "".join(prefix)
 
     @staticmethod
     def _trim_spans_to_text(spans: List[TextSpan], keep: int) -> List[TextSpan]:
