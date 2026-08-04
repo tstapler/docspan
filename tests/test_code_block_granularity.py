@@ -134,3 +134,79 @@ class TestPushIsIdempotent:
         ]
         for text in texts:
             assert text.count("\n") == 1, text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The render glyph Docs puts in front of a native code block
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRenderGlyphIsNormalizedAway:
+    """U+E907 is a rendering artifact, not content.
+
+    Docs writes it at the start of a paragraph it renders itself. Markdown has no
+    syntax for one, so the two codecs `project()` exists to reconcile were drawing
+    from different alphabets and the diff read the glyph as an authored difference.
+
+    Docs then **refuses** any `deleteContentRange` covering such a paragraph, and
+    `batchUpdate` is atomic — so one refused delete failed the whole push and a
+    document containing a native code block could not be pushed at all, however
+    unrelated the edit. Measured on a real design doc: 56 requests, HTTP 400,
+    nothing written. See issue #47.
+    """
+
+    GLYPH = ""
+
+    def _para(self, runs: list[dict], start: int = 1) -> dict:
+        text = "".join(r["textRun"]["content"] for r in runs)
+        return {
+            "startIndex": start,
+            "endIndex": start + len(text),
+            "paragraph": {"paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                          "elements": runs},
+        }
+
+    def test_a_leading_glyph_is_stripped_from_text_and_spans(self) -> None:
+        doc = {"revisionId": "r", "body": {"content": [self._para([
+            {"textRun": {"content": f"{self.GLYPH}# markgate.yaml\n", "textStyle": {}}},
+        ])]}}
+        node = structure.parse(doc)[0]
+        assert node.text == "# markgate.yaml"
+        assert "".join(s.text for s in node.spans) == node.text
+
+    def test_start_index_advances_with_the_strip(self) -> None:
+        """The index risk. The API counted the glyph; if `start_index` does not move
+        with it, every span in the paragraph is placed one unit early."""
+        doc = {"revisionId": "r", "body": {"content": [self._para([
+            {"textRun": {"content": f"{self.GLYPH}see ", "textStyle": {}}},
+            {"textRun": {"content": "bold", "textStyle": {"bold": True}}},
+            {"textRun": {"content": " now\n", "textStyle": {}}},
+        ])]}}
+        node = structure.parse(doc)[0]
+        assert node.text == "see bold now"
+        assert node.start_index == 2, "the glyph occupied index 1"
+        # 'bold' sits at [6,10) in the document; the offset must agree.
+        assert node.start_index + len("see ") == 6
+
+    def test_a_glyph_only_paragraph_becomes_empty_and_is_projected_away(self) -> None:
+        """Then rule 1 drops it from *both* sides, so the diff never sees it."""
+        doc = {"revisionId": "r", "body": {"content": [self._para([
+            {"textRun": {"content": f"{self.GLYPH}\n", "textStyle": {}}},
+        ])]}}
+        node = structure.parse(doc)[0]
+        assert node.text == ""
+        kept, residue = project([node])
+        assert kept == []
+        assert [r.kind for r in residue] == ["empty_paragraph"]
+
+    def test_no_delete_is_emitted_for_a_glyph_paragraph(self) -> None:
+        """The property that was broken: the push must not ask Docs to delete it."""
+        doc = {"revisionId": "r", "body": {"content": [
+            self._para([{"textRun": {"content": "intro\n", "textStyle": {}}}], start=1),
+            self._para([{"textRun": {"content": f"{self.GLYPH}# cfg\n",
+                                     "textStyle": {}}}], start=7),
+        ]}}
+        target, _ = project(markdown.parse("intro\n\n```yaml\n# cfg\n```\n"))
+        current, _ = project(structure.parse(doc))
+
+        requests = builder.build(current, target, 14)
+        assert not [r for r in requests if "deleteContentRange" in r], requests
