@@ -1,20 +1,26 @@
 """Internal markdown anchors (`[A1](#a1-...)`) as Google Docs heading links.
 
-Covers both directions and the gate between them:
+Covers both directions and what happens when an anchor resolves to nothing:
 
     markdown `#slug`  --heading_anchors.link_payload-->  {"headingId": ...}
     {"headingId": ...} --DocsStructureParser.parse--->  markdown `#slug`
-    an anchor naming no heading  --push()-->  status="error", nothing written
+    an anchor naming no heading  --push()-->  status="warning", text unlinked
 
-The slug tests are the load-bearing ones: an anchor that slugs differently from
-the heading it names does not fail, it *silently* fails — the link resolves to
-nothing and, before the gate existed, was written as a `url` link the reader of
-the Doc could click and land nowhere.
+Two families carry the weight, and both are about *silent* failure rather than
+loud failure:
+
+* the slug tests — an anchor that slugs differently from the heading it names
+  resolves to nothing, and before any of this existed was written as a `url`
+  link the reader of the Doc could click and land nowhere;
+* TestNeverResolvesToTheWrongHeading — an anchor that resolves to the *wrong*
+  heading is worse still, because the push reports a green ✓. Every test there
+  was written against a mutant that survived this whole suite.
 """
 from __future__ import annotations
 
 import json
 import pathlib
+import unicodedata
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -325,7 +331,7 @@ class TestWriteDirection:
         assert builder.unresolved_anchor_links(doc, target) == []
 
     def test_a_heading_the_document_reports_without_an_id_is_reported(self) -> None:
-        # The residue the pre-write check cannot see: the heading exists, in the
+        # The residue the --dry-run advisory cannot see: the heading exists, in the
         # markdown and in the document, but the document gives it no headingId.
         doc = _doc(
             _paragraph("Intro", 1, "HEADING_1", heading_id=None),
@@ -474,7 +480,7 @@ class TestRoundTrip:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The pre-write gate
+# The dry-run advisory, and what push reports
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestUnresolvedAnchorsCheck:
@@ -556,16 +562,253 @@ class TestPushReporting:
 
         assert result.status == "warning"
         assert "#current-state" in result.message
-        assert "nothing to point at" in result.message
+        # Cause-neutral wording: three different causes reach this report, and
+        # an earlier version asserted the rarest of them.
+        assert "nothing in the document matches what they name" in result.message
+        # The "did you mean" tail the deleted exception used to carry.
+        assert "available heading anchors" in result.message
 
-    def test_a_good_anchor_is_not_blocked(
+    def test_a_good_anchor_writes_the_heading_id_link(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:
+        """A resolvable anchor reaches the document as a `headingId` link.
+
+        The pre/post `side_effect` is load-bearing. With a single
+        `return_value`, pass 2 refetches the *pre-write* document — a state that
+        cannot occur in production — and this test passed while the push
+        returned `warning` and wrote **zero** links, which is the opposite of
+        what its name claims. Asserting on the request that actually reaches
+        batch_update, not on the status, is the other half.
+        """
         backend, fake_client = make_backend()
-        fake_client.get_document.return_value = _doc(revision_id="rev-1")
+        # Pass 1 sees an empty document and writes the content; pass 2 refetches
+        # and finds the heading it just created, carrying the id Docs assigns.
+        before = _doc(revision_id="rev-1")
+        after = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.current"),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+            revision_id="rev-2",
+        )
+        fake_client.get_document.side_effect = [before, after]
         local = self._local(tmp_path, "## Current state\n\nsee [it](#current-state)\n")
 
         result = backend.push(local, "doc-1")
 
-        assert result.status != "error", result.message
-        assert fake_client.batch_update.call_count >= 1
+        assert result.status in ("ok", "warning"), result.message
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for call in fake_client.batch_update.call_args_list
+            for request in call.args[1]
+            if "updateTextStyle" in request
+            and "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert {"headingId": "h.current"} in links, links
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Never a link to the WRONG heading
+#
+# The failure these pin is worse than a missing link and invisible without
+# them: the anchor resolves, push reports a green "ok", and the reader lands on
+# a different section. Each test was written against a mutant that survived the
+# whole suite.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNeverResolvesToTheWrongHeading:
+    def _links(self, doc: dict, md: str) -> list[dict]:
+        target = markdown.parse(md)
+        return [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for request in builder.build_span_style_requests(doc, target)
+            if "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+
+    def test_a_duplicate_suffix_never_lands_on_an_unaligned_heading(self) -> None:
+        """`#overview-1` means "my second `## Overview`" — never the first.
+
+        Kills the mutant that seeds slug->id from the document alone. difflib
+        pairs the markdown's *second* Overview with the document's *only* one
+        (`[Overview, Details]` is the longest matching block), so the markdown's
+        first Overview goes unpaired. Reading the document's numbering then maps
+        `overview-1` onto the first Overview's id and both anchors point at the
+        same heading.
+        """
+        doc = _doc(
+            _paragraph("Overview", 1, "HEADING_2", "h.first"),
+            _paragraph("Details", 10, "HEADING_2", "h.details"),
+            _paragraph("see one and two", 18, runs=[
+                {"textRun": {"content": "see one and two\n", "textStyle": {}}}
+            ]),
+        )
+        md = (
+            "## Overview\n\n## Overview\n\n## Details\n\n"
+            "see [one](#overview) and [two](#overview-1)\n"
+        )
+        links = self._links(doc, md)
+        heading_ids = [link.get("headingId") for link in links]
+
+        # The two anchors name different headings, so they must never share an
+        # id — that is the whole defect, stated without depending on which of
+        # the two difflib happens to pair.
+        assert len(set(heading_ids)) == len(heading_ids), heading_ids
+        assert builder.unresolved_anchor_links(doc, markdown.parse(md)), (
+            "an anchor with no heading of its own must be reported, not silently "
+            "redirected to another heading"
+        )
+
+    def test_a_heading_the_document_reports_without_an_id_does_not_capture_an_anchor(
+        self,
+    ) -> None:
+        """`#intro-1` must not land on a literal `## Intro 1` heading.
+
+        The markdown's second `## Intro` owns `intro-1`. The document also holds
+        a heading whose own text slugs to `intro-1`, and the paragraph the
+        markdown's second Intro aligns with reports no `headingId` — so seeding
+        from the document hands the anchor to the wrong heading entirely.
+        """
+        doc = _doc(
+            _paragraph("Intro", 1, "HEADING_2", "h.a"),
+            _paragraph("Intro 1", 7, "HEADING_2", "h.x"),
+            _paragraph("Intro", 15, "HEADING_2", heading_id=None),
+            _paragraph("see it", 21, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        md = "## Intro\n\n## Intro\n\nsee [it](#intro-1)\n"
+
+        assert "h.x" not in [link.get("headingId") for link in self._links(doc, md)]
+        assert builder.unresolved_anchor_links(doc, markdown.parse(md)) == ["#intro-1"]
+
+    def test_a_document_title_is_a_valid_anchor_target(self) -> None:
+        """TITLE and SUBTITLE are anchor targets, not just `HEADING_*`.
+
+        This is a **read**-side property. Markdown `#` parses to `HEADING_1`, not
+        to `TITLE` — measured — so the push path never consults a TITLE style and
+        a test there cannot see this branch (one did not, and the mutant
+        survived). What does consult it is a document Docs itself styled as
+        TITLE, which is every doc whose title was typed into the title bar.
+
+        Verified against a live Google Doc: a TITLE paragraph does carry a
+        `headingId` (`h.cw5ps6hndpkc`) and a SUBTITLE one does too
+        (`h.xkpxvmbu5mys`), so this fixture is not an invented API shape.
+        """
+        doc = _doc(
+            _paragraph("My doc", 1, "TITLE", "h.title"),
+            _paragraph("Sub", 8, "SUBTITLE", "h.sub"),
+        )
+        nodes = structure.parse(doc)
+
+        # Without TITLE/SUBTITLE these maps are empty and a link into the
+        # document's own title reads back as no link at all.
+        assert heading_slug_to_id(nodes) == {"my-doc": "h.title", "sub": "h.sub"}
+        assert heading_id_to_slug(nodes) == {"h.title": "my-doc", "h.sub": "sub"}
+
+    def test_a_title_link_reads_back_as_its_slug(self) -> None:
+        """The same property end to end: pull renders `#my-doc`, not a bare id."""
+        doc = _doc(
+            _paragraph("My doc", 1, "TITLE", "h.title"),
+            _paragraph("back to top", 8, runs=[
+                {"textRun": {"content": "back to ", "textStyle": {}}},
+                {"textRun": {
+                    "content": "top",
+                    "textStyle": {"link": {"headingId": "h.title"}},
+                }},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+        )
+        assert "[top](#my-doc)" in render_nodes_to_markdown(structure.parse(doc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-ASCII anchors survive the markdown parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPercentEncodedAnchors:
+    def test_the_parser_percent_encodes_a_non_ascii_anchor(self) -> None:
+        """Pins the upstream behaviour the rest of this class compensates for.
+
+        If mistune ever stops encoding, this fails and the decode below can go.
+        """
+        spans = [
+            span
+            for node in markdown.parse("see [Café](#café-notes)\n")
+            for span in (node.spans or [])
+            if span.link
+        ]
+        assert [span.link for span in spans] == ["#caf%C3%A9-notes"]
+
+    def test_an_accented_anchor_still_resolves(self) -> None:
+        doc = _doc(
+            _paragraph("Café notes", 1, "HEADING_2", "h.cafe"),
+            _paragraph("see Café", 12, runs=[
+                {"textRun": {"content": "see Café\n", "textStyle": {}}}
+            ]),
+        )
+        md = "## Café notes\n\nsee [Café](#café-notes)\n"
+        target = markdown.parse(md)
+
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for request in builder.build_span_style_requests(doc, target)
+            if "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert {"headingId": "h.cafe"} in links, links
+        assert builder.unresolved_anchor_links(doc, target) == []
+
+    def test_the_two_normalization_forms_of_one_heading_agree(self) -> None:
+        """NFD heading text, NFC href — the case macOS produces."""
+        nfd = unicodedata.normalize("NFD", "Café notes")
+        assert nfd != "Café notes"
+        doc = _doc(
+            _paragraph(nfd, 1, "HEADING_2", "h.cafe"),
+            _paragraph("see x", 2 + len(nfd), runs=[
+                {"textRun": {"content": "see x\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse(f"## {nfd}\n\nsee [x](#café-notes)\n")
+
+        assert builder.unresolved_anchor_links(doc, target) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The tabs-aware Link union
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestTabsAwareLinkUnion:
+    @pytest.mark.parametrize(
+        "link, expected",
+        [
+            # Returned when includeTabsContent is false or unset.
+            ({"headingId": "h.abc"}, "#h.abc"),
+            # Returned when it is true — which client.get_document defaults to,
+            # so this is the shape the parser actually sees. Verified against a
+            # live Doc: the same document parsed to 5 links without the flag and
+            # 0 with it, before this member was handled.
+            ({"heading": {"id": "h.abc", "tabId": "t.0"}}, "#h.abc"),
+            ({"url": "https://example.com"}, "https://example.com"),
+            # Still out of scope, and named so the union is visibly closed.
+            ({"bookmarkId": "kix.b1"}, None),
+            ({"bookmark": {"id": "kix.b1", "tabId": "t.0"}}, None),
+            ({"tabId": "t.1"}, None),
+            ({}, None),
+        ],
+    )
+    def test_every_union_member_is_accounted_for(self, link: dict, expected) -> None:
+        assert structure._parse_link(link) == expected
+
+    def test_a_tab_scoped_document_round_trips_its_anchors(self) -> None:
+        """The read half, on the shape a real tab-scoped fetch returns."""
+        doc = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see ", "textStyle": {}}},
+                {"textRun": {
+                    "content": "it",
+                    "textStyle": {"link": {"heading": {"id": "h.cur", "tabId": "t.0"}}},
+                }},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+        )
+        assert "[it](#current-state)" in render_nodes_to_markdown(structure.parse(doc))

@@ -340,14 +340,28 @@ class DocsStructureParser:
     def _parse_link(link: Optional[dict]) -> Optional[str]:
         """Flatten a Docs `Link` union into the markdown href it round-trips as.
 
-        `Link` is a union of `url`, `headingId` and `bookmarkId`, so reading
-        only `url` — as this did — makes a heading link indistinguishable from
-        no link at all, and `pull` silently drops the cross-reference.
+        Reading only `url` makes a heading link indistinguishable from no link at
+        all, so `pull` silently drops the cross-reference.
 
-        A `headingId` becomes "#" + the id here; _resolve_heading_links then
+        `Link` has **six** members, and which one a heading link arrives as
+        depends on a request flag rather than on the document: with
+        `includeTabsContent=true` it is `heading: {id, tabId}`, and only without
+        it is the flat `headingId` returned. Google documents the flat forms as
+        legacy. `client.get_document` defaults the flag to True, so the object
+        form is the one this parser actually sees — handling only `headingId`
+        parses a live tab-scoped document to zero links:
+
+            $ # same doc, one flag apart
+            $ ...includeTabsContent=false -> 5 linked spans
+            $ ...includeTabsContent=true  -> 0 linked spans
+
+        Both are accepted here so the parser does not depend on how it was
+        fetched. Either becomes "#" + the id; _resolve_heading_links then
         upgrades it to the heading's slug once the whole body is known.
-        `bookmarkId` is deliberately still unhandled (out of scope) and returns
-        None, which is the pre-existing behaviour for it.
+
+        `bookmark`/`bookmarkId` and `tabId` are still unhandled (out of scope)
+        and return None, which is the pre-existing behaviour. They are named
+        here so the next reader knows the union is closed and what is left.
         """
         if not isinstance(link, dict):
             return None
@@ -357,6 +371,11 @@ class DocsStructureParser:
         heading_id = link.get("headingId")
         if isinstance(heading_id, str) and heading_id:
             return "#" + heading_id
+        heading = link.get("heading")
+        if isinstance(heading, dict):
+            heading_id = heading.get("id")
+            if isinstance(heading_id, str) and heading_id:
+                return "#" + heading_id
         return None
 
     def _resolve_is_native_checkbox(self, bullet: Optional[dict], lists: dict) -> bool:

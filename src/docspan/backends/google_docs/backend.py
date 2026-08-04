@@ -28,7 +28,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
 )
-from docspan.backends.google_docs.heading_anchors import unresolved_anchors
+from docspan.backends.google_docs.heading_anchors import heading_slugs, unresolved_anchors
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
@@ -45,6 +45,7 @@ from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
     find_high_risk_paragraphs,
+    render_available_anchors,
     render_high_risk,
 )
 from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
@@ -188,6 +189,11 @@ class GoogleDocsBackend(Backend):
         self._ensure_client()
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
+            # Inside the try/except deliberately: the docstring above promises a
+            # PushPreview(error=…) rather than a traceback, and evaluating these
+            # in the return expression put them outside that promise.
+            unresolved = unresolved_anchors(plan.target_nodes, plan.current_nodes)
+            available = heading_slugs(plan.target_nodes)
         except HttpError as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
@@ -203,13 +209,12 @@ class GoogleDocsBackend(Backend):
             request_count=len(plan.requests),
             tab_warning=plan.tab_warning,
             # Anchors are resolved by pass 2, against a document this dry-run
-            # never writes — so this is the markdown-and-current-document
-            # approximation of what push() will report. It can only be wrong in
-            # the safe direction for headings this push would create, whose
-            # slugs are already in the markdown.
-            unresolved_anchors=unresolved_anchors(
-                plan.target_nodes, DocsStructureParser().parse(plan.doc)
-            ),
+            # never writes, so this is the markdown-and-current-document
+            # approximation of what push() will report: it under-reports and
+            # never over-reports. unresolved_anchors' docstring names the three
+            # causes it cannot see.
+            unresolved_anchors=unresolved,
+            available_anchors=available,
         )
 
     def push(
@@ -248,7 +253,6 @@ class GoogleDocsBackend(Backend):
                     doc_id=doc_id,
                     message=render_high_risk(plan.high_risk),
                 )
-
 
             if plan.requests:
                 self._client.batch_update(
@@ -344,23 +348,36 @@ class GoogleDocsBackend(Backend):
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
 
-            backstop_result = self._comment_backstop_result(doc_id, len(plan.comments), url)
-            if backstop_result is not None:
-                return backstop_result
-            if unstyled or dead_anchors:
-                messages = []
-                if unstyled:
-                    messages.append(self._render_unstyled(unstyled))
-                if dead_anchors:
-                    messages.append(self._render_dead_anchors(dead_anchors))
-                return PushResult(
-                    status="warning",
-                    doc_id=doc_id,
-                    url=url,
-                    message="\n".join(messages),
+            # Every warning signal is collected, not raced. Returning on the
+            # first one meant whichever fired earliest hid the rest: a single
+            # typo'd anchor suppressed the multi-tab warning entirely, so
+            # docspan kept writing to a possibly-wrong tab while the user read a
+            # message about a link. These are independent facts about one push
+            # and the user needs all of them.
+            messages = [
+                message
+                for message in (
+                    # Only after a write. Its own contract is "re-check the count
+                    # after a successful batch_update", and a push that reports a
+                    # dead anchor without writing anything no longer short-circuits
+                    # to "skipped" above — so without this gate a no-op push could
+                    # blame docspan for a comment a human resolved mid-run, and pay
+                    # an extra list_comments call to do it.
+                    self._comment_backstop_message(doc_id, len(plan.comments))
+                    if (plan.requests or second)
+                    else None,
+                    self._render_unstyled(unstyled) if unstyled else None,
+                    self._render_dead_anchors(dead_anchors, heading_slugs(plan.target_nodes))
+                    if dead_anchors
+                    else None,
+                    plan.tab_warning,
                 )
-            if plan.tab_warning:
-                return PushResult(status="warning", doc_id=doc_id, url=url, message=plan.tab_warning)
+                if message
+            ]
+            if messages:
+                return PushResult(
+                    status="warning", doc_id=doc_id, url=url, message="\n".join(messages)
+                )
             return PushResult(status="ok", doc_id=doc_id, url=url)
         except TabNotFoundError as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
@@ -376,25 +393,32 @@ class GoogleDocsBackend(Backend):
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
 
     @staticmethod
-    def _render_dead_anchors(anchors: list[str]) -> str:
-        """Report internal anchors pass 2 found no heading id for.
+    def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:
+        """Report internal anchors pass 2 could not point at a heading.
 
         Distinct from _render_unstyled: those paragraphs got no styling because
         pass 2 could not place them, whereas these were placed and styled and
-        only the link was left off, because the heading they name has no
-        `headingId` in the written document. Everything else about the paragraph
-        did land, so saying "styling was not applied" would be wrong.
+        only the link was left off. Everything else about the paragraph landed,
+        so saying "styling was not applied" would be wrong.
+
+        The wording stays cause-neutral, and matches PushPreview's. Three
+        different causes reach here — the author typo'd the anchor, the heading
+        was renamed or deleted, or the document reports the heading with no
+        `headingId` — and an earlier wording asserted the third ("the heading
+        each names has no id"), which is simply false for the first, the most
+        common one. It also avoids "were written": these anchors may be reported
+        by a push that made no API write at all.
         """
         shown = anchors[:5]
         more = len(anchors) - len(shown)
         lines = [
-            f"⚠ {len(anchors)} internal anchor(s) were written without a link — the "
-            f"heading each names has no id in the document, so there is nothing to "
-            f"point at:",
+            f"⚠ {len(anchors)} internal anchor(s) have no link — nothing in the "
+            f"document matches what they name:",
         ]
         lines += [f"    • {anchor}" for anchor in shown]
         if more:
             lines.append(f"    • … and {more} more")
+        lines.append(render_available_anchors(available))
         return "\n".join(lines)
 
     @staticmethod
@@ -412,27 +436,23 @@ class GoogleDocsBackend(Backend):
             lines.append(f"    • …and {more} more")
         return "\n".join(lines)
 
-    def _comment_backstop_result(
-        self, doc_id: str, before_count: int, url: str
-    ) -> PushResult | None:
+    def _comment_backstop_message(self, doc_id: str, before_count: int) -> Optional[str]:
         """CommentCountBackstop — orthogonal, exact check independent of the
         substring heuristic in find_high_risk_paragraphs(). Re-checks the
         open-comment count after a successful batch_update(); a drop
         escalates status to "warning", never leaves it "ok" with only a
         message appended (see plan.md Task 1.2.3c / ADR-002). Returns None
         when the count didn't drop.
+
+        Returns the message rather than a whole PushResult so push() can report
+        it *alongside* its other warnings instead of instead of them.
         """
         assert self._client is not None
         after_count = len(self._client.list_comments(doc_id))
         if after_count < before_count:
-            return PushResult(
-                status="warning",
-                doc_id=doc_id,
-                url=url,
-                message=(
-                    f"⚠ open comment count dropped ({before_count}→{after_count}) — "
-                    "a comment may have been lost even though it wasn't flagged"
-                ),
+            return (
+                f"⚠ open comment count dropped ({before_count}→{after_count}) — "
+                "a comment may have been lost even though it wasn't flagged"
             )
         return None
 

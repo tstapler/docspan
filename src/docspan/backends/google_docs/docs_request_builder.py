@@ -482,15 +482,15 @@ class DocsRequestBuilder:
         """Internal anchors pass 2 could not point at a heading, in use order.
 
         The loud half of _span_style_requests' refusal to write a link with no
-        target. push() rejects an anchor that names no heading *before* writing
-        anything (heading_anchors.unresolved_anchors), so this normally returns
-        empty; it catches the residue that check cannot see — an anchor whose
-        heading exists in the markdown and in the written document but which the
-        document reports without a `headingId`, so there is no id to link to.
+        target, and push()'s **primary** report — not a residue catcher. Every
+        cause lands here: the author typo'd the anchor, the heading was renamed
+        or deleted, or the document reports the heading with no `headingId`.
+        heading_anchors.unresolved_anchors() covers the same ground for
+        ``--dry-run`` only; push() does not call it and does not gate on it.
 
-        Reported rather than raised because the cause is the document, not the
-        author: aborting would discard every other paragraph's inline styling
-        for one bad link, and the next push would abort identically.
+        Reported rather than raised: aborting would discard every other
+        paragraph's inline styling for one bad link, and the next push would
+        abort identically.
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
@@ -643,6 +643,27 @@ class DocsRequestBuilder:
         document's own headings are folded in underneath for anchors that point
         at a heading this push does not contain (a partial push), and the id set
         makes a bare `#h.abc123` from an earlier pull resolve verbatim.
+
+        A slug the markdown owns but that resolves to no id is **deleted**, not
+        left holding the document-derived value. This is the difference between
+        a reported dead anchor and a silent link to the wrong heading, and the
+        wrong-heading case is reachable two ways:
+
+        * the target heading landed outside a difflib `equal` run, so it has no
+          pair — and the alignment failed precisely *because* the two heading
+          sequences differ, which is also what makes the document's duplicate
+          suffixes mean something else. `## Overview / ## Overview / ## Details`
+          against a document holding `Overview, Details` paired markdown heading
+          #2 with document heading #1, and `#overview-1` — the author's *second*
+          Overview — resolved to the *first* one's id;
+        * the paired document paragraph reports no `headingId`, so a document
+          heading whose own literal text happens to slug to `intro-1` captured
+          an anchor that meant "my second `## Intro`".
+
+        Neither was reported: `unaligned_span_targets` filters on `node.spans`
+        and a plain heading has none, and `unresolved_anchor_links` only sees
+        anchors that resolve to *nothing* — a wrong resolution is still a
+        resolution. Both now surface as dead anchors.
         """
         slug_to_id = dict(heading_slug_to_id(current))  # document-only headings
         paired_document_node = {id(tnode): cnode for cnode, tnode in heading_pairs}
@@ -657,6 +678,8 @@ class DocsRequestBuilder:
             heading_id = getattr(cnode, "heading_id", None) if cnode is not None else None
             if heading_id:
                 slug_to_id[slug] = heading_id
+            else:
+                slug_to_id.pop(slug, None)
         known_ids = {
             node.heading_id
             for node in current
@@ -932,11 +955,12 @@ class DocsRequestBuilder:
         ``slug_to_id``/``known_ids`` resolve internal anchors against the
         re-fetched document's headings — heading ids only exist once the
         headings do, which is why this cannot happen in pass 1. An anchor that
-        resolves to nothing raises rather than degrading to a `url` link, which
-        would put a link in the document that a reader can click and land
-        nowhere. push() rejects unresolvable anchors before writing anything
-        (heading_anchors.unresolved_anchors), so reaching this raise means the
-        document disagrees with that check rather than that the author typo'd.
+        resolves to nothing gets **no link at all**: the span keeps its other
+        marks and unresolved_anchor_links() reports it. It is never degraded to
+        a `url` link holding a `#fragment`, which would put something in the
+        document a reader can click and land nowhere. Nothing rejects the push
+        first — this and unresolved_anchor_links() are the only checks on the
+        write path.
         """
         requests: List[dict] = []
         offset = placement.start_index
