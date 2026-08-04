@@ -383,7 +383,7 @@ class GoogleDocsBackend(Backend):
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
-                    message=plan.tab_warning
+                    message=(f"⚠ {plan.tab_warning}" if plan.tab_warning else None)
                     or describe_residue(plan.residue)
                     or "No changes detected",
                 )
@@ -411,7 +411,9 @@ class GoogleDocsBackend(Backend):
                     self._render_unstyled(unstyled) if unstyled else None,
                     # Offer the keys resolution actually consulted, so the list
                     # cannot name the anchor it just called dead.
-                    self._render_dead_anchors(dead_anchors, sorted(alignment.slug_to_id))
+                    self._render_dead_anchors(
+                        dead_anchors, sorted(s for s in alignment.slug_to_id if s)
+                    )
                     if dead_anchors
                     else None,
                     # ⚠-prefixed here as well. Every other collected message

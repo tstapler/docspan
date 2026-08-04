@@ -11,11 +11,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
 )
 from docspan.backends.google_docs.heading_anchors import (
+    _heading_texts_and_ids,
     heading_slug_to_id,
     is_anchor,
     is_heading_style,
     link_payload,
-    slugify,
     slugify_all,
 )
 
@@ -752,16 +752,25 @@ class DocsRequestBuilder:
         anchors that resolve to *nothing* — a wrong resolution is still a
         resolution. Both now surface as dead anchors.
 
-        **The deletion is narrowed to the ambiguous case**, which is the only one
-        it can help. An unpaired heading whose base slug is unique in the markdown
-        has exactly one meaning, and the document's entry for it is that same
-        heading — a doc holding one `Intro` and markdown holding one `## Intro`
-        can only mean `h.intro`, even when difflib leaves the heading out of every
-        `equal` run because it moved past a body paragraph. Popping there replaced
-        a correct link with a dead-anchor warning for a heading plainly present,
-        and `unaligned_span_targets` cannot even explain it (no spans on a
-        heading). Only a *duplicated* base slug makes the document's numbering
-        mean something else, and that is the case both reproductions above share.
+        **An inherited entry is kept only when it names a heading with the same
+        text.** That is the whole test, and it is a fact about the *document*, not
+        about the markdown.
+
+        A previous version gated on "is this base slug duplicated in the
+        markdown", reasoning that only a duplicate can make the document's
+        numbering mean something else. That was wrong, and it reopened the second
+        case above: markdown `## Intro 1` has a *unique* base slug, so it kept the
+        document's `intro-1` — which belongs to the second of the document's two
+        `Intro` headings, not to the author's `Intro 1`. Silent, `ok`, wrong
+        heading. A differential fuzz put that at 7 new silent wrong links against
+        17 recovered correct ones, which is the trade this whole change refuses.
+
+        Comparing the text keeps both properties at once. A document holding one
+        `Intro` and markdown holding one `## Intro` still resolves when difflib
+        leaves the heading unpaired (same text, so the entry is trustworthy) —
+        without it, a heading plainly present got a dead-anchor warning that
+        `unaligned_span_targets` could not even explain, since it filters on
+        `node.spans` and a heading has none.
         """
         slug_to_id = dict(heading_slug_to_id(current))  # document-only headings
         paired_document_node = {id(tnode): cnode for cnode, tnode in heading_pairs}
@@ -769,13 +778,17 @@ class DocsRequestBuilder:
             node for node in target
             if isinstance(node, DocsParagraphNode) and is_heading_style(node.style)
         ]
-        # A base slug more than one of the markdown's headings shares is what
-        # makes the document's duplicate numbering mean something other than the
-        # author's. Only those keys are unsafe to inherit from the document.
-        base_counts: dict = {}
-        for node in target_headings:
-            base = slugify(node.text)
-            base_counts[base] = base_counts.get(base, 0) + 1
+        # slug -> the text of the document heading that produced it, so an
+        # inherited entry can be checked against what the author actually wrote.
+        document_pairs = _heading_texts_and_ids(current)
+        document_slug_text = {
+            slug: text
+            for slug, (text, heading_id) in zip(
+                slugify_all(text for text, _ in document_pairs), document_pairs
+            )
+            if heading_id
+        }
+        unpaired: List[Tuple[str, str]] = []
         for slug, tnode in zip(
             slugify_all(node.text for node in target_headings), target_headings
         ):
@@ -783,8 +796,35 @@ class DocsRequestBuilder:
             heading_id = getattr(cnode, "heading_id", None) if cnode is not None else None
             if heading_id:
                 slug_to_id[slug] = heading_id
-            elif base_counts.get(slugify(tnode.text), 0) > 1:
-                slug_to_id.pop(slug, None)
+            else:
+                unpaired.append((slug, tnode.text))
+
+        # An inherited entry is only trustworthy on two counts, and both are facts
+        # about the document rather than about the markdown:
+        unpaired_slugs = {slug for slug, _ in unpaired}
+        paired_ids = {
+            heading_id
+            for slug, heading_id in slug_to_id.items()
+            if slug not in unpaired_slugs
+        }
+        for slug, tnode_text in unpaired:
+            inherited = slug_to_id.get(slug)
+            if inherited is None:
+                continue
+            # 1. It must name a heading with the *same text*. Otherwise it is a
+            #    different heading — markdown `## Intro 1` inheriting the
+            #    document's `intro-1`, which belongs to the second of its two
+            #    `Intro` headings.
+            if document_slug_text.get(slug) != tnode_text:
+                del slug_to_id[slug]
+                continue
+            # 2. Its id must not already be claimed by a heading this push paired.
+            #    Two slugs naming different headings must never resolve to one id:
+            #    markdown `## Overview / ## Overview` against a document holding
+            #    one `Overview` leaves the first unpaired with matching text, and
+            #    without this both `#overview` and `#overview-1` land on it.
+            if inherited in paired_ids:
+                del slug_to_id[slug]
         known_ids = {
             node.heading_id
             for node in current

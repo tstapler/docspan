@@ -246,19 +246,35 @@ def available_anchor_slugs(
 
     A list that disagrees with resolution is worse than no list: it tells the
     author their correct spelling is both wrong and right.
+
+    Two subtleties, both learned by getting them wrong:
+
+    * an earlier version guarded the markdown side with `if heading_id is None or
+      heading_id`, which is **always true** for both producers — the markdown
+      parser never sets an id, and the document side is already filtered on
+      truthiness. It was dead code, so the function still offered every markdown
+      heading, which is exactly what it was written to stop.
+    * an empty heading slugs to `""`, which would be offered as a bare `#` — not
+      an anchor at all (`is_anchor` needs more than the `#`). Filtered out.
+
+    A markdown heading is only offerable when the *push* will make it resolvable,
+    which means it must actually be paired to a document heading — and that is
+    knowable only in pass 2. So the honest dry-run answer is the markdown's
+    headings *minus* those the document already contradicts, and `push()` passes
+    `sorted(alignment.slug_to_id)` instead, which is the real map.
     """
-    resolvable = set(heading_slug_to_id(document_nodes))
-    resolvable |= {
+    document_slugs = set(heading_slug_to_id(document_nodes))
+    document_headings = _heading_texts_and_ids(document_nodes)
+    # A slug the document reports for a heading with no id cannot resolve.
+    unlinkable = {
         slug
         for slug, (_text, heading_id) in zip(
-            slugify_all(text for text, _ in _heading_texts_and_ids(target_nodes)),
-            _heading_texts_and_ids(target_nodes),
+            slugify_all(text for text, _ in document_headings), document_headings
         )
-        # A markdown heading this push creates gets an id from Docs, so its slug
-        # is offerable even though nothing carries an id yet.
-        if heading_id is None or heading_id
+        if not heading_id
     }
-    return sorted(resolvable)
+    target_slugs = set(heading_slugs(target_nodes)) - unlinkable
+    return sorted(slug for slug in document_slugs | target_slugs if slug)
 
 
 def heading_slugs(nodes: Iterable[object]) -> List[str]:
@@ -356,21 +372,33 @@ def resolve_anchor(
     this resolves it back without either side inventing a syntax for "this is
     an id, not a slug".
 
-    Both sides are compared on ``anchor_target``'s key, so a slug built from
-    NFD heading text still matches an href the markdown parser handed over in
-    NFC — see ``anchor_target``.
+    Three layers, in this order, and the order is the point:
+
+    1. the **exact** decoded target, against ids then slugs. An author who wrote
+       the anchor in the same normal form as the heading gets that heading, full
+       stop. Skipping this layer and normalizing first threw the author's normal
+       form away: with one heading in NFC and one in NFD, each anchor named its
+       own heading unambiguously, and normalizing made them indistinguishable —
+       so an earlier version reported *both* dead, having given up two links it
+       did not need to give up.
+    2. the NFC-folded target against ids.
+    3. the NFC-folded target against an NFC-folded slug map, which is what lets
+       an NFD heading match an NFC href — the common case, since macOS hands text
+       over in NFD and editors write NFC. `_match_keyed` refuses a key two
+       distinct slugs both fold onto, so this layer can never pick a winner
+       between them; layer 1 has already resolved the case where it shouldn't
+       have to.
     """
-    target = anchor_target(href)
+    exact = unquote(href[1:])
     ids = known_ids if isinstance(known_ids, (set, frozenset, dict)) else set(known_ids or ())
+    if exact in ids:
+        return exact
+    direct = slug_to_id.get(exact)
+    if direct is not None:
+        return direct
+    target = unicodedata.normalize("NFC", exact)
     if target in ids:
         return target
-    # Deliberately NOT short-circuited on `slug_to_id.get(target)` first. That
-    # "fast path" looks free and silently reintroduces the collision _match_keyed
-    # exists to refuse: when one heading's slug is already NFC, the raw key hits
-    # directly and its NFD twin never gets a say. Measured — it returned the
-    # second heading's id for *both* anchors. The re-keyed map is the only lookup,
-    # so ambiguity is always seen. It costs O(headings) per anchored span; if that
-    # ever matters, hoist it into _anchor_resolution rather than adding a bypass.
     return _match_keyed(slug_to_id).get(target)
 
 
@@ -451,18 +479,24 @@ def unresolved_anchors(
 
     Do not restate this as "only" one cause. Each of the three was measured.
     """
-    slug_to_id = dict(heading_slug_to_id(document_nodes))
-    resolvable = {
-        unicodedata.normalize("NFC", slug)
-        for slug in list(heading_slugs(target_nodes)) + list(slug_to_id)
-    }
+    document_slugs = dict(heading_slug_to_id(document_nodes))
     known_ids = {
         heading_id
         for _text, heading_id in _heading_texts_and_ids(document_nodes)
         if heading_id
     }
+    # Resolved through resolve_anchor rather than against a set built here, so
+    # the advisory and the write agree on *how* a target is matched — layer by
+    # layer, exact form before NFC. A second set-membership test drifted from it
+    # the moment resolve_anchor grew the exact-match layer, and would have
+    # reported an anchor the push then resolved.
+    #
+    # The markdown's own headings have no ids yet, so they are mapped to a
+    # sentinel: only whether the anchor resolves matters here, never to what.
+    resolvable = {slug: "" for slug in heading_slugs(target_nodes)}
+    resolvable.update(document_slugs)
     return [
         href
         for href in anchors_in(target_nodes)
-        if anchor_target(href) not in resolvable and anchor_target(href) not in known_ids
+        if resolve_anchor(href, resolvable, known_ids) is None
     ]
