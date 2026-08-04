@@ -28,11 +28,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
 )
-from docspan.backends.google_docs.heading_anchors import (
-    UnresolvedAnchorError,
-    heading_slugs,
-    unresolved_anchors,
-)
+from docspan.backends.google_docs.heading_anchors import unresolved_anchors
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
@@ -206,6 +202,14 @@ class GoogleDocsBackend(Backend):
             high_risk=plan.high_risk,
             request_count=len(plan.requests),
             tab_warning=plan.tab_warning,
+            # Anchors are resolved by pass 2, against a document this dry-run
+            # never writes — so this is the markdown-and-current-document
+            # approximation of what push() will report. It can only be wrong in
+            # the safe direction for headings this push would create, whose
+            # slugs are already in the markdown.
+            unresolved_anchors=unresolved_anchors(
+                plan.target_nodes, DocsStructureParser().parse(plan.doc)
+            ),
         )
 
     def push(
@@ -245,28 +249,6 @@ class GoogleDocsBackend(Backend):
                     message=render_high_risk(plan.high_risk),
                 )
 
-            # An internal anchor (`[A1](#a1-current-state)`) can only be written
-            # as a Docs `headingId` link, and pass 2 refuses to degrade one that
-            # resolves to nothing into a `url` link — that is the dead link the
-            # reader of the Doc clicks. Checked here, against this call's own
-            # fetch plus the markdown being pushed, so a renamed heading or a
-            # typo'd anchor costs a rejected push instead of a document written
-            # with a link to nowhere. `force` deliberately does not override it:
-            # force is about overwriting a human's work, not about writing
-            # something known to be broken.
-            missing = unresolved_anchors(plan.target_nodes, DocsStructureParser().parse(plan.doc))
-            if missing:
-                return PushResult(
-                    status="error",
-                    doc_id=doc_id,
-                    message=str(
-                        UnresolvedAnchorError(
-                            missing,
-                            heading_slugs(plan.target_nodes),
-                            source=local_path,
-                        )
-                    ),
-                )
 
             if plan.requests:
                 self._client.batch_update(
@@ -297,6 +279,7 @@ class GoogleDocsBackend(Backend):
             )
             second: list[dict] = []
             unstyled: list[DocsParagraphNode] = []
+            dead_anchors: list[str] = []
             if needs_pass2:
                 # When pass 1 wrote nothing the already-fetched plan.doc is
                 # still current, so pass 2 runs against it and skips a
@@ -319,6 +302,18 @@ class GoogleDocsBackend(Backend):
                 # wrong paragraph — surface that instead of returning a clean
                 # "ok" over a doc whose links didn't land.
                 unstyled = builder.unaligned_span_targets(pass2_doc, plan.target_nodes)
+                # An internal anchor pass 2 found no heading id for — a typo, a
+                # renamed heading, or a link into a heading that no longer
+                # exists. It wrote no link at all rather than a `url` link
+                # holding a "#fragment" the Doc cannot follow, so this is the
+                # only thing standing between that and a green ✓.
+                #
+                # Reported rather than blocking the push: the content changes are
+                # correct and wanted, and refusing the whole document over one
+                # bad anchor would also reject a pull-then-push of a document
+                # that merely contains a link into a heading someone deleted —
+                # which used to work.
+                dead_anchors = builder.unresolved_anchor_links(pass2_doc, plan.target_nodes)
                 if second:
                     # The document's own revisionId guards this batch the same
                     # way pass 1 is guarded, so pass 2 can't silently overwrite
@@ -327,7 +322,7 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if not plan.requests and not second and not unstyled:
+            if not plan.requests and not second and not unstyled and not dead_anchors:
                 # Nothing was applied by either pass. That is now a true
                 # statement about the document rather than an inference from an
                 # empty request list: projection.project() removes the one class
@@ -352,12 +347,17 @@ class GoogleDocsBackend(Backend):
             backstop_result = self._comment_backstop_result(doc_id, len(plan.comments), url)
             if backstop_result is not None:
                 return backstop_result
-            if unstyled:
+            if unstyled or dead_anchors:
+                messages = []
+                if unstyled:
+                    messages.append(self._render_unstyled(unstyled))
+                if dead_anchors:
+                    messages.append(self._render_dead_anchors(dead_anchors))
                 return PushResult(
                     status="warning",
                     doc_id=doc_id,
                     url=url,
-                    message=self._render_unstyled(unstyled),
+                    message="\n".join(messages),
                 )
             if plan.tab_warning:
                 return PushResult(status="warning", doc_id=doc_id, url=url, message=plan.tab_warning)
@@ -374,6 +374,28 @@ class GoogleDocsBackend(Backend):
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
         except Exception as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
+
+    @staticmethod
+    def _render_dead_anchors(anchors: list[str]) -> str:
+        """Report internal anchors pass 2 found no heading id for.
+
+        Distinct from _render_unstyled: those paragraphs got no styling because
+        pass 2 could not place them, whereas these were placed and styled and
+        only the link was left off, because the heading they name has no
+        `headingId` in the written document. Everything else about the paragraph
+        did land, so saying "styling was not applied" would be wrong.
+        """
+        shown = anchors[:5]
+        more = len(anchors) - len(shown)
+        lines = [
+            f"⚠ {len(anchors)} internal anchor(s) were written without a link — the "
+            f"heading each names has no id in the document, so there is nothing to "
+            f"point at:",
+        ]
+        lines += [f"    • {anchor}" for anchor in shown]
+        if more:
+            lines.append(f"    • … and {more} more")
+        return "\n".join(lines)
 
     @staticmethod
     def _render_unstyled(unstyled: list[DocsParagraphNode]) -> str:

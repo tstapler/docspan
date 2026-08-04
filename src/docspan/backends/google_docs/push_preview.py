@@ -174,6 +174,11 @@ class PushPreview:
     request_count: int
     error: Optional[str] = None
     tab_warning: Optional[str] = None
+    # Internal anchors (`[A1](#a1-foo)`) that name no heading in either the
+    # markdown or the document, so push() will write the text without a link and
+    # report them. Surfaced here so --dry-run does not read clean for a file the
+    # real push will warn about.
+    unresolved_anchors: List[str] = field(default_factory=list)
 
     def render(self) -> str:
         if self.error is not None:
@@ -211,6 +216,17 @@ class PushPreview:
 
         if self.high_risk:
             lines.append(render_high_risk(self.high_risk))
+
+        if self.unresolved_anchors:
+            shown = self.unresolved_anchors[:5]
+            more = len(self.unresolved_anchors) - len(shown)
+            lines.append(
+                f"⚠ {len(self.unresolved_anchors)} internal anchor(s) name no heading, "
+                "so they will be written as plain text with no link:"
+            )
+            lines += [f"    • {anchor}" for anchor in shown]
+            if more:
+                lines.append(f"    • … and {more} more")
 
         if self.tab_warning:
             lines.append(f"⚠ {self.tab_warning}")
