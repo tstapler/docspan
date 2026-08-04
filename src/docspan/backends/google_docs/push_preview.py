@@ -170,6 +170,10 @@ class PushPlan:
     # cannot represent it (today: empty paragraphs). Never part of the diff —
     # carried so a push can report what it deliberately left alone.
     residue: List[Residue] = field(default_factory=list)
+    # State projection.project() removed from the *markdown* side because the diff
+    # cannot carry it (today: a blank line inside a fenced code block). Unlike
+    # `residue` this is author content that will NOT be written, so push reports it.
+    target_residue: List[Residue] = field(default_factory=list)
 
 
 @dataclass
@@ -204,6 +208,9 @@ class PushPreview:
     # exception this replaced listed these; dropping it left the user told their
     # anchor is wrong and not what would be right.
     available_anchors: List[str] = field(default_factory=list)
+    # Author content the diff cannot carry, so push will not write it. Surfaced on
+    # the dry-run too, or the first the author hears of it is after the write.
+    target_residue_note: str = ""
 
     def render(self) -> str:
         if self.error is not None:
@@ -253,6 +260,9 @@ class PushPreview:
             if more:
                 lines.append(f"    • … and {more} more")
             lines.append(render_available_anchors(self.available_anchors))
+
+        if self.target_residue_note:
+            lines.append(self.target_residue_note)
 
         if self.tab_warning:
             lines.append(f"⚠ {self.tab_warning}")

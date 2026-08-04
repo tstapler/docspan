@@ -145,6 +145,27 @@ def _describe_empty(node: DocsParagraphNode) -> str:
     return "blank paragraph"
 
 
+def describe_target_residue(residue: List[Residue]) -> str:
+    """One line summarising residue removed from the *markdown* side.
+
+    Separate from describe_residue because the two are opposite situations and the
+    wording cannot be shared. Doc-side residue is state markdown cannot express, so
+    it is *left alone* — nothing is lost. Markdown-side residue is content the
+    author wrote that push will **not write**, which is a loss and has to say so.
+
+    Reachable since fenced code blocks became one node per line: a blank line
+    inside a block, an empty fence and a blank-only fence all produce `text=""`.
+    """
+    blanks = sum(1 for r in residue if r.kind == "empty_paragraph")
+    if not blanks:
+        return ""
+    return (
+        f"⚠ {blanks} blank line(s) inside a code block were not written to the doc — "
+        "markdown can express them but the diff cannot carry them. Add them in Google "
+        "Docs directly if they matter."
+    )
+
+
 def describe_residue(residue: List[Residue]) -> str:
     """One line summarising residue, for a push message. Empty string if none."""
     if not residue:
