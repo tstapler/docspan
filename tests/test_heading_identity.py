@@ -220,7 +220,14 @@ class TestNoHeadingIsDemoted:
 
     The word list is short and generic on purpose: collisions are what make a
     text-only key mispair, so a vocabulary of distinctive sentences would never
-    reach the defect. 6 of these 500 failed before the split; all pass after.
+    reach the defect. 8 of these 500 failed before the split and all pass after —
+    but see the scope note: this measures *heading survival across a single-block
+    edit*. It does not measure a pure restyle of a duplicated heading, which
+    difflib expresses as a non-adjacent insert+delete that `_repair` never
+    inspects, and which therefore still destroys a paragraph. Nor can the
+    synthesized document contain a Private-Use render glyph, a chrome paragraph or
+    a monospace run, so `render_prefix` is "" for every node here even though the
+    word list is drawn from code fences. Both gaps are open.
     """
 
     WORDS = ["Config", "Example", "Setup", "body", "pass", "}", "key: value", "Notes", "A1"]

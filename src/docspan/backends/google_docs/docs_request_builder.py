@@ -258,9 +258,11 @@ class DocsRequestBuilder:
 
         for tag, i1, i2, j1, j2 in self._opcodes(current, target):
             if tag == "equal":
-                # "equal" means equal *text* — _node_key is text-only, so a
-                # restyle (heading level, bullet on/off, nesting) lands here
-                # rather than as a replace. It is still a change the user asked
+                # "equal" means equal *text*: `_node_key` includes style and
+                # bullet, so a restyle lands in a `replace` run, and `_repair`
+                # re-tags it as `equal` on `_content_key`. Either way a restyle
+                # (heading level, bullet on/off, nesting) arrives here rather
+                # than as a replace. It is still a change the user asked
                 # for and push() will write, so it has to be reported; counting
                 # it as unchanged would make --dry-run claim nothing happens
                 # while push emits updateParagraphStyle.
@@ -1261,8 +1263,9 @@ class DocsRequestBuilder:
     def _make_style_update_requests(self, current_node: Node, target_node: Node) -> List[dict]:
         """Restyle a paragraph in place — same text, different paragraph attributes.
 
-        Emitted for `equal` opcodes, which since _node_key became text-only is
-        where every restyle now lands. Covers all three attributes the Docs API
+        Emitted for `equal` opcodes, where every restyle lands — either because
+        the text and attributes both match, or because `_repair` re-tagged a
+        text-identical pair inside a `replace` run. Covers all three attributes the Docs API
         can change without rewriting the text:
 
         * namedStyleType, via updateParagraphStyle

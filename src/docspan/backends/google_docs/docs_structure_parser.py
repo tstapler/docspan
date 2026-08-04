@@ -73,7 +73,7 @@ class DocsParagraphNode:
     # True when this paragraph's bullet resolves to a native BULLET_CHECKBOX
     # glyph (glyphType == GLYPH_TYPE_UNSPECIFIED), resolved live by
     # DocsStructureParser from the document's `lists` map. NOT part of the
-    # diff key (style, text, is_list_item) — feeds GlyphShapeCheck only
+    # diff key (style, bullet, nesting, text) — feeds GlyphShapeCheck only
     # (via DiffEntry.current_is_native_checkbox), never
     # DocsRequestBuilder.build()'s equality/opcode logic. See ADR-001,
     # plan.md Task 1.2.2d.
