@@ -43,29 +43,37 @@ def _render_spans(spans: List[TextSpan]) -> str:
 
 
 def _render_cell(cell: TableCell) -> str:
-    """A cell's markdown — with its marks, and with `|` and newlines neutralised.
+    """A cell's markdown — with its marks, and with `|` escaped.
 
-    A cell holds a *paragraph list*, not a string, and markdown's table syntax has
-    no cell-internal line break. Both characters that would end something early are
-    escaped, for the same reason and in ascending order of damage:
+    An unescaped `|` ends the cell, so a link whose URL or label contains one would
+    split the row into extra columns. Not preserved: a `|` inside a *URL* keeps the
+    row intact but comes back percent-encoded (`%7C`) on the next parse, so such a
+    link is rewritten once and then stable.
 
-    * an unescaped `|` ends the **cell**, so a link whose URL or label contains one
-      splits the row into extra columns;
-    * an unescaped newline ends the **row**, so a two-paragraph cell reparses as a
-      paragraph and the table is destroyed outright. `<br>` is the conventional
-      stand-in and is what GitHub-flavoured markdown renders.
+    **A newline is deliberately left alone**, and that is a decision rather than an
+    omission. A Docs cell holds a paragraph *list* and markdown's table syntax has no
+    cell-internal break, so a two-paragraph cell has no faithful rendering. Every
+    encoding tried is worse than the gap:
 
-    Escaping the pipe alone was half of its own argument, and once spans are
-    rendered it was actively worse: `**line one\nline two**` emits a dangling `**`
-    across the break.
+    * emit the newline — the row ends early and the table reparses as a paragraph.
+      Loud: the next diff shows the table gone.
+    * emit `<br>` — the table survives, but nothing can decode it back, and the table
+      diff key includes cell text, so a pull then an *unmodified* push sees a change
+      and answers it by deleting and re-creating the table, taking every comment
+      anchored inside it. Silent and permanent, since it converges after one push.
+    * emit `<br>` and decode it on parse — closes that, and opens the identical hole
+      for a cell whose author *typed* `<br>`: it becomes a newline, the key stops
+      matching, and the table is destroyed the same way. A cell holding only `<br>`
+      comes back empty. Markdown cannot distinguish the two, so the decode cannot
+      either.
 
-    Not preserved: a `|` inside a link *URL* survives as a row but comes back
-    percent-encoded (`%7C`) on the next parse, so that link is rewritten once and
-    then stable. Spans are not in the table diff key, so it surfaces as a
-    non-idempotent `updateTextStyle` rather than a visible diff.
+    So the loud failure is kept over either quiet one. `_cell_placement` already
+    declines a multi-paragraph cell and `unplaced_table_cells` reports it, so the case
+    is announced rather than merely broken. See the follow-up issue for a real fix,
+    which needs something other than markdown's table syntax to carry the break.
     """
     text = _render_spans(cell.spans) if cell.spans else cell.text
-    return text.replace("|", "\\|").replace("\n", "<br>")
+    return text.replace("|", "\\|")
 
 
 def _render_table(node: DocsTableNode) -> str:

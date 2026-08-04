@@ -265,6 +265,53 @@ class TestPassTwoStylesCells:
         # And now it is reported.
         assert builder.unresolved_anchor_links(doc, target) == ["#no-such-heading"]
 
+    def test_two_distinct_unplaceable_cells_with_the_same_text_are_both_counted(
+        self,
+    ) -> None:
+        """The dedup that made the count wrong — nothing caught its return.
+
+        An earlier version guarded the orphan sweep with `cell.text not in missed`, so
+        two genuinely distinct affected cells collapsed into one entry and the message
+        printed "1 table cell(s)" for two. Cell texts repeat constantly in these
+        tables.
+        """
+        spans = markdown.parse("| x |\n| --- |\n| **Owner** |\n")[0].rows[1][0].spans
+        doc = _doc_with_table(_cell("ref", 30))
+        target = [DocsTableNode(rows=[
+            [TableCell(text="ref")],
+            [TableCell(text="Owner", spans=spans)],
+            [TableCell(text="Owner", spans=spans)],
+        ])]
+        assert builder.unplaced_table_cells(doc, target) == ["Owner", "Owner"]
+
+    def test_an_unstyled_cell_is_never_reported_as_unplaced(self) -> None:
+        """The `if not cell.styled: continue` guard.
+
+        Without it every cell in a table with no live counterpart is reported, so a
+        plain table would raise a warning about formatting it never had.
+        """
+        doc = _doc_with_table(_cell("ref", 30))
+        target = [DocsTableNode(rows=[[TableCell(text="ref")], [TableCell(text="plain")]])]
+        assert builder.unplaced_table_cells(doc, target) == []
+
+    def test_a_placed_cell_whose_spans_overflow_is_reported(self) -> None:
+        """Placing is not the same as styling.
+
+        `_span_requests_in` stops at the first span that would cross the cell's bound
+        and emits nothing for it or anything after — so a cell could place, lose its
+        styling, and be reported by nothing. `_spans_overflow` closes exactly this for
+        paragraphs.
+        """
+        doc = _doc_with_table(_cell("A1", 30))
+        target = [
+            *markdown.parse("## A1 — Current state\n"),
+            DocsTableNode(rows=[[TableCell(text="A1", spans=markdown.parse(
+                "| x |\n| --- |\n| **A1 and rather more text than fits** |\n"
+            )[0].rows[1][0].spans)]]),
+        ]
+        assert builder.build_table_cell_span_requests(doc, target) == []
+        assert builder.unplaced_table_cells(doc, target) == ["A1"]
+
     def test_an_unstyled_table_costs_nothing(self) -> None:
         doc = _doc_with_table(_cell("A1", 30))
         target = [DocsTableNode(rows=[["A1"]])]
@@ -327,17 +374,44 @@ class TestPushReportsWhatItCouldNotStyle:
         assert "pushing again places the styling" in message
         assert "will report this same warning" in message
 
-    # NOT covered: the "nothing to do" gate in backend.py, which counts
-    # `unplaced_cells` so a push that dropped cell styling cannot return
-    # status="skipped". Removing it from that condition leaves this suite green.
-    #
-    # A test needs a push where pass 1 emits *zero* requests while a styled cell is
-    # unplaceable, and I could not construct one here — every fixture I tried had
-    # pass 1 writing something, so the gate was never reached and the assertion
-    # passed for the wrong reason. Recorded as a gap rather than left as a test that
-    # looks like coverage and is not; see the follow-up issue. The user-visible
-    # outcome *is* covered — deleting the rendered message from `messages` fails
-    # `test_push_warns_rather_than_reporting_success`.
+    def test_a_push_that_dropped_cell_styling_is_never_reported_as_no_changes(
+        self, make_backend, tmp_path
+    ) -> None:
+        """The "nothing to do" gate has to count unplaced cells.
+
+        I first recorded this as untestable, having failed to build a fixture where
+        pass 1 emits nothing while a styled cell is unplaceable — every attempt had
+        pass 1 writing something, so the gate was never reached and the assertion
+        passed for the wrong reason. A reviewer built it: put the chip's display name
+        in its **own** element, so the live parsed text equals the markdown text and
+        the text-only diff key gives pass 1 nothing to do, while `_cell_placement`
+        still declines the cell for the non-`textRun` element beside it. My fixture
+        prepended the chip to a run *already* holding the name, yielding
+        `AdaAda owns A1`.
+
+        Without the gate term this returns `status="skipped"` / "No changes detected"
+        — a push that dropped a cell's formatting reporting that nothing happened.
+        """
+        backend, client = make_backend()
+        chip_cell = {"content": [{
+            "startIndex": 40, "endIndex": 52,
+            "paragraph": {"elements": [
+                {"person": {"personProperties": {"name": "Ada", "email": "ada@example.com"}}},
+                {"textRun": {"content": " owns A1\n", "textStyle": {}}},
+            ]},
+        }]}
+        client.get_document.return_value = _doc_with_rows([[_cell("ref", 30)], [chip_cell]])
+        client.batch_update.return_value = {}
+        client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text(self._markdown(), encoding="utf-8")
+        result = backend.push(str(local), "doc-id")
+
+        assert result.status != "skipped", (
+            f"a push that dropped cell styling must not report no changes: {result}"
+        )
+        assert "table cell" in (result.message or "")
 
     def test_a_cell_that_can_be_placed_is_not_reported(self, make_backend, tmp_path) -> None:
         """The other side of the gate — no false warning on a healthy document."""
@@ -363,29 +437,52 @@ class TestRendering:
         nodes = [n for n in structure.parse(doc) if isinstance(n, DocsTableNode)]
         assert "[A1](https://example.com)" in render_nodes_to_markdown(nodes)
 
-    def test_a_newline_in_a_cell_becomes_a_break_rather_than_a_new_row(self) -> None:
-        """A cell holds a paragraph list; markdown's table syntax has no line break.
+    def test_a_multi_paragraph_cell_fails_loudly_rather_than_quietly(self) -> None:
+        """A Docs cell holds a paragraph list; markdown's table syntax has no break.
 
-        An unescaped newline ends the *row*, so a two-paragraph cell reparses as a
-        paragraph and the table is destroyed. Rendering spans made it worse before
-        this: `**line one\nline two**` emitted a dangling `**` across the break.
+        There is no faithful rendering, so the choice is *which* failure. Emitting the
+        newline ends the row and the table reparses as a paragraph — visible in the
+        next diff. Emitting `<br>` keeps the table and silently destroys it on the
+        next push instead, because the table diff key includes cell text: `<br>` does
+        not parse back to a newline, so an *unmodified* push sees a change and answers
+        it by deleting and re-creating the table with every comment anchored in it.
+        Decoding `<br>` back closes that and opens the same hole for a cell whose
+        author typed `<br>` — markdown cannot tell the two apart, so neither can the
+        decode, and a cell holding only `<br>` comes back empty.
+
+        Both quiet options were tried and reverted. This pins the loud one.
         """
         node = DocsTableNode(rows=[[TableCell(text="line one\nline two"), TableCell(text="x")]])
         rendered = render_nodes_to_markdown([node])
-        assert rendered.splitlines()[0] == "| line one<br>line two | x |"
+        assert "<br>" not in rendered, "no encoding that cannot be decoded back"
+        assert "line one\nline two" in rendered
 
-        # And it must come back as the newline it stands for. Asserting only that a
-        # table survives left the escape one-way, which is worse than not escaping:
-        # the diff key includes cell text, so a pull then an *unmodified* push saw a
-        # change, deleted and re-created the table, and wrote a literal "<br>" in
-        # place of the second paragraph. Removing the decode leaves this test green
-        # unless the text itself is asserted.
-        back = markdown.parse(rendered)[0]
-        assert isinstance(back, DocsTableNode)
-        assert back.rows[0][0].text == "line one\nline two"
-        assert builder._node_key(back) == builder._node_key(node), (
-            "the diff key must match, or an unmodified push rewrites the table"
-        )
+        # And the case is announced, not merely broken: such a cell cannot be placed.
+        # A real two-paragraph cell has two `content` elements, and `_cell_placement`
+        # reads only the first — so the cell's full text is not in it and the search
+        # fails, which is the reporting path. Modelling it as one run with an embedded
+        # newline is what a Docs cell never looks like.
+        two_paragraph = {"content": [
+            {"startIndex": 30, "endIndex": 39, "paragraph": {
+                "elements": [{"textRun": {"content": "line one\n", "textStyle": {}}}]}},
+            {"startIndex": 39, "endIndex": 48, "paragraph": {
+                "elements": [{"textRun": {"content": "line two\n", "textStyle": {}}}]}},
+        ]}
+        doc = _doc_with_table(two_paragraph)
+        target = [DocsTableNode(rows=[[TableCell(text="line one\nline two", spans=markdown.parse(
+            "| x |\n| --- |\n| **a** |\n")[0].rows[1][0].spans)]])]
+        assert builder.unplaced_table_cells(doc, target) == ["line one\nline two"]
+
+    def test_a_literal_br_a_person_typed_survives_untouched(self) -> None:
+        """The input the decode destroyed. `HEAD~1` of that fix handled it correctly.
+
+        A cell reading `see <br> tag` came back as `see \n tag`, so the diff key
+        stopped matching and an unmodified push deleted and re-created the table. A
+        cell holding only `<br>` came back empty — content destroyed outright.
+        """
+        for raw in ("see <br> tag", "<br>", "<br/>", "<BR>"):
+            cell = markdown.parse(f"| x |\n| --- |\n| {raw} |\n")[0].rows[1][0]
+            assert cell.text == raw, f"{raw!r} must survive parsing unchanged"
 
     def test_a_parsed_cell_with_no_marks_carries_no_spans(self) -> None:
         """The parser path, not the markdown path.

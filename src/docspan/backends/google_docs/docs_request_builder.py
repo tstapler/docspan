@@ -496,18 +496,26 @@ class DocsRequestBuilder:
         paragraphs: refusing to guess is only safe if the refusal is reported.
 
         Walks the **target** grid outermost and looks the live cell up, rather than
-        walking the live side and reconciling afterwards. That ordering is what makes
-        the answer exact: every styled target cell is visited exactly once, so there
-        is no need to dedup — and an earlier version that deduped on `cell.text`
-        collapsed two genuinely distinct affected cells into one report, understating
-        the count in a message that prints it. Cell texts like "Owner" or "Status"
-        repeat constantly in these tables, so that was the normal case, not a corner.
+        walking the live side and reconciling afterwards. Every styled target cell is
+        then visited exactly once, so nothing needs deduplicating — and an earlier
+        version deduped on `cell.text`, collapsing two genuinely distinct affected
+        cells into one entry and understating the count in a message that prints it.
 
-        It also removes a quadratic scan (`text not in missed` inside a triple loop)
-        from the window between pass 2's `get_document` and its `batch_update` —
-        measured at 268 ms for a 40x160 table, in the window `align()` widens by 43%
-        and calls a correctness lever, because a concurrent edit there costs the user
-        a revisionId conflict on a document pass 1 has already changed.
+        Scope of that, measured rather than assumed: the dedup guarded only the
+        orphan sweep, so it misreported only when the target and live *shapes*
+        differed. Two duplicate-text cells that both had live counterparts were
+        already counted exactly. So it was narrower than "the normal case", which is
+        how an earlier version of this docstring put it.
+
+        The inversion also removes a quadratic `text not in missed` scan from the
+        window between pass 2's `get_document` and its `batch_update`. Measured over
+        6400 styled unplaceable cells: 238 ms before, 10 ms after — but only with
+        *distinct* cell texts. With one repeated text the old scan was ~12 ms, since
+        the list it scanned never grew. Both numbers are real and they bound the win
+        from either side. That window is the one `align()` **narrows** by 43% (its
+        docstring calls itself a correctness lever wearing a performance hat), because
+        a concurrent edit inside it costs the user a revisionId conflict on a document
+        pass 1 has already changed.
         """
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
@@ -523,14 +531,30 @@ class DocsRequestBuilder:
                     if not cell.styled:
                         continue
                     live = live_cells[c] if c < len(live_cells) else None
-                    if live is None or self._cell_placement(live, cell) is None:
+                    placed = self._cell_placement(live, cell) if live is not None else None
+                    if placed is None:
+                        missed.append(cell.text)
+                        continue
+                    # A cell can place and still lose its styling: _span_requests_in
+                    # stops at the first span that would cross the cell's bound and
+                    # emits nothing for it or anything after. Reporting only the
+                    # placement failure would leave that a silent partial
+                    # application — the case unaligned_span_targets calls "the
+                    # failure mode this whole pass exists to remove" and closes for
+                    # paragraphs via _spans_overflow.
+                    start, limit = placed
+                    if limit is not None and start + sum(
+                        _utf16_len(span.text) for span in cell.spans
+                    ) > limit:
                         missed.append(cell.text)
         return missed
 
     @staticmethod
     def _live_tables(doc: dict, limit: int) -> List[dict]:
         """The first `limit` tables in body order — the pairing both cell passes use."""
-        tables = []
+        tables: List[dict] = []
+        if limit <= 0:
+            return tables
         for element in _body_content(doc):
             table = element.get("table")
             if table is not None:
