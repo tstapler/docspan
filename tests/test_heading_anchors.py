@@ -687,6 +687,43 @@ class TestNeverResolvesToTheWrongHeading:
         assert "h.x" not in [link.get("headingId") for link in self._links(doc, md)]
         assert builder.unresolved_anchor_links(doc, markdown.parse(md)) == ["#intro-1"]
 
+    def test_two_document_headings_sharing_a_base_slug_refuse_rather_than_guess(
+        self,
+    ) -> None:
+        """`Q&A` and `QA` both slug to `qa`, so neither can claim the anchor.
+
+        Base-slug equality alone let the author's `## QA` — whose own paragraph
+        reports no id — inherit `Q&A`'s id, and the reader landed in the wrong
+        section with a green ✓. When two document headings share a base there is
+        nothing to distinguish them, so this reports instead of guessing.
+        """
+        doc = _doc(
+            _paragraph("Q&A", 1, "HEADING_2", "h.faq"),
+            _paragraph("answers", 6),
+            _paragraph("QA", 15, "HEADING_2", heading_id=None),
+            _paragraph("see it", 19, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        md = "## QA\n\nsee [it](#qa)\n"
+        assert slugify("Q&A") == slugify("QA") == "qa"
+
+        assert self._links(doc, md) == []
+        assert builder.unresolved_anchor_links(doc, markdown.parse(md)) == ["#qa"]
+
+    def test_a_slug_preserving_rename_keeps_its_link(self) -> None:
+        """The relaxation this pairs with: same base slug, one such heading."""
+        doc = _doc(
+            _paragraph("body first", 1),
+            _paragraph("Rollout Plan", 12, "HEADING_2", "h.plan"),
+            _paragraph("see it", 25, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        md = "## Rollout plan\n\nbody first\n\nsee [it](#rollout-plan)\n"
+
+        assert self._links(doc, md) == [{"headingId": "h.plan"}]
+
     def test_a_document_title_is_a_valid_anchor_target(self) -> None:
         """TITLE and SUBTITLE are anchor targets, not just `HEADING_*`.
 

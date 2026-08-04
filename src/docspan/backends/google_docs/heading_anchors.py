@@ -20,13 +20,14 @@ too, and out of scope here, but the invariant above is about paragraphs only.
   -> markdown `#slug` (`heading_id_to_slug`). Which one a read returns depends on
   the request flag, so both are accepted.
 
-`#target` is resolved in layers (`resolve_anchor`): the exact decoded target
-against ids then slugs, then an NFC fold of it against the same. Exact-first
-matters — folding first threw away the author's normal form and made an NFC and
-an NFD anchor that each named their own heading indistinguishable. Matching ids by
-set membership rather than by an `h.xxxx` shape guess means the read direction can
-emit a bare id when a slug is unavailable and the write direction still resolves
-it, with no invented escape syntax and no assumption about how Docs formats an id.
+`#target` is percent-decoded and then matched **exactly** (`resolve_anchor`) —
+heading id first, then slug. No Unicode normalization: two attempts at folding NFD
+to NFC each produced a silent link to the wrong heading, and folding only ever
+helped a hand-written cross-form anchor, since one a pull wrote comes from the same
+source as the slug. Matching ids by set membership rather than by an `h.xxxx` shape
+guess means the read direction can emit a bare id when a slug is unavailable and
+the write direction still resolves it, with no invented escape syntax and no
+assumption about how Docs formats an id.
 
 A leading `#` is the only discriminator needed between an anchor and a URL — no
 absolute or relative URL begins with one — so `TextSpan.link` keeps carrying a
@@ -318,9 +319,9 @@ def is_anchor(href: Optional[str]) -> bool:
 def anchor_target(href: str) -> str:
     """The part of an anchor after the `#`, as a key comparable with a slug.
 
-    Two transformations, both required for a non-ASCII anchor to resolve at all:
+    Percent-decoding, which a non-ASCII anchor needs to resolve at all:
 
-    * **Percent-decode.** A CommonMark parser normalizes link destinations by
+    * A CommonMark parser normalizes link destinations by
       percent-encoding them, so `[Café](#café-notes)` reaches this module as
       `#caf%C3%A9-notes` — measured, not assumed::
 
@@ -441,11 +442,10 @@ def unresolved_anchors(
         for _text, heading_id in _heading_texts_and_ids(document_nodes)
         if heading_id
     }
-    # Resolved through resolve_anchor rather than against a set built here, so
-    # the advisory and the write agree on *how* a target is matched — layer by
-    # layer, exact form before NFC. A second set-membership test drifted from it
-    # the moment resolve_anchor grew the exact-match layer, and would have
-    # reported an anchor the push then resolved.
+    # Resolved through resolve_anchor rather than against a set built here, so the
+    # advisory and the write agree on *how* a target is matched. A second
+    # set-membership test drifted from it once resolve_anchor changed, and reported
+    # an anchor the push then resolved.
     #
     # The markdown's own headings have no ids yet, so they are mapped to a
     # sentinel: only whether the anchor resolves matters here, never to what.

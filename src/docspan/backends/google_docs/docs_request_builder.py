@@ -733,25 +733,32 @@ class DocsRequestBuilder:
         anchors that resolve to *nothing* — a wrong resolution is still a
         resolution. Both now surface as dead anchors.
 
-        **An inherited entry is kept only when it names a heading with the same
-        text.** That is the whole test, and it is a fact about the *document*, not
-        about the markdown.
+        **An inherited entry survives three tests, all facts about the document.**
+        Each was added because the previous set let a wrong link through:
 
-        A previous version gated on "is this base slug duplicated in the
-        markdown", reasoning that only a duplicate can make the document's
-        numbering mean something else. That was wrong, and it reopened the second
-        case above: markdown `## Intro 1` has a *unique* base slug, so it kept the
-        document's `intro-1` — which belongs to the second of the document's two
-        `Intro` headings, not to the author's `Intro 1`. Silent, `ok`, wrong
-        heading. A differential fuzz put that at 7 new silent wrong links against
-        17 recovered correct ones, which is the trade this whole change refuses.
+        1. its *base* slug must equal the target heading's base slug. Not raw text
+           — comparing text dropped every slug-preserving edit (`Rollout Plan`
+           renamed to `Rollout plan`, a trailing space, added punctuation), 24
+           links lost against 0 gained. Not the whole slug either: markdown
+           `## Intro 1` (base `intro-1`) must not inherit the document's `intro-1`,
+           which is the second of its two `Intro` headings (base `intro`).
+        2. the document must hold exactly **one** heading with that base slug.
+           Base equality alone is not enough: `Q&A` and `QA` both slug to `qa`, so
+           markdown `## QA` whose own paragraph reports no id inherited `Q&A`'s
+           id and the reader landed in the wrong section — green ✓, no warning.
+           When two document headings share a base there is no way to tell which
+           one the author meant, so this refuses rather than guesses.
+        3. its id must not already be claimed by a heading this push paired, or
+           two anchors naming different headings resolve to one id. This narrows
+           one shape of that; it does not establish the general invariant, because
+           a stale document-only entry colliding with a paired id is never
+           inspected here.
 
-        Comparing the text keeps both properties at once. A document holding one
-        `Intro` and markdown holding one `## Intro` still resolves when difflib
-        leaves the heading unpaired (same text, so the entry is trustworthy) —
-        without it, a heading plainly present got a dead-anchor warning that
-        `unaligned_span_targets` could not even explain, since it filters on
-        `node.spans` and a heading has none.
+        What all three preserve: a document holding one `Intro` and markdown
+        holding one `## Intro` still resolves when difflib leaves the heading
+        unpaired. Without that, a heading plainly present got a dead-anchor
+        warning `unaligned_span_targets` could not even explain, since it filters
+        on `node.spans` and a heading has none.
         """
         slug_to_id = dict(heading_slug_to_id(current))  # document-only headings
         paired_document_node = {id(tnode): cnode for cnode, tnode in heading_pairs}
@@ -762,12 +769,9 @@ class DocsRequestBuilder:
         # slug -> the text of the document heading that produced it, so an
         # inherited entry can be checked against what the author actually wrote.
         document_pairs = _heading_texts_and_ids(current)
-        # slug -> the *base* slug of the document heading that produced it. Base,
-        # not raw text: the key is a slug, so what matters is whether the two
-        # headings slug the same, not whether they are spelled the same. Comparing
-        # raw text dropped every slug-preserving edit — `Rollout Plan` renamed to
-        # `Rollout plan`, a trailing space in the Doc, added punctuation — and a
-        # fuzz put that at 24 links lost against 0 gained.
+        # slug -> the base slug of the document heading that produced it, plus how
+        # many document headings share each base. Both are needed; see the
+        # docstring's three tests.
         document_slug_base = {
             slug: slugify(text)
             for slug, (text, heading_id) in zip(
@@ -775,6 +779,10 @@ class DocsRequestBuilder:
             )
             if heading_id
         }
+        document_base_counts: dict = {}
+        for text, _heading_id in document_pairs:
+            base = slugify(text)
+            document_base_counts[base] = document_base_counts.get(base, 0) + 1
         unpaired: List[Tuple[str, str]] = []
         for slug, tnode in zip(
             slugify_all(node.text for node in target_headings), target_headings
@@ -798,11 +806,15 @@ class DocsRequestBuilder:
             inherited = slug_to_id.get(slug)
             if inherited is None:
                 continue
-            # 1. It must name a heading with the same *base* slug. Otherwise the
-            #    suffix means something different on each side — markdown
-            #    `## Intro 1` (base `intro-1`) inheriting the document's `intro-1`,
-            #    which is the second of its two `Intro` headings (base `intro`).
-            if document_slug_base.get(slug) != slugify(tnode_text):
+            base = slugify(tnode_text)
+            # 1. Same base slug, or the suffix means something different on each
+            #    side (markdown `## Intro 1` vs the document's second `Intro`).
+            # 2. And exactly one document heading with that base, or there is no
+            #    way to tell which of them the author meant (`Q&A` / `QA`).
+            if (
+                document_slug_base.get(slug) != base
+                or document_base_counts.get(base, 0) != 1
+            ):
                 del slug_to_id[slug]
                 continue
             # 2. Its id must not already be claimed by a heading this push paired.
