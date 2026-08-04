@@ -58,10 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verbatim; it is upgraded to the slug, so the pulled markdown works as markdown.
 
 ### Changed
-- **google-docs:** heading slugs are computed from the *rendered* heading text. An entity
-  reference (`## Team &amp; process`) and inline HTML (`## <code>push()</code> …`) were
-  previously slugged from the markdown source, which shifted duplicate numbering and could
-  land an anchor on the neighbouring heading. The entity also reached the Doc undecoded.
 - **google-docs:** pass 2 parses and aligns the document once per push instead of three
   times. The discarded work sat inside the window between pass 2's read and its write, where
   a concurrent edit costs a conflict on a document pass 1 has already changed.
@@ -76,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An anchor that resolves to nothing is written as plain text, so a later pull replaces the
   author's `[text](#anchor)` with `text`. The push reports it; nothing does afterwards.
 - Such a push exits non-zero on every run, with no flag to suppress it.
+- A heading containing an HTML entity reference (`## Team &amp; process`) or inline HTML
+  (`## <code>push()</code> …`) is slugged from the markdown *source* rather than the rendered
+  text, so its slug differs from GitHub's. Because duplicate numbering depends on the
+  headings before it, that can land an anchor on a neighbouring heading. Pre-existing; a fix
+  attempt was reverted on this branch because it needs the slug text and the
+  document text separated, which is its own change.
 
 ## [0.1.0] - 2026-06-07
 
