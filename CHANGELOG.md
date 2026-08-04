@@ -39,6 +39,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **google-docs:** internal markdown anchors (`[A1](#a1-current-state)`) now resolve to
+  Google Docs heading links instead of being written as a `#fragment` URL the Doc cannot
+  follow. Slugs follow `github-slugger`, checked against vectors generated from the real
+  implementation. `TITLE`/`SUBTITLE` paragraphs count as anchor targets, and both the
+  modern `Link.heading` and the legacy `Link.headingId` union members are read, so an
+  anchor survives a pull whether or not the fetch used `includeTabsContent`.
+- **google-docs:** an anchor that names no heading is written as plain text with no link
+  and reported — `docspan push --dry-run` lists it, `docspan push` exits non-zero with a
+  warning naming the anchor and the heading anchors that *are* available. It is never
+  written as a link a reader can click and land nowhere, and never reported as a clean ✓.
+- **google-docs:** both pull paths now emit the heading's slug. A default (no `tab_id`) pull
+  goes through Drive's HTML export, which carries the Doc's opaque `#h.abc123` through
+  verbatim; it is upgraded to the slug, so the pulled markdown works as markdown.
+
+### Changed
+- **google-docs:** pass 2 parses and aligns the document once per push instead of three
+  times. The discarded work sat inside the window between pass 2's read and its write, where
+  a concurrent edit costs a conflict on a document pass 1 has already changed.
+
+### Known limitations
+Each of these is tracked as a follow-up rather than half-addressed here.
+- An anchor into a heading in a *different tab* of the same document cannot be resolved and
+  is reported unresolved. The flat `headingId` member resolves against the tab named in the
+  request, so expressing one needs the tabs-aware `Link.heading` member.
+- A pull cannot express a `bookmark`/`bookmarkId` link, a link to a tab, or any link inside
+  a table cell, so those are dropped from the pulled file without a report.
+- Confluence writes an internal anchor as a literal `#fragment` href, which it does not
+  resolve.
+- An anchor that resolves to nothing is written as plain text, so a later pull replaces the
+  author's `[text](#anchor)` with `text`. The push reports it; nothing does afterwards.
+- Such a push exits non-zero on every run, with no flag to suppress it.
+- A heading containing an HTML entity reference (`## Team &amp; process`) or inline HTML
+  (`## <code>push()</code> …`) is slugged from the markdown *source* rather than the rendered
+  text, so its slug differs from GitHub's. Because duplicate numbering depends on the
+  headings before it, that can land an anchor on a neighbouring heading. Pre-existing; a fix
+  attempt was reverted on this branch because it needs the slug text and the
+  document text separated, which is its own change.
+
 ## [0.1.0] - 2026-06-07
 
 ### Added

@@ -10,8 +10,31 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
 )
+from docspan.backends.google_docs.heading_anchors import (
+    _heading_texts_and_ids,
+    heading_slug_to_id,
+    is_anchor,
+    is_heading_style,
+    link_payload,
+    slugify,
+    slugify_all,
+)
 
 Node = Union[DocsParagraphNode, DocsTableNode]
+
+
+@dataclass(frozen=True)
+class Pass2Alignment:
+    """Everything the three pass-2 consumers need, computed once per push.
+
+    See DocsRequestBuilder.align() for why this is shared rather than recomputed:
+    the recomputation sat inside pass 2's optimistic-concurrency window.
+    """
+    current: List[Node]
+    pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]]
+    unaligned: List[DocsParagraphNode]
+    slug_to_id: dict
+    known_ids: set
 
 
 def _utf16_len(text: str) -> int:
@@ -416,7 +439,43 @@ class DocsRequestBuilder:
             if text
         ]
 
-    def build_span_style_requests(self, doc: dict, target: List[Node]) -> List[dict]:
+    def align(self, doc: dict, target: List[Node]) -> "Pass2Alignment":
+        """Parse ``doc``, pair it with ``target``, and resolve anchors — once.
+
+        The three pass-2 consumers below each need the same alignment, and each
+        used to compute its own: three full `DocsStructureParser.parse` calls and
+        three full `SequenceMatcher` runs per push, two of every result thrown
+        away. Measured on a 5000-paragraph document, that put **+43%** on the
+        window between pass 2's `get_document` and its `batch_update` — the
+        window in which a concurrent edit invalidates the revisionId and costs
+        the user a conflict on a document pass 1 has already changed. So this is
+        a correctness lever wearing a performance hat.
+
+        `push()` calls this once and hands the result to all three. Each still
+        accepts ``alignment=None`` and computes its own, so a caller with only a
+        document and a target — every existing test — keeps working.
+        """
+        current, pairs, unaligned, heading_pairs = self._align_for_styling(doc, target)
+        slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
+        return Pass2Alignment(
+            current=current,
+            pairs=pairs,
+            unaligned=unaligned,
+            slug_to_id=slug_to_id,
+            known_ids=known_ids,
+        )
+
+    def _aligned(
+        self, doc: dict, target: List[Node], alignment: Optional["Pass2Alignment"]
+    ) -> "Pass2Alignment":
+        return alignment if alignment is not None else self.align(doc, target)
+
+    def build_span_style_requests(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
         """
         Emit updateTextStyle requests for inline styling (links/bold/italic/monospace).
 
@@ -427,13 +486,19 @@ class DocsRequestBuilder:
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
 
-        pairs, _unaligned = self._align_for_styling(doc, target)
+        aligned = self._aligned(doc, target, alignment)
+        pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         requests: List[dict] = []
         for cnode, tnode in pairs:
-            requests.extend(self._span_style_requests(tnode, cnode))
+            requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
         return requests
 
-    def unaligned_span_targets(self, doc: dict, target: List[Node]) -> List[DocsParagraphNode]:
+    def unaligned_span_targets(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[DocsParagraphNode]:
         """Target paragraphs carrying inline styling that pass 2 could not place.
 
         Pass 2 refuses to guess: a target paragraph whose text it cannot find,
@@ -456,7 +521,8 @@ class DocsRequestBuilder:
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
-        pairs, unaligned = self._align_for_styling(doc, target)
+        aligned = self._aligned(doc, target, alignment)
+        pairs, unaligned = aligned.pairs, aligned.unaligned
         overflowed = [
             tnode for cnode, tnode in pairs if self._spans_overflow(tnode, cnode)
         ]
@@ -469,6 +535,39 @@ class DocsRequestBuilder:
             for node in target
             if isinstance(node, DocsParagraphNode) and id(node) in reported
         ]
+
+    def unresolved_anchor_links(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[str]:
+        """Internal anchors pass 2 could not point at a heading, in use order.
+
+        The loud half of _span_style_requests' refusal to write a link with no
+        target, and push()'s **primary** report — not a residue catcher. Every
+        cause lands here: the author typo'd the anchor, the heading was renamed
+        or deleted, or the document reports the heading with no `headingId`.
+        heading_anchors.unresolved_anchors() covers the same ground for
+        ``--dry-run`` only; push() does not call it and does not gate on it.
+
+        Reported rather than raised: aborting would discard every other
+        paragraph's inline styling for one bad link, and the next push would
+        abort identically.
+        """
+        if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
+            return []
+        aligned = self._aligned(doc, target, alignment)
+        pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
+        unresolved: List[str] = []
+        for _cnode, tnode in pairs:
+            for span in tnode.spans:
+                if not span.link or not is_anchor(span.link):
+                    continue
+                if link_payload(span.link, slug_to_id, known_ids) is None:
+                    if span.link not in unresolved:
+                        unresolved.append(span.link)
+        return unresolved
 
     @staticmethod
     def _spans_overflow(node: DocsParagraphNode, placement: DocsParagraphNode) -> bool:
@@ -511,12 +610,32 @@ class DocsRequestBuilder:
 
     def _align_for_styling(
         self, doc: dict, target: List[Node]
-    ) -> Tuple[List[Tuple[DocsParagraphNode, DocsParagraphNode]], List[DocsParagraphNode]]:
+    ) -> Tuple[
+        List[Node],
+        List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+        List[DocsParagraphNode],
+        List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+    ]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(pairs, unaligned)`` — pairs of (document node, target node)
-        that are safe to style, and the target paragraphs with spans that could
-        not be paired.
+        Returns ``(current, pairs, unaligned, heading_pairs)`` — the parsed
+        document, pairs of (document node, target node) that are safe to style,
+        the target paragraphs with spans that could not be paired, and the same
+        pairing restricted to target paragraphs that are headings.
+
+        ``current`` is returned rather than re-parsed by callers because parsing
+        a large document twice per push to learn the same thing is pure cost.
+
+        ``heading_pairs`` is what lets an anchor be resolved correctly. The slug
+        an author wrote `#foo` against is a fact about *their markdown* — its
+        duplicate suffix depends on the headings before it **in the markdown** —
+        while the `headingId` to link to is a fact about the *document*. Pairing
+        the two here is the only place both are known. Deriving slugs from the
+        document instead goes wrong in two ways that produce a wrong link rather
+        than an error: a heading the document holds but the markdown does not
+        shifts every later duplicate suffix, and a Docs `TITLE`/`SUBTITLE` is not
+        a `HEADING_*` at all, so a doc title could never be an anchor target
+        even though `projection.project()` and `#`/`##` both treat it as one.
 
         Why not zip(): pass 1 does **not** guarantee the re-fetched document
         matches ``target`` node-for-node. It leaves an empty paragraph behind
@@ -551,6 +670,7 @@ class DocsRequestBuilder:
         )
 
         pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
+        heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         aligned_target_indices = set()
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != "equal":
@@ -562,6 +682,8 @@ class DocsRequestBuilder:
                 aligned_target_indices.add(ti)
                 if tnode.spans:
                     pairs.append((cnode, tnode))
+                if is_heading_style(tnode.style):
+                    heading_pairs.append((cnode, tnode))
 
         unaligned = [
             node
@@ -570,10 +692,155 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return pairs, unaligned
+        return current, pairs, unaligned, heading_pairs
+
+    def _anchor_resolution(
+        self, current: List[Node], target: List[Node],
+        heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+    ) -> Tuple[dict, set]:
+        """(slug -> headingId, every headingId the document reports).
+
+        Slugs are computed over the **target's** headings in target order, so a
+        duplicate suffix means what it means in the author's markdown, and each
+        is mapped to the id of the document paragraph it aligned with. The
+        document's own headings are folded in underneath for anchors that point
+        at a heading this push does not contain (a partial push), and the id set
+        makes a bare `#h.abc123` from an earlier pull resolve verbatim.
+
+        A slug the markdown owns but that resolves to no id is **deleted**, not
+        left holding the document-derived value. This is the difference between
+        a reported dead anchor and a silent link to the wrong heading, and the
+        wrong-heading case is reachable two ways:
+
+        * the target heading landed outside a difflib `equal` run, so it has no
+          pair. `## Overview / ## Overview / ## Details` against a document
+          holding only `Overview, Details`: difflib pairs the markdown's *second*
+          Overview with the document's only one, leaving the *first* unpaired.
+          The seed's `overview -> h.first` therefore survives — so `#overview`
+          (the author's first) and `#overview-1` (the second, correctly paired to
+          the same paragraph) both resolved to `h.first`, and two anchors that
+          name different headings pointed at one. Measured pre-fix:
+          `{'overview': 'h.first', 'details': 'h.details', 'overview-1':
+          'h.first'}`. It is the *unpaired* anchor whose entry is stale, not the
+          suffixed one; the seed can never produce the key `overview-1` at all,
+          since the document's lone Overview slugs without a suffix;
+        * the paired document paragraph reports no `headingId`, so a *different*
+          document heading whose own literal text slugs to `intro-1` keeps that
+          key and captures an anchor that meant "my second `## Intro`".
+
+        Neither was reported: `unaligned_span_targets` filters on `node.spans`
+        and a plain heading has none, and `unresolved_anchor_links` only sees
+        anchors that resolve to *nothing* — a wrong resolution is still a
+        resolution. Both now surface as dead anchors.
+
+        **An inherited entry survives three tests, all facts about the document.**
+        Each was added because the previous set let a wrong link through:
+
+        1. its *base* slug must equal the target heading's base slug. Not raw text
+           — comparing text dropped every slug-preserving edit (`Rollout Plan`
+           renamed to `Rollout plan`, a trailing space, added punctuation), 24
+           links lost against 0 gained. Not the whole slug either: markdown
+           `## Intro 1` (base `intro-1`) must not inherit the document's `intro-1`,
+           which is the second of its two `Intro` headings (base `intro`).
+        2. the document must hold exactly **one** heading with that base slug.
+           Base equality alone is not enough: `Q&A` and `QA` both slug to `qa`, so
+           markdown `## QA` whose own paragraph reports no id inherited `Q&A`'s
+           id and the reader landed in the wrong section — green ✓, no warning.
+           When two document headings share a base there is no way to tell which
+           one the author meant, so this refuses rather than guesses.
+        3. its id must not already be claimed by a heading this push paired, or
+           two anchors naming different headings resolve to one id. This narrows
+           one shape of that; it does not establish the general invariant, because
+           a stale document-only entry colliding with a paired id is never
+           inspected here.
+
+        What all three preserve: a document holding one `Intro` and markdown
+        holding one `## Intro` still resolves when difflib leaves the heading
+        unpaired. Without that, a heading plainly present got a dead-anchor
+        warning `unaligned_span_targets` could not even explain, since it filters
+        on `node.spans` and a heading has none.
+        """
+        slug_to_id = dict(heading_slug_to_id(current))  # document-only headings
+        paired_document_node = {id(tnode): cnode for cnode, tnode in heading_pairs}
+        target_headings = [
+            node for node in target
+            if isinstance(node, DocsParagraphNode) and is_heading_style(node.style)
+        ]
+        # slug -> the text of the document heading that produced it, so an
+        # inherited entry can be checked against what the author actually wrote.
+        document_pairs = _heading_texts_and_ids(current)
+        # slug -> the base slug of the document heading that produced it, plus how
+        # many document headings share each base. Both are needed; see the
+        # docstring's three tests.
+        document_slug_base = {
+            slug: slugify(text)
+            for slug, (text, heading_id) in zip(
+                slugify_all(text for text, _ in document_pairs), document_pairs
+            )
+            if heading_id
+        }
+        document_base_counts: dict = {}
+        for text, _heading_id in document_pairs:
+            base = slugify(text)
+            document_base_counts[base] = document_base_counts.get(base, 0) + 1
+        unpaired: List[Tuple[str, str]] = []
+        for slug, tnode in zip(
+            slugify_all(node.text for node in target_headings), target_headings
+        ):
+            cnode = paired_document_node.get(id(tnode))
+            heading_id = getattr(cnode, "heading_id", None) if cnode is not None else None
+            if heading_id:
+                slug_to_id[slug] = heading_id
+            else:
+                unpaired.append((slug, tnode.text))
+
+        # An inherited entry is only trustworthy on two counts, and both are facts
+        # about the document rather than about the markdown:
+        unpaired_slugs = {slug for slug, _ in unpaired}
+        paired_ids = {
+            heading_id
+            for slug, heading_id in slug_to_id.items()
+            if slug not in unpaired_slugs
+        }
+        for slug, tnode_text in unpaired:
+            inherited = slug_to_id.get(slug)
+            if inherited is None:
+                continue
+            base = slugify(tnode_text)
+            # 1. Same base slug, or the suffix means something different on each
+            #    side (markdown `## Intro 1` vs the document's second `Intro`).
+            # 2. And exactly one document heading with that base, or there is no
+            #    way to tell which of them the author meant (`Q&A` / `QA`).
+            if (
+                document_slug_base.get(slug) != base
+                or document_base_counts.get(base, 0) != 1
+            ):
+                del slug_to_id[slug]
+                continue
+            # 2. Its id must not already be claimed by a heading this push paired.
+            #    This narrows one shape of that collision; it does not establish
+            #    the general invariant, because a *stale document-only* entry
+            #    colliding with a paired id is never inspected here. Reachable
+            #    today: a doc with two identical headings and markdown with one
+            #    sends both `#intro` and `#intro-1` to the second.
+            #    markdown `## Overview / ## Overview` against a document holding
+            #    one `Overview` leaves the first unpaired with matching text, and
+            #    without this both `#overview` and `#overview-1` land on it.
+            if inherited in paired_ids:
+                del slug_to_id[slug]
+        known_ids = {
+            node.heading_id
+            for node in current
+            if isinstance(node, DocsParagraphNode) and node.heading_id
+        }
+        return slug_to_id, known_ids
 
     def build_second_pass_requests(
-        self, doc: dict, target: List[Node], tab_id: Optional[str] = None
+        self,
+        doc: dict,
+        target: List[Node],
+        tab_id: Optional[str] = None,
+        alignment: Optional["Pass2Alignment"] = None,
     ) -> List[dict]:
         """
         Combined pass-2 requests: table cell fills + inline text styling.
@@ -590,7 +857,7 @@ class DocsRequestBuilder:
                 tab the *requests* are addressed to.
         """
         requests = self.build_table_fill_requests(doc, target)
-        requests += self.build_span_style_requests(doc, target)
+        requests += self.build_span_style_requests(doc, target, alignment)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
         return requests
@@ -819,7 +1086,11 @@ class DocsRequestBuilder:
         return requests
 
     def _span_style_requests(
-        self, node: DocsParagraphNode, placement: DocsParagraphNode
+        self,
+        node: DocsParagraphNode,
+        placement: DocsParagraphNode,
+        slug_to_id: Optional[dict] = None,
+        known_ids: Optional[set] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -832,6 +1103,16 @@ class DocsRequestBuilder:
         trailing whitespace the markdown parser stripped from .text but kept in
         .spans) can only ever cost styling inside this paragraph. It can never
         spill a range into the next one.
+
+        ``slug_to_id``/``known_ids`` resolve internal anchors against the
+        re-fetched document's headings — heading ids only exist once the
+        headings do, which is why this cannot happen in pass 1. An anchor that
+        resolves to nothing gets **no link at all**: the span keeps its other
+        marks and unresolved_anchor_links() reports it. It is never degraded to
+        a `url` link holding a `#fragment`, which would put something in the
+        document a reader can click and land nowhere. Nothing rejects the push
+        first — this and unresolved_anchor_links() are the only checks on the
+        write path.
         """
         requests: List[dict] = []
         offset = placement.start_index
@@ -849,7 +1130,15 @@ class DocsRequestBuilder:
             if span.italic:
                 attrs["italic"] = True
             if span.link:
-                attrs["link"] = span.link
+                payload = link_payload(span.link, slug_to_id, known_ids)
+                if payload is not None:
+                    attrs["link"] = payload
+                # else: the anchor names no heading in the written document, so
+                # there is nothing to point at. The span keeps its other marks
+                # and unresolved_anchor_links() reports the anchor, rather than
+                # this either writing a `url` link to a "#fragment" the Doc
+                # cannot follow or aborting the whole pass and discarding every
+                # other paragraph's styling.
             if span.monospace:
                 attrs["monospace"] = True
             if attrs:
@@ -951,7 +1240,11 @@ class DocsRequestBuilder:
             text_style["italic"] = style_attrs["italic"]
         if "link" in style_attrs:
             fields.append("link")
-            text_style["link"] = {"url": style_attrs["link"]}
+            link = style_attrs["link"]
+            # Callers may hand over a ready-made Link union member — the
+            # `headingId` form an internal anchor resolves to (heading_anchors)
+            # has no `url` at all. A bare string stays the URL case.
+            text_style["link"] = link if isinstance(link, dict) else {"url": link}
         if style_attrs.get("monospace"):
             fields.append("weightedFontFamily")
             text_style["weightedFontFamily"] = {"fontFamily": "Courier New", "weight": 400}
