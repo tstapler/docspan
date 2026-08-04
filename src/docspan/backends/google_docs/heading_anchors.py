@@ -40,9 +40,11 @@ bookmarks (both `bookmark` and the legacy `bookmarkId`), links to a whole tab
 one — such an anchor is reported unresolved), cross-*document* anchors, and the
 Confluence backend, which still writes a literal `#fragment` href.
 
-A link this module cannot express reads back as no link at all, so a pull drops it
-from the author's file. That is pre-existing for every member except the two
-handled here, and reporting it is a follow-up.
+A link this module cannot express reads back as no link at all, so a **tab-scoped**
+pull drops it from the author's file. A default pull is unaffected: it goes through
+Drive's HTML export, which carries those hrefs through without consulting this
+module. Pre-existing for every member except the two handled here; reporting the
+structural-path loss is a follow-up.
 """
 from __future__ import annotations
 

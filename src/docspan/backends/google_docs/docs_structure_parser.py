@@ -335,7 +335,8 @@ class DocsStructureParser:
                 total = keep
         return [span for span in trimmed if span.text]
 
-    def _parse_link(self, link: Optional[dict]) -> Optional[str]:
+    @staticmethod
+    def _parse_link(link: Optional[dict]) -> Optional[str]:
         """Flatten a Docs `Link` union into the markdown href it round-trips as.
 
         Reading only `url` makes a heading link indistinguishable from no link at
@@ -360,8 +361,9 @@ class DocsStructureParser:
         `bookmark`/`bookmarkId` and `tabId` remain unexpressible in markdown and
         return None — the pre-existing behaviour, and out of scope here. They are
         named so the next reader knows the union is closed and what is left: a
-        pull drops those links from the author's file without a report, which is a
-        tracked follow-up rather than something this change addresses.
+        **tab-scoped** pull drops those links from the author's file without a
+        report — a tracked follow-up. A default pull does not go through this
+        parser for its content, so it is unaffected.
         """
         if not isinstance(link, dict):
             return None

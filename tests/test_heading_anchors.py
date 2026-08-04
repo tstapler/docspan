@@ -41,6 +41,7 @@ from docspan.backends.google_docs.heading_anchors import (
     slugify,
     slugify_all,
     unresolved_anchors,
+    upgrade_heading_id_anchors,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
@@ -1062,4 +1063,64 @@ class TestWarningsAreCollectedNotRaced:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A link markdown cannot express is reported, not dropped in silence
+# The default pull path's slug upgrade
+#
+# `upgrade_heading_id_anchors` had no test at any revision, while "both pull
+# paths now emit the heading's slug" is a headline claim. A mutation that made it
+# return its input unchanged survived the whole suite.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDefaultPullUpgradesHeadingIds:
+    def test_an_opaque_heading_id_becomes_the_slug(self) -> None:
+        markdown_in = "## Current state\n\nsee [it](#h.cur)\n"
+        upgraded = upgrade_heading_id_anchors(markdown_in, {"h.cur": "current-state"})
+        assert "[it](#current-state)" in upgraded
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            # An id the document does not report — may be a bookmark, another
+            # tab's heading, or something a human typed. Left alone, not guessed.
+            "see [it](#h.unknown)\n",
+            # Only a link *destination* is touched, never prose or code.
+            "the id #h.cur appears in prose\n",
+            "```\n#h.cur\n```\n",
+            # A real URL is not a fragment.
+            "see [it](https://example.com)\n",
+        ],
+    )
+    def test_everything_else_is_untouched(self, content: str) -> None:
+        assert upgrade_heading_id_anchors(content, {"h.cur": "current-state"}) == content
+
+    def test_an_empty_map_is_a_no_op(self) -> None:
+        content = "see [it](#h.cur)\n"
+        assert upgrade_heading_id_anchors(content, {}) == content
+
+    def test_the_default_pull_writes_the_slug_not_the_id(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """End to end on the path that had no coverage at all.
+
+        Drive's HTML export carries the Doc's own opaque fragment through
+        verbatim; the structural parse supplies the id -> slug map. Before this,
+        the pulled file held `[it](#h.cur)` — which docspan pushes back correctly
+        and no markdown renderer can resolve.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        fake_client.get_doc_content.return_value = (
+            '<h2 id="h.cur">Current state</h2><p>see <a href="#h.cur">it</a></p>'
+        )
+        local = tmp_path / "doc.md"
+
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok", result.message
+        written = local.read_text()
+        assert "(#current-state)" in written, written
+        assert "#h.cur" not in written, written

@@ -42,6 +42,18 @@ class TestSpansMatchText:
         ))[0]
         assert "".join(span.text for span in node.spans) == node.text == "see it"
 
+    def test_more_than_one_trailing_newline_is_trimmed_in_full(self) -> None:
+        """`.text` uses `rstrip("\\n")`, so the trim must walk back as far.
+
+        Unreachable from the real Docs model — a paragraph's content ends with
+        exactly one "\\n" — but the loop is written to handle it, and a mutant that
+        stripped only a single character passed the entire suite. Defensive
+        branches still need one test, or they are just untested code.
+        """
+        node = structure.parse(_doc(_run("a\n\n"), text_len=1))[0]
+        assert [span.text for span in node.spans] == ["a"]
+        assert "".join(span.text for span in node.spans) == node.text == "a"
+
     def test_an_empty_paragraph_has_no_spans(self) -> None:
         # Its only content is the newline, so there is no text to style and
         # nothing to render.

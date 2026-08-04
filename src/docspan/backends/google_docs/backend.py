@@ -553,23 +553,18 @@ class GoogleDocsBackend(Backend):
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
 
-            # Note for the link-reporting follow-up: a report built from a
-            # structural parse would be *false* on this path. The file here comes
-            # from Drive's HTML export, and that exporter does write a bookmark
-            # href and a table-cell link — the parse above serves only the
-            # id->slug map. Only the tab-scoped path can report what the file
-            # lacks, because there the parser's output *is* the file.
-            messages = [
-                message
-                for message in (f"⚠ {warning}" if warning else None,)
-                if message
-            ]
-            if messages:
+            # Note for the link-reporting follow-up (#38): a report built from a
+            # structural parse would be *false* here. This path's markdown comes
+            # from Drive's HTML export, which does write a bookmark href and a
+            # table-cell link — the parse above serves only the id->slug map. Only
+            # the tab-scoped path can report what the file lacks, because there the
+            # parser's output *is* the file.
+            if warning:
                 return PullResult(
                     status="warning",
                     doc_id=doc_id,
                     local_path=local_path,
-                    message="\n".join(messages),
+                    message=f"⚠ {warning}",
                 )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
         except TabNotFoundError as exc:
