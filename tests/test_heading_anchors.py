@@ -1222,3 +1222,68 @@ class TestCrossTabAnchors:
         assert link_payload(
             "#here", alignment.slug_to_id, alignment.known_ids, alignment.foreign_ids
         ) == {"headingId": "h.here"}
+
+
+class TestCrossTabAmbiguityAndTheDryRun:
+    @staticmethod
+    def _tab(tab_id: str, *paragraphs: dict) -> dict:
+        return {
+            "tabProperties": {"tabId": tab_id, "title": tab_id},
+            "documentTab": {"body": {"content": list(paragraphs)}},
+        }
+
+    def test_a_heading_id_in_two_tabs_is_refused_not_won(self) -> None:
+        """Last-write-wins made the tab a reader lands in depend on tab order.
+
+        Silent, `ok`, and reversible by reordering the tabs — the same trade
+        `_match_keyed` refuses for slugs.
+        """
+        doc = {
+            "revisionId": "r",
+            "tabs": [
+                self._tab("t.0", _paragraph("A", 1, "HEADING_2", "h.a")),
+                self._tab("t.1", _paragraph("D", 1, "HEADING_2", "h.dupe")),
+                self._tab("t.2", _paragraph("D", 1, "HEADING_2", "h.dupe")),
+            ],
+        }
+        assert heading_ids_by_tab(doc) == {"h.a": "t.0"}
+
+    def test_nested_child_tabs_are_included(self) -> None:
+        parent = self._tab("t.0", _paragraph("Top", 1, "HEADING_2", "h.top"))
+        parent["childTabs"] = [self._tab("t.0.0", _paragraph("N", 1, "HEADING_2", "h.n"))]
+        assert heading_ids_by_tab({"revisionId": "r", "tabs": [parent]}) == {
+            "h.top": "t.0",
+            "h.n": "t.0.0",
+        }
+
+    def test_the_dry_run_does_not_report_a_cross_tab_anchor_push_resolves(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """`unresolved_anchors` promises it never over-reports.
+
+        It was tab-scoped while push() had learned about sibling tabs, so the
+        dry-run told the author a link was dead that the push wrote correctly.
+        """
+        doc = {
+            "revisionId": "rev-1",
+            "tabs": [
+                self._tab(
+                    "t.0",
+                    _paragraph("Here", 1, "HEADING_2", "h.here"),
+                    _paragraph("see other", 7, runs=[
+                        {"textRun": {"content": "see other\n", "textStyle": {}}}
+                    ]),
+                ),
+                self._tab("t.1", _paragraph("Elsewhere", 1, "HEADING_2", "h.elsewhere")),
+            ],
+        }
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = doc
+        local = tmp_path / "doc.md"
+        local.write_text("## Here\n\nsee [other](#h.elsewhere)\n", encoding="utf-8")
+
+        preview = backend.preview_push(str(local), "doc-1", tab_id="t.0")
+        result = backend.push(str(local), "doc-1", tab_id="t.0")
+
+        assert preview.unresolved_anchors == []
+        assert result.status == "ok", result.message

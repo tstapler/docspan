@@ -212,7 +212,12 @@ class GoogleDocsBackend(Backend):
             # then wrote correctly, which is the one direction this advisory must
             # never fail in.
             document_nodes = DocsStructureParser().parse(plan.doc)
-            unresolved = unresolved_anchors(plan.target_nodes, document_nodes)
+            # Same foreign-tab map push() gives align(), or the dry-run reports a
+            # cross-tab anchor the push then resolves — an over-report, which is
+            # the direction unresolved_anchors' own contract forbids.
+            unresolved = unresolved_anchors(
+                plan.target_nodes, document_nodes, heading_ids_by_tab(plan.whole_doc)
+            )
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
         except HttpError as exc:
             return PushPreview(
@@ -595,10 +600,19 @@ class GoogleDocsBackend(Backend):
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
 
+            # NOT reporting parser.unreadable_links here. On this path the file
+            # comes from Drive's HTML export, and that exporter *does* write a
+            # bookmark href and a table-cell link — the structural parse above is
+            # used only for the id->slug map and then thrown away. Reporting it
+            # claimed those links were "absent from the pulled file" while they sat
+            # in the file just written, and exited 1 for every document containing
+            # one. The claim only holds on the structural path, where the parser's
+            # output *is* the file.
+            #
             # Collected, not raced — same reason as push()'s warnings.
             messages = [
                 message
-                for message in (warning, self._render_unreadable_links(parser.unreadable_links))
+                for message in (f"⚠ {warning}" if warning else None,)
                 if message
             ]
             if messages:

@@ -252,7 +252,7 @@ class DocsStructureParser:
                             # which is pre-existing and wider than anchors.
                             # Record it rather than fix it here: the cell model
                             # has no spans to hang a link on.
-                            if text_run.get("textStyle", {}).get("link"):
+                            if (text_run.get("textStyle") or {}).get("link"):
                                 self._note_unreadable("link inside a table cell")
                             continue
                         person = pe.get("person")

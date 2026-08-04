@@ -471,6 +471,7 @@ def anchors_in(nodes: Iterable[object]) -> List[str]:
 def unresolved_anchors(
     target_nodes: Sequence[object],
     document_nodes: Sequence[object] = (),
+    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Anchors in ``target_nodes`` that no heading can satisfy, in use order.
 
@@ -494,6 +495,12 @@ def unresolved_anchors(
     * a heading present in both that the document reports with no `headingId`.
 
     Do not restate this as "only" one cause. Each of the three was measured.
+
+    ``foreign_ids`` must be passed whatever `push()` passes to `align()`
+    (`tabs.heading_ids_by_tab` of the *unresolved* document). Without it this
+    function sees one tab, and a cross-tab anchor that `push()` resolves cleanly
+    was reported dead — an over-report, which is the one direction the paragraph
+    above says cannot happen.
     """
     document_slugs = dict(heading_slug_to_id(document_nodes))
     known_ids = {
@@ -517,8 +524,9 @@ def unresolved_anchors(
     # link with no warning, which is the exact class this module exists to remove.
     resolvable = {slug: _UNWRITTEN_HEADING for slug in heading_slugs(target_nodes)}
     resolvable.update(document_slugs)
+    reachable_ids = known_ids | set(foreign_ids or ())
     return [
         href
         for href in anchors_in(target_nodes)
-        if resolve_anchor(href, resolvable, known_ids) is None
+        if resolve_anchor(href, resolvable, reachable_ids) is None
     ]
