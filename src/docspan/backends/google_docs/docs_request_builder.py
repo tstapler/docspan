@@ -601,7 +601,10 @@ class DocsRequestBuilder:
         makes the alignment safe against the residue nodes pass 1 leaves
         behind: every one of them is an *empty* paragraph (a delete trimmed to
         protect an anchoring newline, or the implicit newline insertTable
-        creates), and MarkdownToParagraphParser never emits an empty-text node,
+        creates). MarkdownToParagraphParser *can* now emit an empty-text node — a
+        blank line inside a fenced code block — so this holds because backend.py
+        hands pass 2 already-projected nodes, not because the parser cannot
+        produce one. The protection is projection, not the parser,
         so a residue can never collide with a real target paragraph.
         """
         if isinstance(node, DocsTableNode):

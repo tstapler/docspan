@@ -61,12 +61,30 @@ class TestGranularity:
         nodes = markdown.parse("```\n    deeply indented\n```\n")
         assert [node.text for node in nodes] == ["    deeply indented"]
 
-    def test_no_node_carries_an_embedded_newline(self) -> None:
-        """The invariant the bug violated. A Doc paragraph cannot hold a newline."""
+    def test_no_top_level_node_carries_an_embedded_newline(self) -> None:
+        """The invariant the bug violated. A Doc paragraph cannot hold a newline.
+
+        Scoped to **top-level** blocks on purpose. `block_code` is parsed in three
+        places and only this one is fixed: a fence inside a list item still yields
+        one node with newlines (and concatenates onto the list text), and one
+        inside a blockquote is dropped entirely. Both are byte-identical before
+        this change, so neither is a regression — but an unqualified `all(...)`
+        over a document with no list in it reads as a guarantee that does not hold,
+        which is worse than no test.
+        """
         nodes = markdown.parse(
             "before\n\n```sh\none\ntwo\nthree\n```\n\n```py\nfour\n```\n\nafter\n"
         )
         assert all("\n" not in node.text for node in nodes if hasattr(node, "text"))
+
+    def test_a_fence_in_a_list_item_is_still_unsplit(self) -> None:
+        """Pins the known gap so it cannot be mistaken for fixed.
+
+        Delete this test when the split moves into a helper shared by all three
+        parse sites; until then it is the honest statement of scope.
+        """
+        nodes = markdown.parse("- Steps:\n\n  ```sh\n  make build\n  make test\n  ```\n")
+        assert any("\n" in node.text for node in nodes if hasattr(node, "text"))
 
 
 class TestPushIsIdempotent:
@@ -89,9 +107,15 @@ class TestPushIsIdempotent:
 
         Docs starts a new paragraph at every newline in an `insertText`, so one
         insert carrying two lines creates two paragraphs that the next diff cannot
-        match to their single source node. Each insert must therefore carry
-        exactly one line — the leading "\\n" opens the new paragraph, and there
-        must be nothing after the content.
+        match to their single source node. Each insert must therefore carry exactly
+        one line and exactly one newline.
+
+        Deliberately agnostic about *where* that newline sits: the builder appends
+        with a trailing "\\n" and inserts mid-document with a leading one, and
+        which applies depends on `doc_end_index`. Pinning the placement pinned an
+        implementation detail — and the first version of this test used
+        `doc_end_index=1`, which no real document reports (an empty Doc is 2) and
+        which makes `build()` emit an insert at index 0 that the API rejects.
 
         Asserted on the requests rather than by replaying them: they are emitted
         highest-index-first so they compose, and reconstructing the resulting
@@ -102,10 +126,11 @@ class TestPushIsIdempotent:
 
         texts = [
             request["insertText"]["text"]
-            for request in builder.build([], target, 1)
+            for request in builder.build([], target, 2)
             if "insertText" in request
         ]
-        assert sorted(texts) == ["\nline one", "\nline three", "\nline two"]
+        assert sorted(text.strip("\n") for text in texts) == [
+            "line one", "line three", "line two",
+        ]
         for text in texts:
             assert text.count("\n") == 1, text
-            assert text.startswith("\n"), text

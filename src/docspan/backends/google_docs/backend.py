@@ -140,12 +140,19 @@ class GoogleDocsBackend(Backend):
         # the diff read that asymmetry as "the user deleted this" — issue #17.
         # See projection.project for the rule and the trade it makes.
         current_nodes, current_residue = project(current_nodes)
-        # Projecting the target is a no-op today and no test can make it fail:
-        # MarkdownToParagraphParser cannot emit an empty-text node, so there is
-        # nothing on this side to drop. It is here so the two sides cannot drift
-        # apart if that ever changes — the whole bug was an asymmetry between
-        # these two parsers, and applying the projection to only one of them
-        # would be the same shape of mistake.
+        # Projecting the target is NOT a no-op any more. This comment used to say
+        # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
+        # nothing on this side to drop" — splitting fenced code blocks per line
+        # falsified that: a blank line inside a block, an empty fence and a
+        # blank-only fence all produce `text=""`.
+        #
+        # So this drops author content, and `_target_residue` throws away the
+        # report of it. That is a known defect, not the #17 trade: #17 *preserves*
+        # a blank paragraph the Doc already has, whereas a blank code line exists
+        # only in the markdown and is simply never written. Tracked separately;
+        # fixing it needs projection to tell a blank *code* line (content) from a
+        # stray empty *prose* paragraph (not content), which the node model cannot
+        # currently express.
         target_nodes, _target_residue = project(target_nodes)
 
         body_content = doc.get("body", {}).get("content", [])
