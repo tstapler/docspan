@@ -115,6 +115,31 @@ class DocsTableNode:
 class DocsStructureParser:
     """Parse a Google Docs document dict into a list of DocsParagraphNode."""
 
+    def __init__(self) -> None:
+        # Per-instance, not a class attribute: a shared mutable default would
+        # accumulate across every parse in the process and make one document's
+        # warning show up on another's pull.
+        self._unreadable_links: List[str] = []
+
+    @property
+    def unreadable_links(self) -> List[str]:
+        """Links the last parse could not express in markdown, in document order.
+
+        A `Link` union member this parser does not handle — a bookmark, or a link
+        to a whole tab — comes back as no link at all, so `pull` writes the text
+        without it and the author's file loses the reference *silently*. That is
+        the same defect class heading anchors were fixed for, on sibling members
+        of the same union, and reporting it costs nothing.
+
+        Also collects links inside table cells, which `_parse_table` flattens to
+        plain strings — so every cell link, `url` ones included, is dropped on
+        read. Pre-existing and out of scope to *fix*, but not to *report*.
+
+        Not raised and not a failure: the document is fine, and the pull is what
+        markdown can express. It is a warning so nobody discovers the loss later.
+        """
+        return list(self._unreadable_links)
+
     def parse(self, doc: dict) -> List[Union[DocsParagraphNode, DocsTableNode]]:
         """
         Parse a Google Docs document dict.
@@ -144,6 +169,8 @@ class DocsStructureParser:
 
         content = body.get("content", [])
         nodes: List[Union[DocsParagraphNode, DocsTableNode]] = []
+        # Reset per parse, so re-parsing the same instance does not accumulate.
+        self._unreadable_links = []
 
         for position, element in enumerate(content):
             if "paragraph" in element:
@@ -220,6 +247,13 @@ class DocsStructureParser:
                         text_run = pe.get("textRun")
                         if text_run is not None:
                             parts.append(text_run.get("content", ""))
+                            # A cell is flattened to a plain string, so *any*
+                            # link inside it is dropped — `url` links included,
+                            # which is pre-existing and wider than anchors.
+                            # Record it rather than fix it here: the cell model
+                            # has no spans to hang a link on.
+                            if text_run.get("textStyle", {}).get("link"):
+                                self._note_unreadable("link inside a table cell")
                             continue
                         person = pe.get("person")
                         if person is not None:
@@ -336,8 +370,7 @@ class DocsStructureParser:
                 total = keep
         return [span for span in trimmed if span.text]
 
-    @staticmethod
-    def _parse_link(link: Optional[dict]) -> Optional[str]:
+    def _parse_link(self, link: Optional[dict]) -> Optional[str]:
         """Flatten a Docs `Link` union into the markdown href it round-trips as.
 
         Reading only `url` makes a heading link indistinguishable from no link at
@@ -359,9 +392,11 @@ class DocsStructureParser:
         fetched. Either becomes "#" + the id; _resolve_heading_links then
         upgrades it to the heading's slug once the whole body is known.
 
-        `bookmark`/`bookmarkId` and `tabId` are still unhandled (out of scope)
-        and return None, which is the pre-existing behaviour. They are named
-        here so the next reader knows the union is closed and what is left.
+        `bookmark`/`bookmarkId` and `tabId` remain unexpressible in markdown and
+        return None — the pre-existing behaviour, and out of scope to fix. They
+        are named here so the next reader knows the union is closed, and they are
+        now *recorded* on the way out rather than dropped in silence: see
+        `unreadable_links`.
         """
         if not isinstance(link, dict):
             return None
@@ -376,7 +411,27 @@ class DocsStructureParser:
             heading_id = heading.get("id")
             if isinstance(heading_id, str) and heading_id:
                 return "#" + heading_id
+        if link:
+            self._record_unreadable_link(link)
         return None
+
+    def _record_unreadable_link(self, link: dict) -> None:
+        """Note a `Link` this parser cannot express, for pull() to report."""
+        for member, described in (
+            ("bookmarkId", "bookmark link"),
+            ("bookmark", "bookmark link"),
+            ("tabId", "link to a tab"),
+        ):
+            if link.get(member):
+                break
+        else:
+            described = f"unrecognised link ({', '.join(sorted(link))})"
+        self._note_unreadable(described)
+
+    def _note_unreadable(self, described: str) -> None:
+        """Record one kind of unreadable link, once, in first-seen order."""
+        if described not in self._unreadable_links:
+            self._unreadable_links.append(described)
 
     def _resolve_is_native_checkbox(self, bullet: Optional[dict], lists: dict) -> bool:
         """Resolve whether a bullet paragraph is a native BULLET_CHECKBOX glyph.

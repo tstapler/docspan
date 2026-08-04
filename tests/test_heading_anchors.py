@@ -999,3 +999,107 @@ class TestWarningsAreCollectedNotRaced:
         )
         target2 = markdown.parse("## Current state\n\nsee [x](#current-state)\n")
         assert "current-state" in available_anchor_slugs(target2, document2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A link markdown cannot express is reported, not dropped in silence
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUnreadableLinksAreReported:
+    """The same defect anchors were fixed for, on the union's other members.
+
+    A bookmark link, a link to a tab, and any link inside a table cell all come
+    back as no link at all, so `pull` writes the text without them and the
+    author's file loses the reference. The Doc keeps it, so nothing is lost
+    *yet* — the point of the warning is that they find out now rather than after
+    a later push rewrites that paragraph and takes the link with it.
+    """
+
+    @pytest.mark.parametrize(
+        "link, described",
+        [
+            ({"bookmarkId": "kix.b1"}, "bookmark link"),
+            ({"bookmark": {"id": "kix.b1", "tabId": "t.0"}}, "bookmark link"),
+            ({"tabId": "t.1"}, "link to a tab"),
+        ],
+    )
+    def test_each_unreadable_member_is_named(self, link: dict, described: str) -> None:
+        parser = DocsStructureParser()
+        doc = _doc(
+            _paragraph("see it", 1, runs=[
+                {"textRun": {"content": "see ", "textStyle": {}}},
+                {"textRun": {"content": "it", "textStyle": {"link": link}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ])
+        )
+        nodes = parser.parse(doc)
+
+        # Still unread — this reports the loss, it does not fix it.
+        assert [s.link for n in nodes for s in (n.spans or []) if s.link] == []
+        assert parser.unreadable_links == [described]
+
+    def test_a_resolvable_heading_link_is_not_reported(self) -> None:
+        parser = DocsStructureParser()
+        doc = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+            _paragraph("see it", 16, runs=[
+                {"textRun": {"content": "see ", "textStyle": {}}},
+                {"textRun": {
+                    "content": "it",
+                    "textStyle": {"link": {"heading": {"id": "h.cur", "tabId": "t.0"}}},
+                }},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+        )
+        parser.parse(doc)
+        assert parser.unreadable_links == []
+
+    def test_a_link_inside_a_table_cell_is_reported(self) -> None:
+        """Cells flatten to plain strings, so every cell link is dropped — `url`
+        ones too. Wider than anchors and out of scope to fix; not to report."""
+        parser = DocsStructureParser()
+        doc = {
+            "revisionId": "rev-1",
+            "body": {"content": [{
+                "startIndex": 1,
+                "endIndex": 40,
+                "table": {"tableRows": [{"tableCells": [{"content": [{"paragraph": {
+                    "elements": [{"textRun": {
+                        "content": "jump",
+                        "textStyle": {"link": {"url": "https://example.com"}},
+                    }}]
+                }}]}]}]},
+            }]},
+        }
+        parser.parse(doc)
+        assert parser.unreadable_links == ["link inside a table cell"]
+
+    def test_each_kind_is_reported_once(self) -> None:
+        parser = DocsStructureParser()
+        doc = _doc(
+            _paragraph("a", 1, runs=[
+                {"textRun": {"content": "a", "textStyle": {"link": {"bookmarkId": "kix.1"}}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+            _paragraph("b", 3, runs=[
+                {"textRun": {"content": "b", "textStyle": {"link": {"bookmarkId": "kix.2"}}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+        )
+        parser.parse(doc)
+        assert parser.unreadable_links == ["bookmark link"]
+
+    def test_the_list_does_not_leak_between_instances(self) -> None:
+        """A shared mutable class attribute would put one doc's warning on another."""
+        first = DocsStructureParser()
+        first.parse(_doc(
+            _paragraph("a", 1, runs=[
+                {"textRun": {"content": "a", "textStyle": {"link": {"bookmarkId": "k"}}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ])
+        ))
+        assert first.unreadable_links == ["bookmark link"]
+
+        second = DocsStructureParser()
+        second.parse(_doc(_paragraph("clean", 1)))
+        assert second.unreadable_links == []
