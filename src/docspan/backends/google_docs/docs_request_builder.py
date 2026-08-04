@@ -22,6 +22,11 @@ from docspan.backends.google_docs.heading_anchors import (
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
+# difflib's opcode tuple. Named because it is now threaded through three
+# functions (_opcodes, _repair, _coalesce) and `list` is invariant, so an
+# inlined Literal in one signature and a bare `str` in the next do not unify.
+Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
+
 
 @dataclass(frozen=True)
 class Pass2Alignment:
@@ -103,24 +108,40 @@ class DocsRequestBuilder:
     def _node_key(self, node: Node) -> Tuple:
         """Identity used by SequenceMatcher to align the two node sequences.
 
-        **Text only.** Paragraph-level attributes — namedStyleType, bullet,
-        nesting level — deliberately do NOT participate, because they are
-        *editable in place*: `updateParagraphStyle`, `createParagraphBullets` and
-        `deleteParagraphBullets` change them without touching the text.
+        **Full identity** — style and bullet participate. This answers only
+        *"which live paragraph is this markdown node about?"*, which is a different
+        question from *"is this an in-place restyle or a rewrite?"*. `_content_key`
+        answers the second, and `_repair` applies it.
 
-        Including them made a restyle look like a different paragraph, so
-        difflib reported `replace` and build() answered with delete-then-insert.
-        Changing `## Sec` to `### Sec` therefore deleted the paragraph and
-        retyped it — 5 requests, and any comment anchored to it destroyed —
-        while the preview said `change 'Sec' -> 'Sec'`, identical text on both
-        sides, which tells the reader nothing about what is about to happen.
+        The key used to be text-only, so that a restyle would align rather than
+        delete-and-reinsert. That worked while nodes were long and distinctive, but
+        it weakened correspondence to "same text ⇒ same paragraph" — and once
+        fenced code blocks became one node per line, the sequence filled with short
+        generic strings (`}`, `pass`, `Config`, `Example`) that collide with
+        headings and list items elsewhere in the document.
 
-        With text as the whole identity, a restyle is an `equal` opcode carrying
-        a paragraph-attribute difference, which _make_style_update_requests
-        turns into the two or three in-place requests it actually needs.
+        The consequence was not cosmetic. A code line reading `Config` beside a
+        live `# Config` heading paired with it, so push demoted the heading to
+        NORMAL_TEXT and inserted a fresh one — destroying the `headingId` every
+        internal anchor resolves against, and any comment anchored to it, while the
+        preview said `change 'Config' -> 'Config'`. Reproduces with pure prose too
+        (a heading whose text repeats as body text), so this predates the code-block
+        split; the split made it easy to hit.
 
-        Two paragraphs with the same text and different styles now align with
-        each other. That is the point: they *are* the same paragraph, restyled.
+        Restyle-in-place is now re-admitted deliberately by `_repair` instead of
+        falling out of a key that was too weak to tell paragraphs apart.
+        """
+        if isinstance(node, DocsTableNode):
+            return ("__table__", tuple(tuple(row) for row in node.rows))
+        return ("__para__", node.style, node.is_list_item, node.nesting_level, node.text)
+
+    def _content_key(self, node: Node) -> Tuple:
+        """Identity ignoring everything editable in place — the old `_node_key`.
+
+        Used only to classify a pairing that `_node_key` has already made: two nodes
+        with the same content differ only by attributes `updateParagraphStyle`,
+        `createParagraphBullets` and `deleteParagraphBullets` can change without
+        touching the text, so the edit is a restyle and not a rewrite.
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(row) for row in node.rows))
@@ -130,7 +151,7 @@ class DocsRequestBuilder:
         self,
         current: List[Node],
         target: List[Node],
-    ) -> List[Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]]:
+    ) -> List[Opcode]:
         """Build the single difflib.SequenceMatcher opcode list shared by
         build() and diff_summary().
 
@@ -145,7 +166,70 @@ class DocsRequestBuilder:
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
         matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        return matcher.get_opcodes()
+        return self._repair(matcher.get_opcodes(), current, target)
+
+    def _repair(
+        self,
+        opcodes: List[Opcode],
+        current: List[Node],
+        target: List[Node],
+    ) -> List[Opcode]:
+        """Re-classify text-identical pairs inside a `replace` run as `equal`.
+
+        `_node_key` includes style and bullet, so a paragraph that was only
+        *restyled* now lands in a `replace` run — and `build()` answers a replace
+        with delete-then-insert, which retypes the paragraph and destroys any
+        comment anchored to it. That behaviour is what the old text-only key
+        avoided, at the cost of correspondence (see `_node_key`).
+
+        So the two concerns are separated: the key decides *correspondence*, and
+        this decides *classification*. Where a replace run pairs nodes with equal
+        `_content_key`, the edit is an in-place restyle and the opcode becomes
+        `equal`, which `_make_style_update_requests` turns into the two or three
+        in-place requests it actually needs.
+
+        Leftovers on either side stay a `replace`/`insert`/`delete` for the part
+        that genuinely differs, so nothing is silently dropped.
+        """
+        repaired: List[Opcode] = []
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag != "replace":
+                repaired.append((tag, i1, i2, j1, j2))
+                continue
+            # Walk the run pairwise; a pair with equal content is a restyle.
+            ci, tj = i1, j1
+            pending: List[Opcode] = []
+            while ci < i2 and tj < j2:
+                if self._content_key(current[ci]) == self._content_key(target[tj]):
+                    pending.append(("equal", ci, ci + 1, tj, tj + 1))
+                else:
+                    pending.append(("replace", ci, ci + 1, tj, tj + 1))
+                ci += 1
+                tj += 1
+            if ci < i2:
+                pending.append(("delete", ci, i2, tj, tj))
+            if tj < j2:
+                pending.append(("insert", ci, ci, tj, j2))
+            repaired.extend(self._coalesce(pending))
+        return repaired
+
+    @staticmethod
+    def _coalesce(
+        opcodes: List[Opcode],
+    ) -> List[Opcode]:
+        """Merge adjacent same-tag opcodes, so downstream sees runs not singletons.
+
+        `build()` treats a `replace` run as one range, and emitting N single-node
+        replaces instead of one N-node replace would change the request shape.
+        """
+        merged: List[Opcode] = []
+        for op in opcodes:
+            if merged and merged[-1][0] == op[0] and merged[-1][2] == op[1] and merged[-1][4] == op[3]:
+                tag, i1, _, j1, _ = merged[-1]
+                merged[-1] = (tag, i1, op[2], j1, op[4])
+            else:
+                merged.append(op)
+        return merged
 
     def diff_summary(
         self,
