@@ -33,6 +33,7 @@ and the Confluence backend.
 """
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import unquote
@@ -183,6 +184,45 @@ def heading_slug_to_id(nodes: Iterable[object]) -> Dict[str, str]:
 def heading_id_to_slug(nodes: Iterable[object]) -> Dict[str, str]:
     """headingId -> slug, the inverse map the read direction needs."""
     return {heading_id: slug for slug, heading_id in heading_slug_to_id(nodes).items()}
+
+
+def upgrade_heading_id_anchors(markdown: str, id_to_slug: Dict[str, str]) -> str:
+    """Rewrite `](#h.abc123)` to `](#the-headings-slug)` in rendered markdown.
+
+    For the **default** pull path, which goes through Drive's HTML export rather
+    than DocsStructureParser and therefore never gets the slug upgrade the
+    structural path does. Verified live: that export emits the Doc's own opaque
+    fragment, so the pulled file holds `[A1](#h.70l3py5ob5tg)` — which docspan
+    pushes back correctly, and which no markdown renderer can resolve.
+
+    Deliberately conservative. Only a fragment that is a **known heading id of
+    this document** is rewritten:
+
+    * an id the document does not report is left alone rather than guessed at —
+      it may be a bookmark, a heading in another tab, or a fragment a human
+      typed;
+    * a heading with no id contributes nothing to the map, so it cannot capture
+      an unrelated fragment;
+    * only the link-destination position is touched, so `#h.abc` appearing in
+      prose or in a code fence is untouched.
+
+    Not merged into the structural path, which resolves the union member before
+    a slug ever exists as text. This one has only rendered markdown to work with.
+    """
+    if not id_to_slug:
+        return markdown
+
+    def replace(match: "re.Match[str]") -> str:
+        slug = id_to_slug.get(match.group("target"))
+        return match.group(0) if slug is None else f"](#{slug})"
+
+    return _ANCHOR_DESTINATION.sub(replace, markdown)
+
+
+# The destination half of an inline markdown link whose target is a fragment.
+# Anchored on "](#" so it cannot match a bare "#h.abc" in prose, and the target
+# excludes ")" and whitespace so it stops at the end of the destination.
+_ANCHOR_DESTINATION = re.compile(r"\]\(#(?P<target>[^)\s]+)\)")
 
 
 def heading_slugs(nodes: Iterable[object]) -> List[str]:
