@@ -29,8 +29,8 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
 )
 from docspan.backends.google_docs.heading_anchors import (
+    available_anchor_slugs,
     heading_id_to_slug,
-    heading_slugs,
     unresolved_anchors,
     upgrade_heading_id_anchors,
 )
@@ -197,8 +197,18 @@ class GoogleDocsBackend(Backend):
             # Inside the try/except deliberately: the docstring above promises a
             # PushPreview(error=…) rather than a traceback, and evaluating these
             # in the return expression put them outside that promise.
-            unresolved = unresolved_anchors(plan.target_nodes, plan.current_nodes)
-            available = heading_slugs(plan.target_nodes)
+            #
+            # Parsed unprojected, NOT reused from plan.current_nodes, even though
+            # that would save a parse. project() drops empty paragraphs — and an
+            # empty *heading* (press Enter at the end of a heading) carries a real
+            # `headingId`. Dropping it takes that id out of the resolvable set,
+            # while pass 2 parses unprojected and resolves it fine. So the cheap
+            # version made --dry-run invent a broken cross-reference that the push
+            # then wrote correctly, which is the one direction this advisory must
+            # never fail in.
+            document_nodes = DocsStructureParser().parse(plan.doc)
+            unresolved = unresolved_anchors(plan.target_nodes, document_nodes)
+            available = available_anchor_slugs(plan.target_nodes, document_nodes)
         except HttpError as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
@@ -386,10 +396,17 @@ class GoogleDocsBackend(Backend):
                     if (plan.requests or second)
                     else None,
                     self._render_unstyled(unstyled) if unstyled else None,
-                    self._render_dead_anchors(dead_anchors, heading_slugs(plan.target_nodes))
+                    # Offer the keys resolution actually consulted, so the list
+                    # cannot name the anchor it just called dead.
+                    self._render_dead_anchors(dead_anchors, sorted(alignment.slug_to_id))
                     if dead_anchors
                     else None,
-                    plan.tab_warning,
+                    # ⚠-prefixed here as well. Every other collected message
+                    # carries one, and PushPreview.render() adds one to this same
+                    # string — without it the tab warning read as a continuation
+                    # of the bulleted anchor list above it, and push and dry-run
+                    # rendered the same warning differently.
+                    f"⚠ {plan.tab_warning}" if plan.tab_warning else None,
                 )
                 if message
             ]
