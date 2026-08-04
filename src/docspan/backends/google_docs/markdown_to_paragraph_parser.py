@@ -1,7 +1,6 @@
 """Parse Markdown content into DocsParagraphNode/DocsTableNode list for Google Docs push."""
 from __future__ import annotations
 
-import html
 from typing import List, Optional, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -13,43 +12,14 @@ from docspan.backends.google_docs.docs_structure_parser import (
 Node = Union[DocsParagraphNode, DocsTableNode]
 
 
-def _rendered(raw: str) -> str:
-    """A token's raw source as the *rendered* text a reader (and GitHub) sees.
-
-    CommonMark recognises HTML entity references, so `&amp;` in the source means
-    a literal `&`. mistune hands them over undecoded, and taking `raw` verbatim
-    put `Team &amp; process` into the Google Doc *and* slugged that heading to
-    `team-amp-process` where GitHub gives `team--process`.
-
-    The slug is the dangerous half. A wrong slug does not fail — it shifts the
-    duplicate numbering, so `#team--process` (GitHub's id for the *first* such
-    heading) resolved to the *second* one. A link to the wrong section, reported
-    as a clean ✓.
-    """
-    return html.unescape(raw)
-
-
 def _extract_text_from_token(token: dict) -> str:
-    """Recursively extract plain text from a mistune AST token.
-
-    `inline_html` contributes nothing: GitHub slugs the *rendered* heading, whose
-    text content for `## <code>push()</code> behaviour` is `push() behaviour` —
-    not the tags. Including them slugged it to `codepushcode-behaviour` and shifted
-    every later duplicate suffix.
-    """
-    ttype = token.get("type")
-    if ttype == "inline_html":
-        return ""
-    if ttype in ("raw", "text"):
-        return _rendered(token.get("raw", ""))
-    if ttype == "codespan":
-        # A codespan's content is literal — entities inside backticks are not
-        # references, so this one is NOT unescaped.
+    """Recursively extract plain text from a mistune AST token."""
+    if token.get("type") in ("raw", "text", "codespan"):
         return token.get("raw", "")
     children = token.get("children")
     if children:
         return "".join(_extract_text_from_token(c) for c in children)
-    return _rendered(token.get("raw", ""))
+    return token.get("raw", "")
 
 
 def _link_url(token: dict) -> str:
@@ -69,14 +39,8 @@ def _spans_from_inline(
     spans: List[TextSpan] = []
     for tok in children or []:
         ttype = tok.get("type")
-        if ttype == "inline_html":
-            # Contributes no text, exactly as _extract_text_from_token does. The
-            # two must agree: node.text and the span texts are compared offset by
-            # offset in pass 2, so a token counted by one and not the other
-            # desyncs every span after it in the paragraph.
-            continue
         if ttype in ("text", "raw"):
-            spans.append(TextSpan(text=_rendered(tok.get("raw", "")), bold=bold, italic=italic,
+            spans.append(TextSpan(text=tok.get("raw", ""), bold=bold, italic=italic,
                                   link=link, monospace=monospace))
         elif ttype == "codespan":
             spans.append(TextSpan(text=tok.get("raw", ""), bold=bold, italic=italic,
@@ -95,7 +59,7 @@ def _spans_from_inline(
             if kids:
                 spans.extend(_spans_from_inline(kids, bold, italic, link, monospace))
             else:
-                raw = _rendered(tok.get("raw", ""))
+                raw = tok.get("raw", "")
                 if raw:
                     spans.append(TextSpan(text=raw, bold=bold, italic=italic,
                                           link=link, monospace=monospace))
