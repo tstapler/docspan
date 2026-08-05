@@ -855,7 +855,11 @@ class TestBlankParagraphIsPreserved:
 
         result = backend.push(str(local), "doc-1")
 
-        assert result.status == "ok", result.message
+        # The blank paragraph is residue markdown cannot express, so the push
+        # now reports it as a warning rather than silently dropping it — but
+        # the edit alongside it must still go through.
+        assert result.status == "warning", result.message
+        assert "blank paragraph" in result.message
         assert client.batch_update.call_count == 1
         texts = [
             r["insertText"]["text"]

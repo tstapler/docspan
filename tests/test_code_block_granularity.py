@@ -271,6 +271,27 @@ class TestRenderPrefix:
         assert [r.kind for r in residue] == ["ambiguous_code_prefix"]
         assert kept[0].text == "bold notes", "the paragraph is still kept, not dropped"
 
+    def test_a_prefix_followed_by_a_non_courier_monospace_font_is_not_flagged(
+        self,
+    ) -> None:
+        """"Courier"/"mono" alone missed every other font Docs' own code-block
+        picker offers — a real code block set in Consolas tripped
+        `ambiguous_code_prefix` on every single push.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Consolas", "weight": 400}}
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "# cfg\n", "textStyle": mono}},
+                ],
+            }}]}}
+        kept, residue = project(structure.parse(doc))
+        assert residue == []
+        assert kept[0].text == "# cfg"
+
     def test_an_unchanged_code_block_emits_nothing(self) -> None:
         """The #47 path: a document with a native code block must be pushable."""
         doc, end = self._code_block_doc()

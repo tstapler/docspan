@@ -420,6 +420,13 @@ class GoogleDocsBackend(Backend):
                     if dead_anchors
                     else None,
                     describe_target_residue(plan.target_residue) or None,
+                    # Doc-side residue (e.g. an ambiguous code-block prefix) is only
+                    # reported unconditionally above when the push is a no-op. A push
+                    # that writes something else must still surface it here, or the
+                    # warning this residue exists to give is silently dropped on the
+                    # common case — the exact failure mode `project()`'s docstring
+                    # says residue exists to avoid.
+                    describe_residue(plan.residue) or None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation

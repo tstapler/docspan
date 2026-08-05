@@ -34,6 +34,29 @@ UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 # loud failure, not corruption.
 _PRIVATE_USE = range(0xE000, 0xF900)
 
+# Fonts Google Docs' own code-block picker offers, beyond "Courier"/"mono" — the
+# "Courier"/"mono" check this extends. Not exhaustive — an arbitrary custom
+# monospace font will still miss — but "Courier"/"mono" alone missed every
+# other font the picker offers, so a real code block set in one of these
+# tripped `ambiguous_code_prefix` on every single push.
+_MONOSPACE_FONT_MARKERS = (
+    "courier",
+    "mono",
+    "consolas",
+    "menlo",
+    "monaco",
+    "fira code",
+    "inconsolata",
+    "source code pro",
+    "cascadia code",
+    "roboto mono",
+    "jetbrains mono",
+    "ibm plex mono",
+    "space mono",
+    "pt mono",
+    "andale mono",
+)
+
 
 def _is_all_private_use(text: str) -> bool:
     """True when `text` is non-empty and holds nothing but PUA (bar the newline)."""
@@ -294,9 +317,10 @@ class DocsStructureParser:
             bold = text_style.get("bold", False)
             italic = text_style.get("italic", False)
             link = self._parse_link(text_style.get("link"))
-            # Monospace: check weightedFontFamily.fontFamily for "Courier New" or similar
+            # Monospace: check weightedFontFamily.fontFamily against known monospace fonts
             font_family = text_style.get("weightedFontFamily", {}).get("fontFamily", "")
-            monospace = "Courier" in font_family or "mono" in font_family.lower()
+            font_family_lower = font_family.lower()
+            monospace = any(marker in font_family_lower for marker in _MONOSPACE_FONT_MARKERS)
 
             text_parts.append(run_content)
             spans.append(TextSpan(
