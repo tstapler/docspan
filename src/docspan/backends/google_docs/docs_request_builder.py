@@ -394,9 +394,6 @@ class DocsRequestBuilder:
         start = node.start_index
         end = node.end_index
         trimmed = False
-        if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
-            end -= 1
-            trimmed = True
         if isinstance(node, DocsParagraphNode) and node.render_prefix:
             # A paragraph inside a block Docs renders itself. Neither whole-paragraph
             # range works, verified against the live API on a copy of a real document:
@@ -415,7 +412,16 @@ class DocsRequestBuilder:
             # sides of the diff. That is what keeps push idempotent rather than
             # retrying a delete it can never complete.
             #
-            # `start` already skips the prefix: project() advanced it.
+            # `start` already skips the prefix: project() advanced it. Computed
+            # directly from the text length rather than by decrementing `end`,
+            # because `precedes_structural_element` (#55) can be true on the
+            # same node — a render-glyph paragraph immediately before a Table,
+            # ToC or SectionBreak — and two independent `end -= 1`s would trim
+            # the range twice, deleting the author's last character along with
+            # the newline.
+            end = start + _utf16_len(node.text)
+            trimmed = True
+        elif isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
             end -= 1
             trimmed = True
         if end >= doc_end_index:

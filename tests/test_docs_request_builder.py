@@ -1,5 +1,7 @@
 """Unit tests for DocsRequestBuilder — structural diff algorithm, no network."""
 
+from dataclasses import replace
+
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -205,6 +207,20 @@ def test_delete_does_not_exceed_doc_end() -> None:
         if "deleteContentRange" in r:
             end_idx = r["deleteContentRange"]["range"]["endIndex"]
             assert end_idx <= doc_end, f"Delete range {end_idx} exceeds doc_end {doc_end}"
+
+
+def test_delete_bounds_does_not_compound_render_prefix_and_structural_trim() -> None:
+    """Regression (#55): a render-glyph paragraph (#47) that is also the last
+    paragraph before a Table/ToC/SectionBreak used to trim twice — once for
+    each independent rule — eating the author's last character along with the
+    newline. `# cfg` at [8, 14) is 5 units of text starting at 8, so only
+    [8, 13) may be deleted; the old code produced [8, 12)."""
+    node = _para("# cfg", start=8, end=14, precedes_structural_element=True)
+    node = replace(node, render_prefix="")
+
+    start, end, trimmed = DocsRequestBuilder._delete_bounds(node, doc_end_index=100)
+
+    assert (start, end, trimmed) == (8, 13, True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
