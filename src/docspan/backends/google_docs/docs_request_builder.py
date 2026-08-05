@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -230,8 +230,125 @@ class DocsRequestBuilder:
                 else:
                     # Genuinely different content in this sub-window -> real rewrite.
                     pending.append((itag, aci1, aci2, atj1, atj2))
+            pending = self._prefer_structural_pairing(pending, cur_slice, tgt_slice, i1, j1)
             repaired.extend(self._coalesce(pending))
         return repaired
+
+    def _prefer_structural_pairing(
+        self,
+        pending: List[Opcode],
+        cur_slice: List[Node],
+        tgt_slice: List[Node],
+        i1: int,
+        j1: int,
+    ) -> List[Opcode]:
+        """Reassign ambiguous equal/delete pairings toward their structurally closest node.
+
+        The inner `SequenceMatcher` in `_repair` treats every current node sharing
+        a `_content_key` as interchangeable and pairs whichever ones it meets first
+        with the target — typically by position. When several current nodes share
+        text (a stale body paragraph and a live heading both reading "Setup"),
+        that can restyle-in-place the wrong one and delete the live heading
+        instead, destroying its `headingId`. Same thing happens, worse, when the
+        *target* side also repeats the text (e.g. restyling one duplicate up to a
+        heading and another down to a bullet): each ambiguous target then needs
+        its own best-matching current node, not just the first one considered.
+
+        So for every `_content_key` shared by more than one current node in this
+        run, this treats it as a small assignment problem: each target position
+        that currently has an "equal" pairing is a slot, every current node
+        sharing the key (whether currently paired or currently "delete") is a
+        candidate, and slots claim candidates greedily by structural similarity
+        (style, heading-ness, list-item-ness), highest score first, ties going to
+        a candidate's own existing slot so an already-fine pairing is not
+        needlessly perturbed. Whichever candidates no slot claims become deletes.
+
+        This only ever reassigns which current index a given target range maps
+        to — the target ranges themselves, and every other opcode's indices, are
+        untouched — so it cannot double-book or drop a target index. There is no
+        list-order requirement to preserve: `build()` and `diff_summary()` both
+        consume each opcode by its own absolute (i1, i2, j1, j2), and `_coalesce`
+        only merges entries whose indices are exactly contiguous, so reordering
+        which candidate owns which target range cannot corrupt either consumer.
+
+        Scope note: this only ever looks at singleton "equal"/"delete" entries
+        in `pending` — a duplicate-content current node that the inner matcher
+        folded into a multi-node "replace" block (alongside other, genuinely
+        different content in the same run) is invisible here and still falls
+        through `build()`'s replace branch as delete-then-insert. Splitting a
+        "replace" block by content key would require deciding how to divide its
+        target range between the extracted piece and what remains, which is not
+        well-founded without a real per-index correspondence — unlike the
+        delete/equal case, where the extracted piece's target range is already
+        known. That gap is open.
+        """
+        expanded: List[Opcode] = []
+        for tag, ci1, ci2, cj1, cj2 in pending:
+            if tag == "delete" and ci2 - ci1 > 1:
+                for idx in range(ci1, ci2):
+                    expanded.append(("delete", idx, idx + 1, cj1, cj1))
+            else:
+                expanded.append((tag, ci1, ci2, cj1, cj2))
+
+        by_key: Dict[Tuple, List[int]] = {}
+        for pos, (tag, ci1, ci2, _cj1, _cj2) in enumerate(expanded):
+            if tag in ("equal", "delete") and ci2 - ci1 == 1:
+                by_key.setdefault(self._content_key(cur_slice[ci1 - i1]), []).append(pos)
+
+        for positions in by_key.values():
+            slot_positions = [p for p in positions if expanded[p][0] == "equal"]
+            if not slot_positions or len(positions) < 2:
+                continue
+            original = {p: expanded[p] for p in positions}
+
+            pair_scores = []
+            for si, sp in enumerate(slot_positions):
+                _, _sci1, _sci2, scj1, _scj2 = original[sp]
+                target_node = tgt_slice[scj1 - j1]
+                for ci, cp in enumerate(positions):
+                    _, cci1, _cci2, _, _ = original[cp]
+                    score = self._structural_score(cur_slice[cci1 - i1], target_node)
+                    pair_scores.append((score, sp == cp, si, ci, sp, cp))
+            pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
+
+            assigned_candidate_for: Dict[int, int] = {}
+            chosen_candidates = set()
+            for _score, _self_pair, _si, _ci, sp, cp in pair_scores:
+                if sp in assigned_candidate_for or cp in chosen_candidates:
+                    continue
+                assigned_candidate_for[sp] = cp
+                chosen_candidates.add(cp)
+
+            for sp, cp in assigned_candidate_for.items():
+                if cp == sp:
+                    continue
+                _, sci1, sci2, scj1, scj2 = original[sp]
+                _, cci1, cci2, _, _ = original[cp]
+                expanded[cp] = ("equal", cci1, cci2, scj1, scj2)
+
+            for sp in slot_positions:
+                if sp not in chosen_candidates:
+                    _, sci1, sci2, scj1, _scj2 = original[sp]
+                    expanded[sp] = ("delete", sci1, sci2, scj1, scj1)
+
+        return expanded
+
+    @staticmethod
+    def _structural_score(node: Node, target_node: Node) -> int:
+        """How closely `node`'s non-text attributes already match `target_node`'s.
+
+        Used only to rank candidates in `_prefer_structural_pairing`.
+        """
+        if isinstance(node, DocsTableNode) or isinstance(target_node, DocsTableNode):
+            return 0
+        score = 0
+        if node.style == target_node.style:
+            score += 2
+        if is_heading_style(node.style) == is_heading_style(target_node.style):
+            score += 1
+        if node.is_list_item == target_node.is_list_item:
+            score += 1
+        return score
 
     @staticmethod
     def _coalesce(

@@ -240,6 +240,64 @@ class TestTheLiveHeadingSurvives:
         )
         assert replay.style["heading"] == "HEADING_3"
 
+    def test_a_duplicate_text_sibling_does_not_steal_the_restyle(self) -> None:
+        """Two current nodes share `_content_key`; only one target node matches.
+
+        The document has both a plain `Setup` paragraph and a real `Setup`
+        heading. The markdown restyles the heading to `###` and drops the plain
+        paragraph. `_repair`'s inner `SequenceMatcher` sees two current nodes
+        with the same content key ("Setup") and one target node with that key —
+        an ambiguous pairing it used to resolve by picking whichever candidate it
+        met first (the plain paragraph), restyling *it* into the heading and
+        deleting the real one, taking `headingId` with it.
+        """
+        replay = ParagraphReplay([
+            ("Setup", "NORMAL_TEXT", "body", False),
+            ("Setup", "HEADING_2", "heading", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        _push(replay, "### Setup\n\ntail\n")
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+        assert not replay.alive("body")
+
+    def test_duplicate_text_on_both_sides_still_saves_every_live_node(self) -> None:
+        """Both the current *and* target side repeat the content key.
+
+        Four current nodes all read "Setup" (a stray body line, the real
+        heading, the real bullet, and a stray HEADING_3) and the target keeps
+        two of them restyled ("Setup" as `##` and "Setup" as a bullet). Every
+        current node sharing a key is a candidate for every target sharing that
+        key, not just whichever pairing the inner `SequenceMatcher` happens to
+        walk into first — resolving the heading's slot must not be allowed to
+        starve the bullet's slot (or vice versa) of the candidate that actually
+        matches it.
+        """
+        replay = ParagraphReplay([
+            ("Setup", "NORMAL_TEXT", "body", False),
+            ("Setup", "HEADING_2", "heading", False),
+            ("Setup", "BULLET", "bullet", True),
+            ("Setup", "HEADING_3", "extra", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        _push(replay, "## Setup\n\n- Setup\n\ntail\n")
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_2"
+        assert replay.alive("bullet") and replay.bullet["bullet"], (
+            "the live bullet must survive as the bullet, not be swapped out "
+            "for one of the other 'Setup' nodes"
+        )
+        assert not replay.alive("body")
+        assert not replay.alive("extra")
+
 
 class TestNoHeadingIsDemoted:
     """Seeded sweep over single-block edits — the regime the bug lives in.
@@ -248,12 +306,12 @@ class TestNoHeadingIsDemoted:
     text-only key mispair, so a vocabulary of distinctive sentences would never
     reach the defect. 8 of these 500 failed before the split and all pass after —
     but see the scope note: this measures *heading survival across a single-block
-    edit*. It does not measure a pure restyle of a duplicated heading, which
-    difflib expresses as a non-adjacent insert+delete that `_repair` never
-    inspects, and which therefore still destroys a paragraph. Nor can the
-    synthesized document contain a Private-Use render glyph, a chrome paragraph or
-    a monospace run, so `render_prefix` is "" for every node here even though the
-    word list is drawn from code fences. Both gaps are open.
+    edit*. The duplicate-text-sibling case (two current nodes sharing a
+    `_content_key`, one target node) is now covered separately in
+    `TestTheLiveHeadingSurvives.test_a_duplicate_text_sibling_does_not_steal_the_restyle`.
+    Nor can the synthesized document contain a Private-Use render glyph, a chrome
+    paragraph or a monospace run, so `render_prefix` is "" for every node here
+    even though the word list is drawn from code fences — that gap is open.
     """
 
     WORDS = ["Config", "Example", "Setup", "body", "pass", "}", "key: value", "Notes", "A1"]
