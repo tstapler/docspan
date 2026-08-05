@@ -35,7 +35,9 @@ from docspan.backends.google_docs.docs_structure_parser import (
 # it, not the other way round.
 Node = Union[DocsParagraphNode, DocsTableNode]
 
-ResidueKind = Literal["empty_paragraph", "paragraph_style", "private_use_glyph"]
+ResidueKind = Literal[
+    "empty_paragraph", "paragraph_style", "private_use_glyph", "ambiguous_code_prefix"
+]
 
 # Named styles markdown has no syntax for, mapped to the nearest style it does.
 # Google Docs' own outline treats TITLE/SUBTITLE as document-level headings, and
@@ -158,11 +160,27 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
             continue
         if isinstance(node, DocsParagraphNode) and node.render_prefix:
             # A paragraph *inside* a Docs-rendered block: the glyph goes, the
-            # author's content stays. Not residue — nothing is lost, and the
-            # paragraph still participates in the diff and can be restyled or
-            # have its text changed. Only deleting it is off limits, which
-            # DocsRequestBuilder enforces from `render_prefix`.
-            kept.append(_without_render_prefix(node))
+            # author's content stays. The paragraph still participates in the
+            # diff and can be restyled or have its text changed. Only deleting
+            # it is off limits, which DocsRequestBuilder enforces from
+            # `render_prefix`.
+            stripped = _without_render_prefix(node)
+            # There is no signal in the parsed API data that reliably tells
+            # Docs' own render chrome apart from an author's own PUA character
+            # sitting alone in its leading run (e.g. a bold/italic boundary
+            # puts it in its own run). A real code block's first line is
+            # monospace; if what remains after the prefix is not, this may be
+            # an author's character silently dropped rather than chrome, so
+            # it is reported instead of assumed safe.
+            if not (stripped.spans and stripped.spans[0].monospace):
+                residue.append(
+                    Residue(
+                        kind="ambiguous_code_prefix",
+                        index=index,
+                        detail=node.render_prefix,
+                    )
+                )
+            kept.append(stripped)
             continue
         if isinstance(node, DocsParagraphNode) and node.style in _UNWRITABLE_STYLES:
             residue.append(
@@ -226,14 +244,23 @@ def describe_target_residue(residue: List[Residue]) -> str:
     Reachable since fenced code blocks became one node per line: a blank line
     inside a block, an empty fence and a blank-only fence all produce `text=""`.
     """
+    parts: List[str] = []
     blanks = sum(1 for r in residue if r.kind == "empty_paragraph")
-    if not blanks:
-        return ""
-    return (
-        f"⚠ {blanks} blank line(s) inside a code block were not written to the doc — "
-        "markdown can express them but the diff cannot carry them. Add them in Google "
-        "Docs directly if they matter."
-    )
+    if blanks:
+        parts.append(
+            f"⚠ {blanks} blank line(s) inside a code block were not written to the doc — "
+            "markdown can express them but the diff cannot carry them. Add them in Google "
+            "Docs directly if they matter."
+        )
+    glyphs = sum(1 for r in residue if r.kind == "private_use_glyph")
+    if glyphs:
+        parts.append(
+            f"⚠ {glyphs} paragraph(s) in the markdown hold only a Google Docs "
+            "private-use character and were not written to the doc — that character has "
+            "no meaning outside a Doc Google renders itself. Remove it from the markdown "
+            "if it was not intentional."
+        )
+    return " ".join(parts)
 
 
 def describe_residue(residue: List[Residue]) -> str:
@@ -253,6 +280,14 @@ def describe_residue(residue: List[Residue]) -> str:
             f"{glyphs} paragraph(s) hold only a Google Docs private-use glyph, which "
             "markdown cannot express, so they were left alone. Docs refuses to delete "
             "them, and batchUpdate is atomic, so trying would fail the whole push."
+        )
+    ambiguous = sum(1 for r in residue if r.kind == "ambiguous_code_prefix")
+    if ambiguous:
+        parts.append(
+            f"{ambiguous} paragraph(s) start with a Google Docs private-use glyph that "
+            "was treated as code-block chrome and dropped, but the rest of the paragraph "
+            "is not monospace, so it may instead be a character the author wrote. Check "
+            "these in Google Docs if that glyph was intentional."
         )
     styles = sorted({r.detail for r in residue if r.kind == "paragraph_style"})
     if styles:

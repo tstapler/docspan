@@ -248,6 +248,29 @@ class TestRenderPrefix:
         # The block's own chrome paragraph is unrepresentable and is dropped.
         assert [r.kind for r in residue] == ["private_use_glyph"]
 
+    def test_a_prefix_glyph_followed_by_non_monospace_text_is_flagged_as_ambiguous(
+        self,
+    ) -> None:
+        """An author's own PUA character can land alone in its leading run too.
+
+        Nothing in the parsed API data distinguishes that from Docs' own chrome glyph
+        — both are a lone PUA run with an empty `textStyle`. A real code block's first
+        line is monospace, so when what follows the dropped prefix is not, this may be
+        the author's own character being silently discarded rather than chrome, and it
+        is reported instead of assumed safe.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "bold notes\n", "textStyle": {"bold": True}}},
+                ],
+            }}]}}
+        kept, residue = project(structure.parse(doc))
+        assert [r.kind for r in residue] == ["ambiguous_code_prefix"]
+        assert kept[0].text == "bold notes", "the paragraph is still kept, not dropped"
+
     def test_an_unchanged_code_block_emits_nothing(self) -> None:
         """The #47 path: a document with a native code block must be pushable."""
         doc, end = self._code_block_doc()
