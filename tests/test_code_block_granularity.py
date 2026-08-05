@@ -248,6 +248,21 @@ class TestRenderPrefix:
         # The block's own chrome paragraph is unrepresentable and is dropped.
         assert [r.kind for r in residue] == ["private_use_glyph"]
 
+    def test_a_glyph_only_paragraph_padded_with_spaces_is_still_dropped(self) -> None:
+        """A chrome paragraph is "entirely PUA ignoring surrounding whitespace" (projection.py's
+        Rule 1b docstring) — not just ignoring a trailing newline. `_is_all_private_use` used to
+        strip only "\\n", so a glyph padded with spaces/tabs read as mixed content and fell
+        through to the diff/delete path instead of being dropped as residue.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 5, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": "  \n", "textStyle": {}}}],
+            }}]}}
+        kept, residue = project(structure.parse(doc))
+        assert kept == []
+        assert [r.kind for r in residue] == ["private_use_glyph"]
+
     def test_a_prefix_glyph_followed_by_non_monospace_text_is_flagged_as_ambiguous(
         self,
     ) -> None:

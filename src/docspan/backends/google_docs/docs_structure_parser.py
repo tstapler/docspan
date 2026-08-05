@@ -59,8 +59,8 @@ _MONOSPACE_FONT_MARKERS = (
 
 
 def _is_all_private_use(text: str) -> bool:
-    """True when `text` is non-empty and holds nothing but PUA (bar the newline)."""
-    stripped = text.strip("\n")
+    """True when `text` is non-empty and holds nothing but PUA, ignoring surrounding whitespace."""
+    stripped = text.strip()
     return bool(stripped) and all(ord(ch) in _PRIVATE_USE for ch in stripped)
 
 
