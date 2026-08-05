@@ -214,6 +214,32 @@ class TestTheLiveHeadingSurvives:
         replay.apply(requests)
         assert replay.style["heading"] == "HEADING_3"
 
+    def test_a_restyle_survives_next_to_an_unrelated_deletion_in_the_same_run(self) -> None:
+        """A restyle sharing a `replace` run with an unrelated delete must not mispair.
+
+        `_node_key` mismatches both `Unique1` (dropped) and `Config` (restyled)
+        against the single surviving target node, so difflib puts them in one
+        `replace` run together. `_repair` used to walk that run pairwise by
+        position — comparing `Unique1` (position 0) to `Config` (position 0 on
+        the target side) — which is not a correspondence, just a coincidence of
+        offset. That found no content match, so the *real* `Config` heading
+        (position 1) fell off the end of the loop as a bare `delete`, while the
+        target's `Config` came in as a fresh `insert`: the live heading, and its
+        `headingId`, gone.
+        """
+        replay = ParagraphReplay([
+            ("Unique1", "NORMAL_TEXT", "extra", False),
+            ("Config", "HEADING_2", "heading", False),
+            ("body", "NORMAL_TEXT", "tail", False),
+        ])
+        _push(replay, "### Config\n\nbody\n")
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+
 
 class TestNoHeadingIsDemoted:
     """Seeded sweep over single-block edits — the regime the bug lives in.

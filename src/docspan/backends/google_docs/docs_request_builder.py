@@ -190,26 +190,46 @@ class DocsRequestBuilder:
 
         Leftovers on either side stay a `replace`/`insert`/`delete` for the part
         that genuinely differs, so nothing is silently dropped.
+
+        Pairing nodes by their position within the run (same offset from the
+        run's start on both sides) is not a correspondence relation — it just
+        assumes the run has no internal insert/delete of its own. Where it
+        does (e.g. a restyle sitting next to an unrelated deletion in the same
+        run), a positional walk mispairs nodes: a live heading can end up
+        "paired" with an unrelated line, so the heading looks like a rewrite
+        and gets deleted-and-reinserted, destroying its headingId. So instead
+        of walking positionally, a second SequenceMatcher (keyed on
+        `_content_key`) finds the actual content correspondence within the
+        run's own sub-ranges. `get_opcodes()` returns a partition of both
+        inputs, so this can't assign two current nodes to the same target
+        node.
         """
         repaired: List[Opcode] = []
         for tag, i1, i2, j1, j2 in opcodes:
             if tag != "replace":
                 repaired.append((tag, i1, i2, j1, j2))
                 continue
-            # Walk the run pairwise; a pair with equal content is a restyle.
-            ci, tj = i1, j1
+            cur_slice = current[i1:i2]
+            tgt_slice = target[j1:j2]
+            inner = difflib.SequenceMatcher(
+                None,
+                [self._content_key(n) for n in cur_slice],
+                [self._content_key(n) for n in tgt_slice],
+                autojunk=False,
+            )
             pending: List[Opcode] = []
-            while ci < i2 and tj < j2:
-                if self._content_key(current[ci]) == self._content_key(target[tj]):
-                    pending.append(("equal", ci, ci + 1, tj, tj + 1))
+            for itag, ci1, ci2, tj1, tj2 in inner.get_opcodes():
+                aci1, aci2 = i1 + ci1, i1 + ci2
+                atj1, atj2 = j1 + tj1, j1 + tj2
+                if itag == "equal":
+                    # Real content correspondence inside the run -> restyle-in-place.
+                    for off in range(aci2 - aci1):
+                        pending.append(
+                            ("equal", aci1 + off, aci1 + off + 1, atj1 + off, atj1 + off + 1)
+                        )
                 else:
-                    pending.append(("replace", ci, ci + 1, tj, tj + 1))
-                ci += 1
-                tj += 1
-            if ci < i2:
-                pending.append(("delete", ci, i2, tj, tj))
-            if tj < j2:
-                pending.append(("insert", ci, ci, tj, j2))
+                    # Genuinely different content in this sub-window -> real rewrite.
+                    pending.append((itag, aci1, aci2, atj1, atj2))
             repaired.extend(self._coalesce(pending))
         return repaired
 
