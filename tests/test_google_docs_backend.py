@@ -946,3 +946,80 @@ class TestPullRendersUnwritableStyles:
 
         assert result.status == "skipped", result.message
         client.batch_update.assert_not_called()
+
+
+def _tabbed_doc_with_pua_paragraph() -> dict:
+    """A single-tab document with a real paragraph plus a lone PUA-glyph one.
+
+    The PUA paragraph is indistinguishable, in the parsed API data, from
+    content an author actually typed — project() turns it into
+    `private_use_glyph` residue and drops it from the rendered markdown.
+    """
+    return {
+        "revisionId": "rev-1",
+        "tabs": [
+            {
+                "tabProperties": {"tabId": "t.0"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 8,
+                                "paragraph": {
+                                    "elements": [{"textRun": {"content": "Intro\n"}}],
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                },
+                            },
+                            {
+                                "startIndex": 8,
+                                "endIndex": 10,
+                                "paragraph": {
+                                    "elements": [
+                                        {"textRun": {"content": "\n", "textStyle": {}}}
+                                    ],
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                },
+                            },
+                        ]
+                    }
+                },
+            }
+        ],
+    }
+
+
+class TestPullSurfacesResidue:
+    def test_pull_warns_when_a_private_use_glyph_paragraph_is_dropped(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """A paragraph holding only a private-use character vanishes from the
+        rendered markdown with no trace — pull() must say so rather than
+        reporting `status="ok"` over content that silently disappeared.
+        """
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_pua_paragraph()
+        client.list_comments.return_value = []
+
+        result = backend.pull("doc-1", str(local), tab_id="t.0")
+
+        assert result.status == "warning", result.message
+        assert "private-use glyph" in (result.message or "")
+        assert local.read_text().strip() == "Intro"
+
+    def test_pull_stays_ok_when_the_only_residue_is_a_mapped_style(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """A TITLE/SUBTITLE style is mapped to a heading, not dropped — this
+        must stay a plain "ok", matching
+        test_pull_renders_a_title_as_a_heading.
+        """
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_style("TITLE")
+        client.list_comments.return_value = []
+
+        result = backend.pull("doc-1", str(local), tab_id="t.0")
+
+        assert result.status == "ok", result.message
