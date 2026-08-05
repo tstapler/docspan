@@ -223,6 +223,21 @@ def test_delete_bounds_does_not_compound_render_prefix_and_structural_trim() -> 
     assert (start, end, trimmed) == (8, 13, True)
 
 
+def test_replace_of_a_render_prefix_paragraph_does_not_add_a_second_newline() -> None:
+    """Regression (#56): _make_delete_requests already spares a render-glyph
+    paragraph's own newline (#47/#55), but build()'s "replace" branch used to
+    write `target_text + "\\n"` regardless, adding a second newline on top of
+    the one just protected — splitting the paragraph and leaving a stray empty
+    one behind on every edit to that line."""
+    current = [replace(_para("# cfg", start=8, end=14), render_prefix="")]
+    target = [_para("# other", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=100)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\n# other"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Style-only change
 # ─────────────────────────────────────────────────────────────────────────────

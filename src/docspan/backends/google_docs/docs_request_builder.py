@@ -364,7 +364,33 @@ class DocsRequestBuilder:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
                         groups.append((node.start_index, requests))
-                requests = self._make_insert_requests(target[j1:j2], delete_start)
+                # render_prefix and precedes_structural_element both stop the
+                # first deleted node's delete range short of a newline that
+                # belongs to something else — chrome shared with a following
+                # render-glyph paragraph, or the anchor for a following
+                # Table/ToC/SectionBreak (see _delete_bounds) — and that
+                # newline collapses down to sit at delete_start once the
+                # delete runs. The insert therefore lands on an existing
+                # newline rather than in front of a following paragraph, the
+                # same situation `before_newline` exists for on the "insert"
+                # branch above; writing `text + "\n"` there adds a *second*
+                # newline on top of the one just protected, splitting the
+                # paragraph and leaving a stray empty one behind on every such
+                # edit (#56).
+                #
+                # The doc_end_index clamp in _delete_bounds is deliberately
+                # excluded: the newline it spares is this same paragraph's
+                # own terminator, not a boundary borrowed from something
+                # else, so a normal `text + "\n"` insert recreates it exactly
+                # as before — before_newline would instead prepend a blank
+                # paragraph in front of it.
+                first = current[i1]
+                spares_newline = isinstance(first, DocsParagraphNode) and (
+                    bool(first.render_prefix) or first.precedes_structural_element
+                )
+                requests = self._make_insert_requests(
+                    target[j1:j2], delete_start, before_newline=spares_newline
+                )
                 if requests:
                     # Same anchor as the first deleted node's group, and emitted
                     # after it, so the delete runs before the insert that
