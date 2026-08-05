@@ -380,12 +380,18 @@ class DocsRequestBuilder:
                 # of the one just protected, splitting the paragraph and
                 # leaving a stray empty one behind on every such edit (#56).
                 #
-                # The doc_end_index clamp in _delete_bounds is deliberately
-                # excluded: the newline it spares is this same paragraph's
-                # own terminator, not a boundary borrowed from something
-                # else, so a normal `text + "\n"` insert recreates it exactly
-                # as before — before_newline would instead prepend a blank
-                # paragraph in front of it.
+                # KNOWN LIMITATION (pre-existing, not introduced here): the
+                # doc_end_index clamp in _delete_bounds also spares a
+                # newline — the paragraph's own terminator — when the
+                # deleted range ends at the document's last paragraph, but
+                # that case isn't checked here. A normal `text + "\n"`
+                # insert does NOT recreate the original state in that case;
+                # it duplicates the clamp-spared newline and leaves a stray
+                # blank paragraph behind. `before_newline=True` isn't a fix
+                # either — it would prepend a blank paragraph in front of
+                # that newline instead. Properly handling this needs a
+                # third insert-text mode (bare text, no newline) that this
+                # branch doesn't have yet. See #62.
                 last = current[i2 - 1]
                 spares_newline = isinstance(last, DocsParagraphNode) and (
                     bool(last.render_prefix) or last.precedes_structural_element
