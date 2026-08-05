@@ -271,16 +271,29 @@ class DocsRequestBuilder:
         only merges entries whose indices are exactly contiguous, so reordering
         which candidate owns which target range cannot corrupt either consumer.
 
-        Scope note: this only ever looks at singleton "equal"/"delete" entries
-        in `pending` — a duplicate-content current node that the inner matcher
-        folded into a multi-node "replace" block (alongside other, genuinely
-        different content in the same run) is invisible here and still falls
-        through `build()`'s replace branch as delete-then-insert. Splitting a
-        "replace" block by content key would require deciding how to divide its
-        target range between the extracted piece and what remains, which is not
-        well-founded without a real per-index correspondence — unlike the
-        delete/equal case, where the extracted piece's target range is already
-        known. That gap is open.
+        Generalization: a duplicate-content current node does not stop being a
+        candidate just because the inner matcher happened to fold it into a
+        multi-node "replace" block alongside other, genuinely different content
+        in the same run (e.g. a live heading sitting next to an edited sentence,
+        with the actual duplicate target slot won by a stray paragraph
+        elsewhere in the run). Every current index inside a "replace" opcode is
+        registered as a candidate the same way a singleton "delete" is; if one
+        wins a slot, its parent "replace" opcode is structurally split
+        afterward — the winning index is carved out as its own "equal", and
+        whatever current indices remain keep the original, untouched target
+        range (attached to the first surviving contiguous run; any other
+        surviving run becomes a plain "delete", since the target content is
+        already spoken for). If every current index in the block is claimed,
+        the target range becomes a fresh "insert" anchored where the block used
+        to be. This never touches a target index more than once and never
+        drops one, so it cannot corrupt `build()`/`diff_summary()` the same way
+        the singleton case cannot (see above).
+
+        Scope note: only the *current* side of "replace"/"insert" opcodes is
+        considered here. A duplicate *target* slot trapped inside a multi-node
+        block (the symmetric case) is not decomposed — there is no existing
+        "equal" opcode to use as the slot in that case, only a range with no
+        established per-index correspondence to split by. That gap is open.
         """
         expanded: List[Opcode] = []
         for tag, ci1, ci2, cj1, cj2 in pending:
@@ -290,48 +303,96 @@ class DocsRequestBuilder:
             else:
                 expanded.append((tag, ci1, ci2, cj1, cj2))
 
-        by_key: Dict[Tuple, List[int]] = {}
+        # A candidate id is either ("pos", position) — a singleton "equal"/
+        # "delete" entry in `expanded`, matching the prior behavior — or
+        # ("interior", position, idx) — a current index still trapped inside
+        # the "replace" opcode at `position`. Only "pos" candidates that are
+        # currently "equal" can be slots; "interior" candidates can only win.
+        by_key: Dict[Tuple, List[Tuple]] = {}
         for pos, (tag, ci1, ci2, _cj1, _cj2) in enumerate(expanded):
             if tag in ("equal", "delete") and ci2 - ci1 == 1:
-                by_key.setdefault(self._content_key(cur_slice[ci1 - i1]), []).append(pos)
+                by_key.setdefault(self._content_key(cur_slice[ci1 - i1]), []).append(("pos", pos))
+            elif tag == "replace":
+                for idx in range(ci1, ci2):
+                    key = self._content_key(cur_slice[idx - i1])
+                    by_key.setdefault(key, []).append(("interior", pos, idx))
+
+        def _current_index(cid: Tuple) -> int:
+            if cid[0] == "pos":
+                return int(expanded[cid[1]][1])
+            return int(cid[2])
+
+        # position -> {idx: (target j1, target j2)} claimed out of a "replace" opcode
+        extractions: Dict[int, Dict[int, Tuple[int, int]]] = {}
 
         for positions in by_key.values():
-            slot_positions = [p for p in positions if expanded[p][0] == "equal"]
-            if not slot_positions or len(positions) < 2:
+            slot_ids = [cid for cid in positions if cid[0] == "pos" and expanded[cid[1]][0] == "equal"]
+            if not slot_ids or len(positions) < 2:
                 continue
-            original = {p: expanded[p] for p in positions}
+            slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
 
             pair_scores = []
-            for si, sp in enumerate(slot_positions):
-                _, _sci1, _sci2, scj1, _scj2 = original[sp]
+            for si, sid in enumerate(slot_ids):
+                scj1, _scj2 = slot_targets[sid]
                 target_node = tgt_slice[scj1 - j1]
-                for ci, cp in enumerate(positions):
-                    _, cci1, _cci2, _, _ = original[cp]
-                    score = self._structural_score(cur_slice[cci1 - i1], target_node)
-                    pair_scores.append((score, sp == cp, si, ci, sp, cp))
+                for ci, cid in enumerate(positions):
+                    score = self._structural_score(cur_slice[_current_index(cid) - i1], target_node)
+                    pair_scores.append((score, sid == cid, si, ci, sid, cid))
             pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
 
-            assigned_candidate_for: Dict[int, int] = {}
+            assigned_candidate_for: Dict[Tuple, Tuple] = {}
             chosen_candidates = set()
-            for _score, _self_pair, _si, _ci, sp, cp in pair_scores:
-                if sp in assigned_candidate_for or cp in chosen_candidates:
+            for _score, _self_pair, _si, _ci, sid, cid in pair_scores:
+                if sid in assigned_candidate_for or cid in chosen_candidates:
                     continue
-                assigned_candidate_for[sp] = cp
-                chosen_candidates.add(cp)
+                assigned_candidate_for[sid] = cid
+                chosen_candidates.add(cid)
 
-            for sp, cp in assigned_candidate_for.items():
-                if cp == sp:
+            for sid, cid in assigned_candidate_for.items():
+                if cid == sid:
                     continue
-                _, sci1, sci2, scj1, scj2 = original[sp]
-                _, cci1, cci2, _, _ = original[cp]
-                expanded[cp] = ("equal", cci1, cci2, scj1, scj2)
+                scj1, scj2 = slot_targets[sid]
+                if cid[0] == "pos":
+                    _, cci1, cci2, _, _ = expanded[cid[1]]
+                    expanded[cid[1]] = ("equal", cci1, cci2, scj1, scj2)
+                else:
+                    _, rpos, idx = cid
+                    extractions.setdefault(rpos, {})[idx] = (scj1, scj2)
 
-            for sp in slot_positions:
-                if sp not in chosen_candidates:
-                    _, sci1, sci2, scj1, _scj2 = original[sp]
-                    expanded[sp] = ("delete", sci1, sci2, scj1, scj1)
+            for sid in slot_ids:
+                if sid not in chosen_candidates:
+                    _, sci1, sci2, scj1, _scj2 = expanded[sid[1]]
+                    expanded[sid[1]] = ("delete", sci1, sci2, scj1, scj1)
 
-        return expanded
+        if not extractions:
+            return expanded
+
+        rebuilt: List[Opcode] = []
+        new_equals: List[Opcode] = []
+        for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
+            claimed = extractions.get(pos)
+            if not claimed:
+                rebuilt.append((tag, ci1, ci2, cj1, cj2))
+                continue
+            for idx, (scj1, scj2) in claimed.items():
+                new_equals.append(("equal", idx, idx + 1, scj1, scj2))
+            remaining = []
+            start = ci1
+            for idx in sorted(claimed):
+                if idx > start:
+                    remaining.append((start, idx))
+                start = idx + 1
+            if start < ci2:
+                remaining.append((start, ci2))
+            if not remaining:
+                rebuilt.append(("insert", ci1, ci1, cj1, cj2))
+            else:
+                (first_start, first_end), *rest = remaining
+                rebuilt.append(("replace", first_start, first_end, cj1, cj2))
+                for start, end in rest:
+                    rebuilt.append(("delete", start, end, cj1, cj1))
+        rebuilt.extend(new_equals)
+        return rebuilt
 
     @staticmethod
     def _structural_score(node: Node, target_node: Node) -> int:

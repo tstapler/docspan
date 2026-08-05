@@ -298,6 +298,32 @@ class TestTheLiveHeadingSurvives:
         assert not replay.alive("body")
         assert not replay.alive("extra")
 
+    def test_duplicate_trapped_inside_a_replace_block_still_saves_the_heading(self) -> None:
+        """The duplicate's real match lives outside the multi-node `replace` run.
+
+        A stray "Setup" body paragraph sits *before* the live "Setup" heading;
+        an unrelated paragraph ("Beta") sits *between* them and is also edited.
+        The outer `SequenceMatcher` pairs the stray paragraph with the target's
+        one "Setup" node as an "equal" — leaving the live heading and "Beta"
+        together in one multi-node `replace` block, where `_repair` used to
+        never look. `build()`'s replace branch then deletes the whole block
+        outright, including the live heading and its `headingId`.
+        """
+        replay = ParagraphReplay([
+            ("Alpha", "NORMAL_TEXT", "p1", False),
+            ("Setup", "NORMAL_TEXT", "body", False),
+            ("Beta", "NORMAL_TEXT", "p3", False),
+            ("Setup", "HEADING_2", "heading", False),
+        ])
+        _push(replay, "AlphaX\n\n### Setup\n\nBetaX\n")
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+        assert not replay.alive("body")
+
 
 class TestNoHeadingIsDemoted:
     """Seeded sweep over single-block edits — the regime the bug lives in.
