@@ -365,18 +365,20 @@ class DocsRequestBuilder:
                     if requests:
                         groups.append((node.start_index, requests))
                 # render_prefix and precedes_structural_element both stop the
-                # first deleted node's delete range short of a newline that
+                # last deleted node's delete range short of a newline that
                 # belongs to something else — chrome shared with a following
                 # render-glyph paragraph, or the anchor for a following
                 # Table/ToC/SectionBreak (see _delete_bounds) — and that
                 # newline collapses down to sit at delete_start once the
-                # delete runs. The insert therefore lands on an existing
-                # newline rather than in front of a following paragraph, the
-                # same situation `before_newline` exists for on the "insert"
-                # branch above; writing `text + "\n"` there adds a *second*
-                # newline on top of the one just protected, splitting the
-                # paragraph and leaving a stray empty one behind on every such
-                # edit (#56).
+                # delete runs. It's the last node, not the first, because
+                # that's the one bordering what comes after the deleted
+                # range once all the deletes in the range have run. The
+                # insert therefore lands on an existing newline rather than
+                # in front of a following paragraph, the same situation
+                # `before_newline` exists for on the "insert" branch above;
+                # writing `text + "\n"` there adds a *second* newline on top
+                # of the one just protected, splitting the paragraph and
+                # leaving a stray empty one behind on every such edit (#56).
                 #
                 # The doc_end_index clamp in _delete_bounds is deliberately
                 # excluded: the newline it spares is this same paragraph's
@@ -384,9 +386,9 @@ class DocsRequestBuilder:
                 # else, so a normal `text + "\n"` insert recreates it exactly
                 # as before — before_newline would instead prepend a blank
                 # paragraph in front of it.
-                first = current[i1]
-                spares_newline = isinstance(first, DocsParagraphNode) and (
-                    bool(first.render_prefix) or first.precedes_structural_element
+                last = current[i2 - 1]
+                spares_newline = isinstance(last, DocsParagraphNode) and (
+                    bool(last.render_prefix) or last.precedes_structural_element
                 )
                 requests = self._make_insert_requests(
                     target[j1:j2], delete_start, before_newline=spares_newline

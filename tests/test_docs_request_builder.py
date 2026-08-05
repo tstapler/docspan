@@ -238,6 +238,42 @@ def test_replace_of_a_render_prefix_paragraph_does_not_add_a_second_newline() ->
     assert insert_requests[0]["insertText"]["text"] == "\n# other"
 
 
+def test_replace_of_a_multi_node_range_uses_the_last_node_for_spared_newline() -> None:
+    """Regression (#56 follow-up, found in review of PR #48): when a replace
+    spans multiple nodes, the newline that survives at delete_start once all
+    the deletes run is spared by whichever node borders what comes after the
+    range — the LAST deleted node, not the first. build() used to read the
+    trim flag off current[i1] (the first node), so a trim flag set only on a
+    later node in the range was ignored and a spurious second newline was
+    inserted."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9, precedes_structural_element=True),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=100)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\nZZZZZZ"
+
+
+def test_replace_of_a_multi_node_range_does_not_spare_newline_when_only_first_node_trims() -> None:
+    """Mirror of the above: when the trim flag is on the FIRST node but not
+    the last, the first node no longer borders what comes after the deleted
+    range, so its newline must NOT be spared."""
+    current = [
+        _para("AAAA", start=1, end=6, precedes_structural_element=True),
+        _para("BB", start=6, end=9),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=100)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ\n"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Style-only change
 # ─────────────────────────────────────────────────────────────────────────────
