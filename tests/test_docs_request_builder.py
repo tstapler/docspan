@@ -1,5 +1,7 @@
 """Unit tests for DocsRequestBuilder — structural diff algorithm, no network."""
 
+from dataclasses import replace
+
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -205,6 +207,71 @@ def test_delete_does_not_exceed_doc_end() -> None:
         if "deleteContentRange" in r:
             end_idx = r["deleteContentRange"]["range"]["endIndex"]
             assert end_idx <= doc_end, f"Delete range {end_idx} exceeds doc_end {doc_end}"
+
+
+def test_delete_bounds_does_not_compound_render_prefix_and_structural_trim() -> None:
+    """Regression (#55): a render-glyph paragraph (#47) that is also the last
+    paragraph before a Table/ToC/SectionBreak used to trim twice — once for
+    each independent rule — eating the author's last character along with the
+    newline. `# cfg` at [8, 14) is 5 units of text starting at 8, so only
+    [8, 13) may be deleted; the old code produced [8, 12)."""
+    node = _para("# cfg", start=8, end=14, precedes_structural_element=True)
+    node = replace(node, render_prefix="")
+
+    start, end, trimmed = DocsRequestBuilder._delete_bounds(node, doc_end_index=100)
+
+    assert (start, end, trimmed) == (8, 13, True)
+
+
+def test_replace_of_a_render_prefix_paragraph_does_not_add_a_second_newline() -> None:
+    """Regression (#56): _make_delete_requests already spares a render-glyph
+    paragraph's own newline (#47/#55), but build()'s "replace" branch used to
+    write `target_text + "\\n"` regardless, adding a second newline on top of
+    the one just protected — splitting the paragraph and leaving a stray empty
+    one behind on every edit to that line."""
+    current = [replace(_para("# cfg", start=8, end=14), render_prefix="")]
+    target = [_para("# other", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=100)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\n# other"
+
+
+def test_replace_of_a_multi_node_range_uses_the_last_node_for_spared_newline() -> None:
+    """Regression (#56 follow-up, found in review of PR #48): when a replace
+    spans multiple nodes, the newline that survives at delete_start once all
+    the deletes run is spared by whichever node borders what comes after the
+    range — the LAST deleted node, not the first. build() used to read the
+    trim flag off current[i1] (the first node), so a trim flag set only on a
+    later node in the range was ignored and a spurious second newline was
+    inserted."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9, precedes_structural_element=True),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=100)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\nZZZZZZ"
+
+
+def test_replace_of_a_multi_node_range_does_not_spare_newline_when_only_first_node_trims() -> None:
+    """Mirror of the above: when the trim flag is on the FIRST node but not
+    the last, the first node no longer borders what comes after the deleted
+    range, so its newline must NOT be spared."""
+    current = [
+        _para("AAAA", start=1, end=6, precedes_structural_element=True),
+        _para("BB", start=6, end=9),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=100)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

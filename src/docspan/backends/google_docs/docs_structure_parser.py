@@ -20,6 +20,54 @@ from docspan.backends.google_docs.heading_anchors import (
 # DocsRequestBuilder._make_delete_requests.
 UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 
+# Google Docs renders some blocks itself — a native code block, for one — and marks
+# each paragraph of such a block by writing a Private-Use-Area glyph in front of it
+# (U+E907 for a code block). It arrives as its **own leading textRun**, which is what
+# makes it identifiable; see `_render_prefix_of`.
+#
+# U+E000-U+F8FF is the BMP Private Use Area by definition, so a `unicodedata.category`
+# filter over it returned every codepoint — the filter was a no-op. Matching the range
+# directly says the same thing without building a 6400-character class on every parse.
+#
+# Only the BMP range, so a supplementary-plane Private Use glyph (planes 15 and 16) is
+# not recognised. No observed document uses one; if one appears the result is the old
+# loud failure, not corruption.
+_PRIVATE_USE = range(0xE000, 0xF900)
+
+# Fonts Google Docs' own code-block picker offers, beyond "Courier"/"mono" — the
+# "Courier"/"mono" check this extends. Not exhaustive — an arbitrary custom
+# monospace font will still miss — but "Courier"/"mono" alone missed every
+# other font the picker offers, so a real code block set in one of these
+# tripped `ambiguous_code_prefix` on every single push.
+_MONOSPACE_FONT_MARKERS = (
+    "courier",
+    "mono",
+    "consolas",
+    "menlo",
+    "monaco",
+    "fira code",
+    "inconsolata",
+    "source code pro",
+    "cascadia code",
+    "roboto mono",
+    "jetbrains mono",
+    "ibm plex mono",
+    "space mono",
+    "pt mono",
+    "andale mono",
+)
+
+
+def _is_all_private_use(text: str) -> bool:
+    """True when `text` is non-empty and holds nothing but PUA, ignoring surrounding whitespace."""
+    stripped = text.strip()
+    return bool(stripped) and all(ord(ch) in _PRIVATE_USE for ch in stripped)
+
+
+def _utf16_len(text: str) -> int:
+    """UTF-16 code units in `text` — the unit Docs indices are measured in."""
+    return len(text.encode("utf-16-le")) // 2
+
 
 def _trim_spans_to_cell_text(
     spans: List["TextSpan"], joined: str, text: str
@@ -106,6 +154,14 @@ class DocsParagraphNode:
     start_index: int = 0
     end_index: int = 0
     spans: List[TextSpan] = field(default_factory=list)
+    # The Private-Use glyph Docs writes in front of a paragraph it renders itself
+    # (a native code block writes U+E907). Non-empty means the paragraph belongs to
+    # a Docs-rendered block: `.text` still contains it, `projection.project()` drops
+    # it so the diff never sees it, and DocsRequestBuilder deletes only the
+    # paragraph's *text*, never the paragraph: the API refuses a range covering the
+    # glyph, and a range that skips it silently orphans the glyph onto the next
+    # paragraph. Both verified against the live API.
+    render_prefix: str = ""
     # True when this paragraph's bullet resolves to a native BULLET_CHECKBOX
     # glyph (glyphType == GLYPH_TYPE_UNSPECIFIED), resolved live by
     # DocsStructureParser from the document's `lists` map. NOT part of the
@@ -372,9 +428,10 @@ class DocsStructureParser:
             bold = text_style.get("bold", False)
             italic = text_style.get("italic", False)
             link = self._parse_link(text_style.get("link"))
-            # Monospace: check weightedFontFamily.fontFamily for "Courier New" or similar
+            # Monospace: check weightedFontFamily.fontFamily against known monospace fonts
             font_family = text_style.get("weightedFontFamily", {}).get("fontFamily", "")
-            monospace = "Courier" in font_family or "mono" in font_family.lower()
+            font_family_lower = font_family.lower()
+            monospace = any(marker in font_family_lower for marker in _MONOSPACE_FONT_MARKERS)
 
             text_parts.append(run_content)
             spans.append(TextSpan(
@@ -388,6 +445,26 @@ class DocsStructureParser:
         raw_text = "".join(text_parts)
         # Strip trailing newline (each paragraph ends with \n in the Docs model)
         text = raw_text.rstrip("\n")
+
+        # A glyph Docs writes to mark a paragraph it renders itself is a *rendering
+        # artifact*, not content — markdown has no syntax for one, so the diff read it
+        # as a difference the author had asked for and rewrote the block on every push.
+        #
+        # It is recorded rather than removed. `text` stays faithful to the document,
+        # because two different consumers read it: the index arithmetic (delete bounds,
+        # span ranges) needs what the document actually contains, and the diff and
+        # renderer need what the markdown should say. Stripping it here made the parser
+        # lie to the first group — a delete then either covered the glyph, which the
+        # API refuses outright (#47), or skipped it, which the API accepts and which
+        # orphans the glyph onto the following paragraph. Verified against the live API:
+        # `[34052,34069)` → "Invalid deletion range"; `[34053,34069)` → accepted, and
+        # the next paragraph came back reading "\ue907mappings:".
+        #
+        # `projection.project()` is the layer that drops it for the diff, and
+        # `render_prefix` is how `DocsRequestBuilder` knows the paragraph belongs to a
+        # block it must not take apart.
+        render_prefix = self._render_prefix_of(paragraph.get("elements", []))
+
         spans = self._trim_spans_to_text(spans, len(text))
 
         # Check for bullet / list item
@@ -404,9 +481,43 @@ class DocsStructureParser:
             start_index=start_index,
             end_index=end_index,
             spans=spans,
+            render_prefix=render_prefix,
             is_native_checkbox=is_native_checkbox,
             heading_id=paragraph_style.get("headingId"),
         )
+
+    @staticmethod
+    def _render_prefix_of(elements: List[dict]) -> str:
+        """The leading run(s) Docs writes to mark a paragraph it renders itself.
+
+        Matched **per run**, not against the concatenated text, and that is the whole
+        point of the signature:
+
+        * An empty `textRun` — which the API does send — cannot hide the glyph behind
+          it. Testing `lstrip` on the joined text and walking spans to match stopped at
+          the empty run, read it as "no glyph here", and then reconciled the
+          length mismatch by trimming from the *end*, destroying a real character.
+        * An author's own Private-Use character is left alone. Someone typing an Apple
+          logo or a Nerd Font glyph types it inside a run with their text, so the run
+          is not *entirely* PUA and this returns "". Treating any leading PUA as an
+          artifact silently altered legitimate content.
+
+        Both shapes are what the live document shows: `run0 = "\ue907"` with
+        `textStyle {}`, content following in its own runs. `textStyle` is deliberately
+        not part of the test — Docs is free to put a `fontSize` on it.
+        """
+        prefix: List[str] = []
+        for element in elements:
+            text_run = element.get("textRun")
+            if text_run is None:
+                break
+            content = text_run.get("content", "")
+            if not content:
+                continue  # an empty run neither is nor conceals a prefix
+            if not _is_all_private_use(content):
+                break
+            prefix.append(content.strip("\n"))
+        return "".join(prefix)
 
     @staticmethod
     def _trim_spans_to_text(spans: List[TextSpan], keep: int) -> List[TextSpan]:

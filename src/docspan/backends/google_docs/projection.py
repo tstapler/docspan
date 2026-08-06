@@ -26,6 +26,8 @@ from typing import Dict, List, Literal, Sequence, Tuple, Union
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    _is_all_private_use,
+    _utf16_len,
 )
 
 # The same alias DocsRequestBuilder uses. Declared here rather than imported
@@ -33,7 +35,9 @@ from docspan.backends.google_docs.docs_structure_parser import (
 # it, not the other way round.
 Node = Union[DocsParagraphNode, DocsTableNode]
 
-ResidueKind = Literal["empty_paragraph", "paragraph_style"]
+ResidueKind = Literal[
+    "empty_paragraph", "paragraph_style", "private_use_glyph", "ambiguous_code_prefix"
+]
 
 # Named styles markdown has no syntax for, mapped to the nearest style it does.
 # Google Docs' own outline treats TITLE/SUBTITLE as document-level headings, and
@@ -90,6 +94,30 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     node's ``end_index`` lands in front of the dropped paragraph rather than
     inside it.
 
+    Rule 1b — a paragraph holding only Private-Use-Area glyphs is dropped.
+
+    Exactly rule 1's situation with a different unrepresentable character. Google
+    Docs writes `U+E907` into a paragraph for constructs it renders itself, and
+    markdown has no syntax for one — so `MarkdownToParagraphParser` can never
+    produce a matching node, the diff reads the paragraph as "the user deleted
+    this", and push emits a delete for it.
+
+    Docs then **refuses that delete**, and because `batchUpdate` is atomic the
+    *entire push fails*:
+
+        Invalid requests[4].deleteContentRange: Invalid deletion range.
+        Cannot delete the requested range.
+
+    Measured on a real design doc — three such paragraphs, 56 requests, HTTP 400,
+    nothing written. Any document containing one could never be pushed at all,
+    which makes this the same self-inflicted trap rule 1 already describes: the
+    tool cannot represent the state, so it tries to delete it, and fails forever.
+
+    Only a paragraph whose text is *entirely* PUA (ignoring surrounding
+    whitespace) is dropped. One that also carries real text is kept, because
+    dropping it would lose the author's content — the glyph is then a cosmetic
+    wart on a paragraph that still round-trips.
+
     Rule 2 — ``TITLE`` and ``SUBTITLE`` become ``HEADING_1``/``HEADING_2``.
 
     Markdown has no syntax for either, so ``nodes_to_markdown`` rendered them as
@@ -125,6 +153,35 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
                 )
             )
             continue
+        if isinstance(node, DocsParagraphNode) and _is_all_private_use(node.text):
+            residue.append(
+                Residue(kind="private_use_glyph", index=index, detail=node.text.strip())
+            )
+            continue
+        if isinstance(node, DocsParagraphNode) and node.render_prefix:
+            # A paragraph *inside* a Docs-rendered block: the glyph goes, the
+            # author's content stays. The paragraph still participates in the
+            # diff and can be restyled or have its text changed. Only deleting
+            # it is off limits, which DocsRequestBuilder enforces from
+            # `render_prefix`.
+            stripped = _without_render_prefix(node)
+            # There is no signal in the parsed API data that reliably tells
+            # Docs' own render chrome apart from an author's own PUA character
+            # sitting alone in its leading run (e.g. a bold/italic boundary
+            # puts it in its own run). A real code block's first line is
+            # monospace; if what remains after the prefix is not, this may be
+            # an author's character silently dropped rather than chrome, so
+            # it is reported instead of assumed safe.
+            if not (stripped.spans and stripped.spans[0].monospace):
+                residue.append(
+                    Residue(
+                        kind="ambiguous_code_prefix",
+                        index=index,
+                        detail=node.render_prefix,
+                    )
+                )
+            kept.append(stripped)
+            continue
         if isinstance(node, DocsParagraphNode) and node.style in _UNWRITABLE_STYLES:
             residue.append(
                 Residue(kind="paragraph_style", index=index, detail=node.style)
@@ -134,6 +191,37 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
             node = replace(node, style=_UNWRITABLE_STYLES[node.style])
         kept.append(node)
     return kept, residue
+
+
+def _without_render_prefix(node: DocsParagraphNode) -> DocsParagraphNode:
+    """The same paragraph as the markdown would describe it — prefix removed.
+
+    `start_index` advances by the prefix's width and the spans lose it, so pass 2
+    still places styling correctly: the API counted those units, and removing them
+    from the text without moving the index puts every span in the paragraph one
+    unit early.
+
+    `render_prefix` is *kept* on the result. It is what tells
+    `DocsRequestBuilder` the paragraph belongs to a block Docs renders and must
+    not be taken apart — the whole reason the prefix is recorded rather than
+    discarded at parse time.
+    """
+    width = _utf16_len(node.render_prefix)
+    remaining, spans = width, list(node.spans)
+    while remaining > 0 and spans:
+        head = _utf16_len(spans[0].text)
+        if head <= remaining:
+            remaining -= head
+            spans.pop(0)
+        else:
+            spans[0] = replace(spans[0], text=spans[0].text[remaining:])
+            remaining = 0
+    return replace(
+        node,
+        text=node.text[len(node.render_prefix):],
+        start_index=node.start_index + width,
+        spans=spans,
+    )
 
 
 def _describe_empty(node: DocsParagraphNode) -> str:
@@ -156,14 +244,23 @@ def describe_target_residue(residue: List[Residue]) -> str:
     Reachable since fenced code blocks became one node per line: a blank line
     inside a block, an empty fence and a blank-only fence all produce `text=""`.
     """
+    parts: List[str] = []
     blanks = sum(1 for r in residue if r.kind == "empty_paragraph")
-    if not blanks:
-        return ""
-    return (
-        f"⚠ {blanks} blank line(s) inside a code block were not written to the doc — "
-        "markdown can express them but the diff cannot carry them. Add them in Google "
-        "Docs directly if they matter."
-    )
+    if blanks:
+        parts.append(
+            f"⚠ {blanks} blank line(s) inside a code block were not written to the doc — "
+            "markdown can express them but the diff cannot carry them. Add them in Google "
+            "Docs directly if they matter."
+        )
+    glyphs = sum(1 for r in residue if r.kind == "private_use_glyph")
+    if glyphs:
+        parts.append(
+            f"⚠ {glyphs} paragraph(s) in the markdown hold only a Google Docs "
+            "private-use character and were not written to the doc — that character has "
+            "no meaning outside a Doc Google renders itself. Remove it from the markdown "
+            "if it was not intentional."
+        )
+    return " ".join(parts)
 
 
 def describe_residue(residue: List[Residue]) -> str:
@@ -176,6 +273,21 @@ def describe_residue(residue: List[Residue]) -> str:
         parts.append(
             f"{blanks} blank paragraph(s) in the doc are not represented in markdown, "
             "so they were left alone. Add or remove them in Google Docs directly."
+        )
+    glyphs = sum(1 for r in residue if r.kind == "private_use_glyph")
+    if glyphs:
+        parts.append(
+            f"{glyphs} paragraph(s) hold only a Google Docs private-use glyph, which "
+            "markdown cannot express, so they were left alone. Docs refuses to delete "
+            "them, and batchUpdate is atomic, so trying would fail the whole push."
+        )
+    ambiguous = sum(1 for r in residue if r.kind == "ambiguous_code_prefix")
+    if ambiguous:
+        parts.append(
+            f"{ambiguous} paragraph(s) start with a Google Docs private-use glyph that "
+            "was treated as code-block chrome and dropped, but the rest of the paragraph "
+            "is not monospace, so it may instead be a character the author wrote. Check "
+            "these in Google Docs if that glyph was intentional."
         )
     styles = sorted({r.detail for r in residue if r.kind == "paragraph_style"})
     if styles:

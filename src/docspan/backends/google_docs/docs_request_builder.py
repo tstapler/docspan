@@ -366,7 +366,41 @@ class DocsRequestBuilder:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
                         groups.append((node.start_index, requests))
-                requests = self._make_insert_requests(target[j1:j2], delete_start)
+                # render_prefix and precedes_structural_element both stop the
+                # last deleted node's delete range short of a newline that
+                # belongs to something else — chrome shared with a following
+                # render-glyph paragraph, or the anchor for a following
+                # Table/ToC/SectionBreak (see _delete_bounds) — and that
+                # newline collapses down to sit at delete_start once the
+                # delete runs. It's the last node, not the first, because
+                # that's the one bordering what comes after the deleted
+                # range once all the deletes in the range have run. The
+                # insert therefore lands on an existing newline rather than
+                # in front of a following paragraph, the same situation
+                # `before_newline` exists for on the "insert" branch above;
+                # writing `text + "\n"` there adds a *second* newline on top
+                # of the one just protected, splitting the paragraph and
+                # leaving a stray empty one behind on every such edit (#56).
+                #
+                # KNOWN LIMITATION (pre-existing, not introduced here): the
+                # doc_end_index clamp in _delete_bounds also spares a
+                # newline — the paragraph's own terminator — when the
+                # deleted range ends at the document's last paragraph, but
+                # that case isn't checked here. A normal `text + "\n"`
+                # insert does NOT recreate the original state in that case;
+                # it duplicates the clamp-spared newline and leaves a stray
+                # blank paragraph behind. `before_newline=True` isn't a fix
+                # either — it would prepend a blank paragraph in front of
+                # that newline instead. Properly handling this needs a
+                # third insert-text mode (bare text, no newline) that this
+                # branch doesn't have yet. See #62.
+                last = current[i2 - 1]
+                spares_newline = isinstance(last, DocsParagraphNode) and (
+                    bool(last.render_prefix) or last.precedes_structural_element
+                )
+                requests = self._make_insert_requests(
+                    target[j1:j2], delete_start, before_newline=spares_newline
+                )
                 if requests:
                     # Same anchor as the first deleted node's group, and emitted
                     # after it, so the delete runs before the insert that
@@ -396,7 +430,34 @@ class DocsRequestBuilder:
         start = node.start_index
         end = node.end_index
         trimmed = False
-        if isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
+        if isinstance(node, DocsParagraphNode) and node.render_prefix:
+            # A paragraph inside a block Docs renders itself. Neither whole-paragraph
+            # range works, verified against the live API on a copy of a real document:
+            #
+            #   [34052,34069)  covers the glyph  -> "Invalid deletion range. Cannot
+            #                                       delete the requested range."
+            #   [34053,34069)  skips the glyph   -> accepted, and the orphaned glyph
+            #                                       merges into the *next* paragraph,
+            #                                       which came back "mappings:"
+            #
+            # The first fails the whole atomic batch (#47); the second corrupts a
+            # paragraph the author never touched, invisibly. So delete the text and
+            # leave the paragraph: the author's line goes, the block keeps its shape,
+            # and what remains is a glyph-only paragraph — the same shape Docs writes
+            # for the block's own chrome, which `project()` rule 1b drops from both
+            # sides of the diff. That is what keeps push idempotent rather than
+            # retrying a delete it can never complete.
+            #
+            # `start` already skips the prefix: project() advanced it. Computed
+            # directly from the text length rather than by decrementing `end`,
+            # because `precedes_structural_element` (#55) can be true on the
+            # same node — a render-glyph paragraph immediately before a Table,
+            # ToC or SectionBreak — and two independent `end -= 1`s would trim
+            # the range twice, deleting the author's last character along with
+            # the newline.
+            end = start + _utf16_len(node.text)
+            trimmed = True
+        elif isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
             end -= 1
             trimmed = True
         if end >= doc_end_index:

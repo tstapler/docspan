@@ -434,6 +434,13 @@ class GoogleDocsBackend(Backend):
                     if dead_anchors
                     else None,
                     describe_target_residue(plan.target_residue) or None,
+                    # Doc-side residue (e.g. an ambiguous code-block prefix) is only
+                    # reported unconditionally above when the push is a no-op. A push
+                    # that writes something else must still surface it here, or the
+                    # warning this residue exists to give is silently dropped on the
+                    # common case — the exact failure mode `project()`'s docstring
+                    # says residue exists to avoid.
+                    describe_residue(plan.residue) or None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation
@@ -584,11 +591,31 @@ class GoogleDocsBackend(Backend):
                 # text, which re-parsed as NORMAL_TEXT and made the next push
                 # demote the title. project() maps it to the nearest style
                 # markdown *does* have, so pull/push is a fixpoint.
-                nodes, _residue = project(nodes)
+                nodes, residue = project(nodes)
                 markdown_content = render_nodes_to_markdown(nodes)
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
                 self._write_comment_sidecar(doc_id, local_path)
+                # Only the two kinds that can hide real authored content are
+                # surfaced here. `paragraph_style` (e.g. TITLE) is mapped to
+                # the closest markdown heading, not dropped — pull/push stays
+                # a fixpoint and nothing is lost. `empty_paragraph` is blank
+                # whitespace, already low-stakes on the push side. But
+                # `private_use_glyph`/`ambiguous_code_prefix` paragraphs are
+                # elided from the markdown entirely with nothing left in
+                # their place, which is exactly the silent-drop failure mode
+                # project()'s docstring exists to avoid, and push() already
+                # surfaces it unconditionally.
+                residue_note = describe_residue(
+                    [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
+                )
+                if residue_note:
+                    return PullResult(
+                        status="warning",
+                        doc_id=doc_id,
+                        local_path=local_path,
+                        message=f"⚠ {residue_note}",
+                    )
                 return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
 
             doc = self._client.get_document(doc_id)
