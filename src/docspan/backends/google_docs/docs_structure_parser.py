@@ -20,6 +20,90 @@ from docspan.backends.google_docs.heading_anchors import (
 # DocsRequestBuilder._make_delete_requests.
 UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 
+# Google Docs renders some blocks itself — a native code block, for one — and marks
+# each paragraph of such a block by writing a Private-Use-Area glyph in front of it
+# (U+E907 for a code block). It arrives as its **own leading textRun**, which is what
+# makes it identifiable; see `_render_prefix_of`.
+#
+# U+E000-U+F8FF is the BMP Private Use Area by definition, so a `unicodedata.category`
+# filter over it returned every codepoint — the filter was a no-op. Matching the range
+# directly says the same thing without building a 6400-character class on every parse.
+#
+# Only the BMP range, so a supplementary-plane Private Use glyph (planes 15 and 16) is
+# not recognised. No observed document uses one; if one appears the result is the old
+# loud failure, not corruption.
+_PRIVATE_USE = range(0xE000, 0xF900)
+
+# Fonts Google Docs' own code-block picker offers, beyond "Courier"/"mono" — the
+# "Courier"/"mono" check this extends. Not exhaustive — an arbitrary custom
+# monospace font will still miss — but "Courier"/"mono" alone missed every
+# other font the picker offers, so a real code block set in one of these
+# tripped `ambiguous_code_prefix` on every single push.
+_MONOSPACE_FONT_MARKERS = (
+    "courier",
+    "mono",
+    "consolas",
+    "menlo",
+    "monaco",
+    "fira code",
+    "inconsolata",
+    "source code pro",
+    "cascadia code",
+    "roboto mono",
+    "jetbrains mono",
+    "ibm plex mono",
+    "space mono",
+    "pt mono",
+    "andale mono",
+)
+
+
+def _is_all_private_use(text: str) -> bool:
+    """True when `text` is non-empty and holds nothing but PUA, ignoring surrounding whitespace."""
+    stripped = text.strip()
+    return bool(stripped) and all(ord(ch) in _PRIVATE_USE for ch in stripped)
+
+
+def _utf16_len(text: str) -> int:
+    """UTF-16 code units in `text` — the unit Docs indices are measured in."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _trim_spans_to_cell_text(
+    spans: List["TextSpan"], joined: str, text: str
+) -> List["TextSpan"]:
+    """Trim `spans` at both ends so they concatenate to exactly `text`.
+
+    `text` is `joined.strip()`, so the amount to remove is the leading and
+    trailing whitespace width. Marks on what survives are preserved; a span left
+    holding nothing is dropped, because a bold span with no text renders as
+    `****`.
+    """
+    lead = len(joined) - len(joined.lstrip())
+    tail = len(joined) - len(joined.rstrip())
+    out: List["TextSpan"] = []
+    for span in spans:
+        out.append(span)
+    # Front.
+    while lead > 0 and out:
+        head = out[0]
+        if len(head.text) <= lead:
+            lead -= len(head.text)
+            out.pop(0)
+        else:
+            out[0] = replace(head, text=head.text[lead:])
+            lead = 0
+    # Back.
+    while tail > 0 and out:
+        last = out[-1]
+        if len(last.text) <= tail:
+            tail -= len(last.text)
+            out.pop()
+        else:
+            out[-1] = replace(last, text=last.text[: len(last.text) - tail])
+            tail = 0
+    return [span for span in out if span.text]
+
 
 def _person_display_text(person: dict) -> str:
     """Return display text for a Docs API `person` structural element.
@@ -70,6 +154,14 @@ class DocsParagraphNode:
     start_index: int = 0
     end_index: int = 0
     spans: List[TextSpan] = field(default_factory=list)
+    # The Private-Use glyph Docs writes in front of a paragraph it renders itself
+    # (a native code block writes U+E907). Non-empty means the paragraph belongs to
+    # a Docs-rendered block: `.text` still contains it, `projection.project()` drops
+    # it so the diff never sees it, and DocsRequestBuilder deletes only the
+    # paragraph's *text*, never the paragraph: the API refuses a range covering the
+    # glyph, and a range that skips it silently orphans the glyph onto the next
+    # paragraph. Both verified against the live API.
+    render_prefix: str = ""
     # True when this paragraph's bullet resolves to a native BULLET_CHECKBOX
     # glyph (glyphType == GLYPH_TYPE_UNSPECIFIED), resolved live by
     # DocsStructureParser from the document's `lists` map. NOT part of the
@@ -97,11 +189,54 @@ class DocsParagraphNode:
 
 
 @dataclass
+class TableCell:
+    """One table cell: its text, and the inline styling on that text.
+
+    Cells were plain `str`, so every mark inside one was dropped on both sides —
+    bold, monospace, and **links, including internal `#anchor` cross-references**.
+    A reference written inside a table cell rendered as dead text in the Doc while
+    the identical reference in a paragraph resolved, with nothing reported.
+
+    `text` and `spans` are co-located rather than kept in parallel structures so they
+    are easy to hold in agreement: pass 2 walks span widths against `text` to place
+    index ranges, so a character in one and not the other shifts every range after
+    it. Same intended invariant as `DocsParagraphNode` — `spans` is either empty
+    (unstyled) or concatenates to exactly `text`.
+
+    Nothing *enforces* it. `TableCell(text="a", spans=[TextSpan(text="bbbb")])` is
+    constructible, and `__post_init__` normalises a `str` cell without checking.
+    What actually protects the document is the `limit` in
+    `DocsRequestBuilder._span_requests_in`, which bounds a disagreement to inside the
+    cell instead of spilling a range into whatever follows it.
+    """
+    text: str = ""
+    spans: List[TextSpan] = field(default_factory=list)
+
+    @property
+    def styled(self) -> bool:
+        return bool(self.spans)
+
+
+@dataclass
 class DocsTableNode:
-    """Represents a table in a Google Docs document (plain-text cells)."""
-    rows: List[List[str]] = field(default_factory=list)
+    """Represents a table in a Google Docs document."""
+    rows: List[List[TableCell]] = field(default_factory=list)
     start_index: int = 0
     end_index: int = 0
+
+    def __post_init__(self) -> None:
+        """Accept plain strings for cells and normalise them to `TableCell`.
+
+        Cells were `str` before they had to carry inline styling. Callers that pass
+        strings are normalised here rather than left to fail later on
+        `cell.text` — an `AttributeError` several frames deep inside request
+        building, which says nothing about the actual mistake. After this, `rows`
+        is uniformly `List[List[TableCell]]` everywhere downstream.
+        """
+        self.rows = [
+            [TableCell(text=cell) if isinstance(cell, str) else cell for cell in row]
+            for row in self.rows
+        ]
 
     @property
     def num_rows(self) -> int:
@@ -206,30 +341,62 @@ class DocsStructureParser:
     def _parse_table(self, element: dict) -> DocsTableNode:
         """Parse a structural element that contains a table into a DocsTableNode."""
         table = element["table"]
-        rows: List[List[str]] = []
+        rows: List[List[TableCell]] = []
         for table_row in table.get("tableRows", []):
-            cells: List[str] = []
+            cells: List[TableCell] = []
             for cell in table_row.get("tableCells", []):
-                parts: List[str] = []
-                for cell_element in cell.get("content", []):
-                    paragraph = cell_element.get("paragraph")
-                    if paragraph is None:
-                        continue
-                    for pe in paragraph.get("elements", []):
-                        text_run = pe.get("textRun")
-                        if text_run is not None:
-                            parts.append(text_run.get("content", ""))
-                            continue
-                        person = pe.get("person")
-                        if person is not None:
-                            parts.append(_person_display_text(person))
-                cells.append("".join(parts).strip())
+                cells.append(self._parse_cell(cell))
             rows.append(cells)
         return DocsTableNode(
             rows=rows,
             start_index=element.get("startIndex", 0),
             end_index=element.get("endIndex", 0),
         )
+
+    def _parse_cell(self, cell: dict) -> TableCell:
+        """Collect a cell's runs into text plus matching spans.
+
+        The joined text is `strip()`ped — a Docs cell paragraph ends in "\n" and
+        cells are conventionally compared without surrounding whitespace — so the
+        spans are trimmed by the same amount at each end. Letting them keep the
+        whitespace would break the spans-concatenate-to-text invariant, and pass 2
+        would then place every range in the cell off by the width of the trim.
+        """
+        spans: List[TextSpan] = []
+        for cell_element in cell.get("content", []):
+            paragraph = cell_element.get("paragraph")
+            if paragraph is None:
+                continue
+            for pe in paragraph.get("elements", []):
+                text_run = pe.get("textRun")
+                if text_run is not None:
+                    content = text_run.get("content", "")
+                    if not content:
+                        continue
+                    text_style = text_run.get("textStyle", {})
+                    font = text_style.get("weightedFontFamily", {}).get("fontFamily", "")
+                    spans.append(TextSpan(
+                        text=content,
+                        bold=bool(text_style.get("bold", False)),
+                        italic=bool(text_style.get("italic", False)),
+                        link=self._parse_link(text_style.get("link")),
+                        monospace="Courier" in font or "mono" in font.lower(),
+                    ))
+                    continue
+                person = pe.get("person")
+                if person is not None:
+                    name = _person_display_text(person)
+                    if name:
+                        spans.append(TextSpan(text=name))
+
+        joined = "".join(span.text for span in spans)
+        text = joined.strip()
+        spans = _trim_spans_to_cell_text(spans, joined, text)
+        # An unstyled cell carries no spans, matching DocsParagraphNode: it keeps
+        # the diff key and the renderer on the plain-text path.
+        if not any(s.bold or s.italic or s.link or s.monospace for s in spans):
+            spans = []
+        return TableCell(text=text, spans=spans)
 
     def _parse_paragraph(
         self, element: dict, lists: Optional[dict] = None
@@ -261,9 +428,10 @@ class DocsStructureParser:
             bold = text_style.get("bold", False)
             italic = text_style.get("italic", False)
             link = self._parse_link(text_style.get("link"))
-            # Monospace: check weightedFontFamily.fontFamily for "Courier New" or similar
+            # Monospace: check weightedFontFamily.fontFamily against known monospace fonts
             font_family = text_style.get("weightedFontFamily", {}).get("fontFamily", "")
-            monospace = "Courier" in font_family or "mono" in font_family.lower()
+            font_family_lower = font_family.lower()
+            monospace = any(marker in font_family_lower for marker in _MONOSPACE_FONT_MARKERS)
 
             text_parts.append(run_content)
             spans.append(TextSpan(
@@ -277,6 +445,26 @@ class DocsStructureParser:
         raw_text = "".join(text_parts)
         # Strip trailing newline (each paragraph ends with \n in the Docs model)
         text = raw_text.rstrip("\n")
+
+        # A glyph Docs writes to mark a paragraph it renders itself is a *rendering
+        # artifact*, not content — markdown has no syntax for one, so the diff read it
+        # as a difference the author had asked for and rewrote the block on every push.
+        #
+        # It is recorded rather than removed. `text` stays faithful to the document,
+        # because two different consumers read it: the index arithmetic (delete bounds,
+        # span ranges) needs what the document actually contains, and the diff and
+        # renderer need what the markdown should say. Stripping it here made the parser
+        # lie to the first group — a delete then either covered the glyph, which the
+        # API refuses outright (#47), or skipped it, which the API accepts and which
+        # orphans the glyph onto the following paragraph. Verified against the live API:
+        # `[34052,34069)` → "Invalid deletion range"; `[34053,34069)` → accepted, and
+        # the next paragraph came back reading "\ue907mappings:".
+        #
+        # `projection.project()` is the layer that drops it for the diff, and
+        # `render_prefix` is how `DocsRequestBuilder` knows the paragraph belongs to a
+        # block it must not take apart.
+        render_prefix = self._render_prefix_of(paragraph.get("elements", []))
+
         spans = self._trim_spans_to_text(spans, len(text))
 
         # Check for bullet / list item
@@ -293,9 +481,43 @@ class DocsStructureParser:
             start_index=start_index,
             end_index=end_index,
             spans=spans,
+            render_prefix=render_prefix,
             is_native_checkbox=is_native_checkbox,
             heading_id=paragraph_style.get("headingId"),
         )
+
+    @staticmethod
+    def _render_prefix_of(elements: List[dict]) -> str:
+        """The leading run(s) Docs writes to mark a paragraph it renders itself.
+
+        Matched **per run**, not against the concatenated text, and that is the whole
+        point of the signature:
+
+        * An empty `textRun` — which the API does send — cannot hide the glyph behind
+          it. Testing `lstrip` on the joined text and walking spans to match stopped at
+          the empty run, read it as "no glyph here", and then reconciled the
+          length mismatch by trimming from the *end*, destroying a real character.
+        * An author's own Private-Use character is left alone. Someone typing an Apple
+          logo or a Nerd Font glyph types it inside a run with their text, so the run
+          is not *entirely* PUA and this returns "". Treating any leading PUA as an
+          artifact silently altered legitimate content.
+
+        Both shapes are what the live document shows: `run0 = "\ue907"` with
+        `textStyle {}`, content following in its own runs. `textStyle` is deliberately
+        not part of the test — Docs is free to put a `fontSize` on it.
+        """
+        prefix: List[str] = []
+        for element in elements:
+            text_run = element.get("textRun")
+            if text_run is None:
+                break
+            content = text_run.get("content", "")
+            if not content:
+                continue  # an empty run neither is nor conceals a prefix
+            if not _is_all_private_use(content):
+                break
+            prefix.append(content.strip("\n"))
+        return "".join(prefix)
 
     @staticmethod
     def _trim_spans_to_text(spans: List[TextSpan], keep: int) -> List[TextSpan]:

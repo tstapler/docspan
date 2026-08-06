@@ -15,7 +15,11 @@ ends up wrong; it is:
   line of code was destroyed on a sync that changed nothing;
 * pass 2 reported the block `unaligned` and emitted **zero** span requests, so the
   monospace styling was never applied at all — measured 0 span requests before the
-  fix, 2 after.
+  fix, 2 after, *for a block with no render glyph*. A native Google Docs code block
+  does carry one, and `_align_for_styling` parses the document **unprojected** and
+  keys on `node.text`, so the glyph is present on one side and absent on the other
+  and pass 2 still emits zero. That is a third consumer of `.text` needing the
+  projected view; it is open, and this claim is scoped accordingly.
 
 The preview reported N removals, which reads as content deletion and is
 indistinguishable from content the author removed deliberately. That is what made
@@ -134,3 +138,224 @@ class TestPushIsIdempotent:
         ]
         for text in texts:
             assert text.count("\n") == 1, text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The render glyph Docs puts in front of a native code block
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRenderPrefix:
+    """The glyph Docs writes in front of a paragraph it renders itself.
+
+    Recorded, not stripped. `.text` stays faithful to the document because two
+    groups of consumers read it — the index arithmetic needs what the document
+    contains, the diff and renderer need what the markdown says — and an earlier
+    attempt to strip it at parse time made the parser lie to the first group.
+
+    Both whole-paragraph delete ranges are wrong, verified against the live API on
+    a throwaway copy of a real document:
+
+    * `[34052,34069)` covers the glyph -> `Invalid deletion range. Cannot delete the
+      requested range.` `batchUpdate` is atomic, so one such delete fails the whole
+      push and the document cannot be synced at all (#47).
+    * `[34053,34069)` skips the glyph -> **accepted**, and the orphaned glyph merges
+      into the following paragraph, which came back reading `\ue907mappings:`. The
+      next pull strips it and reports zero requests, so it is permanent and silent.
+    """
+
+    def _code_block_doc(self) -> tuple[dict, int]:
+        """The shape a live document actually reports for a native code block.
+
+        Taken from a real document: the glyph is its **own** leading textRun with an
+        empty textStyle, content follows in monospace runs, and the block's chrome is
+        a glyph-only paragraph carrying the border/shading style.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
+        paragraphs = [
+            [("Intro\n", {})],
+            [("\ue907", {}), ("# cfg\n", mono)],
+            [("\ue907\n", {})],
+            [("Tail\n", {})],
+        ]
+        content, index = [], 1
+        for runs in paragraphs:
+            text = "".join(c for c, _ in runs)
+            end = index + len(text.encode("utf-16-le")) // 2
+            content.append({"startIndex": index, "endIndex": end, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": c, "textStyle": st}} for c, st in runs],
+            }})
+            index = end
+        return {"revisionId": "rev-1", "body": {"content": content}}, index
+
+    def test_the_parser_keeps_the_glyph_and_records_it(self) -> None:
+        doc, _ = self._code_block_doc()
+        node = structure.parse(doc)[1]
+        assert node.render_prefix == "\ue907"
+        assert node.text == "\ue907# cfg", "text must stay faithful to the document"
+        assert "".join(span.text for span in node.spans) == node.text
+        assert node.start_index == 7, "the index must not move; the API counted the glyph"
+
+    def test_an_empty_leading_run_cannot_hide_the_glyph(self) -> None:
+        """The shape that destroyed a character.
+
+        Matching `lstrip` against the concatenated text and then walking spans
+        stopped at the empty run, read it as "no glyph here", and reconciled the
+        resulting length mismatch by trimming from the *end* — so `code line` came
+        back as `code lin` with the glyph still attached. Matching per run cannot
+        reach that state: an empty run is skipped, not treated as a terminator.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 12, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "\ue907", "textStyle": {}}},
+                    {"textRun": {"content": "code line\n", "textStyle": {}}},
+                ]}}]}}
+        node = structure.parse(doc)[0]
+        assert node.render_prefix == "\ue907"
+        assert node.text == "\ue907code line"
+        assert "".join(span.text for span in node.spans) == node.text
+
+    def test_an_authors_own_private_use_character_is_left_alone(self) -> None:
+        """U+F8FF is the Apple logo. Nerd Fonts live in the PUA too.
+
+        Treating any leading PUA as an artifact silently altered legitimate content:
+        the character was eaten on read, so it never matched the markdown and push
+        emitted a delete-and-reinsert that dropped it. An author types such a
+        character *inside* a run with their text, so the run is not entirely PUA.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": "\uf8ff macOS notes\n", "textStyle": {}}}],
+            }}]}}
+        node = structure.parse(doc)[0]
+        assert node.render_prefix == ""
+        assert node.text == "\uf8ff macOS notes"
+
+    def test_projection_hides_the_prefix_from_the_diff_but_keeps_the_flag(self) -> None:
+        doc, _ = self._code_block_doc()
+        kept, residue = project(structure.parse(doc))
+        code = [n for n in kept if getattr(n, "render_prefix", "")]
+        assert len(code) == 1
+        assert code[0].text == "# cfg", "the diff must see what the markdown says"
+        assert code[0].start_index == 8, "start_index advances so pass 2 still lands"
+        assert "".join(s.text for s in code[0].spans) == "# cfg"
+        assert code[0].render_prefix == "\ue907", "the builder needs this to spare the block"
+        # The block's own chrome paragraph is unrepresentable and is dropped.
+        assert [r.kind for r in residue] == ["private_use_glyph"]
+
+    def test_a_glyph_only_paragraph_padded_with_spaces_is_still_dropped(self) -> None:
+        """A chrome paragraph is "entirely PUA ignoring surrounding whitespace" (projection.py's
+        Rule 1b docstring) — not just ignoring a trailing newline. `_is_all_private_use` used to
+        strip only "\\n", so a glyph padded with spaces/tabs read as mixed content and fell
+        through to the diff/delete path instead of being dropped as residue.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 5, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": "  \n", "textStyle": {}}}],
+            }}]}}
+        kept, residue = project(structure.parse(doc))
+        assert kept == []
+        assert [r.kind for r in residue] == ["private_use_glyph"]
+
+    def test_a_prefix_glyph_followed_by_non_monospace_text_is_flagged_as_ambiguous(
+        self,
+    ) -> None:
+        """An author's own PUA character can land alone in its leading run too.
+
+        Nothing in the parsed API data distinguishes that from Docs' own chrome glyph
+        — both are a lone PUA run with an empty `textStyle`. A real code block's first
+        line is monospace, so when what follows the dropped prefix is not, this may be
+        the author's own character being silently discarded rather than chrome, and it
+        is reported instead of assumed safe.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "bold notes\n", "textStyle": {"bold": True}}},
+                ],
+            }}]}}
+        kept, residue = project(structure.parse(doc))
+        assert [r.kind for r in residue] == ["ambiguous_code_prefix"]
+        assert kept[0].text == "bold notes", "the paragraph is still kept, not dropped"
+
+    def test_a_prefix_followed_by_a_non_courier_monospace_font_is_not_flagged(
+        self,
+    ) -> None:
+        """"Courier"/"mono" alone missed every other font Docs' own code-block
+        picker offers — a real code block set in Consolas tripped
+        `ambiguous_code_prefix` on every single push.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Consolas", "weight": 400}}
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "# cfg\n", "textStyle": mono}},
+                ],
+            }}]}}
+        kept, residue = project(structure.parse(doc))
+        assert residue == []
+        assert kept[0].text == "# cfg"
+
+    def test_an_unchanged_code_block_emits_nothing(self) -> None:
+        """The #47 path: a document with a native code block must be pushable."""
+        doc, end = self._code_block_doc()
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\n# cfg\n```\n\nTail\n"))
+        assert builder.build(current, target, end) == []
+
+    def test_removing_the_code_line_deletes_its_text_and_spares_the_paragraph(self) -> None:
+        """Neither whole-paragraph range is emitted — see the class docstring.
+
+        The delete must start past the glyph, so the API accepts it, and stop before
+        the newline, so the glyph is not orphaned onto the next paragraph.
+        """
+        doc, end = self._code_block_doc()
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\nTail\n"))
+        deletes = [r["deleteContentRange"]["range"]
+                   for r in builder.build(current, target, end)
+                   if "deleteContentRange" in r]
+
+        assert deletes == [{"startIndex": 8, "endIndex": 13}], (
+            "8 skips the glyph at 7, which the API refuses to delete; 13 stops before "
+            "the newline at 13, which would otherwise merge the glyph into 'Tail'"
+        )
+
+    def test_the_leftover_glyph_paragraph_does_not_make_push_repeat_itself(self) -> None:
+        """What makes sparing the paragraph safe rather than merely non-destructive.
+
+        The delete leaves a glyph-only paragraph. `project()` rule 1b drops that from
+        both sides, so the next diff does not see it and does not try again — which is
+        what a whole-paragraph delete could never achieve, the API having refused it.
+        """
+        doc, end = self._code_block_doc()
+        after = {"revisionId": "rev-2", "body": {"content": [
+            dict(el) for el in doc["body"]["content"]
+        ]}}
+        # The document as it stands once the delete above has been applied.
+        after["body"]["content"][1] = {
+            "startIndex": 7, "endIndex": 8, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": "\ue907\n", "textStyle": {}}}]}}
+        # Recompute every index rather than patching the shift piecemeal.
+        index = 1
+        for element in after["body"]["content"]:
+            text = "".join(r["textRun"]["content"] for r in element["paragraph"]["elements"])
+            element["startIndex"] = index
+            index += len(text.encode("utf-16-le")) // 2
+            element["endIndex"] = index
+
+        current, _ = project(structure.parse(after))
+        target, _ = project(markdown.parse("Intro\n\nTail\n"))
+        assert builder.build(current, target, index) == []

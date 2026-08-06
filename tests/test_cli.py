@@ -623,7 +623,7 @@ class TestConflictsResolve:
              patch("docspan.cli.main._get_backend", return_value=FakeBackend()):
             result = runner.invoke(app, ["conflicts", "resolve", str(local), "--accept", "merged", "--config", cfg])
         assert result.exit_code == 1
-        assert "conflict markers" in result.output
+        assert "conflict markers" in _unwrapped(result.output)
 
     def test_resolve_merged_clean_succeeds(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
@@ -662,6 +662,36 @@ class TestConflictsResolve:
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
+def _unwrapped(output: str) -> str:
+    """`output` with escapes stripped and whitespace collapsed to single spaces.
+
+    **Rich** wraps this CLI's output — not Click. `main.py` holds module-level Rich
+    `Console`s, and `Console.size` reads `COLUMNS` from the live environment at print
+    time. Click's own formatter is not in play: Typer's `CliRunner` hardcodes
+    `FORCED_WIDTH = 80` inside `isolation()`, so Click's `terminal_width` knob has no
+    effect at all here — measured, max line length stays 80 whatever it is set to.
+
+    Which means a phrase an assertion looks for can be split by a line break, and
+    whether it is depends on how much interpolated content precedes it.
+    `test_resolve_merged_with_conflict_markers_exits_nonzero` asserted
+    `"conflict markers" in result.output` and broke between the two words once the
+    pytest `tmp_path` reached 126 characters — i.e. **it was green for this
+    machine's first 999 pytest runs and went red when the run counter grew a fourth
+    digit.** CI cannot catch it either: the Linux tmp_path is 69 characters and never
+    breaks at that phrase.
+
+    Collapsing whitespace makes the assertion about the text rather than about the
+    terminal, and unlike pinning a wide `COLUMNS` it has no headroom limit — a pin of
+    1000 merely moves the first breaking content length out to ~958. Verified holding
+    at every width from 8 upward.
+
+    Generalised from `_plain_help`, which already did exactly this for `--help` and
+    documents the same cause. The other 42 substring assertions in this file are
+    latently exposed the same way and can adopt it as they bite.
+    """
+    return " ".join(_ANSI_ESCAPE.sub("", output).split())
+
+
 def _plain_help(*argv: str) -> str:
     """`--help` output as plain text, with the renderer's environment pinned.
 
@@ -683,7 +713,7 @@ def _plain_help(*argv: str) -> str:
     )
     assert result.exit_code == 0, result.output
     # Collapse whitespace too: Rich wraps, so a phrase can span a line break.
-    return " ".join(_ANSI_ESCAPE.sub("", result.output).split())
+    return _unwrapped(result.output)
 
 
 class TestGroupLevelOptions:

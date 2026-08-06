@@ -259,7 +259,7 @@ def test_person_mention_inside_table_cell_renders_name() -> None:
     nodes = parser.parse(doc)
     table = nodes[0]
     assert isinstance(table, DocsTableNode)
-    assert table.rows == [["Shivam Malpani"]]
+    assert [[c.text for c in row] for row in table.rows] == [["Shivam Malpani"]]
 
 
 def test_person_mention_with_no_name_or_email_is_skipped_not_raised() -> None:

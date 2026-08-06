@@ -37,6 +37,10 @@ The Google Docs push path drops two things, both blocking real-world design-doc 
 
 ### Tables (Part 2)
 - New `DocsTableNode(rows: List[List[str]], start_index, end_index)` in the structure module.
+  - **Superseded.** `rows` is now `List[List[TableCell]]`, where `TableCell` carries
+    `text` *and* `spans`. Plain-text cells meant every mark inside one was dropped —
+    including internal `#anchor` cross-references, which rendered as dead text in the
+    Doc while the identical reference in a paragraph resolved. See #49.
 - Parser emits `DocsTableNode` for `table` tokens (header row + body rows, cell = plain text).
 - `DocsStructureParser` parses live `table` elements into `DocsTableNode` (rows from
   `table.tableRows[].tableCells[].content` paragraphs), with real start/end indices.

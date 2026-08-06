@@ -314,6 +314,7 @@ class GoogleDocsBackend(Backend):
             )
             second: list[dict] = []
             unstyled: list[DocsParagraphNode] = []
+            unplaced_cells: list[str] = []
             dead_anchors: list[str] = []
             if needs_pass2:
                 # When pass 1 wrote nothing the already-fetched plan.doc is
@@ -363,6 +364,17 @@ class GoogleDocsBackend(Backend):
                 dead_anchors = builder.unresolved_anchor_links(
                     pass2_doc, plan.target_nodes, alignment
                 )
+                # Styled table cells pass 2 could not place. Same trade as
+                # `unstyled` above and the same reason it has to be said out loud:
+                # the cell got no styling rather than styling aimed at whatever sat
+                # at that ordinal, and a silent drop is indistinguishable from
+                # success. Reachable when a table is created by this very push (its
+                # cells are still empty when the ranges are computed), when a
+                # concurrent edit changed a cell, or when the cell holds an inline
+                # object whose index width the text search cannot see.
+                unplaced_cells = builder.unplaced_table_cells(
+                    pass2_doc, plan.target_nodes, alignment
+                )
                 if second:
                     # The document's own revisionId guards this batch the same
                     # way pass 1 is guarded, so pass 2 can't silently overwrite
@@ -371,7 +383,8 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if not plan.requests and not second and not unstyled and not dead_anchors:
+            if (not plan.requests and not second and not unstyled
+                    and not dead_anchors and not unplaced_cells):
                 # Nothing was applied by either pass. That is now a true
                 # statement about the document rather than an inference from an
                 # empty request list: projection.project() removes the one class
@@ -412,6 +425,7 @@ class GoogleDocsBackend(Backend):
                     if (plan.requests or second)
                     else None,
                     self._render_unstyled(unstyled) if unstyled else None,
+                    self._render_unplaced_cells(unplaced_cells) if unplaced_cells else None,
                     # Offer the keys resolution actually consulted, so the list
                     # cannot name the anchor it just called dead.
                     self._render_dead_anchors(
@@ -420,6 +434,13 @@ class GoogleDocsBackend(Backend):
                     if dead_anchors
                     else None,
                     describe_target_residue(plan.target_residue) or None,
+                    # Doc-side residue (e.g. an ambiguous code-block prefix) is only
+                    # reported unconditionally above when the push is a no-op. A push
+                    # that writes something else must still surface it here, or the
+                    # warning this residue exists to give is silently dropped on the
+                    # common case — the exact failure mode `project()`'s docstring
+                    # says residue exists to avoid.
+                    describe_residue(plan.residue) or None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation
@@ -475,6 +496,34 @@ class GoogleDocsBackend(Backend):
             lines.append(f"    • … and {more} more")
         lines.append(render_available_anchors(available))
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_unplaced_cells(cells: list[str]) -> str:
+        """Styled table cells whose styling was not written.
+
+        Distinct from _render_unstyled, which is about paragraphs.
+
+        Two causes with opposite remedies, so the message names both rather than
+        promising the wrong one. A table this push *created* is still empty when pass 2
+        computes its ranges, and pushing again places the styling. But a cell holding a
+        smart chip, an inline object, or more than one paragraph can never be placed,
+        so "push again" is false there — and because a warning exits non-zero, such a
+        document would exit 1 on every push forever while being told to retry.
+        Non-convergence is the same known open decision `unresolved_anchor_links`
+        documents; misdescribing the remedy is not, so that part is fixed here.
+        """
+        preview = [(text[:40] or "(empty)") for text in cells[:5]]
+        more = len(cells) - len(preview)
+        listed = "; ".join(preview) + (f"; +{more} more" if more > 0 else "")
+        return (
+            f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
+            f"— docspan could not locate them in the written document, so it wrote no "
+            f"styling rather than styling aimed at the wrong cell: {listed}. "
+            f"If this push created the table, pushing again places the styling. "
+            f"Otherwise the cell holds something docspan cannot measure around — a "
+            f"smart chip, an image, or more than one paragraph — and pushing again "
+            f"will report this same warning; style that cell in the document instead."
+        )
 
     @staticmethod
     def _render_unstyled(unstyled: list[DocsParagraphNode]) -> str:
@@ -542,11 +591,31 @@ class GoogleDocsBackend(Backend):
                 # text, which re-parsed as NORMAL_TEXT and made the next push
                 # demote the title. project() maps it to the nearest style
                 # markdown *does* have, so pull/push is a fixpoint.
-                nodes, _residue = project(nodes)
+                nodes, residue = project(nodes)
                 markdown_content = render_nodes_to_markdown(nodes)
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
                 self._write_comment_sidecar(doc_id, local_path)
+                # Only the two kinds that can hide real authored content are
+                # surfaced here. `paragraph_style` (e.g. TITLE) is mapped to
+                # the closest markdown heading, not dropped — pull/push stays
+                # a fixpoint and nothing is lost. `empty_paragraph` is blank
+                # whitespace, already low-stakes on the push side. But
+                # `private_use_glyph`/`ambiguous_code_prefix` paragraphs are
+                # elided from the markdown entirely with nothing left in
+                # their place, which is exactly the silent-drop failure mode
+                # project()'s docstring exists to avoid, and push() already
+                # surfaces it unconditionally.
+                residue_note = describe_residue(
+                    [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
+                )
+                if residue_note:
+                    return PullResult(
+                        status="warning",
+                        doc_id=doc_id,
+                        local_path=local_path,
+                        message=f"⚠ {residue_note}",
+                    )
                 return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
 
             doc = self._client.get_document(doc_id)
