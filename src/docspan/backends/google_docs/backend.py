@@ -296,7 +296,7 @@ class GoogleDocsBackend(Backend):
             #
             # Pass 1 being empty does NOT mean there is nothing to do, and this
             # used to be checked in the wrong order. The diff key covers style,
-            # bullet and text — it does not include marks — so
+            # bullet, text and nesting level — it does not include marks — so
             # adding a link to text that is otherwise unchanged produces zero
             # diffs and zero pass-1 requests. When the "nothing to do" return
             # sat above this block, that push wrote nothing and reported

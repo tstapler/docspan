@@ -41,6 +41,24 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
+def _assert_bmp_only(text: str, where: str) -> None:
+    """Fail fast on non-BMP characters rather than silently desyncing indices.
+
+    `ParagraphReplay` stores/mutates `self.chars`/`self.owner` as one entry per
+    Python code point and derives lengths from that count, while `_utf16_len`
+    (matching the real Docs API) counts UTF-16 code units. Those agree only for
+    BMP text; a surrogate-pair character (emoji, astral-plane scripts) would
+    make the harness's bookkeeping quietly diverge from the API it's modeling.
+    Rewriting the harness to track UTF-16 code units is out of scope here.
+    """
+    for char in text:
+        if ord(char) > 0xFFFF:
+            raise ValueError(
+                f"ParagraphReplay is BMP-only: {char!r} in {where} requires a "
+                "UTF-16 surrogate pair, which this harness cannot represent."
+            )
+
+
 class ParagraphReplay:
     """Replays a batch tracking *which* paragraph owns each character.
 
@@ -68,6 +86,7 @@ class ParagraphReplay:
         self.style: Dict[str, str] = {}
         self.bullet: Dict[str, bool] = {}
         for text, style, pid, bullet in paragraphs:
+            _assert_bmp_only(text, f"paragraph {pid!r}")
             self.style[pid], self.bullet[pid] = style, bullet
             for char in text + "\n":
                 self.chars.append(char)
@@ -127,6 +146,7 @@ class ParagraphReplay:
             elif "insertText" in request:
                 index = request["insertText"]["location"]["index"] - 1
                 text = request["insertText"]["text"]
+                _assert_bmp_only(text, "an insertText request")
                 inserts += 1
                 # One fresh id per insert. Finer granularity is not needed: the
                 # question is only ever "is this the paragraph that held the
