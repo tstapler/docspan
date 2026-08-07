@@ -393,6 +393,31 @@ class TestRenderPrefix:
             }
         }]
 
+    def test_align_surfaces_residue_from_its_own_current_parse(self) -> None:
+        """The second half of #53's fix: `current`'s residue must reach the caller.
+
+        `_align_for_styling` re-parses the live document post-pass-1 and used to
+        discard that parse's residue outright (`current, _ = project(...)`).
+        An `ambiguous_code_prefix` there — a paragraph whose leading character
+        looks like Docs' code-block glyph but is not actually monospace — is
+        exactly the residue kind `project()`'s docstring says is unsafe to drop
+        silently, and pass 1's own edits are as capable of producing it as the
+        original document is. `align()` is the public entry point `push()`
+        calls, so this asserts on `Pass2Alignment.residue` rather than reaching
+        into the private method directly.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "bold notes\n", "textStyle": {"bold": True}}},
+                ],
+            }}]}}
+        target, _ = project(markdown.parse("bold notes\n"))
+        alignment = builder.align(doc, target)
+        assert [r.kind for r in alignment.residue] == ["ambiguous_code_prefix"]
+
 
 class TestRenderPrefixParticipatesInIdentity:
     """A prose paragraph and a code-block line with the same text are not the same node.

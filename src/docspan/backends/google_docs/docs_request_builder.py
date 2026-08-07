@@ -21,7 +21,7 @@ from docspan.backends.google_docs.heading_anchors import (
     slugify,
     slugify_all,
 )
-from docspan.backends.google_docs.projection import project
+from docspan.backends.google_docs.projection import Residue, project
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -43,6 +43,7 @@ class Pass2Alignment:
     unaligned: List[DocsParagraphNode]
     slug_to_id: dict
     known_ids: set
+    residue: List[Residue]
 
 
 def _utf16_len(text: str) -> int:
@@ -1088,7 +1089,7 @@ class DocsRequestBuilder:
         accepts ``alignment=None`` and computes its own, so a caller with only a
         document and a target — every existing test — keeps working.
         """
-        current, pairs, unaligned, heading_pairs = self._align_for_styling(doc, target)
+        current, pairs, unaligned, heading_pairs, residue = self._align_for_styling(doc, target)
         slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
         return Pass2Alignment(
             current=current,
@@ -1096,6 +1097,7 @@ class DocsRequestBuilder:
             unaligned=unaligned,
             slug_to_id=slug_to_id,
             known_ids=known_ids,
+            residue=residue,
         )
 
     def _aligned(
@@ -1273,13 +1275,15 @@ class DocsRequestBuilder:
         List[Tuple[DocsParagraphNode, DocsParagraphNode]],
         List[DocsParagraphNode],
         List[Tuple[DocsParagraphNode, DocsParagraphNode]],
+        List[Residue],
     ]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(current, pairs, unaligned, heading_pairs)`` — the parsed
-        document, pairs of (document node, target node) that are safe to style,
-        the target paragraphs with spans that could not be paired, and the same
-        pairing restricted to target paragraphs that are headings.
+        Returns ``(current, pairs, unaligned, heading_pairs, residue)`` — the
+        parsed document, pairs of (document node, target node) that are safe to
+        style, the target paragraphs with spans that could not be paired, the
+        same pairing restricted to target paragraphs that are headings, and any
+        residue from projecting this second, post-pass-1 parse of the document.
 
         ``current`` is returned rather than re-parsed by callers because parsing
         a large document twice per push to learn the same thing is pure cost.
@@ -1295,30 +1299,16 @@ class DocsRequestBuilder:
         a `HEADING_*` at all, so a doc title could never be an anchor target
         even though `projection.project()` and `#`/`##` both treat it as one.
 
-        Inventory of `.text`/`.start_index` consumers in this file and
-        backend.py, done while fixing issue #53 (this method was the only one
-        that had it wrong): `_align_for_styling`'s own `current` needed the
-        projected view and got the raw one — fixed above. Everything that
-        reads `current`/`pairs`/`unaligned` transitively through `align()`
-        (`build_span_style_requests`, `_spans_overflow`,
-        `unaligned_span_targets`, `_anchor_resolution`,
-        `build_table_cell_span_requests`, `unplaced_table_cells`) needed the
-        projected view and, once this method is fixed, now gets it — no
-        further changes required there. `heading_slug_to_id(current)` inside
-        `_anchor_resolution` also wants projected text so a `TITLE`/`SUBTITLE`
-        reads as `HEADING_*` the same way the markdown side does (see
-        heading_anchors.is_heading_style's docstring); it gets that for the
-        same reason. `nodes_to_markdown` and the pull-path
-        `heading_id_to_slug` calls in backend.py already received projected
-        nodes before this fix (backend.py projects immediately after every
-        parse on those paths) and were not affected by this bug.
-        `backend.preview_push` is the one deliberate, unrelated exception:
-        it parses unprojected on purpose, because an empty heading's
-        `headingId` is real data that `project()` would drop, and pass 2
-        resolves it correctly from the same unprojected parse it does its own
-        pairing on — it does not call this method, so it never saw #53's bug
-        and needs no change. No other consumer of a parsed node's `.text` in
-        this file was found to be reading the wrong view.
+        This method's own `current` used to parse the live doc unprojected
+        (issue #53) while `target` was always projected, so a native
+        code-block paragraph's PUA render prefix broke the `_alignment_key`
+        text match and pass 2 silently skipped its styling. Every other
+        `.text`/`.start_index` consumer reachable from `align()` — including
+        `push_preview.find_high_risk_paragraphs`, which reads already-projected
+        `current_nodes` from `_build_push_plan` — was audited and found
+        unaffected; the full consumer-by-consumer inventory from that audit
+        lives in PR #69's description rather than here, to keep this docstring
+        from going stale as a permanent record of a one-time investigation.
 
         Why not zip(): pass 1 does **not** guarantee the re-fetched document
         matches ``target`` node-for-node. It leaves an empty paragraph behind
@@ -1357,10 +1347,15 @@ class DocsRequestBuilder:
         # (issue #53). `project()` strips the prefix and advances
         # `start_index` past it (`_without_render_prefix`), which is exactly
         # what `_spans_overflow` and `_span_style_requests` need those fields
-        # to mean. Residue is discarded here (`[0]`) the same way backend.py's
-        # default pull path discards it at the `heading_id_to_slug(project(...)[0])`
-        # call: nothing downstream of `current` in this method reports residue.
-        current, _current_residue = project(DocsStructureParser().parse(doc))
+        # to mean. Unlike backend.py's default pull path (which discards this
+        # same residue kind at `heading_id_to_slug(project(...)[0])`), this
+        # residue is threaded through to Pass2Alignment.residue below: an
+        # `ambiguous_code_prefix` here would be a paragraph pass 1's own edits
+        # left looking like a code block without actually being monospace, and
+        # that is not safe to drop silently (see projection.py's Residue
+        # docstring) — it must reach the caller the same way the identical
+        # residue kind on the original doc parse reaches plan.residue.
+        current, current_residue = project(DocsStructureParser().parse(doc))
         matcher = difflib.SequenceMatcher(
             None,
             [self._alignment_key(n) for n in current],
@@ -1391,7 +1386,7 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return current, pairs, unaligned, heading_pairs
+        return current, pairs, unaligned, heading_pairs, current_residue
 
     def _anchor_resolution(
         self, current: List[Node], target: List[Node],
