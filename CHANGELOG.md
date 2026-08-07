@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/tstapler/docspan/compare/docspan-v0.2.0...docspan-v0.3.0) (2026-08-07)
+
+
+### Features
+
+* **gdocs:** keep inline styling inside table cells ([#51](https://github.com/tstapler/docspan/issues/51)) ([880eeb1](https://github.com/tstapler/docspan/commit/880eeb1feb3a3f700a1641f360abf5bc32cab191)), closes [#49](https://github.com/tstapler/docspan/issues/49)
+* **google-docs:** add Google Doc tab support (tab_id) ([#14](https://github.com/tstapler/docspan/issues/14)) ([cee1db6](https://github.com/tstapler/docspan/commit/cee1db6dde0c957088159339527a6b8dbef70b47))
+* **google-docs:** resolve internal markdown anchors to heading links ([#36](https://github.com/tstapler/docspan/issues/36)) ([5faaa6c](https://github.com/tstapler/docspan/commit/5faaa6c7ded880eba048d20807ff76a4a5f480a8))
+* **google-docs:** restyle a paragraph in place instead of retyping it ([edf0b13](https://github.com/tstapler/docspan/commit/edf0b13520aa1a60b1fb02ee51dc1bd4a967c412))
+
+
+### Bug Fixes
+
+* **cli:** accept --config and --prefix before the subcommand as well as after ([00f6524](https://github.com/tstapler/docspan/commit/00f65241e41c5bb2deec5642eb36e8ea64a58744))
+* **gdocs:** stop a repeated line stealing a live heading's identity ([#50](https://github.com/tstapler/docspan/issues/50)) ([2992d39](https://github.com/tstapler/docspan/commit/2992d3974dc9f7dea2547b5b8b3881f7c141f810))
+* **google-docs:** align pass 2 by content so trimmed deletes can't mis-style ([ba56e08](https://github.com/tstapler/docspan/commit/ba56e08b7cc482c6bd569e9e5560e1c71a768ebf))
+* **google-docs:** append past the last node without merging it into the last paragraph ([1aef861](https://github.com/tstapler/docspan/commit/1aef861981ee95463e7c2c9caa67bf32d90c9d2a))
+* **google-docs:** apply inline styling when it is the only change ([c205552](https://github.com/tstapler/docspan/commit/c205552aed5c0f483ba5213bd39f2aff16587efe))
+* **google-docs:** clear the inherited bullet on inserted non-list paragraphs ([dda8a50](https://github.com/tstapler/docspan/commit/dda8a505e8f822c077478656158b87cf6d74132b))
+* **google-docs:** insert before a Table/ToC/SectionBreak into the body, not into it ([701e2d0](https://github.com/tstapler/docspan/commit/701e2d01433e9efc2c42a159ffb4f92d90972c56))
+* **google-docs:** keep the paragraph newline out of the spans ([#35](https://github.com/tstapler/docspan/issues/35)) ([f73272a](https://github.com/tstapler/docspan/commit/f73272a0422e5c525a63bcedb6cb68fdb7ff517b))
+* **google-docs:** make push idempotent for documents with fenced code blocks ([#41](https://github.com/tstapler/docspan/issues/41)) ([e98406e](https://github.com/tstapler/docspan/commit/e98406e2858958421c3bdf5e17c94f880056e540))
+* **google-docs:** make render_prefix part of node/content identity ([#67](https://github.com/tstapler/docspan/issues/67)) ([6205850](https://github.com/tstapler/docspan/commit/62058503c38372dec7de64e4a8ea1b6603c7c2fc))
+* **google-docs:** normalize away the render glyph Docs writes before a native code block ([#48](https://github.com/tstapler/docspan/issues/48)) ([31b4edd](https://github.com/tstapler/docspan/commit/31b4edd1bc944f1b48605d3a1ffe0d2283e161fe))
+* **google-docs:** order pass-1 requests by their anchor, not their own index ([58e2b6a](https://github.com/tstapler/docspan/commit/58e2b6af2271dc200c225c39c44d1a567ae5722a))
+* **google-docs:** project empty paragraphs out of the diff instead of deleting them ([d8b1b5f](https://github.com/tstapler/docspan/commit/d8b1b5feb56439da34ae7be64c092b80927c30a7))
+* **google-docs:** project the re-fetched live doc before pass-2 style alignment ([#69](https://github.com/tstapler/docspan/issues/69)) ([cf36561](https://github.com/tstapler/docspan/commit/cf36561b953e7d2c2da4c11f60c2a74bca3a2259))
+* **google-docs:** render @-mention person chips as name/email text ([#15](https://github.com/tstapler/docspan/issues/15)) ([f5d7427](https://github.com/tstapler/docspan/commit/f5d742758855aeab435c50fba3a1cb51b9a79eef))
+* **google-docs:** render TITLE/SUBTITLE as headings instead of silently demoting them ([cc6cd0b](https://github.com/tstapler/docspan/commit/cc6cd0b6e8fdb8337cfa871f77c4466445041922))
+* **google-docs:** report a dropped over-long span, and share the delete-trim arithmetic ([daa77a6](https://github.com/tstapler/docspan/commit/daa77a6398f9ed967deef1376b39d73e66050aea))
+* **google-docs:** stop deleting the newline that anchors a table/ToC/section break ([9eba496](https://github.com/tstapler/docspan/commit/9eba496ee1d4db3fb788e910c359d9487f217baa))
+
 ## [0.2.0](https://github.com/tstapler/docspan/compare/docspan-v0.1.0...docspan-v0.2.0) (2026-07-22)
 
 
