@@ -344,6 +344,91 @@ class TestTheLiveHeadingSurvives:
         assert replay.style["heading"] == "HEADING_3"
         assert not replay.alive("body")
 
+    def _assert_no_destruction(self, replay: ParagraphReplay, pids, expected_styles) -> None:
+        """Both original paragraphs must still exist and carry the target styles.
+
+        Both `pids` share the same text ("A"), so which original paragraph
+        maps to which target index is inherently ambiguous when their current
+        styles also coincide — that ambiguity is not the bug. The bug is a
+        paragraph getting deleted and reinserted (losing its `headingId`)
+        instead of restyled in place. So this checks the property the issue
+        actually cares about: nothing was deleted/reinserted (no `inserted-*`
+        id appears, both original pids are still alive) and the resulting
+        styles match the target's multiset.
+        """
+        for pid in pids:
+            assert replay.alive(pid), f"{pid!r} was deleted and not preserved"
+        assert not any(pid.startswith("inserted-") for pid in replay.owner if pid), (
+            "a new paragraph was inserted -> the original was deleted and "
+            "reinserted rather than restyled in place"
+        )
+        assert sorted(replay.style[pid] for pid in pids) == sorted(expected_styles)
+
+    def test_a_duplicated_heading_survives_restyle_of_the_first_copy(self) -> None:
+        """Issue #52's exact shape: two identical-content, identical-style headings.
+
+        Both current paragraphs read "A" as `HEADING_2`. The markdown restyles
+        one copy to `###`, keeping the other at `##`. `_node_key` (style-
+        inclusive) can't anchor either copy to a specific target index, since
+        both current nodes are identical to each other — so the phase-1
+        matcher can express this as a standalone `insert` (the new
+        `HEADING_3` "A") and a standalone `delete` (one of the `HEADING_2`
+        "A"s) with an unrelated `equal` opcode for the *other* "A" sitting
+        between them. `_repair` must still recognize the leftover
+        insert+delete pair as one in-place restyle rather than
+        delete-and-reinsert, for whichever original copy the outer matcher
+        happened to anchor.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_2", "first", False),
+            ("A", "HEADING_2", "second", False),
+        ])
+        _push(replay, "### A\n\n## A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_2", "HEADING_3"])
+
+    def test_restyle_only_shape_a_survives(self) -> None:
+        """Minimal L=2 destructive shape from the issue #52 measurement.
+
+        `AA`/(H1,H1) -> `AA`/(H2,H1): one paragraph is restyled, the other
+        untouched — neither is deleted and reinserted.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_1", "second", False),
+        ])
+        _push(replay, "## A\n\n# A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "HEADING_2"])
+
+    def test_restyle_only_shape_b_survives(self) -> None:
+        """Minimal L=2 destructive shape from the issue #52 measurement.
+
+        `AA`/(H1,H1) -> `AA`/(NORMAL_TEXT,H1): one paragraph is demoted to
+        body text in place, not deleted and reinserted.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_1", "second", False),
+        ])
+        _push(replay, "A\n\n# A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "NORMAL_TEXT"])
+
+    def test_restyle_only_shape_c_survives(self) -> None:
+        """Minimal L=2 destructive shape from the issue #52 measurement.
+
+        `AA`/(H1,H2) -> `AA`/(H2,H1): both paragraphs' styles change (or the
+        pairing flips, needing no edit at all) — either way, in place.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_2", "second", False),
+        ])
+        _push(replay, "## A\n\n# A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "HEADING_2"])
+
 
 class TestNoHeadingIsDemoted:
     """Seeded sweep over single-block edits — the regime the bug lives in.
