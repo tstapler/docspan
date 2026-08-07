@@ -483,7 +483,7 @@ class DocsRequestBuilder:
         def _candidate_origin(cid: Tuple) -> int:
             # Both "pos" and "interior" candidate ids carry the owning
             # expanded-list position as their second element.
-            return expanded_origin[cid[1]]
+            return expanded_origin[int(cid[1])]
 
         def _current_index(cid: Tuple) -> int:
             if cid[0] == "pos":
@@ -565,15 +565,15 @@ class DocsRequestBuilder:
             slot_target_range = {spos: (expanded[spos][3], expanded[spos][4]) for spos, _ in slot_entries}
 
             for spos, self_cid in slot_entries:
-                cid = assigned_candidate_for.get(spos)
-                if cid is None or cid == self_cid:
+                winning_cid = assigned_candidate_for.get(spos)
+                if winning_cid is None or winning_cid == self_cid:
                     continue
                 scj1, scj2 = slot_target_range[spos]
-                if cid[0] == "pos":
-                    _, cci1, cci2, _, _ = expanded[cid[1]]
-                    expanded[cid[1]] = ("equal", cci1, cci2, scj1, scj2)
+                if winning_cid[0] == "pos":
+                    _, cci1, cci2, _, _ = expanded[winning_cid[1]]
+                    expanded[winning_cid[1]] = ("equal", cci1, cci2, scj1, scj2)
                 else:
-                    _, rpos, idx = cid
+                    _, rpos, idx = winning_cid
                     extractions.setdefault(rpos, {})[idx] = (scj1, scj2)
                 if self_cid is None:
                     satisfied_inserts.add(spos)
@@ -610,15 +610,15 @@ class DocsRequestBuilder:
             # just one (its current node reassigned to fill someone else's
             # slot, but its own target range still needs (1)).
             for spos, self_cid in slot_entries:
-                cid = assigned_candidate_for.get(spos)
-                if cid == self_cid:
+                winning_cid = assigned_candidate_for.get(spos)
+                if winning_cid == self_cid:
                     continue
                 if self_cid is None:
                     # Standalone "insert" slot, left unclaimed: stays
                     # "insert" (nothing regresses over the old behavior).
                     continue
                 scj1, scj2 = slot_target_range[spos]
-                if cid is None:
+                if winning_cid is None:
                     new_inserts.append((expanded[spos][1], scj1, scj2))
                 if self_cid not in chosen_candidates:
                     _, sci1, sci2, _, _ = expanded[spos]
