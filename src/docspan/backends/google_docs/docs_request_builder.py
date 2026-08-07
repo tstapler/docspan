@@ -132,10 +132,46 @@ class DocsRequestBuilder:
 
         Restyle-in-place is now re-admitted deliberately by `_repair` instead of
         falling out of a key that was too weak to tell paragraphs apart.
+
+        `_is_code_line` (`bool(node.render_prefix)`) participates too: a
+        paragraph inside a Docs-rendered block and a plain paragraph with
+        otherwise-identical style/bullet/nesting/text are not the same
+        paragraph to align against (issue #54). Without it, SequenceMatcher
+        could pair a prose paragraph with a code-rendered one sharing its
+        text — permanently trapping the prose inside the rendered block, or
+        the reverse, or opening a `replace` across that boundary whose insert
+        then lands at an index `project()` has already advanced past the
+        glyph, landing it inside the Docs-rendered block instead of beside it.
+
+        Only `_node_key` carries this signal, not `_content_key` — see the
+        latter's docstring for why the split is necessary.
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(self._cell_key(c) for c in row) for row in node.rows))
-        return ("__para__", node.style, node.is_list_item, node.nesting_level, node.text)
+        return (
+            "__para__",
+            node.style,
+            node.is_list_item,
+            node.nesting_level,
+            self._is_code_line(node),
+            node.text,
+        )
+
+    @staticmethod
+    def _is_code_line(node: DocsParagraphNode) -> bool:
+        """Whether a paragraph belongs to a Docs-rendered block (e.g. a native code block).
+
+        `render_prefix` is populated only by `DocsStructureParser`, when parsing a
+        live document — a target node parsed from markdown never carries it, even
+        for a fenced code line. That asymmetry is deliberate here: this only needs
+        to split `_node_key`'s current-side alphabet so a prose paragraph and a
+        rendered-block paragraph with identical text stop looking like the same
+        node (issue #54). It does not need to make an unchanged code line's key
+        equal its target's — `_content_key` stays text-only precisely so `_repair`
+        can still fold that pairing back to `equal` once `_node_key` has separated
+        it from any unrelated prose (see `_content_key`'s docstring).
+        """
+        return bool(node.render_prefix)
 
     def _cell_key(self, cell: TableCell) -> Tuple:
         """Hashable full identity for a table cell, including inline styling.
@@ -157,6 +193,26 @@ class DocsRequestBuilder:
         with the same content differ only by attributes `updateParagraphStyle`,
         `createParagraphBullets` and `deleteParagraphBullets` can change without
         touching the text, so the edit is a restyle and not a rewrite.
+
+        Deliberately still text-only with respect to `render_prefix` — unlike
+        `_node_key` — because `_content_key` also has to recognize an unchanged
+        code line as content-equal so `_repair` can fold it back to `equal`
+        (see `_node_key`'s docstring on why a raw `render_prefix` there means a
+        current code line's `_node_key` never matches its own unchanged target).
+
+        A stray `_content_key` collision between a prose and a code node with
+        the same text is harmless *when they are the only two candidates for
+        their own slots*: `_node_key` already keeps them apart there, so
+        `_repair` — which only inspects the two sides of a single
+        `_node_key`-identified `replace` run — never gets a run containing
+        both to conflate. It is not harmless in general: when a plain current
+        paragraph and a real code-rendered current paragraph both read the
+        same text and only one target slot exists for that text, the *outer*
+        `_node_key` matcher (not `_repair`) can still let the plain one win
+        the correspondence and leave the code-rendered one an unpaired
+        `delete` — a pre-existing gap this fix narrows but does not close; see
+        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        in `tests/test_code_block_granularity.py`.
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(c.text for c in row) for row in node.rows))
