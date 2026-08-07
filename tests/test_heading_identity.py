@@ -26,7 +26,10 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    DocsStructureParser,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.projection import project
 
@@ -428,6 +431,40 @@ class TestTheLiveHeadingSurvives:
         _push(replay, "## A\n\n# A\n")
 
         self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "HEADING_2"])
+
+    def test_a_two_way_content_swap_does_not_drop_a_target(self) -> None:
+        """Regression: pooling can pick each slot's winner to be the *other*
+        slot's own current node — a genuine two-way swap. `_prefer_structural_
+        pairing` used to look up a slot's target range by re-reading
+        `expanded[spos]` from inside the loop that reassigns winners, so once
+        one swap side had already overwritten the other's `expanded` entry, the
+        second side's lookup returned the first side's (already-consumed)
+        target range instead of its own. That silently duplicated one target
+        opcode and dropped the other, so `_opcodes()` no longer returned a
+        full partition of `target` — the paragraph mapped to the dropped range
+        never got any request at all.
+
+        Exercised directly at the `_opcodes()` level, not through markdown
+        parsing, because reproducing the exact opcode shape end-to-end depends
+        on `SequenceMatcher` internals that are otherwise fiddly to steer.
+        """
+        current = [
+            DocsParagraphNode(text="A", style="HEADING_1", is_list_item=False),
+            DocsParagraphNode(text="A", style="HEADING_1", is_list_item=True),
+        ]
+        target = [
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=True),
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        covered = set()
+        for _tag, _i1, _i2, j1, j2 in opcodes:
+            for j in range(j1, j2):
+                assert j not in covered, f"target index {j} produced twice: {opcodes}"
+                covered.add(j)
+        assert covered == set(range(len(target))), f"target coverage incomplete: {opcodes}"
 
 
 class TestNoHeadingIsDemoted:

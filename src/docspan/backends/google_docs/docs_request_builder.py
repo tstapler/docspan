@@ -513,11 +513,23 @@ class DocsRequestBuilder:
                 assigned_candidate_for[spos] = cid
                 chosen_candidates.add(cid)
 
+            # Snapshot each slot's target range before mutating `expanded`.
+            # A slot position can *also* be another slot's winning "pos"
+            # candidate (every singleton "equal" entry is registered as both
+            # a slot and a candidate) — e.g. a genuine two-way swap where
+            # slot A's winner is slot B's own node and vice versa. Re-reading
+            # `expanded[spos]` inside this loop, after an earlier iteration
+            # may have already overwritten it via the `expanded[cid[1]] = `
+            # assignment below, silently swapped in the wrong target range
+            # and dropped one target index while duplicating another —
+            # verified by direct repro before this snapshot was added.
+            slot_target_range = {spos: (expanded[spos][3], expanded[spos][4]) for spos, _ in slot_entries}
+
             for spos, self_cid in slot_entries:
                 cid = assigned_candidate_for.get(spos)
                 if cid is None or cid == self_cid:
                     continue
-                _, _sci1, _sci2, scj1, scj2 = expanded[spos]
+                scj1, scj2 = slot_target_range[spos]
                 if cid[0] == "pos":
                     _, cci1, cci2, _, _ = expanded[cid[1]]
                     expanded[cid[1]] = ("equal", cci1, cci2, scj1, scj2)
