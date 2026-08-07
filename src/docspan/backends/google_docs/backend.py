@@ -295,8 +295,8 @@ class GoogleDocsBackend(Backend):
             # post-insert indices.
             #
             # Pass 1 being empty does NOT mean there is nothing to do, and this
-            # used to be checked in the wrong order. The diff key is
-            # (style, text, is_list_item) — it does not include marks — so
+            # used to be checked in the wrong order. The diff key covers style,
+            # bullet, text and nesting level — it does not include marks — so
             # adding a link to text that is otherwise unchanged produces zero
             # diffs and zero pass-1 requests. When the "nothing to do" return
             # sat above this block, that push wrote nothing and reported

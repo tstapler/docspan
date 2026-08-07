@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass
-from typing import Iterator, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -23,6 +23,11 @@ from docspan.backends.google_docs.heading_anchors import (
 )
 
 Node = Union[DocsParagraphNode, DocsTableNode]
+
+# difflib's opcode tuple. Named because it is now threaded through three
+# functions (_opcodes, _repair, _coalesce) and `list` is invariant, so an
+# inlined Literal in one signature and a bare `str` in the next do not unify.
+Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -105,24 +110,53 @@ class DocsRequestBuilder:
     def _node_key(self, node: Node) -> Tuple:
         """Identity used by SequenceMatcher to align the two node sequences.
 
-        **Text only.** Paragraph-level attributes — namedStyleType, bullet,
-        nesting level — deliberately do NOT participate, because they are
-        *editable in place*: `updateParagraphStyle`, `createParagraphBullets` and
-        `deleteParagraphBullets` change them without touching the text.
+        **Full identity** — style and bullet participate. This answers only
+        *"which live paragraph is this markdown node about?"*, which is a different
+        question from *"is this an in-place restyle or a rewrite?"*. `_content_key`
+        answers the second, and `_repair` applies it.
 
-        Including them made a restyle look like a different paragraph, so
-        difflib reported `replace` and build() answered with delete-then-insert.
-        Changing `## Sec` to `### Sec` therefore deleted the paragraph and
-        retyped it — 5 requests, and any comment anchored to it destroyed —
-        while the preview said `change 'Sec' -> 'Sec'`, identical text on both
-        sides, which tells the reader nothing about what is about to happen.
+        The key used to be text-only, so that a restyle would align rather than
+        delete-and-reinsert. That worked while nodes were long and distinctive, but
+        it weakened correspondence to "same text ⇒ same paragraph" — and once
+        fenced code blocks became one node per line, the sequence filled with short
+        generic strings (`}`, `pass`, `Config`, `Example`) that collide with
+        headings and list items elsewhere in the document.
 
-        With text as the whole identity, a restyle is an `equal` opcode carrying
-        a paragraph-attribute difference, which _make_style_update_requests
-        turns into the two or three in-place requests it actually needs.
+        The consequence was not cosmetic. A code line reading `Config` beside a
+        live `# Config` heading paired with it, so push demoted the heading to
+        NORMAL_TEXT and inserted a fresh one — destroying the `headingId` every
+        internal anchor resolves against, and any comment anchored to it, while the
+        preview said `change 'Config' -> 'Config'`. Reproduces with pure prose too
+        (a heading whose text repeats as body text), so this predates the code-block
+        split; the split made it easy to hit.
 
-        Two paragraphs with the same text and different styles now align with
-        each other. That is the point: they *are* the same paragraph, restyled.
+        Restyle-in-place is now re-admitted deliberately by `_repair` instead of
+        falling out of a key that was too weak to tell paragraphs apart.
+        """
+        if isinstance(node, DocsTableNode):
+            return ("__table__", tuple(tuple(self._cell_key(c) for c in row) for row in node.rows))
+        return ("__para__", node.style, node.is_list_item, node.nesting_level, node.text)
+
+    def _cell_key(self, cell: TableCell) -> Tuple:
+        """Hashable full identity for a table cell, including inline styling.
+
+        `TableCell` and `TextSpan` are plain (unfrozen, unhashable) dataclasses —
+        `_node_key` needs a hashable key to feed `difflib.SequenceMatcher`, so this
+        flattens a cell's text and spans into a tuple instead of hashing the
+        objects themselves.
+        """
+        return (
+            cell.text,
+            tuple((s.text, s.bold, s.italic, s.link, s.monospace) for s in cell.spans),
+        )
+
+    def _content_key(self, node: Node) -> Tuple:
+        """Identity ignoring everything editable in place — the old `_node_key`.
+
+        Used only to classify a pairing that `_node_key` has already made: two nodes
+        with the same content differ only by attributes `updateParagraphStyle`,
+        `createParagraphBullets` and `deleteParagraphBullets` can change without
+        touching the text, so the edit is a restyle and not a rewrite.
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(c.text for c in row) for row in node.rows))
@@ -132,7 +166,7 @@ class DocsRequestBuilder:
         self,
         current: List[Node],
         target: List[Node],
-    ) -> List[Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]]:
+    ) -> List[Opcode]:
         """Build the single difflib.SequenceMatcher opcode list shared by
         build() and diff_summary().
 
@@ -147,7 +181,268 @@ class DocsRequestBuilder:
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
         matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        return matcher.get_opcodes()
+        return self._repair(matcher.get_opcodes(), current, target)
+
+    def _repair(
+        self,
+        opcodes: List[Opcode],
+        current: List[Node],
+        target: List[Node],
+    ) -> List[Opcode]:
+        """Re-classify text-identical pairs inside a `replace` run as `equal`.
+
+        `_node_key` includes style and bullet, so a paragraph that was only
+        *restyled* now lands in a `replace` run — and `build()` answers a replace
+        with delete-then-insert, which retypes the paragraph and destroys any
+        comment anchored to it. That behaviour is what the old text-only key
+        avoided, at the cost of correspondence (see `_node_key`).
+
+        So the two concerns are separated: the key decides *correspondence*, and
+        this decides *classification*. Where a replace run pairs nodes with equal
+        `_content_key`, the edit is an in-place restyle and the opcode becomes
+        `equal`, which `_make_style_update_requests` turns into the two or three
+        in-place requests it actually needs.
+
+        Leftovers on either side stay a `replace`/`insert`/`delete` for the part
+        that genuinely differs, so nothing is silently dropped.
+
+        Pairing nodes by their position within the run (same offset from the
+        run's start on both sides) is not a correspondence relation — it just
+        assumes the run has no internal insert/delete of its own. Where it
+        does (e.g. a restyle sitting next to an unrelated deletion in the same
+        run), a positional walk mispairs nodes: a live heading can end up
+        "paired" with an unrelated line, so the heading looks like a rewrite
+        and gets deleted-and-reinserted, destroying its headingId. So instead
+        of walking positionally, a second SequenceMatcher (keyed on
+        `_content_key`) finds the actual content correspondence within the
+        run's own sub-ranges. `get_opcodes()` returns a partition of both
+        inputs, so this can't assign two current nodes to the same target
+        node.
+        """
+        repaired: List[Opcode] = []
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag != "replace":
+                repaired.append((tag, i1, i2, j1, j2))
+                continue
+            cur_slice = current[i1:i2]
+            tgt_slice = target[j1:j2]
+            inner = difflib.SequenceMatcher(
+                None,
+                [self._content_key(n) for n in cur_slice],
+                [self._content_key(n) for n in tgt_slice],
+                autojunk=False,
+            )
+            pending: List[Opcode] = []
+            for itag, ci1, ci2, tj1, tj2 in inner.get_opcodes():
+                aci1, aci2 = i1 + ci1, i1 + ci2
+                atj1, atj2 = j1 + tj1, j1 + tj2
+                if itag == "equal":
+                    # Real content correspondence inside the run -> restyle-in-place.
+                    for off in range(aci2 - aci1):
+                        pending.append(
+                            ("equal", aci1 + off, aci1 + off + 1, atj1 + off, atj1 + off + 1)
+                        )
+                else:
+                    # Genuinely different content in this sub-window -> real rewrite.
+                    pending.append((itag, aci1, aci2, atj1, atj2))
+            pending = self._prefer_structural_pairing(pending, cur_slice, tgt_slice, i1, j1)
+            repaired.extend(self._coalesce(pending))
+        return repaired
+
+    def _prefer_structural_pairing(
+        self,
+        pending: List[Opcode],
+        cur_slice: List[Node],
+        tgt_slice: List[Node],
+        i1: int,
+        j1: int,
+    ) -> List[Opcode]:
+        """Reassign ambiguous equal/delete pairings toward their structurally closest node.
+
+        The inner `SequenceMatcher` in `_repair` treats every current node sharing
+        a `_content_key` as interchangeable and pairs whichever ones it meets first
+        with the target — typically by position. When several current nodes share
+        text (a stale body paragraph and a live heading both reading "Setup"),
+        that can restyle-in-place the wrong one and delete the live heading
+        instead, destroying its `headingId`. Same thing happens, worse, when the
+        *target* side also repeats the text (e.g. restyling one duplicate up to a
+        heading and another down to a bullet): each ambiguous target then needs
+        its own best-matching current node, not just the first one considered.
+
+        So for every `_content_key` shared by more than one current node in this
+        run, this treats it as a small assignment problem: each target position
+        that currently has an "equal" pairing is a slot, every current node
+        sharing the key (whether currently paired or currently "delete") is a
+        candidate, and slots claim candidates greedily by structural similarity
+        (style, heading-ness, list-item-ness), highest score first, ties going to
+        a candidate's own existing slot so an already-fine pairing is not
+        needlessly perturbed. Whichever candidates no slot claims become deletes.
+
+        This only ever reassigns which current index a given target range maps
+        to — the target ranges themselves, and every other opcode's indices, are
+        untouched — so it cannot double-book or drop a target index. There is no
+        list-order requirement to preserve: `build()` and `diff_summary()` both
+        consume each opcode by its own absolute (i1, i2, j1, j2), and `_coalesce`
+        only merges entries whose indices are exactly contiguous, so reordering
+        which candidate owns which target range cannot corrupt either consumer.
+
+        Generalization: a duplicate-content current node does not stop being a
+        candidate just because the inner matcher happened to fold it into a
+        multi-node "replace" block alongside other, genuinely different content
+        in the same run (e.g. a live heading sitting next to an edited sentence,
+        with the actual duplicate target slot won by a stray paragraph
+        elsewhere in the run). Every current index inside a "replace" opcode is
+        registered as a candidate the same way a singleton "delete" is; if one
+        wins a slot, its parent "replace" opcode is structurally split
+        afterward — the winning index is carved out as its own "equal", and
+        whatever current indices remain keep the original, untouched target
+        range (attached to the first surviving contiguous run; any other
+        surviving run becomes a plain "delete", since the target content is
+        already spoken for). If every current index in the block is claimed,
+        the target range becomes a fresh "insert" anchored where the block used
+        to be. This never touches a target index more than once and never
+        drops one, so it cannot corrupt `build()`/`diff_summary()` the same way
+        the singleton case cannot (see above).
+
+        Scope note: only the *current* side of "replace"/"insert" opcodes is
+        considered here. A duplicate *target* slot trapped inside a multi-node
+        block (the symmetric case) is not decomposed — there is no existing
+        "equal" opcode to use as the slot in that case, only a range with no
+        established per-index correspondence to split by. That gap is open.
+        """
+        expanded: List[Opcode] = []
+        for tag, ci1, ci2, cj1, cj2 in pending:
+            if tag == "delete" and ci2 - ci1 > 1:
+                for idx in range(ci1, ci2):
+                    expanded.append(("delete", idx, idx + 1, cj1, cj1))
+            else:
+                expanded.append((tag, ci1, ci2, cj1, cj2))
+
+        # A candidate id is either ("pos", position) — a singleton "equal"/
+        # "delete" entry in `expanded`, matching the prior behavior — or
+        # ("interior", position, idx) — a current index still trapped inside
+        # the "replace" opcode at `position`. Only "pos" candidates that are
+        # currently "equal" can be slots; "interior" candidates can only win.
+        by_key: Dict[Tuple, List[Tuple]] = {}
+        for pos, (tag, ci1, ci2, _cj1, _cj2) in enumerate(expanded):
+            if tag in ("equal", "delete") and ci2 - ci1 == 1:
+                by_key.setdefault(self._content_key(cur_slice[ci1 - i1]), []).append(("pos", pos))
+            elif tag == "replace":
+                for idx in range(ci1, ci2):
+                    key = self._content_key(cur_slice[idx - i1])
+                    by_key.setdefault(key, []).append(("interior", pos, idx))
+
+        def _current_index(cid: Tuple) -> int:
+            if cid[0] == "pos":
+                return int(expanded[cid[1]][1])
+            return int(cid[2])
+
+        # position -> {idx: (target j1, target j2)} claimed out of a "replace" opcode
+        extractions: Dict[int, Dict[int, Tuple[int, int]]] = {}
+
+        for positions in by_key.values():
+            slot_ids = [cid for cid in positions if cid[0] == "pos" and expanded[cid[1]][0] == "equal"]
+            if not slot_ids or len(positions) < 2:
+                continue
+            slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
+
+            pair_scores = []
+            for si, sid in enumerate(slot_ids):
+                scj1, _scj2 = slot_targets[sid]
+                target_node = tgt_slice[scj1 - j1]
+                for ci, cid in enumerate(positions):
+                    score = self._structural_score(cur_slice[_current_index(cid) - i1], target_node)
+                    pair_scores.append((score, sid == cid, si, ci, sid, cid))
+            pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
+
+            assigned_candidate_for: Dict[Tuple, Tuple] = {}
+            chosen_candidates = set()
+            for _score, _self_pair, _si, _ci, sid, cid in pair_scores:
+                if sid in assigned_candidate_for or cid in chosen_candidates:
+                    continue
+                assigned_candidate_for[sid] = cid
+                chosen_candidates.add(cid)
+
+            for sid, cid in assigned_candidate_for.items():
+                if cid == sid:
+                    continue
+                scj1, scj2 = slot_targets[sid]
+                if cid[0] == "pos":
+                    _, cci1, cci2, _, _ = expanded[cid[1]]
+                    expanded[cid[1]] = ("equal", cci1, cci2, scj1, scj2)
+                else:
+                    _, rpos, idx = cid
+                    extractions.setdefault(rpos, {})[idx] = (scj1, scj2)
+
+            for sid in slot_ids:
+                if sid not in chosen_candidates:
+                    _, sci1, sci2, scj1, _scj2 = expanded[sid[1]]
+                    expanded[sid[1]] = ("delete", sci1, sci2, scj1, scj1)
+
+        if not extractions:
+            return expanded
+
+        rebuilt: List[Opcode] = []
+        new_equals: List[Opcode] = []
+        for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
+            claimed = extractions.get(pos)
+            if not claimed:
+                rebuilt.append((tag, ci1, ci2, cj1, cj2))
+                continue
+            for idx, (scj1, scj2) in claimed.items():
+                new_equals.append(("equal", idx, idx + 1, scj1, scj2))
+            remaining = []
+            start = ci1
+            for idx in sorted(claimed):
+                if idx > start:
+                    remaining.append((start, idx))
+                start = idx + 1
+            if start < ci2:
+                remaining.append((start, ci2))
+            if not remaining:
+                rebuilt.append(("insert", ci1, ci1, cj1, cj2))
+            else:
+                (first_start, first_end), *rest = remaining
+                rebuilt.append(("replace", first_start, first_end, cj1, cj2))
+                for start, end in rest:
+                    rebuilt.append(("delete", start, end, cj1, cj1))
+        rebuilt.extend(new_equals)
+        return rebuilt
+
+    @staticmethod
+    def _structural_score(node: Node, target_node: Node) -> int:
+        """How closely `node`'s non-text attributes already match `target_node`'s.
+
+        Used only to rank candidates in `_prefer_structural_pairing`.
+        """
+        if isinstance(node, DocsTableNode) or isinstance(target_node, DocsTableNode):
+            return 0
+        score = 0
+        if node.style == target_node.style:
+            score += 2
+        if is_heading_style(node.style) == is_heading_style(target_node.style):
+            score += 1
+        if node.is_list_item == target_node.is_list_item:
+            score += 1
+        return score
+
+    @staticmethod
+    def _coalesce(
+        opcodes: List[Opcode],
+    ) -> List[Opcode]:
+        """Merge adjacent same-tag opcodes, so downstream sees runs not singletons.
+
+        `build()` treats a `replace` run as one range, and emitting N single-node
+        replaces instead of one N-node replace would change the request shape.
+        """
+        merged: List[Opcode] = []
+        for op in opcodes:
+            if merged and merged[-1][0] == op[0] and merged[-1][2] == op[1] and merged[-1][4] == op[3]:
+                tag, i1, _, j1, _ = merged[-1]
+                merged[-1] = (tag, i1, op[2], j1, op[4])
+            else:
+                merged.append(op)
+        return merged
 
     def diff_summary(
         self,
@@ -176,9 +471,11 @@ class DocsRequestBuilder:
 
         for tag, i1, i2, j1, j2 in self._opcodes(current, target):
             if tag == "equal":
-                # "equal" means equal *text* — _node_key is text-only, so a
-                # restyle (heading level, bullet on/off, nesting) lands here
-                # rather than as a replace. It is still a change the user asked
+                # "equal" means equal *text*: `_node_key` includes style and
+                # bullet, so a restyle lands in a `replace` run, and `_repair`
+                # re-tags it as `equal` on `_content_key`. Either way a restyle
+                # (heading level, bullet on/off, nesting) arrives here rather
+                # than as a replace. It is still a change the user asked
                 # for and push() will write, so it has to be reported; counting
                 # it as unchanged would make --dry-run claim nothing happens
                 # while push emits updateParagraphStyle.
@@ -1511,8 +1808,9 @@ class DocsRequestBuilder:
     def _make_style_update_requests(self, current_node: Node, target_node: Node) -> List[dict]:
         """Restyle a paragraph in place — same text, different paragraph attributes.
 
-        Emitted for `equal` opcodes, which since _node_key became text-only is
-        where every restyle now lands. Covers all three attributes the Docs API
+        Emitted for `equal` opcodes, where every restyle lands — either because
+        the text and attributes both match, or because `_repair` re-tagged a
+        text-identical pair inside a `replace` run. Covers all three attributes the Docs API
         can change without rewriting the text:
 
         * namedStyleType, via updateParagraphStyle
