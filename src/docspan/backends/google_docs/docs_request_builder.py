@@ -212,7 +212,7 @@ class DocsRequestBuilder:
         the correspondence and leave the code-rendered one an unpaired
         `delete` — a pre-existing gap this fix narrows but does not close; see
         `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
-        in `tests/test_code_block_granularity.py`.
+        in `tests/test_code_block_granularity.py` and issue #68.
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(c.text for c in row) for row in node.rows))

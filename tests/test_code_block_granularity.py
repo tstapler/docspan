@@ -376,21 +376,39 @@ class TestRenderPrefixParticipatesInIdentity:
     inside the Docs-rendered block. See issue #54.
     """
 
-    def _doc_prose_and_code_sharing_text(self, text: str) -> tuple[dict, int]:
+    def _doc_prose_and_code_sharing_text(
+        self, text: str, code_first: bool = False
+    ) -> tuple[dict, int]:
         """A document with a plain prose paragraph and a rendered code line, same text.
 
         Same JSON shape as `TestRenderPrefix._code_block_doc`, with an
-        extra plain paragraph reading the same text ahead of the code line.
+        extra plain paragraph reading the same text ahead of the code line
+        (or after it, when `code_first` is set — see
+        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`,
+        which needs that ordering to actually put `_node_key`'s
+        `_is_code_line` signal to work).
         """
         mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
                 "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
-        paragraphs = [
-            [("Intro\n", {})],
-            [(text + "\n", {})],
-            [("", {}), (text + "\n", mono)],
-            [("\n", {})],
-            [("Tail\n", {})],
-        ]
+        prose = [(text + "\n", {})]
+        code = [("", {}), (text + "\n", mono)]
+        code_chrome = [("\n", {})]
+        if code_first:
+            paragraphs = [
+                [("Intro\n", {})],
+                code,
+                code_chrome,
+                prose,
+                [("Tail\n", {})],
+            ]
+        else:
+            paragraphs = [
+                [("Intro\n", {})],
+                prose,
+                code,
+                code_chrome,
+                [("Tail\n", {})],
+            ]
         content, index = [], 1
         for runs in paragraphs:
             raw = "".join(c for c, _ in runs)
@@ -427,41 +445,73 @@ class TestRenderPrefixParticipatesInIdentity:
         assert builder._content_key(projected_prose) == builder._content_key(projected_code)
 
     def test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph(self) -> None:
-        """Bullet 3's literal reproduction: a `replace` whose current side is a
-        Docs-rendered paragraph must delete/insert relative to the index
-        `project()` already advanced past the glyph, not the paragraph's raw
-        (unprojected) start.
+        """Bullet 3's literal reproduction, arranged as a collision so it actually
+        exercises `_node_key`'s `_is_code_line` split rather than only the
+        index arithmetic in isolation.
 
-        Single current node, single target node, different text — a clean 1:1
-        `replace`, so this isolates the index-arithmetic half of the bug from
-        the separate (and separately tracked) multi-candidate correspondence
-        gap that `_node_key` alone cannot resolve — see
+        Same shared-text setup as
+        `test_node_key_distinguishes_prose_from_a_code_line_with_the_same_text`,
+        but with the code line ordered *before* the prose line
+        (`code_first=True`). With `_is_code_line` reverted out of `_node_key`,
+        difflib's positional matching binds the *code* node — not the prose
+        one — to the target's unchanged `"cfg"` slot: the delete/insert meant
+        for the changed code line then lands on the unrelated prose
+        paragraph instead, and the actual Docs-rendered paragraph is left
+        untouched, silently keeping its stale text. That is the #54 failure
+        mode: a `replace` whose current side is a Docs-rendered paragraph
+        must land relative to the index `project()` already advanced past
+        the glyph, which cannot happen if the wrong node absorbs the edit in
+        the first place. Confirmed by temporarily dropping `_is_code_line`
+        from `_node_key`: this test fails (the prose paragraph's range gets
+        overwritten and the code paragraph's stale text survives untouched).
+
+        A separate, harder collision — where `_node_key` alone still cannot
+        resolve which current node should absorb a *single* target slot — is
+        pinned and out of scope for this fix; see
         `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
         below.
         """
-        doc, end = TestRenderPrefix()._code_block_doc()
+        doc, end = self._doc_prose_and_code_sharing_text("cfg", code_first=True)
         current, _ = project(structure.parse(doc))
-        target, _ = project(markdown.parse("Intro\n\n```\nnew_cfg\n```\n\nTail\n"))
+        target, _ = project(markdown.parse("Intro\n\ncfg\n\n```\nnew_cfg\n```\n\nTail\n"))
 
         code_node = next(n for n in current if n.render_prefix)
+        prose_node = next(n for n in current if n.text == "cfg" and not n.render_prefix)
         requests = builder.build(current, target, end)
 
-        for request in requests:
-            for key in ("deleteContentRange", "insertText"):
-                if key not in request:
-                    continue
-                rng = request[key].get("range") or {
-                    "startIndex": request[key].get("location", {}).get("index")
-                }
-                start = rng.get("startIndex")
-                if start is None:
-                    continue
-                # The glyph itself (at code_node.start_index - 1, since project()
-                # already advanced past it) must never be touched — Docs refuses
-                # to delete it, and an insert there would land ahead of it.
-                assert start >= code_node.start_index, (
-                    f"a request landed on or before the render_prefix glyph: {request}"
-                )
+        def edit_starts():
+            for request in requests:
+                for key in ("deleteContentRange", "insertText"):
+                    if key not in request:
+                        continue
+                    rng = request[key].get("range") or {
+                        "startIndex": request[key].get("location", {}).get("index")
+                    }
+                    start = rng.get("startIndex")
+                    if start is not None:
+                        yield start
+
+        starts = list(edit_starts())
+
+        # The prose paragraph reads "cfg" in both current and target — it must
+        # not be touched at all, let alone absorb the code line's edit.
+        assert not any(
+            prose_node.start_index <= start < prose_node.end_index for start in starts
+        ), f"a request rewrote the unrelated prose paragraph instead of the code line: {requests}"
+
+        # The code paragraph's own text must actually change to "new_cfg" ...
+        assert any(
+            code_node.start_index <= start < code_node.end_index for start in starts
+        ), f"the code paragraph's stale text was left untouched: {requests}"
+
+        # ... and every edit inside it must start at or past the glyph
+        # (at code_node.start_index - 1, since project() already advanced
+        # past it): Docs refuses to delete the glyph itself, and an insert
+        # there would land ahead of it.
+        for start in starts:
+            assert start >= code_node.start_index, (
+                f"a request landed on or before the render_prefix glyph: {requests}"
+            )
 
     def test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence(self) -> None:
         """A known residual gap, pinned rather than silently left undiscovered.
@@ -482,8 +532,8 @@ class TestRenderPrefixParticipatesInIdentity:
         before this fix), so it predates issue #54 and is not something a key
         signal alone can fix — it needs `_prefer_structural_pairing`-style
         disambiguation lifted to the top-level correspondence matcher, which is
-        outside this fix's scope. Pinned here as documented, not silently
-        reintroduced.
+        outside this fix's scope. Tracked in issue #68. Pinned here as
+        documented, not silently reintroduced.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg")
         current, _ = project(structure.parse(doc))
