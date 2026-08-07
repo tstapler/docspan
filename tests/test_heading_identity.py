@@ -466,6 +466,28 @@ class TestTheLiveHeadingSurvives:
                 covered.add(j)
         assert covered == set(range(len(target))), f"target coverage incomplete: {opcodes}"
 
+    def test_three_duplicate_headings_cyclically_restyled_all_survive(self) -> None:
+        """Three (not just two) duplicate-content nodes, cyclically restyled.
+
+        `_prefer_structural_pairing`'s pooling and same-origin tie-break are
+        exercised more heavily as the number of same-`_content_key` copies
+        grows past two — this checks the assignment logic still resolves a
+        3-way cycle to three in-place restyles rather than falling back to
+        any delete+insert. Before this PR's fix, this exact shape lost one
+        of the three paragraphs (`insert`+`equal`+`delete` instead of three
+        `equal`s).
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_2", "second", False),
+            ("A", "HEADING_3", "third", False),
+        ])
+        _push(replay, "### A\n\n# A\n\n## A\n")
+
+        self._assert_no_destruction(
+            replay, ["first", "second", "third"], ["HEADING_1", "HEADING_2", "HEADING_3"]
+        )
+
 
 class TestNoHeadingIsDemoted:
     """Seeded sweep over single-block edits — the regime the bug lives in.
