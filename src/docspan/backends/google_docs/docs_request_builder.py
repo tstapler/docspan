@@ -21,6 +21,7 @@ from docspan.backends.google_docs.heading_anchors import (
     slugify,
     slugify_all,
 )
+from docspan.backends.google_docs.projection import project
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -1294,6 +1295,31 @@ class DocsRequestBuilder:
         a `HEADING_*` at all, so a doc title could never be an anchor target
         even though `projection.project()` and `#`/`##` both treat it as one.
 
+        Inventory of `.text`/`.start_index` consumers in this file and
+        backend.py, done while fixing issue #53 (this method was the only one
+        that had it wrong): `_align_for_styling`'s own `current` needed the
+        projected view and got the raw one — fixed above. Everything that
+        reads `current`/`pairs`/`unaligned` transitively through `align()`
+        (`build_span_style_requests`, `_spans_overflow`,
+        `unaligned_span_targets`, `_anchor_resolution`,
+        `build_table_cell_span_requests`, `unplaced_table_cells`) needed the
+        projected view and, once this method is fixed, now gets it — no
+        further changes required there. `heading_slug_to_id(current)` inside
+        `_anchor_resolution` also wants projected text so a `TITLE`/`SUBTITLE`
+        reads as `HEADING_*` the same way the markdown side does (see
+        heading_anchors.is_heading_style's docstring); it gets that for the
+        same reason. `nodes_to_markdown` and the pull-path
+        `heading_id_to_slug` calls in backend.py already received projected
+        nodes before this fix (backend.py projects immediately after every
+        parse on those paths) and were not affected by this bug.
+        `backend.preview_push` is the one deliberate, unrelated exception:
+        it parses unprojected on purpose, because an empty heading's
+        `headingId` is real data that `project()` would drop, and pass 2
+        resolves it correctly from the same unprojected parse it does its own
+        pairing on — it does not call this method, so it never saw #53's bug
+        and needs no change. No other consumer of a parsed node's `.text` in
+        this file was found to be reading the wrong view.
+
         Why not zip(): pass 1 does **not** guarantee the re-fetched document
         matches ``target`` node-for-node. It leaves an empty paragraph behind
         whenever a delete had to be trimmed to preserve the newline anchoring a
@@ -1318,7 +1344,23 @@ class DocsRequestBuilder:
         difflib reports as replace/insert/delete is ambiguous, so it is left
         unstyled and reported by unaligned_span_targets().
         """
-        current = DocsStructureParser().parse(doc)
+        # Projected, like every other diff/render consumer in this file and in
+        # backend.py's _build_push_plan/pull — NOT like `target` here, which
+        # backend.py already projected before this method ever sees it (see
+        # _alignment_key's docstring). Before this fix `current` was the one
+        # exception: it parsed the live doc raw, so a native code-block
+        # paragraph's `.text` still carried Docs' Private-Use-Area render
+        # prefix while `target`'s never did (MarkdownToParagraphParser never
+        # emits one). `_alignment_key` is text-only, so that pair could never
+        # produce an "equal" opcode — pass 2 reported every such paragraph in
+        # `unaligned_span_targets` and never applied its monospace styling
+        # (issue #53). `project()` strips the prefix and advances
+        # `start_index` past it (`_without_render_prefix`), which is exactly
+        # what `_spans_overflow` and `_span_style_requests` need those fields
+        # to mean. Residue is discarded here (`[0]`) the same way backend.py's
+        # default pull path discards it at the `heading_id_to_slug(project(...)[0])`
+        # call: nothing downstream of `current` in this method reports residue.
+        current, _current_residue = project(DocsStructureParser().parse(doc))
         matcher = difflib.SequenceMatcher(
             None,
             [self._alignment_key(n) for n in current],

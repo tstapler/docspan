@@ -16,10 +16,12 @@ ends up wrong; it is:
 * pass 2 reported the block `unaligned` and emitted **zero** span requests, so the
   monospace styling was never applied at all — measured 0 span requests before the
   fix, 2 after, *for a block with no render glyph*. A native Google Docs code block
-  does carry one, and `_align_for_styling` parses the document **unprojected** and
-  keys on `node.text`, so the glyph is present on one side and absent on the other
-  and pass 2 still emits zero. That is a third consumer of `.text` needing the
-  projected view; it is open, and this claim is scoped accordingly.
+  does carry one, and `_align_for_styling` used to parse the document
+  **unprojected** and key on `node.text`, so the glyph was present on one side and
+  absent on the other and pass 2 still emitted zero. That was a third consumer of
+  `.text` needing the projected view (`_align_for_styling` was the only remaining
+  one — see issue #53 and `TestRenderPrefix.test_align_for_styling_projects_current`
+  below); it is now fixed.
 
 The preview reported N removals, which reads as content deletion and is
 indistinguishable from content the author removed deliberately. That is what made
@@ -359,6 +361,37 @@ class TestRenderPrefix:
         current, _ = project(structure.parse(after))
         target, _ = project(markdown.parse("Intro\n\nTail\n"))
         assert builder.build(current, target, index) == []
+
+    def test_align_for_styling_projects_current(self) -> None:
+        """Issue #53: pass 2 must strip the glyph from `current`, not just `target`.
+
+        Every other `DocsStructureParser().parse()` call site in the google_docs
+        backend feeds the result through `project()` before diffing (or is
+        `preview_push`'s deliberately-unprojected exception, which never reaches
+        this method). `_align_for_styling` was the one place that parsed the live
+        doc raw: `target` (already projected by `backend.py`) read `# cfg`, but
+        `current` still carried the glyph and read `# cfg`. `_alignment_key`
+        is text-only, so that pair could never produce an "equal" opcode — the
+        code line was reported in `unaligned_span_targets` and its monospace
+        styling was silently dropped on every push of a document with a native
+        code block. Confirmed against the pre-fix code (git stash) to emit
+        `requests == []` and the node in `unaligned`; this asserts the fixed
+        behavior.
+        """
+        doc, _ = self._code_block_doc()
+        target, _ = project(markdown.parse("Intro\n\n```\n# cfg\n```\n\nTail\n"))
+        requests = builder.build_span_style_requests(doc, target)
+        unaligned = builder.unaligned_span_targets(doc, target)
+        assert unaligned == []
+        assert requests == [{
+            "updateTextStyle": {
+                "range": {"startIndex": 8, "endIndex": 13},
+                "textStyle": {
+                    "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}
+                },
+                "fields": "weightedFontFamily",
+            }
+        }]
 
 
 class TestRenderPrefixParticipatesInIdentity:
