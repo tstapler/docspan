@@ -165,10 +165,13 @@ def is_heading_style(style: object) -> bool:
     What produces a TITLE paragraph is Google Docs itself, for any document whose
     title was typed into the title bar — markdown `#` parses to `HEADING_1`, so
     the *target* side never carries one. Both directions still reach this branch:
-    `pull` maps the id back to a slug, and on push `_align_for_styling` parses the
-    document **unprojected**, so `heading_slug_to_id(current)` asks this question
-    about document nodes. A partial push of one section against a doc whose title
-    is a TITLE resolves `#the-title` through exactly that path.
+    `pull` maps the id back to a slug, and on push `_align_for_styling` calls
+    `heading_slug_to_id(current)` on `current` after `projection.project()` has
+    already remapped that TITLE's style to `HEADING_1` (project() replaces only
+    `style`, never `heading_id`, so the id this branch needs survives that
+    remap). A partial push of one section against a doc whose title is a TITLE
+    resolves `#the-title` through exactly that path either way, since
+    `is_heading_style` accepts both spellings.
     """
     return isinstance(style, str) and (
         style.startswith("HEADING_") or style in ("TITLE", "SUBTITLE")

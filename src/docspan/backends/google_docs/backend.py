@@ -316,6 +316,12 @@ class GoogleDocsBackend(Backend):
             unstyled: list[DocsParagraphNode] = []
             unplaced_cells: list[str] = []
             dead_anchors: list[str] = []
+            # Residue from the second, post-pass-1 parse `align()` does inside
+            # `_align_for_styling` — distinct from plan.residue (the *first*
+            # parse's residue) and reported the same way for the same reason:
+            # an `ambiguous_code_prefix` here is pass 1's own edits, not the
+            # original document, and is just as unsafe to drop silently.
+            pass2_residue: list = []
             if needs_pass2:
                 # When pass 1 wrote nothing the already-fetched plan.doc is
                 # still current, so pass 2 runs against it and skips a
@@ -338,6 +344,7 @@ class GoogleDocsBackend(Backend):
                 # a document pass 1 has already changed. Measured at +43% on that
                 # window for a 5000-paragraph document.
                 alignment = builder.align(pass2_doc, plan.target_nodes)
+                pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
                     pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
                 )
@@ -401,6 +408,7 @@ class GoogleDocsBackend(Backend):
                     doc_id=doc_id,
                     message=(f"⚠ {plan.tab_warning}" if plan.tab_warning else None)
                     or describe_residue(plan.residue)
+                    or describe_residue(pass2_residue)
                     or "No changes detected",
                 )
 
@@ -441,6 +449,12 @@ class GoogleDocsBackend(Backend):
                     # common case — the exact failure mode `project()`'s docstring
                     # says residue exists to avoid.
                     describe_residue(plan.residue) or None,
+                    # Same reporting, for residue from pass 2's own re-parse of
+                    # the document (see `pass2_residue`'s definition above) —
+                    # a distinct occurrence of the same residue kind that
+                    # `plan.residue` cannot see, since it comes from a parse
+                    # `_build_push_plan` never runs.
+                    describe_residue(pass2_residue) or None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation

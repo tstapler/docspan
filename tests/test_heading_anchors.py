@@ -245,6 +245,34 @@ class TestWriteDirection:
         ]
         assert links == [{"headingId": "h.intro"}]
 
+    def test_a_title_anchor_resolves_through_build_span_style_requests(self) -> None:
+        """TITLE variant of the test above, through the real push entry point.
+
+        This is a pre-existing property, not something introduced by the
+        pass-2-residue fix: `is_heading_style` already accepted a literal
+        `"TITLE"` on `main`, so `heading_slug_to_id(current)` resolves `#my-doc`
+        whether or not `current` was projected first. It is kept here (rather
+        than only via `structure.parse` in `TestHeadingMaps`) because it is the
+        one place this resolves through `build_span_style_requests` instead of
+        directly against parsed nodes.
+        """
+        doc = _doc(
+            _paragraph("My doc", 1, "TITLE", "h.title"),
+            _paragraph("see it", 8, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse("see [it](#my-doc)\n")
+
+        requests = builder.build_span_style_requests(doc, target)
+
+        links = [
+            r["updateTextStyle"]["textStyle"]["link"]
+            for r in requests
+            if "link" in r["updateTextStyle"]["textStyle"]
+        ]
+        assert links == [{"headingId": "h.title"}]
+
     def test_a_url_and_an_anchor_in_one_paragraph_each_get_their_own_union_member(self) -> None:
         doc = _doc(
             _paragraph("Intro", 1, "HEADING_1", "h.intro"),

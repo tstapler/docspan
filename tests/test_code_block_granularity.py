@@ -16,10 +16,12 @@ ends up wrong; it is:
 * pass 2 reported the block `unaligned` and emitted **zero** span requests, so the
   monospace styling was never applied at all — measured 0 span requests before the
   fix, 2 after, *for a block with no render glyph*. A native Google Docs code block
-  does carry one, and `_align_for_styling` parses the document **unprojected** and
-  keys on `node.text`, so the glyph is present on one side and absent on the other
-  and pass 2 still emits zero. That is a third consumer of `.text` needing the
-  projected view; it is open, and this claim is scoped accordingly.
+  does carry one, and `_align_for_styling` used to parse the document
+  **unprojected** and key on `node.text`, so the glyph was present on one side and
+  absent on the other and pass 2 still emitted zero. That was a third consumer of
+  `.text` needing the projected view (`_align_for_styling` was the only remaining
+  one — see issue #53 and `TestRenderPrefix.test_align_for_styling_projects_current`
+  below); it is now fixed.
 
 The preview reported N removals, which reads as content deletion and is
 indistinguishable from content the author removed deliberately. That is what made
@@ -27,6 +29,10 @@ it look like data loss, and what kept it unnoticed. See issue #40.
 """
 from __future__ import annotations
 
+from typing import Callable
+from unittest.mock import MagicMock
+
+from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
@@ -359,6 +365,97 @@ class TestRenderPrefix:
         current, _ = project(structure.parse(after))
         target, _ = project(markdown.parse("Intro\n\nTail\n"))
         assert builder.build(current, target, index) == []
+
+    def test_align_for_styling_projects_current(self) -> None:
+        """Issue #53: pass 2 must strip the glyph from `current`, not just `target`.
+
+        Every other `DocsStructureParser().parse()` call site in the google_docs
+        backend feeds the result through `project()` before diffing (or is
+        `preview_push`'s deliberately-unprojected exception, which never reaches
+        this method). `_align_for_styling` was the one place that parsed the live
+        doc raw: `target` (already projected by `backend.py`) read `# cfg`, but
+        `current` still carried the glyph and read `# cfg`. `_alignment_key`
+        is text-only, so that pair could never produce an "equal" opcode — the
+        code line was reported in `unaligned_span_targets` and its monospace
+        styling was silently dropped on every push of a document with a native
+        code block. Confirmed against the pre-fix code (git stash) to emit
+        `requests == []` and the node in `unaligned`; this asserts the fixed
+        behavior.
+        """
+        doc, _ = self._code_block_doc()
+        target, _ = project(markdown.parse("Intro\n\n```\n# cfg\n```\n\nTail\n"))
+        requests = builder.build_span_style_requests(doc, target)
+        unaligned = builder.unaligned_span_targets(doc, target)
+        assert unaligned == []
+        assert requests == [{
+            "updateTextStyle": {
+                "range": {"startIndex": 8, "endIndex": 13},
+                "textStyle": {
+                    "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}
+                },
+                "fields": "weightedFontFamily",
+            }
+        }]
+
+    def test_align_surfaces_residue_from_its_own_current_parse(self) -> None:
+        """The second half of #53's fix: `current`'s residue must reach the caller.
+
+        `_align_for_styling` re-parses the live document post-pass-1 and used to
+        discard that parse's residue outright (`current, _ = project(...)`).
+        An `ambiguous_code_prefix` there — a paragraph whose leading character
+        looks like Docs' code-block glyph but is not actually monospace — is
+        exactly the residue kind `project()`'s docstring says is unsafe to drop
+        silently, and pass 1's own edits are as capable of producing it as the
+        original document is. `align()` is the public entry point `push()`
+        calls, so this asserts on `Pass2Alignment.residue` rather than reaching
+        into the private method directly.
+        """
+        doc = {"revisionId": "rev-1", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "bold notes\n", "textStyle": {"bold": True}}},
+                ],
+            }}]}}
+        target, _ = project(markdown.parse("bold notes\n"))
+        alignment = builder.align(doc, target)
+        assert [r.kind for r in alignment.residue] == ["ambiguous_code_prefix"]
+
+    def test_push_surfaces_pass_2_residue_from_its_own_reparse(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """The wiring, not just the pure function above: `push()` must forward it.
+
+        `align()`'s residue (proven by the test above) only reaches a caller of
+        `push()` if `backend.py` actually reads `alignment.residue` and threads
+        it through `describe_residue` — that plumbing (`pass2_residue` in
+        `GoogleDocsBackend.push`) had no coverage of its own: deleting all four
+        touch points (the declaration, the assignment, and both
+        `describe_residue(pass2_residue)` call sites) left the full suite green.
+        This drives the real `push()` entry point against a document that
+        produces an `ambiguous_code_prefix` residue on pass 2's own re-parse —
+        not pass 1's — so dropping that wiring again fails a test instead of
+        only a manual revert.
+        """
+        backend, fake_client = make_backend()
+        before = {"revisionId": "rev-1", "body": {"content": []}}
+        after = {"revisionId": "rev-2", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "bold notes\n", "textStyle": {"bold": True}}},
+                ],
+            }}]}}
+        fake_client.get_document.side_effect = [before, after]
+        local = tmp_path / "doc.md"
+        local.write_text("**bold notes**\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        assert "code-block chrome" in (result.message or ""), result.message
 
 
 class TestRenderPrefixParticipatesInIdentity:
