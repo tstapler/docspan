@@ -205,14 +205,18 @@ class DocsRequestBuilder:
         A stray `_content_key` collision between a prose and a code node with
         the same text is harmless *when they are the only two candidates for
         their own slots*: `_node_key` already keeps them apart there, so
-        `_repair` — which only inspects the two sides of a single
-        `_node_key`-identified `replace` run — never gets a run containing
-        both to conflate. It is not harmless in general: when a plain current
-        paragraph and a real code-rendered current paragraph both read the
-        same text and only one target slot exists for that text, the *outer*
-        `_node_key` matcher (not `_repair`) can still let the plain one win
-        the correspondence and leave the code-rendered one an unpaired
-        `delete` — a pre-existing gap this fix narrows but does not close; see
+        nothing conflates them. It is not harmless in general: since PR #70,
+        `_repair`'s `_prefer_structural_pairing` pools every `_content_key`
+        across the *whole document*, not just the two sides of a single
+        `_node_key`-identified `replace` run — so a code line and an
+        unrelated same-text prose node living in *different* pre-repair runs
+        now do share a candidate/slot pool, and `_structural_score`'s style
+        comparison is what is relied on to keep them from winning each
+        other's slot. Where only one target slot for that text exists and
+        the *outer* `_node_key` matcher (not `_repair`) has already let the
+        plain paragraph win the correspondence, the code-rendered one can
+        still end up an unpaired `delete` — a pre-existing gap this fix
+        narrows but does not close; see
         `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
         in `tests/test_code_block_granularity.py` and issue #68.
         """
@@ -247,40 +251,67 @@ class DocsRequestBuilder:
         current: List[Node],
         target: List[Node],
     ) -> List[Opcode]:
-        """Re-classify text-identical pairs inside a `replace` run as `equal`.
+        """Re-classify text-identical pairs as `equal`, across the whole diff gap.
 
-        `_node_key` includes style and bullet, so a paragraph that was only
-        *restyled* now lands in a `replace` run — and `build()` answers a replace
-        with delete-then-insert, which retypes the paragraph and destroys any
-        comment anchored to it. That behaviour is what the old text-only key
-        avoided, at the cost of correspondence (see `_node_key`).
+        Two phases, as real diff tools do it (issue #52): phase 1 is the outer
+        `SequenceMatcher` (in `_opcodes`, before this runs), keyed on
+        `_node_key` — full identity, including style — which already
+        establishes every strong anchor: an `equal` opcode here means "this is
+        provably the same live paragraph, untouched," and is never revisited.
+        Everything else (every `replace`/`insert`/`delete` opcode) is the gap
+        phase 1 could not resolve.
 
-        So the two concerns are separated: the key decides *correspondence*, and
-        this decides *classification*. Where a replace run pairs nodes with equal
-        `_content_key`, the edit is an in-place restyle and the opcode becomes
-        `equal`, which `_make_style_update_requests` turns into the two or three
-        in-place requests it actually needs.
+        Phase 2 (this method, plus `_prefer_structural_pairing`) refines that
+        whole gap on `_content_key` — text-only identity — globally, not run by
+        run. `_node_key` includes style and bullet, so a paragraph that was
+        only *restyled* lands in a non-`equal` opcode, and naively answering a
+        `replace` with delete-then-insert (or an `insert`+`delete` pair with
+        an unrelated `equal` opcode between them, which is exactly the shape a
+        duplicate current-side text produces) retypes the paragraph and
+        destroys any comment or heading-anchor pinned to it. That is what the
+        old text-only key avoided, at the cost of correspondence — see
+        `_node_key`.
 
-        Leftovers on either side stay a `replace`/`insert`/`delete` for the part
-        that genuinely differs, so nothing is silently dropped.
+        So content-identity within a `replace` run is still resolved with a
+        second SequenceMatcher (keyed on `_content_key`) exactly as before —
+        positional pairing within a run is not a correspondence relation, see
+        below — but the resulting candidates (including whole standalone
+        `insert`/`delete` opcodes, not just `replace` interiors) are pooled and
+        matched by `_prefer_structural_pairing` across the *entire* gap at
+        once, so a restyle whose two halves ended up in unrelated opcodes still
+        gets recognized as one in-place edit.
 
-        Pairing nodes by their position within the run (same offset from the
+        Pairing nodes by their position within a run (same offset from the
         run's start on both sides) is not a correspondence relation — it just
         assumes the run has no internal insert/delete of its own. Where it
         does (e.g. a restyle sitting next to an unrelated deletion in the same
         run), a positional walk mispairs nodes: a live heading can end up
         "paired" with an unrelated line, so the heading looks like a rewrite
-        and gets deleted-and-reinserted, destroying its headingId. So instead
-        of walking positionally, a second SequenceMatcher (keyed on
-        `_content_key`) finds the actual content correspondence within the
-        run's own sub-ranges. `get_opcodes()` returns a partition of both
-        inputs, so this can't assign two current nodes to the same target
-        node.
+        and gets deleted-and-reinserted, destroying its headingId.
         """
-        repaired: List[Opcode] = []
-        for tag, i1, i2, j1, j2 in opcodes:
+        passthrough: List[Opcode] = []
+        pending: List[Opcode] = []
+        # Which top-level (pre-repair) opcode each `pending` entry came from.
+        # `_prefer_structural_pairing` uses this to prefer a candidate that
+        # shares its slot's original opcode over an equally- or
+        # better-scored one from elsewhere in the document — see that
+        # method's docstring for why raw structural score alone is not
+        # enough once the pool is global.
+        origin: List[int] = []
+        for run_id, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+            if tag == "equal":
+                # A strong phase-1 anchor: full identity already matched, so
+                # this pair is never a candidate for reassignment elsewhere —
+                # doing so would perturb a paragraph nothing actually touched.
+                passthrough.append((tag, i1, i2, j1, j2))
+                continue
             if tag != "replace":
-                repaired.append((tag, i1, i2, j1, j2))
+                # insert / delete: one side is empty, so there is no interior
+                # content pairing to resolve here — but this opcode's whole
+                # range is still a first-class candidate/slot for the global
+                # pooling in _prefer_structural_pairing below.
+                pending.append((tag, i1, i2, j1, j2))
+                origin.append(run_id)
                 continue
             cur_slice = current[i1:i2]
             tgt_slice = target[j1:j2]
@@ -290,7 +321,6 @@ class DocsRequestBuilder:
                 [self._content_key(n) for n in tgt_slice],
                 autojunk=False,
             )
-            pending: List[Opcode] = []
             for itag, ci1, ci2, tj1, tj2 in inner.get_opcodes():
                 aci1, aci2 = i1 + ci1, i1 + ci2
                 atj1, atj2 = j1 + tj1, j1 + tj2
@@ -300,171 +330,355 @@ class DocsRequestBuilder:
                         pending.append(
                             ("equal", aci1 + off, aci1 + off + 1, atj1 + off, atj1 + off + 1)
                         )
+                        origin.append(run_id)
                 else:
                     # Genuinely different content in this sub-window -> real rewrite.
                     pending.append((itag, aci1, aci2, atj1, atj2))
-            pending = self._prefer_structural_pairing(pending, cur_slice, tgt_slice, i1, j1)
-            repaired.extend(self._coalesce(pending))
-        return repaired
+                    origin.append(run_id)
+        pending = self._prefer_structural_pairing(pending, origin, current, target)
+        # `build()`/`diff_summary()` only need each opcode's own absolute
+        # indices (see `build()`'s per-tag anchor computation) — not overall
+        # list order — so passthrough and pending can simply be concatenated
+        # before the final coalesce.
+        return self._coalesce(sorted(passthrough + pending, key=lambda op: (op[1], op[3])))
+
+    @staticmethod
+    def _covered_target_indices(opcodes: List[Opcode]) -> set:
+        """The set of target indices these opcodes account for.
+
+        Used only as an invariant check in `_prefer_structural_pairing`: a
+        "delete" opcode carries no target range (`cj1 == cj2`) by
+        convention, everything else does.
+        """
+        covered: set = set()
+        for tag, _ci1, _ci2, cj1, cj2 in opcodes:
+            if tag != "delete":
+                covered.update(range(cj1, cj2))
+        return covered
 
     def _prefer_structural_pairing(
         self,
         pending: List[Opcode],
-        cur_slice: List[Node],
-        tgt_slice: List[Node],
-        i1: int,
-        j1: int,
+        origin: List[int],
+        current: List[Node],
+        target: List[Node],
     ) -> List[Opcode]:
-        """Reassign ambiguous equal/delete pairings toward their structurally closest node.
+        """Reassign ambiguous equal/delete/insert pairings to their structurally closest node.
 
-        The inner `SequenceMatcher` in `_repair` treats every current node sharing
-        a `_content_key` as interchangeable and pairs whichever ones it meets first
-        with the target — typically by position. When several current nodes share
-        text (a stale body paragraph and a live heading both reading "Setup"),
-        that can restyle-in-place the wrong one and delete the live heading
-        instead, destroying its `headingId`. Same thing happens, worse, when the
-        *target* side also repeats the text (e.g. restyling one duplicate up to a
-        heading and another down to a bullet): each ambiguous target then needs
-        its own best-matching current node, not just the first one considered.
+        Phase 2 of `_repair` (see its docstring): `pending` is every opcode
+        `_repair` produced from a non-`equal` phase-1 opcode — content-matched
+        `equal`/`replace` pieces from inside a `replace` run, plus whole
+        standalone `insert`/`delete` opcodes passed straight through — pooled
+        across the *entire* diff, not scoped to one run. This treats duplicate
+        `_content_key`s as an assignment problem the same way regardless of
+        which original opcode a candidate or slot came from.
 
-        So for every `_content_key` shared by more than one current node in this
-        run, this treats it as a small assignment problem: each target position
-        that currently has an "equal" pairing is a slot, every current node
-        sharing the key (whether currently paired or currently "delete") is a
-        candidate, and slots claim candidates greedily by structural similarity
-        (style, heading-ness, list-item-ness), highest score first, ties going to
-        a candidate's own existing slot so an already-fine pairing is not
-        needlessly perturbed. Whichever candidates no slot claims become deletes.
+        This generalizes what used to be a `replace`-run-local fixup. Two
+        gaps that scoping closed:
 
-        This only ever reassigns which current index a given target range maps
-        to — the target ranges themselves, and every other opcode's indices, are
-        untouched — so it cannot double-book or drop a target index. There is no
-        list-order requirement to preserve: `build()` and `diff_summary()` both
-        consume each opcode by its own absolute (i1, i2, j1, j2), and `_coalesce`
-        only merges entries whose indices are exactly contiguous, so reordering
-        which candidate owns which target range cannot corrupt either consumer.
+        1. A restyle-only pair can end up as a standalone `insert` and a
+           standalone `delete` with an unrelated `equal` opcode between them
+           (issue #52) — duplicate current-side text lets the *outer*,
+           `_node_key`-keyed matcher anchor on the wrong occurrence, pushing
+           the real edit's two halves out of any shared `replace` run
+           entirely. A whole `insert` opcode was never a slot before (only
+           `replace`-interior and singleton `equal`/`delete` entries were),
+           so this shape was invisible to the old, run-scoped repair.
+        2. A `replace` run's duplicate `_content_key` correspondence to a
+           node living in a *different* run (or in a standalone `insert`/
+           `delete`) was invisible for the same reason.
 
-        Generalization: a duplicate-content current node does not stop being a
-        candidate just because the inner matcher happened to fold it into a
-        multi-node "replace" block alongside other, genuinely different content
-        in the same run (e.g. a live heading sitting next to an edited sentence,
-        with the actual duplicate target slot won by a stray paragraph
-        elsewhere in the run). Every current index inside a "replace" opcode is
-        registered as a candidate the same way a singleton "delete" is; if one
-        wins a slot, its parent "replace" opcode is structurally split
+        Mechanics (unchanged from the run-scoped version, just over a wider
+        pool): for every `_content_key` shared by more than one node, this is
+        a small assignment problem. A "slot" is a target position that could
+        receive an in-place restyle — an existing "equal" pairing (which
+        already has a current node assigned, itself a candidate, so ties can
+        prefer leaving it alone) or a standalone "insert" singleton (which
+        has no current node yet — the #52 gap). A "candidate" is any current
+        node that could fill a slot — a singleton "equal"/"delete" entry, or
+        an index still trapped inside a "replace" opcode's current range.
+        Slots claim candidates greedily by structural similarity (style,
+        heading-ness, list-item-ness), highest score first, ties going to a
+        slot's own existing candidate so an already-fine pairing is not
+        needlessly perturbed. An "equal" slot whose own candidate is claimed
+        by someone else has its target range re-exposed as a fresh standalone
+        "insert" (its own current node becomes a "delete" only if that node
+        itself went unclaimed — the two are independent, see the two-part
+        fixup below); an "insert" slot left unclaimed stays an "insert"
+        (nothing regresses over the old behavior — it is simply not fixed,
+        same as before this function ran at all).
+
+        This only ever reassigns which current index a given target range
+        maps to — the target ranges themselves, and every other opcode's
+        indices, are untouched — so it cannot double-book or drop a target
+        index. There is no list-order requirement to preserve: `build()` and
+        `diff_summary()` both consume each opcode by its own absolute
+        (i1, i2, j1, j2), and `_coalesce` only merges entries whose indices
+        are exactly contiguous, so reordering which candidate owns which
+        target range cannot corrupt either consumer.
+
+        Generalization retained from the run-scoped version: a duplicate-
+        content current node does not stop being a candidate just because it
+        sits inside a multi-node "replace" block alongside genuinely
+        different content. Every current index inside a "replace" opcode is
+        registered as a candidate the same way a singleton "delete" is; if
+        one wins a slot, its parent "replace" opcode is structurally split
         afterward — the winning index is carved out as its own "equal", and
         whatever current indices remain keep the original, untouched target
         range (attached to the first surviving contiguous run; any other
         surviving run becomes a plain "delete", since the target content is
         already spoken for). If every current index in the block is claimed,
-        the target range becomes a fresh "insert" anchored where the block used
-        to be. This never touches a target index more than once and never
-        drops one, so it cannot corrupt `build()`/`diff_summary()` the same way
-        the singleton case cannot (see above).
+        the target range becomes a fresh "insert" anchored where the block
+        used to be.
 
         Scope note: only the *current* side of "replace"/"insert" opcodes is
-        considered here. A duplicate *target* slot trapped inside a multi-node
-        block (the symmetric case) is not decomposed — there is no existing
-        "equal" opcode to use as the slot in that case, only a range with no
-        established per-index correspondence to split by. That gap is open.
+        considered as candidates. A duplicate *target* slot trapped inside a
+        multi-node "replace" block (the symmetric case) is not decomposed —
+        there is no existing "equal" opcode to use as the slot in that case,
+        only a range with no established per-index correspondence to split
+        by. That gap is open, same as before.
         """
         expanded: List[Opcode] = []
-        for tag, ci1, ci2, cj1, cj2 in pending:
+        expanded_origin: List[int] = []
+        for (tag, ci1, ci2, cj1, cj2), run_id in zip(pending, origin):
             if tag == "delete" and ci2 - ci1 > 1:
                 for idx in range(ci1, ci2):
                     expanded.append(("delete", idx, idx + 1, cj1, cj1))
+                    expanded_origin.append(run_id)
+            elif tag == "insert" and cj2 - cj1 > 1:
+                for idx in range(cj1, cj2):
+                    expanded.append(("insert", ci1, ci1, idx, idx + 1))
+                    expanded_origin.append(run_id)
             else:
                 expanded.append((tag, ci1, ci2, cj1, cj2))
+                expanded_origin.append(run_id)
 
-        # A candidate id is either ("pos", position) — a singleton "equal"/
-        # "delete" entry in `expanded`, matching the prior behavior — or
-        # ("interior", position, idx) — a current index still trapped inside
-        # the "replace" opcode at `position`. Only "pos" candidates that are
-        # currently "equal" can be slots; "interior" candidates can only win.
-        by_key: Dict[Tuple, List[Tuple]] = {}
+        # Snapshot for the invariant check at the bottom of this function:
+        # the set of target indices this whole pool is responsible for must
+        # come out the same on the other end, however it gets reshuffled.
+        original_targets = self._covered_target_indices(expanded)
+
+        # Candidates: every current-side node available for reassignment —
+        # singleton "equal"/"delete" entries, and every index still trapped
+        # inside a "replace" opcode's current range.
+        #
+        # This pool (and the matching `slots_by_key` below) is now scoped to
+        # the *whole document* rather than one `replace` run (PR #70,
+        # generalizing issue #52's fix) — the per-`_content_key` assignment
+        # below is still worst-case O(n^2) in the size of the largest
+        # duplicate-content group, and that cost is no longer bounded by a
+        # single run. No size guard exists yet; flagged here as a pointer
+        # for a future perf pass rather than blocking this fix on it.
+        candidates_by_key: Dict[Tuple, List[Tuple]] = {}
         for pos, (tag, ci1, ci2, _cj1, _cj2) in enumerate(expanded):
             if tag in ("equal", "delete") and ci2 - ci1 == 1:
-                by_key.setdefault(self._content_key(cur_slice[ci1 - i1]), []).append(("pos", pos))
+                candidates_by_key.setdefault(self._content_key(current[ci1]), []).append(
+                    ("pos", pos)
+                )
             elif tag == "replace":
                 for idx in range(ci1, ci2):
-                    key = self._content_key(cur_slice[idx - i1])
-                    by_key.setdefault(key, []).append(("interior", pos, idx))
+                    key = self._content_key(current[idx])
+                    candidates_by_key.setdefault(key, []).append(("interior", pos, idx))
+
+        def _candidate_origin(cid: Tuple) -> int:
+            # Both "pos" and "interior" candidate ids carry the owning
+            # expanded-list position as their second element.
+            return expanded_origin[int(cid[1])]
 
         def _current_index(cid: Tuple) -> int:
             if cid[0] == "pos":
                 return int(expanded[cid[1]][1])
             return int(cid[2])
 
+        # Slots: singleton "equal" entries (self_cid is their own existing
+        # candidate id, preferred on ties) and singleton "insert" entries
+        # (self_cid is None — no current node is assigned yet, the #52 gap).
+        slots_by_key: Dict[Tuple, List[Tuple[int, Optional[Tuple]]]] = {}
+        for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
+            if tag == "equal" and cj2 - cj1 == 1:
+                key = self._content_key(current[ci1])
+                slots_by_key.setdefault(key, []).append((pos, ("pos", pos)))
+            elif tag == "insert" and cj2 - cj1 == 1:
+                key = self._content_key(target[cj1])
+                slots_by_key.setdefault(key, []).append((pos, None))
+
         # position -> {idx: (target j1, target j2)} claimed out of a "replace" opcode
         extractions: Dict[int, Dict[int, Tuple[int, int]]] = {}
+        # Standalone "insert" slot positions fully satisfied by a relocated
+        # candidate — their meaning transferred to that candidate's new
+        # "equal" opcode, so the original "insert" entry is now redundant.
+        satisfied_inserts: set = set()
+        # (anchor, target j1, target j2) for an "equal" slot's own target
+        # range when nothing won it *and* `expanded[spos]` was reused by a
+        # different slot to record its own reassignment — see the second
+        # per-slot loop below.
+        new_inserts: List[Tuple[int, int, int]] = []
 
-        for positions in by_key.values():
-            slot_ids = [cid for cid in positions if cid[0] == "pos" and expanded[cid[1]][0] == "equal"]
-            if not slot_ids or len(positions) < 2:
+        for key, slot_entries in slots_by_key.items():
+            candidates = candidates_by_key.get(key, [])
+            if not candidates:
                 continue
-            slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
 
             pair_scores = []
-            for si, sid in enumerate(slot_ids):
-                scj1, _scj2 = slot_targets[sid]
-                target_node = tgt_slice[scj1 - j1]
-                for ci, cid in enumerate(positions):
-                    score = self._structural_score(cur_slice[_current_index(cid) - i1], target_node)
-                    pair_scores.append((score, sid == cid, si, ci, sid, cid))
-            pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
+            for si, (spos, self_cid) in enumerate(slot_entries):
+                _, _sci1, _sci2, scj1, _scj2 = expanded[spos]
+                target_node = target[scj1]
+                slot_origin = expanded_origin[spos]
+                for ci, cid in enumerate(candidates):
+                    score = self._structural_score(current[_current_index(cid)], target_node)
+                    same_origin = _candidate_origin(cid) == slot_origin
+                    pair_scores.append(
+                        (same_origin, score, cid == self_cid, si, ci, spos, self_cid, cid)
+                    )
+            # A candidate from the *same* original (pre-repair) opcode as the
+            # slot is preferred outright over one from elsewhere, even if the
+            # elsewhere one scores higher on style/heading/list-item alone —
+            # see the docstring's "closer" note. Without this, pooling
+            # globally lets an unrelated node from a totally different edit
+            # win a slot away from the correct same-run candidate whenever
+            # `_structural_score`'s crude heuristic happens to favor it (e.g.
+            # a coincidental raw-style match beating a real is_list_item
+            # match). Only when nothing in the slot's own run shares the
+            # content key does this fall through to the global pool.
+            pair_scores.sort(
+                key=lambda t: (0 if t[0] else 1, -t[1], 0 if t[2] else 1, t[3], t[4])
+            )
 
-            assigned_candidate_for: Dict[Tuple, Tuple] = {}
+            assigned_candidate_for: Dict[int, Tuple] = {}
             chosen_candidates = set()
-            for _score, _self_pair, _si, _ci, sid, cid in pair_scores:
-                if sid in assigned_candidate_for or cid in chosen_candidates:
+            for _same_origin, _score, _self_pair, _si, _ci, spos, _self_cid, cid in pair_scores:
+                if spos in assigned_candidate_for or cid in chosen_candidates:
                     continue
-                assigned_candidate_for[sid] = cid
+                assigned_candidate_for[spos] = cid
                 chosen_candidates.add(cid)
 
-            for sid, cid in assigned_candidate_for.items():
-                if cid == sid:
+            # Snapshot each slot's target range before mutating `expanded`.
+            # A slot position can *also* be another slot's winning "pos"
+            # candidate (every singleton "equal" entry is registered as both
+            # a slot and a candidate) — e.g. a genuine two-way swap where
+            # slot A's winner is slot B's own node and vice versa. Re-reading
+            # `expanded[spos]` inside this loop, after an earlier iteration
+            # may have already overwritten it via the `expanded[cid[1]] = `
+            # assignment below, silently swapped in the wrong target range
+            # and dropped one target index while duplicating another —
+            # verified by direct repro before this snapshot was added.
+            slot_target_range = {spos: (expanded[spos][3], expanded[spos][4]) for spos, _ in slot_entries}
+
+            for spos, self_cid in slot_entries:
+                winning_cid = assigned_candidate_for.get(spos)
+                if winning_cid is None or winning_cid == self_cid:
                     continue
-                scj1, scj2 = slot_targets[sid]
-                if cid[0] == "pos":
-                    _, cci1, cci2, _, _ = expanded[cid[1]]
-                    expanded[cid[1]] = ("equal", cci1, cci2, scj1, scj2)
+                scj1, scj2 = slot_target_range[spos]
+                if winning_cid[0] == "pos":
+                    _, cci1, cci2, _, _ = expanded[winning_cid[1]]
+                    expanded[winning_cid[1]] = ("equal", cci1, cci2, scj1, scj2)
                 else:
-                    _, rpos, idx = cid
+                    _, rpos, idx = winning_cid
                     extractions.setdefault(rpos, {})[idx] = (scj1, scj2)
+                if self_cid is None:
+                    satisfied_inserts.add(spos)
 
-            for sid in slot_ids:
-                if sid not in chosen_candidates:
-                    _, sci1, sci2, scj1, _scj2 = expanded[sid[1]]
-                    expanded[sid[1]] = ("delete", sci1, sci2, scj1, scj1)
+            # Two independent things can go wrong for a slot that did not
+            # keep its own self-candidate (cid != self_cid above), and they
+            # must be handled separately rather than conflated into one
+            # "becomes a delete" fallback:
+            #
+            #  1. The slot's own *target* range (`spos`) may have won no
+            #     candidate at all (`assigned_candidate_for.get(spos) is
+            #     None`). That target still needs a home. Usually it's
+            #     still sitting untouched in `expanded[spos]` — but `spos`
+            #     doubles as a *candidate id* too (every singleton "equal"
+            #     slot is also its own self-candidate), so a *different*
+            #     slot can have already overwritten `expanded[spos]` via
+            #     the `expanded[cid[1]] = ...` mutation above, when this
+            #     slot's own current node won that other slot's target
+            #     instead. In that case the target range computed here
+            #     would silently vanish unless re-exposed as a fresh
+            #     standalone "insert" — this is the second instance of the
+            #     "shared mutable state across a greedy per-key assignment"
+            #     bug class (the first was the stale-read fixed by the
+            #     snapshot above, in 511bd0d/bdb311c), so use the same
+            #     pre-mutation snapshot rather than re-reading `expanded`.
+            #  2. The slot's own *current node* (`self_cid`) may not have
+            #     been claimed by anyone (`self_cid not in
+            #     chosen_candidates`) — genuinely surplus, so it becomes a
+            #     delete. Standalone "insert" slots (`self_cid is None`)
+            #     have no current node to dispose of.
+            #
+            # These two facts are independent: a slot can need both (its
+            # current node deleted *and* its target range re-inserted), or
+            # just one (its current node reassigned to fill someone else's
+            # slot, but its own target range still needs (1)).
+            for spos, self_cid in slot_entries:
+                winning_cid = assigned_candidate_for.get(spos)
+                if winning_cid == self_cid:
+                    continue
+                if self_cid is None:
+                    # Standalone "insert" slot, left unclaimed: stays
+                    # "insert" (nothing regresses over the old behavior).
+                    continue
+                scj1, scj2 = slot_target_range[spos]
+                if winning_cid is None:
+                    new_inserts.append((expanded[spos][1], scj1, scj2))
+                if self_cid not in chosen_candidates:
+                    _, sci1, sci2, _, _ = expanded[spos]
+                    expanded[spos] = ("delete", sci1, sci2, scj1, scj1)
 
-        if not extractions:
-            return expanded
+        expanded.extend(
+            ("insert", anchor, anchor, scj1, scj2) for anchor, scj1, scj2 in new_inserts
+        )
 
-        rebuilt: List[Opcode] = []
-        new_equals: List[Opcode] = []
-        for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
-            claimed = extractions.get(pos)
-            if not claimed:
-                rebuilt.append((tag, ci1, ci2, cj1, cj2))
-                continue
-            for idx, (scj1, scj2) in claimed.items():
-                new_equals.append(("equal", idx, idx + 1, scj1, scj2))
-            remaining = []
-            start = ci1
-            for idx in sorted(claimed):
-                if idx > start:
-                    remaining.append((start, idx))
-                start = idx + 1
-            if start < ci2:
-                remaining.append((start, ci2))
-            if not remaining:
-                rebuilt.append(("insert", ci1, ci1, cj1, cj2))
-            else:
-                (first_start, first_end), *rest = remaining
-                rebuilt.append(("replace", first_start, first_end, cj1, cj2))
-                for start, end in rest:
-                    rebuilt.append(("delete", start, end, cj1, cj1))
-        rebuilt.extend(new_equals)
+        if extractions or satisfied_inserts:
+            rebuilt: List[Opcode] = []
+            new_equals: List[Opcode] = []
+            for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
+                if pos in satisfied_inserts:
+                    continue
+                claimed = extractions.get(pos)
+                if not claimed:
+                    rebuilt.append((tag, ci1, ci2, cj1, cj2))
+                    continue
+                for idx, (scj1, scj2) in claimed.items():
+                    new_equals.append(("equal", idx, idx + 1, scj1, scj2))
+                remaining = []
+                start = ci1
+                for idx in sorted(claimed):
+                    if idx > start:
+                        remaining.append((start, idx))
+                    start = idx + 1
+                if start < ci2:
+                    remaining.append((start, ci2))
+                if not remaining:
+                    rebuilt.append(("insert", ci1, ci1, cj1, cj2))
+                else:
+                    (first_start, first_end), *rest = remaining
+                    rebuilt.append(("replace", first_start, first_end, cj1, cj2))
+                    for start, end in rest:
+                        rebuilt.append(("delete", start, end, cj1, cj1))
+            rebuilt.extend(new_equals)
+        else:
+            rebuilt = expanded
+
+        # Invariant: this function only ever reassigns which current index
+        # a given target range maps to (see docstring) — it must never drop
+        # or duplicate a target index. Cheap to check unconditionally, and
+        # this exact bug class (a slot's target silently swallowed by
+        # another slot's mutation) has now recurred once already, so make a
+        # future regression fail loudly here instead of surfacing as a
+        # missing paragraph downstream. Checked against the actual return
+        # value (post `extractions`/`satisfied_inserts` rebuild) rather than
+        # the intermediate `expanded` list — a target range that a
+        # `replace`-interior candidate won is legitimately absent from
+        # `expanded` at that point (it lives in `extractions` until the
+        # rebuild below re-homes it as a fresh "equal"), so asserting on
+        # `expanded` mid-rebuild produced false-positive failures.
+        final_targets = self._covered_target_indices(rebuilt)
+        assert final_targets == original_targets, (
+            "_prefer_structural_pairing dropped or duplicated target "
+            f"indices: missing={sorted(original_targets - final_targets)} "
+            f"extra={sorted(final_targets - original_targets)}"
+        )
+
         return rebuilt
 
     @staticmethod
