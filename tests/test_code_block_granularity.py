@@ -29,6 +29,10 @@ it look like data loss, and what kept it unnoticed. See issue #40.
 """
 from __future__ import annotations
 
+from typing import Callable
+from unittest.mock import MagicMock
+
+from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
@@ -417,6 +421,41 @@ class TestRenderPrefix:
         target, _ = project(markdown.parse("bold notes\n"))
         alignment = builder.align(doc, target)
         assert [r.kind for r in alignment.residue] == ["ambiguous_code_prefix"]
+
+    def test_push_surfaces_pass_2_residue_from_its_own_reparse(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """The wiring, not just the pure function above: `push()` must forward it.
+
+        `align()`'s residue (proven by the test above) only reaches a caller of
+        `push()` if `backend.py` actually reads `alignment.residue` and threads
+        it through `describe_residue` — that plumbing (`pass2_residue` in
+        `GoogleDocsBackend.push`) had no coverage of its own: deleting all four
+        touch points (the declaration, the assignment, and both
+        `describe_residue(pass2_residue)` call sites) left the full suite green.
+        This drives the real `push()` entry point against a document that
+        produces an `ambiguous_code_prefix` residue on pass 2's own re-parse —
+        not pass 1's — so dropping that wiring again fails a test instead of
+        only a manual revert.
+        """
+        backend, fake_client = make_backend()
+        before = {"revisionId": "rev-1", "body": {"content": []}}
+        after = {"revisionId": "rev-2", "body": {"content": [{
+            "startIndex": 1, "endIndex": 15, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [
+                    {"textRun": {"content": "", "textStyle": {}}},
+                    {"textRun": {"content": "bold notes\n", "textStyle": {"bold": True}}},
+                ],
+            }}]}}
+        fake_client.get_document.side_effect = [before, after]
+        local = tmp_path / "doc.md"
+        local.write_text("**bold notes**\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        assert "code-block chrome" in (result.message or ""), result.message
 
 
 class TestRenderPrefixParticipatesInIdentity:

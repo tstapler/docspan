@@ -245,6 +245,34 @@ class TestWriteDirection:
         ]
         assert links == [{"headingId": "h.intro"}]
 
+    def test_a_title_anchor_resolves_through_build_span_style_requests(self) -> None:
+        """TITLE variant of the test above, through the real push entry point.
+
+        This is a pre-existing property, not something introduced by the
+        pass-2-residue fix: `is_heading_style` already accepted a literal
+        `"TITLE"` on `main`, so `heading_slug_to_id(current)` resolves `#my-doc`
+        whether or not `current` was projected first. It is kept here (rather
+        than only via `structure.parse` in `TestHeadingMaps`) because it is the
+        one place this resolves through `build_span_style_requests` instead of
+        directly against parsed nodes.
+        """
+        doc = _doc(
+            _paragraph("My doc", 1, "TITLE", "h.title"),
+            _paragraph("see it", 8, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+        )
+        target = markdown.parse("see [it](#my-doc)\n")
+
+        requests = builder.build_span_style_requests(doc, target)
+
+        links = [
+            r["updateTextStyle"]["textStyle"]["link"]
+            for r in requests
+            if "link" in r["updateTextStyle"]["textStyle"]
+        ]
+        assert links == [{"headingId": "h.title"}]
+
     def test_a_url_and_an_anchor_in_one_paragraph_each_get_their_own_union_member(self) -> None:
         doc = _doc(
             _paragraph("Intro", 1, "HEADING_1", "h.intro"),
@@ -748,28 +776,6 @@ class TestNeverResolvesToTheWrongHeading:
         # document's own title reads back as no link at all.
         assert heading_slug_to_id(nodes) == {"my-doc": "h.title", "sub": "h.sub"}
         assert heading_id_to_slug(nodes) == {"h.title": "my-doc", "h.sub": "sub"}
-
-    def test_a_title_resolves_through_the_push_path(self) -> None:
-        """The write-side counterpart of `test_a_document_title_is_a_valid_anchor_target`.
-
-        A partial push whose markdown does not repeat the title still needs
-        `#my-doc` to resolve: `_anchor_resolution` seeds `slug_to_id` from
-        `heading_slug_to_id(current)` (the document's own headings), and
-        `current` is a TITLE paragraph here. `_align_for_styling` projects
-        `current` before this runs, remapping TITLE to HEADING_1 without
-        touching `heading_id` (see `is_heading_style`'s docstring) — this goes
-        through `build_span_style_requests`, the actual push entry point,
-        rather than calling `heading_slug_to_id` directly on parsed nodes the
-        way the read-side test above does.
-        """
-        doc = _doc(
-            _paragraph("My doc", 1, "TITLE", "h.title"),
-            _paragraph("see it", 8, runs=[
-                {"textRun": {"content": "see it\n", "textStyle": {}}}
-            ]),
-        )
-        md = "see [it](#my-doc)\n"
-        assert self._links(doc, md) == [{"headingId": "h.title"}]
 
     def test_a_title_link_reads_back_as_its_slug(self) -> None:
         """The same property end to end: pull renders `#my-doc`, not a bare id."""
