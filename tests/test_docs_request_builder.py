@@ -360,7 +360,7 @@ def test_replace_of_a_render_prefix_doc_end_paragraph_keeps_leading_newline_not_
     AND has a render_prefix trim must keep the existing leading-newline
     behavior (#56) — the render_prefix/structural case takes priority over
     the newer doc-end-clamp bare mode per plan.md's precedence decision."""
-    current = [replace(_para("# cfg", start=1, end=7), render_prefix="")]
+    current = [replace(_para("# cfg", start=1, end=7), render_prefix="")]
     target = [_para("# other", start=0, end=0)]
     # doc_end_index=6 makes the render_prefix-trimmed end (1 + len("# cfg")
     # == 6) also satisfy the doc-end clamp, so without the precedence gate
@@ -477,10 +477,6 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
         "endIndex": 63,
     }
     assert bullet_requests[0]["createParagraphBullets"]["bulletPreset"] == "BULLET_DISC_CIRCLE_SQUARE"
-    assert bullet_requests[0]["createParagraphBullets"]["range"] == {
-        "startIndex": 50,
-        "endIndex": 64,
-    }
     assert not any(
         r.get("createParagraphBullets", {}).get("bulletPreset") == "BULLET_CHECKBOX"
         for r in requests

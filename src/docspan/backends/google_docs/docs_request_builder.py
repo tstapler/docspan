@@ -1951,7 +1951,7 @@ class DocsRequestBuilder:
             text_len = _utf16_len(node.text) if is_bare else _utf16_len(node.text + "\n")
             paragraph_range = {
                 "startIndex": paragraph_start,
-                "endIndex": paragraph_end,
+                "endIndex": paragraph_start + text_len,
             }
             requests.append({
                 "updateParagraphStyle": {
