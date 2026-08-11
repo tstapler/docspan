@@ -17,7 +17,11 @@ _GoogleDocsMarkdownConverter has the same per-line-inline-code symptom via a
 completely separate CSS-font-family-based mechanism and is NOT touched here
 — see issue #45's "Scope gap found late": that HTML-export pipeline has no
 render_prefix/span-shape equivalent to key fence detection off, would need
-its own detection heuristic, and was out of scope for this fix.
+its own detection heuristic, and was out of scope for this fix. This was
+confirmed rather than silently assumed: a live scope-confirmation request
+went unanswered, so the gap was filed as a separate, explicit follow-up
+(docspan backlog item a500ef94-2e02-499e-a628-5f843198c49e) instead of being
+folded into or dropped from this fix.
 """
 from __future__ import annotations
 
