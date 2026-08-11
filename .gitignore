@@ -65,3 +65,8 @@ site/
 *.tfstate.backup
 *.tfvars
 .terraform.lock.hcl
+
+# Session scaffolding — regenerated per backlog-session spawn/attach, never a
+# repo deliverable (see commits 8f80a5b, bd693ca on other branches)
+.backlog-context.md
+.claude/commands/backlog/

@@ -281,6 +281,77 @@ def test_replace_of_a_multi_node_range_does_not_spare_newline_when_only_first_no
     assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ\n"
 
 
+def test_replace_of_the_docs_last_paragraph_does_not_add_a_second_newline() -> None:
+    """Regression (#62): the doc_end_index clamp in _delete_bounds spares the
+    terminal newline of the document's true last paragraph (undeletable), but
+    build()'s replace branch used to write `target_text + "\\n"` regardless,
+    duplicating that newline and leaving a stray empty paragraph behind on
+    every edit to the doc's last line."""
+    current = [_para("Old text", start=8, end=17)]
+    target = [_para("New text", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=17)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "New text"
+
+
+def test_render_prefix_paragraph_that_is_also_the_docs_last_paragraph_uses_before_newline() -> None:
+    """Mutual-exclusivity guard: when a node is BOTH a render_prefix paragraph
+    (#48) and the document's last paragraph (#62), the existing
+    before_newline=True path wins, not the new bare mode."""
+    current = [replace(_para("# cfg", start=8, end=14), render_prefix='\ue907')]
+    target = [_para("# other", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=14)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\n# other"
+
+
+def test_replace_of_a_multi_node_range_at_doc_end_only_bares_the_last_node() -> None:
+    """Multi-node replace ending at doc end: only the last deleted node
+    borders the clamp-spared terminal newline, so only the last TARGET node
+    gets bare treatment — earlier target nodes keep their own trailing
+    newline since they're followed by more inserted text, not by the spared
+    newline."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9),
+    ]
+    target = [
+        _para("XXXXXX", start=0, end=0),
+        _para("YYYYYY", start=0, end=0),
+    ]
+    requests = builder.build(current, target, doc_end_index=9)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 2
+    # Both inserts share the same location; Docs applies them in array order,
+    # so the array-first (YYYYYY, bare) is inserted first and then pushed
+    # right by the array-second (XXXXXX\n) insert landing at the same index —
+    # yielding "XXXXXX\nYYYYYY" in the final document.
+    assert insert_requests[0]["insertText"]["text"] == "YYYYYY"
+    assert insert_requests[1]["insertText"]["text"] == "XXXXXX\n"
+
+
+def test_bare_last_insert_computes_correct_paragraph_range() -> None:
+    """updateParagraphStyle/createParagraphBullets ranges in bare mode must
+    exclude the trailing newline the insert doesn't write, or the computed
+    range extends one UTF-16 unit past the actual inserted text."""
+    node = _para("New text", start=0, end=0)
+    requests = DocsRequestBuilder()._make_insert_requests(
+        [node], insert_at_index=8, bare_last=True
+    )
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert len(style_requests) == 1
+    assert style_requests[0]["updateParagraphStyle"]["range"] == {
+        "startIndex": 8,
+        "endIndex": 16,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Style-only change
 # ─────────────────────────────────────────────────────────────────────────────
@@ -311,14 +382,17 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
     written as a native checkbox glyph)."""
     current = [_para("[ ] Splitwise", start=50, end=65, is_list_item=True)]
     target = [_para("[x] Splitwise", start=50, end=65, is_list_item=True)]
-    # doc_end_index == current node's end_index so the terminal-newline
-    # clamp in _make_delete_requests applies, matching plan.md Story 2.1.3's
-    # worked example: deleteContentRange clamps to [50, 64).
+    # doc_end_index == current node's end_index so both the terminal-newline
+    # clamp in _make_delete_requests (deleteContentRange clamps to [50, 64))
+    # and the mirror bare-insert clamp (#62) apply: this node is the doc's
+    # last paragraph, so the insert must not re-add the newline the delete
+    # already spared.
     requests = builder.build(current, target, doc_end_index=65)
 
     delete_requests = [r for r in requests if "deleteContentRange" in r]
     insert_requests = [r for r in requests if "insertText" in r]
     bullet_requests = [r for r in requests if "createParagraphBullets" in r]
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
 
     assert len(delete_requests) == 1
     assert delete_requests[0]["deleteContentRange"]["range"] == {
@@ -327,9 +401,19 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
     }
 
     assert len(insert_requests) == 1
-    assert insert_requests[0]["insertText"]["text"] == "[x] Splitwise\n"
+    assert insert_requests[0]["insertText"]["text"] == "[x] Splitwise"
+
+    assert len(style_requests) == 1
+    assert style_requests[0]["updateParagraphStyle"]["range"] == {
+        "startIndex": 50,
+        "endIndex": 63,
+    }
 
     assert len(bullet_requests) == 1
+    assert bullet_requests[0]["createParagraphBullets"]["range"] == {
+        "startIndex": 50,
+        "endIndex": 63,
+    }
     assert bullet_requests[0]["createParagraphBullets"]["bulletPreset"] == "BULLET_DISC_CIRCLE_SQUARE"
     assert not any(
         r.get("createParagraphBullets", {}).get("bulletPreset") == "BULLET_CHECKBOX"
@@ -394,7 +478,9 @@ def test_edited_paragraph_with_link_style_loses_text_style_request_confirming_ga
         )
     ]
 
-    requests = builder.build(current, target, doc_end_index=31)
+    # doc_end_index must be >= the node's end_index (34) — this paragraph is
+    # not the document's last, so the #62 bare-insert clamp must not apply.
+    requests = builder.build(current, target, doc_end_index=DOC_END)
 
     insert_requests = [r for r in requests if "insertText" in r]
     style_requests = [r for r in requests if "updateTextStyle" in r]
