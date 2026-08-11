@@ -12,7 +12,8 @@ import pytest
 from googleapiclient.errors import HttpError
 
 from docspan.backends.google_docs.client import GoogleDocsClient
-from docspan.backends.google_docs.docs_request_builder import DiffEntry
+from docspan.backends.google_docs.docs_request_builder import DiffEntry, DocsRequestBuilder
+from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 from docspan.backends.google_docs.push_preview import (
     HighRiskParagraph,
     PushPreview,
@@ -21,6 +22,12 @@ from docspan.backends.google_docs.push_preview import (
     render_churn_note,
     render_high_risk,
 )
+
+def _para(text: str, style: str = "NORMAL_TEXT", is_list_item: bool = False) -> DocsParagraphNode:
+    return DocsParagraphNode(
+        style=style, text=text, start_index=1, end_index=10, is_list_item=is_list_item
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.list_comments()
@@ -396,6 +403,48 @@ def test_find_churn_pairs_ignores_adjacent_entries_from_different_edit_groups() 
     pairs = find_churn_pairs(entries)
 
     assert pairs == []
+
+
+def test_find_churn_pairs_ignores_a_real_structural_split_with_no_hand_built_entries() -> None:
+    """End-to-end version of the test above: drive an actual
+    `DocsRequestBuilder.diff_summary()` call through a real
+    `_prefer_structural_pairing` structural split, instead of hand-constructing
+    `DiffEntry` objects with the `edit_group`s we want to see.
+
+    A stray "Setup" body paragraph and the live "Setup" heading share text, so
+    `_prefer_structural_pairing` awards the heading's slot to the live node and
+    demotes the stray one — landing it as a plain, unmatched `remove`. In the
+    same pass, the heading's restyle is reported as an `add` (it has no
+    surviving current-side pair once its own slot is claimed by the outer
+    "Alpha" edit's run) with identical text ("Setup") and no `equal` entry
+    between them, so they sit directly adjacent in `entries`. They come from
+    different `_opcodes()` iterations (edit_group 0 vs 2) and are not the same
+    paragraph being torn down and rebuilt — pairing them as churn would be a
+    real false positive from naive text+adjacency matching.
+    """
+    current = [
+        _para("Alpha"),
+        _para("Setup"),
+        _para("Setup", style="HEADING_2"),
+    ]
+    target = [
+        _para("AlphaX"),
+        _para("Setup", style="HEADING_3"),
+        _para("Setup"),
+    ]
+
+    entries, _unchanged = DocsRequestBuilder().diff_summary(current, target)
+
+    adds = [e for e in entries if e.kind == "add" and e.target_text == "Setup"]
+    removes = [e for e in entries if e.kind == "remove" and e.current_text == "Setup"]
+    assert adds and removes, (
+        "fixture no longer produces the adjacent same-text remove/add split "
+        "this test depends on — re-derive it against the current "
+        "_prefer_structural_pairing behavior"
+    )
+    assert adds[0].edit_group != removes[0].edit_group
+
+    assert find_churn_pairs(entries) == []
 
 
 def test_find_churn_pairs_excludes_table_rows() -> None:
