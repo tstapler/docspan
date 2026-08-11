@@ -231,6 +231,9 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
         lang: Optional[str] = None
         start = i
         if _is_language_marker(node) and i + 1 < n:
+            # _is_language_marker already requires DocsParagraphNode; assert
+            # narrows the Node union for mypy without re-checking at runtime.
+            assert isinstance(node, DocsParagraphNode)
             if _is_pure_code_line(nodes[i + 1]):
                 lang = node.text[len(FENCE_MARKER):]
                 start = i + 1
@@ -271,7 +274,13 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
 
 
 def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
-    code_lines = [node.text for node in code_nodes]
+    # code_nodes are only ever populated via _is_pure_code_line/
+    # _is_blank_code_line, both of which require DocsParagraphNode; assert
+    # narrows the Node union for mypy without re-checking at runtime.
+    code_lines = []
+    for node in code_nodes:
+        assert isinstance(node, DocsParagraphNode)
+        code_lines.append(node.text)
     delim = _fence_delimiter(lang, code_lines)
     # CommonMark reads the fence's width off the *leading run* of the fence
     # character on the opening line, not a separately-tokenized delimiter —

@@ -316,7 +316,11 @@ class MarkdownToParagraphParser:
                 # merged block on the next pull — an accepted limitation of
                 # the same kind as the marker/prose ambiguity below, not
                 # fixed here.
-                info = (token.get("attrs") or {}).get("info") or ""
+                # token is `str | dict[str, Any]` per mistune's stubs; the
+                # isinstance guard narrows it for mypy (this loop's other
+                # branches already tolerate the same union untyped).
+                attrs = token.get("attrs") if isinstance(token, dict) else None
+                info = (attrs or {}).get("info") or ""
                 lang = info.strip()
                 if lang:
                     nodes.append(DocsParagraphNode(
