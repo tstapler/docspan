@@ -116,6 +116,19 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 spans = []
                 nodes.extend(_walk_list_items(child, nesting_level + 1))
                 continue
+            elif child.get("type") == "block_code":
+                text = _text_of(spans).strip()
+                if text:
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=text, is_list_item=True,
+                        nesting_level=nesting_level, start_index=0, end_index=0,
+                        spans=spans if _has_styling(spans) else [],
+                    ))
+                spans = []
+                nodes.extend(_nodes_from_code_block(
+                    child, is_list_item=True, nesting_level=nesting_level,
+                ))
+                continue
             else:
                 spans.extend(_spans_from_inline([child]))
         text = _text_of(spans).strip()
@@ -125,6 +138,39 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 nesting_level=nesting_level, start_index=0, end_index=0,
                 spans=spans if _has_styling(spans) else [],
             ))
+    return nodes
+
+
+def _nodes_from_code_block(
+    token: dict, *, is_list_item: bool = False, nesting_level: int = 0,
+) -> List[DocsParagraphNode]:
+    """One DocsParagraphNode per line of a fenced code block.
+
+    A Google Doc has no multi-line paragraph. Emitting the whole block as a
+    single node with embedded newlines meant `insertText` wrote "\\nline
+    one\\nline two", which Docs splits into N paragraphs — so every later diff
+    saw N document paragraphs against 1 markdown node and delete-and-reinserted
+    the whole block, on every push, forever. The text survived that; what did
+    not was idempotence, any comment anchored to a line of code, and the
+    monospace styling (pass 2 reported the block unaligned and emitted no span
+    requests at all). See issue #40 (top level) and #43 (list items and
+    blockquotes — the same token falls through to raw multi-line text at
+    those other two parse sites unless routed through this helper).
+
+    `strip("\n")` rather than `strip()`: the fence's own blank edges go,
+    indentation does not. Leading whitespace is meaning in code.
+    """
+    raw = token.get("raw", "").strip("\n")
+    nodes: List[DocsParagraphNode] = []
+    for line in raw.split("\n"):
+        nodes.append(DocsParagraphNode(
+            style="NORMAL_TEXT", text=line, is_list_item=is_list_item,
+            nesting_level=nesting_level, start_index=0, end_index=0,
+            # A blank line inside a block carries no span to style.
+            # projection.project() drops it from *both* sides, so the
+            # diff never sees it and never tries to delete it.
+            spans=[TextSpan(text=line, monospace=True)] if line else [],
+        ))
     return nodes
 
 
@@ -168,12 +214,22 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
             nodes.extend(
                 _prefix_node_text(n, prefix) for n in _walk_list_items(child, nesting_level=0)
             )
+        elif ctype == "block_code":
+            # A blank line inside the fence becomes a bare "> " line rather than
+            # being dropped: `_prefix_node_text` turns the empty text into a
+            # non-empty one, so it survives projection's blank-drop rule (which
+            # is keyed on text == "") — intentionally, so the quote's visual
+            # continuity isn't broken by a vanishing line mid-block. It carries
+            # no monospace span, matching every other blank code line.
+            nodes.extend(
+                _prefix_node_text(n, prefix) for n in _nodes_from_code_block(child)
+            )
         elif ctype == "block_quote":
             nodes.extend(_walk_block_quote(child, quote_depth + 1))
         elif ctype == "blank_line":
             continue
-        # nested tables/code inside a block quote are rare; fall back to
-        # skipping rather than mis-rendering them.
+        # nested tables inside a block quote are rare; fall back to skipping
+        # rather than mis-rendering them.
     return nodes
 
 
@@ -271,28 +327,7 @@ class MarkdownToParagraphParser:
                 nodes.extend(_walk_list_items(token, nesting_level=0))
 
             elif token_type in ("block_code", "code"):
-                # One node per line, because a Google Doc has no multi-line
-                # paragraph. Emitting the whole block as a single node with
-                # embedded newlines meant `insertText` wrote "\nline one\nline
-                # two", which Docs splits into N paragraphs — so every later diff
-                # saw N document paragraphs against 1 markdown node and
-                # delete-and-reinserted the whole block, on every push, forever.
-                # The text survived that; what did not was idempotence, any comment
-                # anchored to a line of code, and the monospace styling (pass 2
-                # reported the block unaligned and emitted no span requests at
-                # all). See issue #40.
-                #
-                # `strip("\n")` rather than `strip()`: the fence's own blank edges
-                # go, indentation does not. Leading whitespace is meaning in code.
-                raw = token.get("raw", "").strip("\n")
-                for line in raw.split("\n"):
-                    nodes.append(DocsParagraphNode(
-                        style="NORMAL_TEXT", text=line, start_index=0, end_index=0,
-                        # A blank line inside a block carries no span to style.
-                        # projection.project() drops it from *both* sides, so the
-                        # diff never sees it and never tries to delete it.
-                        spans=[TextSpan(text=line, monospace=True)] if line else [],
-                    ))
+                nodes.extend(_nodes_from_code_block(token))
 
             elif token_type == "table":
                 nodes.append(_table_from_token(token))
