@@ -46,6 +46,7 @@ class Pass2Alignment:
     current: List[Node]
     pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]]
     unaligned: List[DocsParagraphNode]
+    table_pairs: List[Tuple[int, DocsTableNode]]
     slug_to_id: dict
     known_ids: set
     residue: List[Residue]
@@ -950,30 +951,33 @@ class DocsRequestBuilder:
     # Pass 2 — fill table cells from a re-fetched doc
     # ──────────────────────────────────────────────
 
-    def build_table_fill_requests(self, doc: dict, target: List[Node]) -> List[dict]:
+    def build_table_fill_requests(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
         """
         Emit insertText requests to fill empty tables created by a prior push (pass 1).
 
-        Matches the empty tables in the re-fetched document (in document order) to the
-        DocsTableNodes in ``target`` (in order), reading real cell indices from ``doc`` so
-        no index prediction is required.
+        Pairs live tables with ``target`` DocsTableNodes via `_paired_tables` — the
+        same content-aligned, document-order pairing `build_table_cell_span_requests`
+        uses — then reads real cell indices from ``doc`` so no index prediction is
+        required. A live table that pairs but is not empty (already populated by an
+        earlier push) is skipped for insertion, but still consumes its pairing slot,
+        so a mix of populated and empty tables cannot shift a later table onto the
+        wrong target.
         """
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
 
+        aligned = self._aligned(doc, target, alignment)
         inserts: List[Tuple[int, str]] = []
-        ti = 0
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is None:
-                continue
+        for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             if not self._table_is_empty(table):
                 continue  # already populated (or a pre-existing content table)
-            if ti >= len(target_tables):
-                break
-            inserts.extend(self._cell_inserts(table, target_tables[ti]))
-            ti += 1
+            inserts.extend(self._cell_inserts(table, tnode))
 
         # Insert highest index first so earlier inserts don't shift later cell indices.
         inserts.sort(key=lambda pair: pair[0], reverse=True)
@@ -1013,7 +1017,7 @@ class DocsRequestBuilder:
 
         aligned = self._aligned(doc, target, alignment)
         requests: List[dict] = []
-        for table, tnode in self._paired_tables(doc, target_tables):
+        for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             for live, cell in self._paired_cells(table, tnode):
                 if not cell.styled:
                     continue
@@ -1062,10 +1066,11 @@ class DocsRequestBuilder:
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
-        live_tables = self._live_tables(doc, len(target_tables))
+        aligned = self._aligned(doc, target, alignment)
         missed: List[str] = []
-        for position, tnode in enumerate(target_tables):
-            table = live_tables[position] if position < len(live_tables) else None
+        paired = {id(tnode): table for table, tnode in self._paired_tables(doc, aligned.table_pairs)}
+        for tnode in target_tables:
+            table = paired.get(id(tnode))
             rows = table.get("tableRows", []) if table else []
             for r, row in enumerate(tnode.rows):
                 live_cells = rows[r].get("tableCells", []) if r < len(rows) else []
@@ -1092,50 +1097,37 @@ class DocsRequestBuilder:
         return missed
 
     @staticmethod
-    def _live_tables(doc: dict, limit: int) -> List[dict]:
-        """The first `limit` tables in body order — the pairing both cell passes use."""
-        tables: List[dict] = []
-        if limit <= 0:
-            return tables
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is not None:
-                tables.append(table)
-                if len(tables) >= limit:
-                    break
-        return tables
-
-    @staticmethod
     def _paired_tables(
-        doc: dict, target_tables: List[DocsTableNode]
+        doc: dict, table_pairs: List[Tuple[int, DocsTableNode]]
     ) -> Iterator[Tuple[dict, DocsTableNode]]:
-        """Live tables paired with target tables, in document order.
+        """Live tables paired with target tables via `_align_for_styling`'s content alignment.
 
-        Order is the only correspondence available: a table has no id, and
-        `_align_for_styling` keys a table on its whole cell grid, so a table whose
-        cells changed does not align at all.
+        The single pairing shared by `build_table_fill_requests` and
+        `build_table_cell_span_requests` — both used to compute their own
+        (one advancing only past *empty* live tables, the other advancing
+        unconditionally), which meant a live table's fill and its styling
+        could disagree about which target table it corresponded to. `doc` is
+        walked here, rather than in `_align_for_styling`, because
+        `table_pairs`' ordinals are positions among tables in the *parsed*
+        `current` list, and only the raw API dicts in `_body_content(doc)`
+        carry the real cell indices `_cell_inserts`/`_table_is_empty`/
+        `_cell_placement` need.
 
-        This is **not** the same pairing `build_table_fill_requests` uses — that one
-        advances only past *empty* live tables, so it pairs the Nth empty table with
-        the Nth target table. This pairs the Nth table outright, because by the time
-        styling runs pass 1 has filled them and "empty" no longer identifies them.
-
-        Raw body position is weaker than the content alignment
-        `build_span_style_requests` uses for paragraphs, and the gap is real: if a
-        concurrent edit adds a table between pass 1 and pass 2 the counts shift and a
-        stale table can be styled. `_cell_placement`'s text search catches that only
-        when the two tables' cell texts differ, and headers like "Status" or "Owner"
-        repeat constantly. Narrow, but the same window `_cell_placement` bails on.
+        A table has no id, and `_align_for_styling` keys every table on one
+        sentinel (`_alignment_key`), so within a content-aligned "equal" run
+        tables still pair by relative order — but that order now tracks
+        paragraphs difflib finds inserted or removed around a table, unlike
+        raw body position, which the previous version of this method used and
+        which drifts whenever a concurrent edit shifts table counts between
+        pass 1 and pass 2.
         """
-        index = 0
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is None:
+        live_tables = [
+            element["table"] for element in _body_content(doc) if element.get("table") is not None
+        ]
+        for ordinal, tnode in table_pairs:
+            if ordinal >= len(live_tables):
                 continue
-            if index >= len(target_tables):
-                return
-            yield table, target_tables[index]
-            index += 1
+            yield live_tables[ordinal], tnode
 
     @staticmethod
     def _paired_cells(
@@ -1215,12 +1207,15 @@ class DocsRequestBuilder:
         accepts ``alignment=None`` and computes its own, so a caller with only a
         document and a target — every existing test — keeps working.
         """
-        current, pairs, unaligned, heading_pairs, residue = self._align_for_styling(doc, target)
+        current, pairs, unaligned, heading_pairs, residue, table_pairs = (
+            self._align_for_styling(doc, target)
+        )
         slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
         return Pass2Alignment(
             current=current,
             pairs=pairs,
             unaligned=unaligned,
+            table_pairs=table_pairs,
             slug_to_id=slug_to_id,
             known_ids=known_ids,
             residue=residue,
@@ -1402,14 +1397,31 @@ class DocsRequestBuilder:
         List[DocsParagraphNode],
         List[Tuple[DocsParagraphNode, DocsParagraphNode]],
         List[Residue],
+        List[Tuple[int, DocsTableNode]],
     ]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(current, pairs, unaligned, heading_pairs, residue)`` — the
-        parsed document, pairs of (document node, target node) that are safe to
-        style, the target paragraphs with spans that could not be paired, the
-        same pairing restricted to target paragraphs that are headings, and any
-        residue from projecting this second, post-pass-1 parse of the document.
+        Returns ``(current, pairs, unaligned, heading_pairs, residue,
+        table_pairs)`` — the parsed document, pairs of (document node, target
+        node) that are safe to style, the target paragraphs with spans that
+        could not be paired, the same pairing restricted to target paragraphs
+        that are headings, any residue from projecting this second, post-pass-1
+        parse of the document, and the table pairing described below.
+
+        ``table_pairs`` pairs a *live table ordinal* (its position among only
+        the tables in ``current``, 0-based) with a target ``DocsTableNode``.
+        An ordinal rather than the parsed ``DocsTableNode`` itself, because
+        every table consumer (`_table_is_empty`, `_cell_inserts`,
+        `_cell_placement`) needs the raw API dict from the re-fetched ``doc``,
+        which `current` does not carry — the ordinal is what lets a caller find
+        that dict back in `_body_content(doc)`. `_alignment_key` collapses
+        every table to one sentinel key (see its docstring), so within a
+        difflib "equal" run tables pair by position exactly like duplicate
+        paragraph text does: order-preserving, but blind to which table's
+        *cells* actually match. That is still strictly better than raw body
+        position for this purpose, because it tracks paragraphs inserted or
+        removed around a table rather than assuming the table's index in the
+        body is stable.
 
         ``current`` is returned rather than re-parsed by callers because parsing
         a large document twice per push to learn the same thing is pure cost.
@@ -1489,17 +1501,31 @@ class DocsRequestBuilder:
             autojunk=False,
         )
 
+        # Ordinal of each table's position in `current`, among tables only —
+        # what `table_pairs` reports instead of the parsed DocsTableNode, since
+        # downstream table consumers need the raw dict at that ordinal in
+        # `_body_content(doc)`, not the parsed node.
+        table_ordinals: Dict[int, int] = {}
+        table_count = 0
+        for ci, node in enumerate(current):
+            if isinstance(node, DocsTableNode):
+                table_ordinals[ci] = table_count
+                table_count += 1
+
         pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
+        table_pairs: List[Tuple[int, DocsTableNode]] = []
         aligned_target_indices = set()
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != "equal":
                 continue
             for ci, ti in zip(range(i1, i2), range(j1, j2)):
                 cnode, tnode = current[ci], target[ti]
-                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
-                    continue
                 aligned_target_indices.add(ti)
+                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
+                    if isinstance(cnode, DocsTableNode) and isinstance(tnode, DocsTableNode):
+                        table_pairs.append((table_ordinals[ci], tnode))
+                    continue
                 if tnode.spans:
                     pairs.append((cnode, tnode))
                 if is_heading_style(tnode.style):
@@ -1512,7 +1538,7 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return current, pairs, unaligned, heading_pairs, current_residue
+        return current, pairs, unaligned, heading_pairs, current_residue, table_pairs
 
     def _anchor_resolution(
         self, current: List[Node], target: List[Node],
@@ -1676,7 +1702,7 @@ class DocsRequestBuilder:
                 the right tab's content; this parameter only affects which
                 tab the *requests* are addressed to.
         """
-        requests = self.build_table_fill_requests(doc, target)
+        requests = self.build_table_fill_requests(doc, target, alignment)
         requests += self.build_span_style_requests(doc, target, alignment)
         # Cell styling reads indices from `doc`, i.e. from *before* the fills above
         # are applied. A table that already holds its text — every table on a
