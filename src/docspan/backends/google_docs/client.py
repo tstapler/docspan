@@ -144,6 +144,17 @@ class GoogleDocsClient:
             .execute()
         )
 
+    def create_document(self, title: str) -> dict:
+        """
+        Create a new, empty Google Doc.
+
+        Returns:
+            dict: the created document resource (at minimum `documentId`, `title`).
+        """
+        return self._with_backoff(
+            lambda: self.docs_service.documents().create(body={"title": title}).execute()
+        )
+
     def batch_update(
         self,
         doc_id: str,

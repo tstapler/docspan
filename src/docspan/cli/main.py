@@ -17,10 +17,14 @@ from rich.table import Table
 
 from docspan.backends import BACKENDS
 from docspan.config import (
+    ConfigConflictError,
+    Mapping,
     MarkgateConfig,
+    config_mtime,
     load_central_config,
     load_config,
     resolve_active_project,
+    save_config,
 )
 from docspan.core import (
     MappingState,
@@ -244,6 +248,38 @@ def push(
                 )
             continue
 
+        if mapping.remote_id is None:
+            if not _can_prompt():
+                err_console.print(
+                    f"'{mapping.local}' has no remote_id and this session cannot prompt "
+                    "(non-interactive/CI). Run 'docspan map' to create the remote doc first."
+                )
+                had_error = True
+                continue
+            if not typer.confirm(
+                f"'{mapping.local}' has no remote doc yet. Create one on [{mapping.backend}] now?",
+                default=True,
+            ):
+                console.print("Push cancelled.")
+                had_error = True
+                continue
+            create_result = backend.create(os.path.splitext(os.path.basename(mapping.local))[0])
+            mapping.remote_id = create_result.doc_id
+            expected_mtime = config_mtime(config_path)
+            try:
+                save_config(config, config_path, expected_mtime=expected_mtime)
+            except ConfigConflictError as exc:
+                err_console.print(
+                    f"{exc}\n\n"
+                    f"⚠ A new {mapping.backend} doc/page was created but NOT recorded in markgate.yaml:\n"
+                    f"  remote_id: {create_result.doc_id}\n"
+                    f"  url: {create_result.url or '(none)'}\n"
+                    "Add it manually (or resolve the conflict and re-run)."
+                )
+                had_error = True
+                continue
+            console.print(f"[green]✓[/green]  Created {mapping.backend} doc → {mapping.local}")
+
         # Story 1.2.5: ScratchVerificationMarker — a one-time confirmation
         # tripwire before the very first push against the live wedding doc
         # specifically. Never fires for --dry-run (handled above) or for any
@@ -364,6 +400,95 @@ def pull(
 
     if had_error:
         raise typer.Exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# map command
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command("map")
+def map_(
+    file: str = typer.Argument(..., help="Local markdown file to map to a new remote doc/page"),
+    backend: str = typer.Option(
+        ..., "--backend", "-b", help="Backend to create the doc in: google_docs | confluence"
+    ),
+    space: Optional[str] = typer.Option(
+        None, "--space", help="Confluence space key (required for the confluence backend unless set in markgate.yaml)"
+    ),
+    title: Optional[str] = typer.Option(
+        None, "--title", help="Title for the new doc/page (default: the file's basename)"
+    ),
+    direction: str = typer.Option("both", "--direction", help="push | pull | both"),
+    tab_id: Optional[str] = typer.Option(None, "--tab-id", help="Google Docs tab id to target"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Create a new remote Google Doc / Confluence page and map it to a local file."""
+    if direction not in ("push", "pull", "both"):
+        err_console.print("--direction must be one of: push, pull, both")
+        raise typer.Exit(1)
+
+    config, config_path, prefix = _resolve(config_path, prefix)
+
+    if any(m.local == file for m in config.mappings):
+        err_console.print(
+            f"'{file}' is already mapped in markgate.yaml. Remove the existing mapping before creating a new one."
+        )
+        raise typer.Exit(1)
+
+    if backend not in BACKENDS:
+        err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
+        raise typer.Exit(1)
+
+    doc_title = title or os.path.splitext(os.path.basename(file))[0]
+    backend_instance = _get_backend(backend, config, config_path)
+
+    create_kwargs: dict = {}
+    if space:
+        create_kwargs["space"] = space
+
+    try:
+        create_result = backend_instance.create(doc_title, **create_kwargs)
+    except ValueError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(1)
+
+    mapping = Mapping(
+        local=file,
+        backend=backend,
+        remote_id=create_result.doc_id,
+        direction=direction,  # type: ignore[arg-type]
+        tab_id=tab_id,
+    )
+    config.mappings.append(mapping)
+
+    expected_mtime = config_mtime(config_path)
+    try:
+        save_config(config, config_path, expected_mtime=expected_mtime)
+    except ConfigConflictError as exc:
+        err_console.print(
+            f"{exc}\n\n"
+            f"⚠ A new {backend} doc/page was created but NOT recorded in markgate.yaml:\n"
+            f"  remote_id: {create_result.doc_id}\n"
+            f"  url: {create_result.url or '(none)'}\n"
+            "Add it manually (or resolve the conflict and re-run 'docspan map')."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green]  Created {backend} doc '{create_result.title}' → {file}")
+    if create_result.url:
+        console.print(f"   {create_result.url}")
+
+    if mapping.direction != "pull" and os.path.exists(file):
+        state_path = get_state_path(config_path, prefix)
+        state_dir = get_state_dir(config_path, prefix)
+        state = _load_state(state_path)
+        outcome = orchestrate_push(mapping, backend_instance, state, state_dir, state_path)
+        result = outcome.result
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

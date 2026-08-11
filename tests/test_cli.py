@@ -10,11 +10,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
+import yaml
 from typer.testing import CliRunner
 
-from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.cli.main import LIVE_WEDDING_DOC_ID, SCRATCH_VERIFIED_MARKER, app
-from docspan.config import Mapping, MarkgateConfig
+from docspan.config import ConfigConflictError, Mapping, MarkgateConfig
 from docspan.core.orchestrator import PullOutcome, PushOutcome
 from docspan.core.state import MappingState, SyncState, sha256_of_content
 
@@ -43,6 +44,9 @@ class FakeBackend(Backend):
 
     def get_remote_version(self, doc_id: str) -> str:
         return self.remote_version
+
+    def create(self, title: str, **kwargs) -> CreateResult:
+        return CreateResult(doc_id="new-doc-1", title=title, url="https://example.com/new-doc")
 
     def auth_setup(self, config_path=None) -> None:
         self.auth_setup_called = True
@@ -391,6 +395,194 @@ class TestPushScratchVerificationMarker:
         assert result.exit_code == 0
         mock_orchestrate.assert_called_once()
         assert not (tmp_path / SCRATCH_VERIFIED_MARKER).exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# push — blank remote_id auto-create flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPushAutoCreate:
+    def test_non_interactive_errors_without_prompting(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=None)
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main._can_prompt", return_value=False):
+            result = runner.invoke(app, ["push", "--config", cfg], input="")
+        assert result.exit_code == 1
+        assert "no remote_id" in result.output
+        assert "docspan map" in result.output
+
+    def test_interactive_confirm_yes_creates_persists_and_pushes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=None)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main._can_prompt", return_value=True):
+            result = runner.invoke(app, ["push", "--config", cfg], input="y\n")
+        assert result.exit_code == 0
+        assert "Created fake doc" in result.output
+        assert backend.push_calls and backend.push_calls[0]["doc_id"] == "new-doc-1"
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        assert saved["mappings"][0]["remote_id"] == "new-doc-1"
+
+    def test_interactive_confirm_no_cancels(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=None)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main._can_prompt", return_value=True):
+            result = runner.invoke(app, ["push", "--config", cfg], input="n\n")
+        assert result.exit_code == 1
+        assert "Push cancelled." in result.output
+        assert not backend.push_calls
+
+    def test_orphaned_doc_surfaced_on_conflict_during_auto_create(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=None)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main._can_prompt", return_value=True), \
+             patch("docspan.cli.main.save_config", side_effect=ConfigConflictError("markgate.yaml changed on disk")):
+            result = runner.invoke(app, ["push", "--config", cfg], input="y\n")
+        assert result.exit_code == 1
+        assert "NOT recorded in markgate.yaml" in result.output
+        assert "new-doc-1" in result.output
+        assert not backend.push_calls
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# map
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMap:
+    def test_creates_google_docs_mapping_and_pushes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 0
+        assert "Created google_docs doc" in result.output
+        assert backend.push_calls and backend.push_calls[0]["doc_id"] == "new-doc-1"
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        assert saved["mappings"][0]["local"] == str(local)
+        assert saved["mappings"][0]["backend"] == "google_docs"
+        assert saved["mappings"][0]["remote_id"] == "new-doc-1"
+
+    def test_creates_confluence_mapping_with_space(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend) as get_backend:
+            result = runner.invoke(
+                app, ["map", str(local), "--backend", "confluence", "--space", "ENG", "--config", cfg]
+            )
+        assert result.exit_code == 0
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        assert saved["mappings"][0]["backend"] == "confluence"
+        get_backend.assert_called_once()
+
+    def test_refuses_when_already_mapped(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 1
+        assert "already mapped" in result.output
+
+    def test_unknown_backend_errors(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()):
+            result = runner.invoke(app, ["map", str(local), "--backend", "nope", "--config", cfg])
+        assert result.exit_code == 1
+        assert "Unknown backend" in result.output
+
+    def test_backend_value_error_surfaces_and_does_not_write_mapping(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = MagicMock()
+        backend.create.side_effect = ValueError("Confluence page creation requires a space key.")
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(local), "--backend", "confluence", "--config", cfg])
+        assert result.exit_code == 1
+        assert "space key" in result.output
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        assert saved["mappings"] == []
+
+    def test_conflict_on_save_surfaces_orphaned_doc(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.save_config", side_effect=ConfigConflictError("markgate.yaml changed on disk")):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 1
+        assert "NOT recorded in markgate.yaml" in result.output
+        assert "new-doc-1" in result.output
+        assert "https://example.com/new-doc" in result.output
+
+    def test_skips_immediate_push_for_pull_direction(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(
+                app, ["map", str(local), "--backend", "google_docs", "--direction", "pull", "--config", cfg]
+            )
+        assert result.exit_code == 0
+        assert not backend.push_calls
+
+    def test_skips_immediate_push_when_local_file_missing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        missing = tmp_path / "missing.md"
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(missing), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 0
+        assert not backend.push_calls
+
+    def test_respects_prefix_resolution(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Criterion 11: map resolves the config via the same central-config
+        machinery push/pull use, rather than a hardcoded/local-only path."""
+        local = tmp_path / "new.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        prefixed_cfg = tmp_path / "prefixed-markgate.yaml"
+        prefixed_cfg.write_text("mappings: []\n", encoding="utf-8")
+        backend = FakeBackend()
+        with patch("docspan.cli.main.resolve_active_project", return_value=(str(prefixed_cfg), "myproj")) as mock_resolve, \
+             patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--prefix", "myproj"])
+        assert result.exit_code == 0
+        mock_resolve.assert_called_once_with(prefix="myproj", config_path=None)
+        saved = yaml.safe_load(open(prefixed_cfg, encoding="utf-8"))
+        assert saved["mappings"][0]["local"] == str(local)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
