@@ -484,6 +484,128 @@ class TestPullTabId:
         assert result.message is None
 
 
+def _doc_with_native_checkboxes(*items: tuple, revision_id: str = "rev-checkboxes") -> dict:
+    """A doc whose body has one bullet paragraph per (text, nesting_level) in
+    `items`, each resolving as a native BULLET_CHECKBOX glyph (glyphType
+    GLYPH_TYPE_UNSPECIFIED — see docs_structure_parser._resolve_is_native_checkbox)."""
+    content = []
+    index = 1
+    for text, nesting_level in items:
+        end = index + len(text) + 1
+        content.append(
+            {
+                "startIndex": index,
+                "endIndex": end,
+                "paragraph": {
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "elements": [{"textRun": {"content": text + "\n"}}],
+                    "bullet": {"listId": "kix.cb", "nestingLevel": nesting_level},
+                },
+            }
+        )
+        index = end
+    return {
+        "revisionId": revision_id,
+        "body": {"content": content},
+        "lists": {
+            "kix.cb": {
+                "listProperties": {
+                    "nestingLevels": [
+                        {"glyphType": "GLYPH_TYPE_UNSPECIFIED"},
+                        {"glyphType": "GLYPH_TYPE_UNSPECIFIED"},
+                    ]
+                }
+            }
+        },
+    }
+
+
+class TestPullCheckboxState:
+    def test_pull_recovers_checked_and_unchecked_state_from_markdown_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_native_checkboxes(
+            ("buy milk", 0), ("buy eggs", 0)
+        )
+        fake_client.get_doc_content.return_value = "<ul><li>buy milk</li><li>buy eggs</li></ul>"
+        fake_client.fetch_markdown_export.return_value = "- [ ] buy milk\n- [x] buy eggs\n"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok"
+        content = local.read_text(encoding="utf-8")
+        assert "- [ ] buy milk" in content
+        assert "- [x] buy eggs" in content
+
+    def test_pull_falls_back_to_unchecked_and_warns_on_checkbox_count_mismatch(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_native_checkboxes(
+            ("buy milk", 0), ("buy eggs", 0)
+        )
+        html = "<ul><li>buy milk</li><li>buy eggs</li></ul>"
+        fake_client.get_doc_content.return_value = html
+        # Only one checklist line comes back — count disagrees with the two
+        # native-checkbox paragraphs the structural parse found.
+        fake_client.fetch_markdown_export.return_value = "- [x] buy milk\n"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "warning"
+        assert "checkbox" in (result.message or "").lower()
+        content = local.read_text(encoding="utf-8")
+        assert "[x]" not in content
+        assert "[ ]" not in content
+
+    def test_pull_falls_back_to_unchecked_and_warns_on_markdown_export_failure(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_native_checkboxes(("buy milk", 0))
+        fake_client.get_doc_content.return_value = "<ul><li>buy milk</li></ul>"
+        fake_client.fetch_markdown_export.side_effect = RuntimeError("transport failure")
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "warning"
+        assert "checkbox" in (result.message or "").lower()
+        content = local.read_text(encoding="utf-8")
+        assert local.exists()
+        assert "[x]" not in content
+
+    def test_pull_without_native_checkboxes_never_calls_markdown_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.get_doc_content.return_value = "<p>Hello</p>"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok"
+        fake_client.fetch_markdown_export.assert_not_called()
+
+    def test_pull_with_tab_id_never_calls_markdown_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Tab-scoped pull stays on the structural path — files.export cannot
+        target a tab, so it must never even be attempted (criterion 1)."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local), tab_id="t.second")
+
+        assert result.status == "ok"
+        fake_client.fetch_markdown_export.assert_not_called()
+
+
 class TestPushTabId:
     def test_push_with_tab_id_targets_that_tab_in_batch_update_requests(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
