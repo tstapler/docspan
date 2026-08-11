@@ -345,8 +345,12 @@ def test_push_preview_render_no_mixed_note_when_all_checklist() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_find_churn_pairs_matches_identical_text_from_same_run() -> None:
-    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
-    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    remove = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
     entries = [remove, add]
 
     pairs = find_churn_pairs(entries)
@@ -357,12 +361,16 @@ def test_find_churn_pairs_matches_identical_text_from_same_run() -> None:
 def test_find_churn_pairs_ignores_unrelated_non_adjacent_entries() -> None:
     """Mirrors the `_node_key`/`Config`-heading-collision failure mode
     (docs_request_builder.py:112-150) — identical short text from two
-    unrelated, non-adjacent runs must never be paired."""
-    remove = DiffEntry(kind="remove", current_text="TODO", target_text=None, style="NORMAL_TEXT")
-    unrelated_change = DiffEntry(
-        kind="change", current_text="Friday", target_text="Saturday", style="NORMAL_TEXT"
+    unrelated opcode runs (different `edit_group`) must never be paired."""
+    remove = DiffEntry(
+        kind="remove", current_text="TODO", target_text=None, style="NORMAL_TEXT", edit_group=0
     )
-    add = DiffEntry(kind="add", current_text=None, target_text="TODO", style="NORMAL_TEXT")
+    unrelated_change = DiffEntry(
+        kind="change", current_text="Friday", target_text="Saturday", style="NORMAL_TEXT", edit_group=1
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="TODO", style="NORMAL_TEXT", edit_group=2
+    )
     entries = [remove, unrelated_change, add]
 
     pairs = find_churn_pairs(entries)
@@ -370,9 +378,29 @@ def test_find_churn_pairs_ignores_unrelated_non_adjacent_entries() -> None:
     assert pairs == []
 
 
+def test_find_churn_pairs_ignores_adjacent_entries_from_different_edit_groups() -> None:
+    """`_prefer_structural_pairing` (docs_request_builder.py) can carve one
+    "replace" run into a winning "equal" plus a same-text-elsewhere
+    "delete"/"insert" pair with no "equal" opcode between them, so two
+    genuinely unrelated remove/add entries can sit directly adjacent in the
+    flat `entries` list. Scoping by `edit_group` (not adjacency) must still
+    keep them apart even though nothing else separates them positionally."""
+    remove = DiffEntry(
+        kind="remove", current_text="TODO", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="TODO", style="NORMAL_TEXT", edit_group=1
+    )
+    entries = [remove, add]
+
+    pairs = find_churn_pairs(entries)
+
+    assert pairs == []
+
+
 def test_find_churn_pairs_excludes_table_rows() -> None:
-    remove = DiffEntry(kind="remove", current_text="Row A", target_text=None, style="TABLE")
-    add = DiffEntry(kind="add", current_text=None, target_text="Row A", style="TABLE")
+    remove = DiffEntry(kind="remove", current_text="Row A", target_text=None, style="TABLE", edit_group=0)
+    add = DiffEntry(kind="add", current_text=None, target_text="Row A", style="TABLE", edit_group=0)
 
     pairs = find_churn_pairs([remove, add])
 
@@ -380,9 +408,13 @@ def test_find_churn_pairs_excludes_table_rows() -> None:
 
 
 def test_find_churn_pairs_1to1_matches_duplicate_text_without_double_counting() -> None:
-    remove_a = DiffEntry(kind="remove", current_text="", target_text=None, style="NORMAL_TEXT")
-    remove_b = DiffEntry(kind="remove", current_text="", target_text=None, style="NORMAL_TEXT")
-    add_a = DiffEntry(kind="add", current_text=None, target_text="", style="NORMAL_TEXT")
+    remove_a = DiffEntry(
+        kind="remove", current_text="", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    remove_b = DiffEntry(
+        kind="remove", current_text="", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add_a = DiffEntry(kind="add", current_text=None, target_text="", style="NORMAL_TEXT", edit_group=0)
     entries = [remove_a, remove_b, add_a]
 
     pairs = find_churn_pairs(entries)
@@ -396,8 +428,12 @@ def test_find_churn_pairs_empty_entries_returns_no_pairs() -> None:
 
 
 def test_render_churn_note_mentions_comment_and_identity_loss() -> None:
-    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
-    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    remove = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
 
     note = render_churn_note([(remove, add)])
 
@@ -406,8 +442,12 @@ def test_render_churn_note_mentions_comment_and_identity_loss() -> None:
 
 
 def test_push_preview_render_reports_churn_pair_as_rewritten_not_removal() -> None:
-    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
-    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    remove = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
     preview = PushPreview(entries=[remove, add], unchanged_count=0, high_risk=[], request_count=2)
 
     rendered = preview.render()
@@ -419,8 +459,12 @@ def test_push_preview_render_reports_churn_pair_as_rewritten_not_removal() -> No
 
 
 def test_push_preview_render_still_shows_comment_at_risk_for_churned_paragraph() -> None:
-    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
-    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    remove = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
     high_risk = [
         HighRiskParagraph(
             paragraph_text="Same paragraph",

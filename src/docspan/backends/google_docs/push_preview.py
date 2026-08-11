@@ -10,7 +10,7 @@ itself — never by a separately-fetched CLI-layer preview.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
 from docspan.backends.google_docs.projection import Residue
@@ -145,36 +145,34 @@ def find_churn_pairs(entries: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntr
     comments) without changing what the document says. That is churn, not a
     removal, and this function finds those pairs so `render()` can label them.
 
-    Deliberately scoped to *adjacent* remove/add entries — a maximal run of
-    consecutive "remove"/"add" entries with no "change" (or gap) between
-    them, mirroring how one replace run's leftovers land consecutively in
-    `entries`. Matching identical text anywhere in the flat list (not scoped
-    this way) is exactly the `_node_key`/`Config`-heading-collision failure
-    mode this codebase already got burned by once
-    (`docs_request_builder.py:112-150`) — two unrelated short-text entries
-    from unrelated parts of the document must never be paired.
+    Scoped by `DiffEntry.edit_group` — the index of the single `_opcodes()`
+    iteration in `diff_summary()` that produced the entry — never by
+    adjacency in the flat `entries` list. Adjacency looked equivalent at
+    first (one replace run's leftovers do land consecutively), but
+    `_prefer_structural_pairing` can carve a single "replace" run into a
+    winning "equal" plus a same-text-elsewhere "delete"/"insert" pair with no
+    "equal" opcode between them — two genuinely unrelated entries that would
+    sit adjacent in `entries` despite coming from different opcodes. Matching
+    on `edit_group` is exactly the `_node_key`/`Config`-heading-collision
+    failure mode this codebase already got burned by once
+    (`docs_request_builder.py:112-150`), avoided the same way: only pair
+    entries that provably came from the same edit, never entries that merely
+    look adjacent or share text.
 
-    Within a run, pairing is 1:1 (each `remove` claims at most one unclaimed
-    `add` with identical text) so duplicate short text (two blank lines, two
-    "TODO" bullets) cannot double-count or cross-pair. Table rows
+    Within a group, pairing is 1:1 (each `remove` claims at most one
+    unclaimed `add` with identical text) so duplicate short text (two blank
+    lines, two "TODO" bullets) cannot double-count or cross-pair. Table rows
     (`style == "TABLE"`) are excluded — identical flattened row text is a
     weaker, easier-to-get-wrong signal than paragraph text.
     """
-    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
-    run: List[DiffEntry] = []
-
-    def flush() -> None:
-        if run:
-            pairs.extend(_match_churn_run(run))
-        run.clear()
-
+    groups: Dict[int, List[DiffEntry]] = {}
     for entry in entries:
         if entry.kind in ("remove", "add"):
-            run.append(entry)
-        else:
-            flush()
-    flush()
+            groups.setdefault(entry.edit_group, []).append(entry)
 
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    for group in groups.values():
+        pairs.extend(_match_churn_run(group))
     return pairs
 
 

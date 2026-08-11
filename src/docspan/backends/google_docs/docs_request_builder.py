@@ -104,6 +104,13 @@ class DiffEntry:
     target_text: Optional[str]
     style: str
     current_is_native_checkbox: bool = False
+    # Which `_opcodes()` iteration in diff_summary() produced this entry.
+    # push_preview.find_churn_pairs() uses this (not list adjacency) to scope
+    # remove/add matching, since `_prefer_structural_pairing` can carve a
+    # "replace" run into an "equal" plus a same-text-elsewhere "delete"/"insert"
+    # with no "equal" opcode between them — two genuinely unrelated entries
+    # that would otherwise sit adjacent in the flat `entries` list.
+    edit_group: int = -1
 
 
 class DocsRequestBuilder:
@@ -527,7 +534,7 @@ class DocsRequestBuilder:
         entries: List[DiffEntry] = []
         unchanged_count = 0
 
-        for tag, i1, i2, j1, j2 in self._opcodes(current, target):
+        for edit_group, (tag, i1, i2, j1, j2) in enumerate(self._opcodes(current, target)):
             if tag == "equal":
                 # "equal" means equal *text*: `_node_key` includes style and
                 # bullet, so a restyle lands in a `replace` run, and `_repair`
@@ -548,6 +555,7 @@ class DocsRequestBuilder:
                                 current_is_native_checkbox=_node_is_native_checkbox(
                                     current[ci]
                                 ),
+                                edit_group=edit_group,
                             )
                         )
                     else:
@@ -562,6 +570,7 @@ class DocsRequestBuilder:
                             target_text=None,
                             style=_node_style(node),
                             current_is_native_checkbox=_node_is_native_checkbox(node),
+                            edit_group=edit_group,
                         )
                     )
 
@@ -573,6 +582,7 @@ class DocsRequestBuilder:
                             current_text=None,
                             target_text=_node_text(node),
                             style=_node_style(node),
+                            edit_group=edit_group,
                         )
                     )
 
@@ -588,6 +598,7 @@ class DocsRequestBuilder:
                             target_text=_node_text(tgt_node),
                             style=_node_style(cur_node),
                             current_is_native_checkbox=_node_is_native_checkbox(cur_node),
+                            edit_group=edit_group,
                         )
                     )
                 # Length mismatch (e.g. one checklist line split into two) —
@@ -601,6 +612,7 @@ class DocsRequestBuilder:
                             target_text=None,
                             style=_node_style(extra_cur),
                             current_is_native_checkbox=_node_is_native_checkbox(extra_cur),
+                            edit_group=edit_group,
                         )
                     )
                 for extra_tgt in tgt_slice[common:]:
@@ -610,6 +622,7 @@ class DocsRequestBuilder:
                             current_text=None,
                             target_text=_node_text(extra_tgt),
                             style=_node_style(extra_tgt),
+                            edit_group=edit_group,
                         )
                     )
 
