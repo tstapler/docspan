@@ -242,12 +242,18 @@ class CrossDocLinkResolver:
                 ),
             )
 
+        base_url = f"https://docs.google.com/document/d/{match.remote_id}/edit"
+        # A `tab_id`-scoped target must link into that tab specifically, not
+        # the document's default tab — otherwise the link (and any heading
+        # fragment on it, since a headingId resolves against the tab named in
+        # the request per `heading_anchors.py`) lands in the wrong place.
+        if match.tab_id:
+            base_url += f"?tab={match.tab_id}"
+
         if not fragment:
             # Resolves to the doc's own edit URL whether or not this is a
             # self-reference — no fetch needed either way.
-            return CrossDocResolution(
-                payload={"url": f"https://docs.google.com/document/d/{match.remote_id}/edit"}
-            )
+            return CrossDocResolution(payload={"url": base_url})
 
         is_self_reference = match.remote_id == current_doc_id and (
             (match.tab_id or None) == (current_tab_id or None)
@@ -267,12 +273,12 @@ class CrossDocLinkResolver:
             )
         # ASSUMPTION, not verified against a live Google Docs UI (not
         # reachable from this sandbox): `#heading=<headingId>` on a
-        # `/document/d/<id>/edit` URL navigates to that heading when opened,
-        # the same way Docs' own "Copy link to this heading" feature does for
-        # a heading in the *current* document. Documented here as the one
-        # place this shape is constructed, so a future correction has a
-        # single call site to fix.
-        url = f"https://docs.google.com/document/d/{match.remote_id}/edit#heading={heading_id}"
+        # `/document/d/<id>/edit[?tab=<tabId>]` URL navigates to that heading
+        # when opened, the same way Docs' own "Copy link to this heading"
+        # feature does for a heading in the *current* document/tab.
+        # Documented here as the one place this shape is constructed, so a
+        # future correction has a single call site to fix.
+        url = f"{base_url}#heading={heading_id}"
         return CrossDocResolution(payload={"url": url})
 
     def _fetch(self, mapping: object) -> Tuple[Optional[Dict[str, str]], object]:

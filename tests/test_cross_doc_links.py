@@ -126,6 +126,33 @@ class TestCrossDocLinkResolverBasics:
         }
         assert len(calls) == 1
 
+    def test_mapped_file_with_tab_id_no_fragment_includes_tab_in_url(self):
+        target = _Mapping(local="docs/target.md", remote_id="target-doc-id", tab_id="t.abc")
+        resolver = CrossDocLinkResolver(mappings=[target])
+        result = resolver.resolve(
+            "target.md", "docs/a.md", current_doc_id="current-doc-id"
+        )
+        assert result.payload == {
+            "url": "https://docs.google.com/document/d/target-doc-id/edit?tab=t.abc"
+        }
+
+    def test_mapped_file_with_tab_id_and_fragment_includes_tab_and_heading(self):
+        target = _Mapping(local="docs/target.md", remote_id="target-doc-id", tab_id="t.abc")
+
+        def fetch_headings(mapping):
+            return {"some-heading": "h.abc123"}, {"h.abc123"}
+
+        resolver = CrossDocLinkResolver(mappings=[target], fetch_headings=fetch_headings)
+        result = resolver.resolve(
+            "target.md#some-heading", "docs/a.md", current_doc_id="current-doc-id"
+        )
+        assert result.payload == {
+            "url": (
+                "https://docs.google.com/document/d/target-doc-id/edit"
+                "?tab=t.abc#heading=h.abc123"
+            )
+        }
+
     def test_fragment_not_found_in_target_is_unresolved_not_dead_link(self):
         target = _Mapping(local="docs/target.md", remote_id="target-doc-id")
 
@@ -235,7 +262,9 @@ class TestSelfReference:
             "other-tab.md", "docs/self.md", current_doc_id="doc-1", current_tab_id="t.mine"
         )
         assert result.same_doc_fragment is None
-        assert result.payload == {"url": "https://docs.google.com/document/d/doc-1/edit"}
+        assert result.payload == {
+            "url": "https://docs.google.com/document/d/doc-1/edit?tab=t.other"
+        }
 
 
 class TestBindFetchHeadings:
