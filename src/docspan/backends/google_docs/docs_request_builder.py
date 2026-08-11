@@ -52,6 +52,23 @@ class Pass2Alignment:
     residue: List[Residue]
 
 
+@dataclass(frozen=True)
+class DeleteBounds:
+    """The range a node's deleteContentRange may actually cover, and why it was trimmed.
+
+    ``trimmed`` keeps its original meaning ("some trim happened"), covering
+    both the render_prefix/precedes_structural_element cases and the doc-end
+    clamp. ``doc_end_clamped`` narrows to the last of those specifically — the
+    body's terminal newline was what survived — so callers that need to tell
+    the doc-end case apart from the other two (see the "replace" branch of
+    build(), #62) don't have to re-derive it from node attributes.
+    """
+    start: int
+    end: int
+    trimmed: bool
+    doc_end_clamped: bool
+
+
 def _utf16_len(text: str) -> int:
     """Return the number of UTF-16 code units in text (surrogate pairs count as 2)."""
     return len(text.encode("utf-16-le")) // 2
@@ -854,34 +871,39 @@ class DocsRequestBuilder:
                 # The doc_end_index clamp in _delete_bounds also spares a
                 # newline — the paragraph's own terminator — when the
                 # deleted range ends at the document's last paragraph.
-                # `before_newline=True` is not the right fix there: that
-                # writes "\ntext", which prepends a blank paragraph in
-                # front of the clamp-spared newline instead of reusing it.
-                # The insert must instead be bare text with no newline on
-                # either side, so the clamp-spared newline is reused as the
-                # new text's own terminator (see `bare_last` on
-                # _make_insert_requests). `precedes_structural_element` is
-                # mutually exclusive with this clamp (a following
-                # Table/ToC/SectionBreak means last.end_index <
-                # doc_end_index), but render_prefix is not — a render-glyph
-                # paragraph that is also the doc's last paragraph keeps the
-                # existing before_newline=True behavior (#48 takes
-                # precedence over this narrower case).
+                # Unlike the render_prefix/structural cases above, there is
+                # no following paragraph to open: the spared newline is the
+                # last node's own terminator, so the replacement text goes
+                # in bare, with no newline on either side (#62). This is
+                # checked only when `spares_structural_newline` above is
+                # False — a node can in principle satisfy both (a
+                # render-glyph paragraph that also happens to be the doc's
+                # last paragraph), and the leading-newline mode already has
+                # passing coverage for that case.
+                #
+                # `last_bounds.start < last_bounds.end` excludes the #21
+                # masking case: when `last` is already the doc's empty
+                # terminal placeholder paragraph (nothing left to delete —
+                # start == end after the clamp), the spared "newline" is
+                # that placeholder's *entire* content. Bare mode there would
+                # glue the new text onto that untouched terminator instead
+                # of opening a fresh paragraph in front of it, collapsing
+                # the trailing blank paragraph every doc must keep.
                 last = current[i2 - 1]
                 spares_structural_newline = isinstance(last, DocsParagraphNode) and (
                     bool(last.render_prefix) or last.precedes_structural_element
                 )
-                spares_terminal_newline = (
+                last_bounds = self._delete_bounds(last, doc_end_index)
+                doc_end_clamped = (
                     not spares_structural_newline
-                    and isinstance(last, DocsParagraphNode)
-                    and bool(last.text)
-                    and last.end_index >= doc_end_index
+                    and last_bounds.doc_end_clamped
+                    and last_bounds.start < last_bounds.end
                 )
                 requests = self._make_insert_requests(
                     target[j1:j2],
                     delete_start,
                     before_newline=spares_structural_newline,
-                    bare_last=spares_terminal_newline,
+                    bare_last=doc_end_clamped,
                 )
                 if requests:
                     # Same anchor as the first deleted node's group, and emitted
@@ -896,7 +918,7 @@ class DocsRequestBuilder:
         return all_requests
 
     @staticmethod
-    def _delete_bounds(node: Node, doc_end_index: int) -> Tuple[int, int, bool]:
+    def _delete_bounds(node: Node, doc_end_index: int) -> DeleteBounds:
         """The range a node's deleteContentRange may actually cover, and whether it was trimmed.
 
         Single source of truth for the two undeletable-newline rules described
@@ -942,10 +964,12 @@ class DocsRequestBuilder:
         elif isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
             end -= 1
             trimmed = True
+        doc_end_clamped = False
         if end >= doc_end_index:
             end = doc_end_index - 1
             trimmed = True
-        return start, end, trimmed
+            doc_end_clamped = True
+        return DeleteBounds(start, end, trimmed, doc_end_clamped)
 
     # ──────────────────────────────────────────────
     # Pass 2 — fill table cells from a re-fetched doc
@@ -1791,18 +1815,18 @@ class DocsRequestBuilder:
         """
         requests = []
         for node in nodes:
-            start, end, trimmed = self._delete_bounds(node, doc_end_index)
-            if start >= end:
+            bounds = self._delete_bounds(node, doc_end_index)
+            if bounds.start >= bounds.end:
                 # Nothing left to delete — an already-empty paragraph pinned by
                 # a boundary or by the body's terminal newline. Emitting the
                 # normalisation alone would make every push rewrite a paragraph
                 # it can never remove, so push would never be idempotent.
                 continue
-            if trimmed and isinstance(node, DocsParagraphNode):
+            if bounds.trimmed and isinstance(node, DocsParagraphNode):
                 requests.extend(self._residue_normalize_requests(node))
             requests.append({
                 "deleteContentRange": {
-                    "range": {"startIndex": start, "endIndex": end}
+                    "range": {"startIndex": bounds.start, "endIndex": bounds.end}
                 }
             })
         return requests
@@ -1927,7 +1951,7 @@ class DocsRequestBuilder:
             text_len = _utf16_len(node.text) if is_bare else _utf16_len(node.text + "\n")
             paragraph_range = {
                 "startIndex": paragraph_start,
-                "endIndex": paragraph_start + text_len,
+                "endIndex": paragraph_end,
             }
             requests.append({
                 "updateParagraphStyle": {

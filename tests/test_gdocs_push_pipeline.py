@@ -767,6 +767,23 @@ def test_appending_past_the_last_node_stays_inside_the_body() -> None:
     ]
 
 
+def test_replacing_the_doc_end_paragraph_does_not_leave_a_stray_blank_paragraph() -> None:
+    """(#62) Replacing a document's last paragraph must not duplicate the
+    newline the doc-end clamp already spares. Unlike the #21 masking case
+    above, this document has no trailing empty Para("") — the "Alpha"
+    paragraph itself IS the doc's last paragraph, so the replace's bare-text
+    insert must not leave a stray "" paragraph behind it."""
+    model = DocModel([Para("Intro"), Para("Alpha")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nReplaced\n")
+
+    after = model.apply(builder.build(current, target, model.end_index()))
+    assert [p.text for p in structure.parse(after.doc())] == [
+        "Intro",
+        "Replaced",
+    ]
+
+
 def test_an_appended_heading_does_not_restyle_the_paragraph_above_it() -> None:
     """The tail insert's paragraph range must cover only the new paragraph.
 
