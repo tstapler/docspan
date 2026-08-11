@@ -182,28 +182,30 @@ def test_insert_sharing_an_anchor_with_a_following_equal_restyle_targets_the_ori
 
 
 def test_insert_sharing_an_anchor_with_an_unrelated_delete_deletes_the_correct_paragraph() -> None:
-    """An insert and a standalone delete of an unrelated paragraph tie on
-    anchor 10. The delete must run before the insert so it removes the
-    original "Victim" paragraph rather than colliding with content the
-    insert has already shifted into place."""
+    """An insert opcode (anchored at the preceding kept paragraph's
+    end_index) and a later, unrelated delete opcode (anchored at the
+    deleted paragraph's own start_index) tie on anchor 10 — the delete's
+    node is positioned *after* the insert in traversal order, so the old
+    stable sort appended the insert to `groups` first. The delete must
+    still run first so it removes the original "Victim" paragraph rather
+    than colliding with content the insert has already shifted into
+    place."""
     current = [
         _para("Keep1", start=1, end=10),
-        _para("Victim", start=10, end=20),
-        _para("Keep2", start=5, end=10),
-        _para("Keep3", start=20, end=30),
+        _para("Filler", start=20, end=30),
+        _para("Victim", start=10, end=15),
     ]
     target = [
         _para("Keep1", start=1, end=10),
-        _para("Keep2", start=5, end=10),
         _para("NewLine", start=0, end=0),
-        _para("Keep3", start=20, end=30),
+        _para("Filler", start=20, end=30),
     ]
     requests = builder.build(current, target, doc_end_index=30)
 
     delete_index = next(i for i, r in enumerate(requests) if "deleteContentRange" in r)
     insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
 
-    assert requests[delete_index]["deleteContentRange"]["range"] == {"startIndex": 10, "endIndex": 20}
+    assert requests[delete_index]["deleteContentRange"]["range"] == {"startIndex": 10, "endIndex": 15}
     assert delete_index < insert_index
 
 
