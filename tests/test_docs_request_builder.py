@@ -2,10 +2,17 @@
 
 from dataclasses import replace
 
-from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+import pytest
+
+from docspan.backends.google_docs import docs_request_builder as docs_request_builder_module
+from docspan.backends.google_docs.docs_request_builder import (
+    DiffTooExpensive,
+    DocsRequestBuilder,
+)
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    TableCell,
     TextSpan,
 )
 
@@ -635,3 +642,228 @@ def test_replace_with_unequal_current_and_target_length_does_not_raise() -> None
     kinds = sorted(e.kind for e in entries)
     assert kinds == ["add", "change"]
     assert unchanged_count == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DiffTooExpensive guard — duplicate-heavy documents (backlog: bound difflib's
+# SequenceMatcher(autojunk=False) blowup)
+#
+# These tests override the module's thresholds to small values so they stay
+# fast and deterministic (count/complexity-based, not wall-clock timing) while
+# still exercising the exact branch that trips on real few-thousand-line
+# documents.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _small_thresholds(monkeypatch: pytest.MonkeyPatch, *, max_duplicate_run: int = 5, min_size: int = 10) -> None:
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_DUPLICATE_RUN", max_duplicate_run)
+    monkeypatch.setattr(docs_request_builder_module, "_MIN_SIZE_FOR_DUPLICATE_CHECK", min_size)
+
+
+def _duplicate_paragraphs(text: str, count: int, *, start: int = 1) -> list:
+    nodes = []
+    cursor = start
+    for _ in range(count):
+        end = cursor + len(text) + 1
+        nodes.append(_para(text, start=cursor, end=end))
+        cursor = end
+    return nodes
+
+
+def test_build_raises_diff_too_expensive_above_duplicate_run_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC0: a document whose duplicate-line run exceeds the threshold raises a
+    clear error from build() instead of constructing the expensive matcher."""
+    _small_thresholds(monkeypatch)
+    current = _duplicate_paragraphs("dup", 6)
+    target = _duplicate_paragraphs("dup", 6)
+    with pytest.raises(DiffTooExpensive) as excinfo:
+        builder.build(current, target, DOC_END)
+    assert "too expensive" in str(excinfo.value)
+
+
+def test_build_does_not_raise_below_duplicate_run_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC5 (lower half of the boundary): a duplicate run short of the
+    threshold must diff normally, not raise. `_bounded_opcodes` counts
+    duplicates across `a_keys + b_keys` combined, so with equal current/target
+    the combined run is 2x each side's paragraph count — use a small
+    `min_size` so the duplicate-run branch is actually exercised rather than
+    short-circuited by the size floor."""
+    _small_thresholds(monkeypatch, max_duplicate_run=10, min_size=2)
+    current = _duplicate_paragraphs("dup", 4)
+    target = _duplicate_paragraphs("dup", 4)
+    assert builder.build(current, target, DOC_END) == []
+
+
+def test_threshold_boundary_n_minus_one_vs_n_only_changes_latency_not_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5: crossing the boundary must only ever add a raise — the diff
+    produced just below threshold must be the same *kind* of result (a plain,
+    successful diff) whether the run is far below or exactly at threshold,
+    with no discontinuity in what gets reported. `_bounded_opcodes` counts the
+    duplicate run across `a_keys + b_keys` combined, so passing the same list
+    as both current and target means N identical paragraphs on each side
+    produce a combined run of 2N — the guard's condition is
+    `max_duplicate_run > _MAX_DUPLICATE_RUN`, so N = floor(_MAX_DUPLICATE_RUN / 2)
+    sits at the boundary and N+1 crosses it. `min_size` is set to 2 (well
+    below every N used here) so the duplicate-run branch is always live,
+    isolating the assertions to the boundary itself."""
+    _small_thresholds(monkeypatch, max_duplicate_run=10, min_size=2)
+    max_duplicate_run = docs_request_builder_module._MAX_DUPLICATE_RUN
+    n_at_boundary = max_duplicate_run // 2
+
+    far_below = _duplicate_paragraphs("dup", 1)
+    entries_far_below, unchanged_far_below = builder.diff_summary(far_below, far_below)
+    assert entries_far_below == []
+    assert unchanged_far_below == len(far_below)
+
+    at_boundary = _duplicate_paragraphs("dup", n_at_boundary)
+    entries_at, unchanged_at = builder.diff_summary(at_boundary, at_boundary)
+    assert entries_at == []
+    assert unchanged_at == len(at_boundary)
+
+    over = _duplicate_paragraphs("dup", n_at_boundary + 1)
+    with pytest.raises(DiffTooExpensive):
+        builder.diff_summary(over, over)
+
+
+def test_ordinary_table_and_code_block_never_trip_guard() -> None:
+    """AC1: realistic documents (a 30-row table, a normal-sized fenced code
+    block) never trip the guard, using the real production thresholds."""
+    table_current = DocsTableNode(
+        rows=[[TableCell(text=f"Row {i} value", spans=[]) for _ in range(3)] for i in range(30)],
+        start_index=1,
+        end_index=500,
+    )
+    table_target = DocsTableNode(
+        rows=[[TableCell(text=f"Row {i} value!", spans=[]) for _ in range(3)] for i in range(30)],
+        start_index=1,
+        end_index=500,
+    )
+    code_current = [
+        _para(f"line {i} of code", start=500 + i * 20, end=500 + i * 20 + 18)
+        for i in range(40)
+    ]
+    code_target = [
+        _para(f"line {i} of code!", start=500 + i * 20, end=500 + i * 20 + 19)
+        for i in range(40)
+    ]
+
+    # No DiffTooExpensive raised at production thresholds.
+    builder.build([table_current] + code_current, [table_target] + code_target, DOC_END + 2000)
+    builder.diff_summary([table_current] + code_current, [table_target] + code_target)
+
+
+def test_build_and_diff_summary_raise_identically_on_pathological_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2: build() and diff_summary() both route through the same _opcodes(),
+    so they must never diverge on whether a document is pathological."""
+    _small_thresholds(monkeypatch)
+    current = _duplicate_paragraphs("dup", 6)
+    target = _duplicate_paragraphs("dup", 6)
+
+    with pytest.raises(DiffTooExpensive):
+        builder.build(current, target, DOC_END)
+    with pytest.raises(DiffTooExpensive):
+        builder.diff_summary(current, target)
+
+
+def test_guard_never_reenables_autojunk_or_a_popularity_heuristic() -> None:
+    """AC3: below threshold, `_bounded_opcodes` must produce byte-identical
+    opcodes to a direct `SequenceMatcher(None, ..., autojunk=False)` call —
+    proof no popularity heuristic or autojunk=True fallback was substituted."""
+    import difflib
+
+    a_keys = [("a",), ("b",), ("a",), ("c",), ("a",)]
+    b_keys = [("a",), ("a",), ("c",), ("b",), ("a",)]
+
+    expected = difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False).get_opcodes()
+    actual = docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+    assert actual == expected
+
+
+def test_bounded_opcodes_raises_above_comparison_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The comparison-matrix branch (`len(a_keys) * len(b_keys) > _MAX_COMPARISON_CELLS`)
+    is a separate trip condition from the duplicate-run check and needs its own
+    coverage. Keys here are all unique and the combined input is well under the
+    default duplicate-run size floor, so only the comparison-cell branch can fire."""
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_COMPARISON_CELLS", 20)
+    a_keys = [(f"a{i}",) for i in range(5)]
+    b_keys = [(f"b{i}",) for i in range(5)]  # 5 * 5 = 25 > 20
+    with pytest.raises(DiffTooExpensive):
+        docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+
+
+def test_bounded_opcodes_does_not_raise_at_the_comparison_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boundary check for the comparison-cell branch: a product exactly at the
+    cap must not raise (the guard's condition is strictly `>`)."""
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_COMPARISON_CELLS", 25)
+    a_keys = [(f"a{i}",) for i in range(5)]
+    b_keys = [(f"b{i}",) for i in range(5)]  # 5 * 5 == 25, at the cap
+    result = docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+    assert result == [("replace", 0, 5, 0, 5)]
+
+
+def test_repairs_inner_matcher_shares_the_same_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4: `_repair`'s inner per-replace-run matcher (keyed on `_content_key`,
+    called from inside `_repair` rather than through `_opcodes`) trips the
+    same guard as the outer matcher. Calling `_repair` directly with a single
+    synthetic `replace` opcode isolates the inner `_bounded_opcodes` call from
+    the outer one, so this proves the inner call site itself is guarded, not
+    just that the outer call raised first."""
+    _small_thresholds(monkeypatch)
+    dup_current = _duplicate_paragraphs("dup", 6)
+    dup_target = _duplicate_paragraphs("dup!", 6)
+    opcodes = [("replace", 0, len(dup_current), 0, len(dup_target))]
+
+    with pytest.raises(DiffTooExpensive):
+        builder._repair(opcodes, dup_current, dup_target)
+
+
+def test_align_for_styling_shares_the_same_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4: `_align_for_styling`'s pass-2 matcher trips the same guard as the
+    other two call sites."""
+    _small_thresholds(monkeypatch)
+    dup_text = "dup line\n"
+    content = []
+    index = 1
+    for _ in range(6):
+        content.append({
+            "startIndex": index,
+            "endIndex": index + len(dup_text),
+            "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": dup_text, "textStyle": {}}}],
+            },
+        })
+        index += len(dup_text)
+    doc = {"revisionId": "rev-1", "body": {"content": content}}
+
+    target = _duplicate_paragraphs("dup line!", 6)
+
+    with pytest.raises(DiffTooExpensive):
+        builder.align(doc, target)
+
+
+# AC6 (push()/pull() surface DiffTooExpensive as PushResult(status="error"),
+# never an uncaught traceback) is covered end-to-end in
+# tests/test_google_docs_backend.py::TestDiffTooExpensiveSurfacesAsUserFacingError,
+# which has the make_backend/fake_client fixtures needed to drive push()
+# through its full call path.
+
+
+def test_guard_overhead_is_sub_quadratic_in_input_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC7: the guard's own pre-check (Counter + a multiply) must be cheap
+    enough that both a document at the threshold and one four times larger
+    raise immediately — proof this is a count-based guard, not something that
+    itself scales like the algorithm it is protecting against."""
+    _small_thresholds(monkeypatch)
+    max_duplicate_run = docs_request_builder_module._MAX_DUPLICATE_RUN
+
+    small = _duplicate_paragraphs("dup", max_duplicate_run + 1)
+    large = _duplicate_paragraphs("dup", (max_duplicate_run + 1) * 4)
+
+    for doc in (small, large):
+        with pytest.raises(DiffTooExpensive) as excinfo:
+            builder.build(doc, doc, DOC_END + 10000)
+        assert excinfo.value.size == len(doc) * 2
