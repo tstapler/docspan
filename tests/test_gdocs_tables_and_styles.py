@@ -241,3 +241,57 @@ def test_fill_skips_populated_tables() -> None:
     target = [DocsTableNode(rows=[["A", "B"], ["1", "2"], ["3", "4"]])]
     # Already-populated table should not be re-filled.
     assert builder.build_table_fill_requests(_populated_table_doc(), target) == []
+
+
+def _populated_cell(idx: int, text: str) -> dict:
+    return {"content": [{
+        "startIndex": idx, "endIndex": idx + len(text) + 1,
+        "paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]},
+    }]}
+
+
+def _empty_cell(idx: int) -> dict:
+    return {"content": [{
+        "startIndex": idx, "endIndex": idx + 1,
+        "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+    }]}
+
+
+def test_fill_pairs_by_document_order_not_by_emptiness_count() -> None:
+    """Issue #59: pairing must not advance its target index only on empty tables.
+
+    Live tables ``[populated "KEEP", empty]`` against 2 target tables — the old
+    code advanced `ti` only inside the emptiness branch, so the lone empty
+    (2nd) live table was paired with target *0* instead of target *1*. The
+    correct pairing is by document-order position, unconditional on emptiness.
+    """
+    doc = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 10, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(4, "KEEP")]},
+        ]}},
+        {"startIndex": 10, "endIndex": 15, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_empty_cell(13)]},
+        ]}},
+    ]}}
+    target = [DocsTableNode(rows=[["T0"]]), DocsTableNode(rows=[["T1"]])]
+    reqs = builder.build_table_fill_requests(doc, target)
+    assert reqs == [{"insertText": {"location": {"index": 13}, "text": "T1"}}]
+
+
+def test_fill_pairs_by_document_order_symmetric() -> None:
+    """Same bug, mirrored order: ``[empty, populated "KEEP"]``.
+
+    The first (empty) live table must get target 0's text, and the populated
+    table must be left untouched even though it now consumes a pairing slot.
+    """
+    doc = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 6, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_empty_cell(4)]},
+        ]}},
+        {"startIndex": 6, "endIndex": 15, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(9, "KEEP")]},
+        ]}},
+    ]}}
+    target = [DocsTableNode(rows=[["T0"]]), DocsTableNode(rows=[["T1"]])]
+    reqs = builder.build_table_fill_requests(doc, target)
+    assert reqs == [{"insertText": {"location": {"index": 4}, "text": "T0"}}]
