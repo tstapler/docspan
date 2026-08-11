@@ -387,9 +387,30 @@ def test_delete_bounds_does_not_compound_render_prefix_and_structural_trim() -> 
     node = _para("# cfg", start=8, end=14, precedes_structural_element=True)
     node = replace(node, render_prefix="")
 
-    start, end, trimmed = DocsRequestBuilder._delete_bounds(node, doc_end_index=100)
+    bounds = DocsRequestBuilder._delete_bounds(node, doc_end_index=100)
 
-    assert (start, end, trimmed) == (8, 13, True)
+    assert (bounds.start, bounds.end, bounds.trimmed) == (8, 13, True)
+    assert bounds.doc_end_clamped is False
+
+
+def test_delete_bounds_reports_doc_end_clamped_only_when_end_reaches_doc_end() -> None:
+    """`doc_end_clamped` (#62) must distinguish "the doc-end clamp is what
+    spared this node's newline" from the render_prefix/structural trims,
+    which set `trimmed` too but leave `doc_end_clamped` False."""
+    at_doc_end = _para("Last", start=10, end=15)
+    bounds = DocsRequestBuilder._delete_bounds(at_doc_end, doc_end_index=15)
+    assert bounds.trimmed is True
+    assert bounds.doc_end_clamped is True
+
+    not_at_doc_end = _para("Mid", start=10, end=15)
+    bounds = DocsRequestBuilder._delete_bounds(not_at_doc_end, doc_end_index=100)
+    assert bounds.trimmed is False
+    assert bounds.doc_end_clamped is False
+
+    structural_not_doc_end = _para("Boundary", start=10, end=15, precedes_structural_element=True)
+    bounds = DocsRequestBuilder._delete_bounds(structural_not_doc_end, doc_end_index=100)
+    assert bounds.trimmed is True
+    assert bounds.doc_end_clamped is False
 
 
 def test_replace_of_a_render_prefix_paragraph_does_not_add_a_second_newline() -> None:
@@ -458,6 +479,20 @@ def test_replace_of_the_docs_last_paragraph_does_not_add_a_second_newline() -> N
     assert insert_requests[0]["insertText"]["text"] == "New text"
 
 
+def test_replace_of_the_doc_end_paragraph_inserts_bare_text_with_no_stray_newline() -> None:
+    """(#62) Replacing a document's last paragraph must not duplicate the
+    newline the doc-end clamp already spared: the insert goes in bare, with
+    no leading or trailing "\\n", and the doc reconstructs to exactly one
+    paragraph."""
+    current = [_para("Old text", start=1, end=10)]
+    target = [_para("New text", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=10)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "New text"
+
+
 def test_render_prefix_paragraph_that_is_also_the_docs_last_paragraph_uses_before_newline() -> None:
     """Mutual-exclusivity guard: when a node is BOTH a render_prefix paragraph
     (#48) and the document's last paragraph (#62), the existing
@@ -465,6 +500,42 @@ def test_render_prefix_paragraph_that_is_also_the_docs_last_paragraph_uses_befor
     current = [replace(_para("# cfg", start=8, end=14), render_prefix='\ue907')]
     target = [_para("# other", start=0, end=0)]
     requests = builder.build(current, target, doc_end_index=14)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\n# other"
+
+
+def test_replace_of_a_multi_node_range_at_doc_end_uses_the_last_node_for_bare_insert() -> None:
+    """(#62 follow-up, mirrors the #56 multi-node regression above) The
+    doc-end clamp is a property of whichever node borders the doc's mandatory
+    terminal newline — the LAST deleted node — not the first. A multi-node
+    replace must go bare when the last node reaches doc_end_index, even
+    though the first node's own end_index does not."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=9)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ"
+
+
+def test_replace_of_a_render_prefix_doc_end_paragraph_keeps_leading_newline_not_bare() -> None:
+    """(#62 precedence) A node that is simultaneously the doc's last paragraph
+    AND has a render_prefix trim must keep the existing leading-newline
+    behavior (#56) — the render_prefix/structural case takes priority over
+    the newer doc-end-clamp bare mode per plan.md's precedence decision."""
+    current = [replace(_para("# cfg", start=1, end=7), render_prefix="")]
+    target = [_para("# other", start=0, end=0)]
+    # doc_end_index=6 makes the render_prefix-trimmed end (1 + len("# cfg")
+    # == 6) also satisfy the doc-end clamp, so without the precedence gate
+    # `doc_end_clamped` would be True too — this pins that `spares_structural_newline`
+    # wins.
+    requests = builder.build(current, target, doc_end_index=6)
 
     insert_requests = [r for r in requests if "insertText" in r]
     assert len(insert_requests) == 1
@@ -512,8 +583,6 @@ def test_bare_last_insert_computes_correct_paragraph_range() -> None:
         "startIndex": 8,
         "endIndex": 16,
     }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Style-only change
 # ─────────────────────────────────────────────────────────────────────────────
