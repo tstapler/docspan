@@ -850,24 +850,37 @@ class DocsRequestBuilder:
                 # of the one just protected, splitting the paragraph and
                 # leaving a stray empty one behind on every such edit (#56).
                 #
-                # KNOWN LIMITATION (pre-existing, not introduced here): the
-                # doc_end_index clamp in _delete_bounds also spares a
+                # The doc_end_index clamp in _delete_bounds also spares a
                 # newline — the paragraph's own terminator — when the
-                # deleted range ends at the document's last paragraph, but
-                # that case isn't checked here. A normal `text + "\n"`
-                # insert does NOT recreate the original state in that case;
-                # it duplicates the clamp-spared newline and leaves a stray
-                # blank paragraph behind. `before_newline=True` isn't a fix
-                # either — it would prepend a blank paragraph in front of
-                # that newline instead. Properly handling this needs a
-                # third insert-text mode (bare text, no newline) that this
-                # branch doesn't have yet. See #62.
+                # deleted range ends at the document's last paragraph.
+                # `before_newline=True` is not the right fix there: that
+                # writes "\ntext", which prepends a blank paragraph in
+                # front of the clamp-spared newline instead of reusing it.
+                # The insert must instead be bare text with no newline on
+                # either side, so the clamp-spared newline is reused as the
+                # new text's own terminator (see `bare_last` on
+                # _make_insert_requests). `precedes_structural_element` is
+                # mutually exclusive with this clamp (a following
+                # Table/ToC/SectionBreak means last.end_index <
+                # doc_end_index), but render_prefix is not — a render-glyph
+                # paragraph that is also the doc's last paragraph keeps the
+                # existing before_newline=True behavior (#48 takes
+                # precedence over this narrower case).
                 last = current[i2 - 1]
-                spares_newline = isinstance(last, DocsParagraphNode) and (
+                spares_structural_newline = isinstance(last, DocsParagraphNode) and (
                     bool(last.render_prefix) or last.precedes_structural_element
                 )
+                spares_terminal_newline = (
+                    not spares_structural_newline
+                    and isinstance(last, DocsParagraphNode)
+                    and bool(last.text)
+                    and last.end_index >= doc_end_index
+                )
                 requests = self._make_insert_requests(
-                    target[j1:j2], delete_start, before_newline=spares_newline
+                    target[j1:j2],
+                    delete_start,
+                    before_newline=spares_structural_newline,
+                    bare_last=spares_terminal_newline,
                 )
                 if requests:
                     # Same anchor as the first deleted node's group, and emitted
@@ -1802,7 +1815,11 @@ class DocsRequestBuilder:
         return requests
 
     def _make_insert_requests(
-        self, nodes: List[Node], insert_at_index: int, before_newline: bool = False
+        self,
+        nodes: List[Node],
+        insert_at_index: int,
+        before_newline: bool = False,
+        bare_last: bool = False,
     ) -> List[dict]:
         """
         Emit insert requests per node.
@@ -1839,7 +1856,22 @@ class DocsRequestBuilder:
         which is what the ``+ 1`` below accounts for. Without it the
         updateParagraphStyle range begins on the preceding paragraph's newline
         and Docs applies namedStyleType to both paragraphs.
+
+        ``bare_last`` is the mirror case: ``insert_at_index`` sits on a newline
+        that terminates the *inserted* text rather than the preceding one — the
+        deleted range's own terminal newline, spared by the doc_end_index clamp
+        in ``_delete_bounds`` because it is undeletable. Writing either
+        ``"text\\n"`` or ``"\\ntext"`` there would duplicate that newline; the
+        text must go in bare, with no newline on either side, so the
+        clamp-spared newline is reused as the new text's own terminator. It
+        only ever applies to the last of ``nodes`` (the one bordering that
+        clamp-spared newline once all nodes have been inserted) — earlier
+        nodes in a multi-node replace are still followed by more inserted
+        text, not by the spared newline, so they keep their own trailing
+        ``"\\n"``. Mutually exclusive with ``before_newline``: both describe
+        the same insert point, and only one boundary condition can hold.
         """
+        assert not (before_newline and bare_last)
         requests: List[dict] = []
         for node in reversed(nodes):
             if isinstance(node, DocsTableNode):
@@ -1852,14 +1884,21 @@ class DocsRequestBuilder:
                 })
                 continue
 
-            # The paragraph's own text always ends up as node.text + "\n"; only
-            # which side of it carries the newline in the insert differs.
-            text = "\n" + node.text if before_newline else node.text + "\n"
+            is_bare = bare_last and node is nodes[-1]
+            # The paragraph's own text always ends up as node.text + "\n",
+            # except in bare mode, where the trailing "\n" already exists at
+            # the insert point and must not be duplicated.
+            if is_bare:
+                text = node.text
+            elif before_newline:
+                text = "\n" + node.text
+            else:
+                text = node.text + "\n"
             requests.append({
                 "insertText": {"location": {"index": insert_at_index}, "text": text}
             })
             paragraph_start = insert_at_index + 1 if before_newline else insert_at_index
-            text_len = _utf16_len(node.text + "\n")
+            text_len = _utf16_len(node.text) if is_bare else _utf16_len(node.text + "\n")
             paragraph_range = {
                 "startIndex": paragraph_start,
                 "endIndex": paragraph_start + text_len,
