@@ -1400,4 +1400,48 @@ class TestCrossDocLinkResolution:
 
         assert result.status == "error", result.message
         assert "Ambiguous cross-doc link target" in (result.message or "")
-        client.batch_update.assert_not_called()
+
+    def test_push_all_across_mappings_shares_one_resolver_and_fetches_each_target_once(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Mirrors `push --all`: one `CrossDocLinkResolver`, built once, is
+        reused across every mapping's `backend.push()` call in the run — the
+        shape `cli/main.py` actually uses. Two *different* source documents
+        both link to the *same* target with a fragment; the target must be
+        fetched only once across the whole run, not once per source.
+        """
+        doc_a = tmp_path / "a.md"
+        doc_a.write_text("[Beta](c.md#two)\n", encoding="utf-8")
+        doc_b = tmp_path / "b.md"
+        doc_b.write_text("[Beta](c.md#two)\n", encoding="utf-8")
+
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta"),  # a.md's own document
+            _target_doc_with_headings(("One", "h.1"), ("Two", "h.2")),  # c.md, fetched once
+            _doc_with_paragraph("Beta"),  # b.md's own document
+        ]
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(doc_a), backend="google_docs", remote_id="doc-a"),
+                Mapping(local=str(doc_b), backend="google_docs", remote_id="doc-b"),
+                Mapping(local=str(tmp_path / "c.md"), backend="google_docs", remote_id="doc-c"),
+            ]
+        )
+
+        result_a = backend.push(str(doc_a), "doc-a", cross_doc_resolver=resolver)
+        result_b = backend.push(str(doc_b), "doc-b", cross_doc_resolver=resolver)
+
+        assert result_a.status == "ok", result_a.message
+        assert result_b.status == "ok", result_b.message
+        # 2 source-document fetches (one per push) + exactly 1 fetch of the
+        # shared target `c.md` — not 2, which is what a per-mapping (rather
+        # than per-run) resolver would cost.
+        assert client.get_document.call_count == 3
+        assert client.batch_update.call_count == 2
+        expected_url = "https://docs.google.com/document/d/doc-c/edit#heading=h.2"
+        for call in client.batch_update.call_args_list:
+            requests = call.args[1]
+            assert requests[0]["updateTextStyle"]["textStyle"]["link"]["url"] == expected_url
