@@ -43,6 +43,43 @@ structure = DocsStructureParser()
 builder = DocsRequestBuilder()
 
 
+class TestCodeBlockLinesDoNotStealAHeadingOrBullet:
+    """Splitting fenced blocks per line (#40/#41) makes issue #42 easy to reach.
+
+    A code block contributes duplicate short lines in bulk (`}`, `);`, `EOF`,
+    `pass`), and any one matching a heading or list item's text elsewhere in
+    the document can share that node's anchor with the surrounding edit's
+    insert group. Criterion 6 of #42: this must not demote the heading or
+    steal the bullet.
+    """
+
+    def test_duplicate_short_code_lines_next_to_a_heading_edit_spare_the_heading(
+        self,
+    ) -> None:
+        from .test_heading_identity import ParagraphReplay, _push
+
+        replay = ParagraphReplay([
+            ("pass", "HEADING_2", "heading", False),
+            ("pass", "NORMAL_TEXT", "body", False),
+            ("EOF", "NORMAL_TEXT", "item", True),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        _push(
+            replay,
+            "```py\npass\n```\n\n## pass\n\n```py\nEOF\n```\n\n- EOF\n\ntail\n",
+        )
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_2"
+        assert replay.alive("item") and replay.bullet["item"], (
+            "the live list item must survive as the bullet, not be swapped out "
+            "for one of the code block's duplicate 'EOF' lines"
+        )
+
+
 def _doc_of_lines(*lines: str) -> tuple[dict, int]:
     """A document holding one paragraph per line — how Docs actually stores it."""
     content, idx = [], 1

@@ -209,6 +209,35 @@ class TestTheLiveHeadingSurvives:
         )
         assert replay.text_of("heading") == "Config"
 
+    def test_a_heading_duplicated_as_body_text_survives_with_its_heading_id_intact(self) -> None:
+        """The literal repro from the bug report: an insert shares an anchor with
+        the following `equal`-restyle group for the live heading.
+
+        Document: `HEADING_2 'Overview'` / `NORMAL_TEXT 'Overview'` / `'tail'`.
+        Markdown adds another `Overview` line above the heading, so the opcode
+        shape is `[('insert', ...), ('equal', ...)]` — the insert must not shift
+        the coordinates the restyle-preserving `equal` group was computed against.
+        """
+        replay = ParagraphReplay([
+            ("Overview", "HEADING_2", "heading", False),
+            ("Overview", "NORMAL_TEXT", "body", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        _push(replay, "## Overview\n\nOverview\n\nOverview\n\ntail\n")
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_2"
+        doc, _ = replay.document()
+        headings = [
+            p["paragraph"]["paragraphStyle"]["headingId"]
+            for p in doc["body"]["content"]
+            if p["paragraph"]["paragraphStyle"].get("namedStyleType") == "HEADING_2"
+        ]
+        assert headings == ["h.heading"], "the original headingId must survive unchanged"
+
     def test_the_heading_is_restyled_in_place_rather_than_retyped(self) -> None:
         """A genuine restyle must stay an in-place edit.
 

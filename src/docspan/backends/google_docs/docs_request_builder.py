@@ -643,13 +643,25 @@ class DocsRequestBuilder:
         """
         opcodes = self._opcodes(current, target)
 
-        # (anchor_index, requests) — the requests for one node or one insert
-        # group, and the document index they are all written against.
+        # (anchor_index, is_insert, requests) — the requests for one node or
+        # one insert group, the document index they are all written against,
+        # and whether this group is an insert (vs. a restyle/delete against
+        # pre-existing content).
         #
         # Ordering rule, stated once here because getting it wrong is silent:
         # groups are applied highest-anchor-first (so every edit runs against
-        # coordinates nothing has shifted yet), and within a group in emission
-        # order (so an insert precedes the styling of what it inserted).
+        # coordinates nothing has shifted yet). Within a *tied* anchor,
+        # non-insert groups (equal-restyle, delete) go first and insert
+        # groups go last: every non-insert group's range was computed from
+        # `current[...].start_index`, a pre-insert coordinate, so an insert
+        # sharing that anchor must not run first — it would shift the range
+        # out from under the paragraph it was meant for, corrupting whichever
+        # node happens to land in the old range instead (e.g. #42: a live
+        # heading demoted and the new paragraph promoted in its place, or a
+        # bullet request landing on the wrong paragraph). The `replace`
+        # opcode's delete-then-insert pair already got this right by
+        # emission order alone; `is_insert` makes that same rule explicit
+        # and general instead of accidental.
         #
         # This used to be one flat sort over every request's own startIndex,
         # which is only equivalent while every request in a group shares the
@@ -658,20 +670,20 @@ class DocsRequestBuilder:
         # carried a higher startIndex than the insertText it depends on and
         # sorted ahead of it — a style request against a range that did not
         # exist yet. The anchor is now carried explicitly instead of inferred.
-        groups: List[Tuple[int, List[dict]]] = []
+        groups: List[Tuple[int, int, List[dict]]] = []
 
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
                 for ci, ti in zip(range(i1, i2), range(j1, j2)):
                     requests = self._make_style_update_requests(current[ci], target[ti])
                     if requests:
-                        groups.append((current[ci].start_index, requests))
+                        groups.append((current[ci].start_index, 0, requests))
 
             elif tag == "delete":
                 for node in current[i1:i2]:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
-                        groups.append((node.start_index, requests))
+                        groups.append((node.start_index, 0, requests))
 
             elif tag == "insert":
                 previous = current[i1 - 1] if i1 > 0 else None
@@ -713,14 +725,14 @@ class DocsRequestBuilder:
                     before_newline=at_body_end or before_boundary,
                 )
                 if requests:
-                    groups.append((insert_at, requests))
+                    groups.append((insert_at, 1, requests))
 
             elif tag == "replace":
                 delete_start = current[i1].start_index
                 for node in current[i1:i2]:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
-                        groups.append((node.start_index, requests))
+                        groups.append((node.start_index, 0, requests))
                 # render_prefix and precedes_structural_element both stop the
                 # last deleted node's delete range short of a newline that
                 # belongs to something else — chrome shared with a following
@@ -757,14 +769,16 @@ class DocsRequestBuilder:
                     target[j1:j2], delete_start, before_newline=spares_newline
                 )
                 if requests:
-                    # Same anchor as the first deleted node's group, and emitted
-                    # after it, so the delete runs before the insert that
-                    # replaces it.
-                    groups.append((delete_start, requests))
+                    # Same anchor as the first deleted node's group. is_insert=1
+                    # places it after that delete group in the sort below, so
+                    # the delete still runs before the insert that replaces it.
+                    groups.append((delete_start, 1, requests))
 
-        # Stable, so groups sharing an anchor keep the order above.
-        groups.sort(key=lambda group: group[0], reverse=True)
-        all_requests = [request for _anchor, requests in groups for request in requests]
+        # Descending by anchor so later edits never shift an earlier one's
+        # coordinates; at a tied anchor, non-insert groups (is_insert=0)
+        # before insert groups (is_insert=1) — see the comment above.
+        groups.sort(key=lambda group: (-group[0], group[1]))
+        all_requests = [request for _anchor, _is_insert, requests in groups for request in requests]
         self._inject_tab_id(all_requests, tab_id)
         return all_requests
 

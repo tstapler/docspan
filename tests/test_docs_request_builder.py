@@ -138,6 +138,134 @@ def test_requests_sorted_descending_by_start_index() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Same-anchor tie-break: insert vs. equal-restyle / delete / bullets (#42)
+#
+# When an insert group and a same-anchor equal-restyle/delete/bullet group tie
+# on start_index, the restyle/delete must be computed and emitted against the
+# ORIGINAL (pre-insert) coordinates and ordered before the insert — otherwise
+# the insert shifts those coordinates out from under it and the wrong
+# paragraph gets restyled/deleted/bulleted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_insert_sharing_an_anchor_with_a_following_equal_restyle_targets_the_original_paragraph() -> None:
+    """A HEADING_2 paragraph followed by a NORMAL_TEXT paragraph; the target
+    inserts a new paragraph between them and promotes the second (original)
+    paragraph to HEADING_2. The insert's anchor (10, the end of "Heading")
+    coincides with the restyle's anchor (10, the start of "Body") — the
+    restyle must use the pre-insert range [10, 15) and run before the insert,
+    not restyle the newly-inserted paragraph."""
+    current = [
+        _para("Heading", style="HEADING_2", start=1, end=10),
+        _para("Body", style="NORMAL_TEXT", start=10, end=15),
+    ]
+    target = [
+        _para("Heading", style="HEADING_2", start=0, end=0),
+        _para("NewPara", style="NORMAL_TEXT", start=0, end=0),
+        _para("Body", style="HEADING_2", start=0, end=0),
+    ]
+    requests = builder.build(current, target, doc_end_index=15)
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    original_body_restyle = next(
+        r for r in style_requests if r["updateParagraphStyle"]["range"] == {"startIndex": 10, "endIndex": 15}
+    )
+    assert original_body_restyle["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+    assert requests.index(original_body_restyle) < insert_index
+
+    # The newly inserted paragraph must not be the one carrying the promotion.
+    assert not any(
+        r["updateParagraphStyle"]["range"] == {"startIndex": 10, "endIndex": 10}
+        for r in style_requests
+    )
+
+
+def test_insert_sharing_an_anchor_with_an_unrelated_delete_deletes_the_correct_paragraph() -> None:
+    """An insert and a standalone delete of an unrelated paragraph tie on
+    anchor 10. The delete must run before the insert so it removes the
+    original "Victim" paragraph rather than colliding with content the
+    insert has already shifted into place."""
+    current = [
+        _para("Keep1", start=1, end=10),
+        _para("Victim", start=10, end=20),
+        _para("Keep2", start=5, end=10),
+        _para("Keep3", start=20, end=30),
+    ]
+    target = [
+        _para("Keep1", start=1, end=10),
+        _para("Keep2", start=5, end=10),
+        _para("NewLine", start=0, end=0),
+        _para("Keep3", start=20, end=30),
+    ]
+    requests = builder.build(current, target, doc_end_index=30)
+
+    delete_index = next(i for i, r in enumerate(requests) if "deleteContentRange" in r)
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    assert requests[delete_index]["deleteContentRange"]["range"] == {"startIndex": 10, "endIndex": 20}
+    assert delete_index < insert_index
+
+
+def test_doc_start_insert_colliding_with_restyle_of_original_first_paragraph() -> None:
+    """previous is None for the doc-start insert, so insert_at=1 — the same
+    value as the original first paragraph's start_index. The restyle of that
+    original paragraph must still target its own (pre-insert) range and run
+    before the insert."""
+    current = [_para("Body", style="NORMAL_TEXT", start=1, end=10)]
+    target = [
+        _para("NewFirst", style="NORMAL_TEXT", start=0, end=0),
+        _para("Body", style="HEADING_2", start=0, end=0),
+    ]
+    requests = builder.build(current, target, doc_end_index=10)
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    original_body_restyle = next(
+        r for r in style_requests if r["updateParagraphStyle"]["range"] == {"startIndex": 1, "endIndex": 10}
+    )
+    assert original_body_restyle["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+    assert requests.index(original_body_restyle) < insert_index
+
+
+def test_replace_delete_before_insert_ordering_unchanged_by_sort_key_fix() -> None:
+    """Non-regression: the existing replace opcode's delete-before-insert
+    same-anchor ordering (already correct pre-fix) must be unchanged now that
+    the sort key is explicit rather than incidental."""
+    current = [_para("Old text", start=1, end=9)]
+    target = [_para("New text", start=1, end=9)]
+    requests = builder.build(current, target, DOC_END)
+
+    delete_index = next(i for i, r in enumerate(requests) if "deleteContentRange" in r)
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+    assert delete_index < insert_index
+
+
+def test_insert_sharing_an_anchor_with_a_list_item_bullet_change_targets_the_original_paragraph() -> None:
+    """createParagraphBullets for a paragraph promoted to a list item must
+    land on the ORIGINAL paragraph's pre-insert range, and run before an
+    insert tied on the same anchor."""
+    current = [
+        _para("Heading", style="HEADING_2", start=1, end=10),
+        _para("Item", style="NORMAL_TEXT", start=10, end=15),
+    ]
+    target = [
+        _para("Heading", style="HEADING_2", start=0, end=0),
+        _para("NewPara", style="NORMAL_TEXT", start=0, end=0),
+        _para("Item", style="NORMAL_TEXT", start=0, end=0, is_list_item=True),
+    ]
+    requests = builder.build(current, target, doc_end_index=15)
+
+    bullet_requests = [r for r in requests if "createParagraphBullets" in r]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    assert len(bullet_requests) == 1
+    assert bullet_requests[0]["createParagraphBullets"]["range"] == {"startIndex": 10, "endIndex": 15}
+    assert requests.index(bullet_requests[0]) < insert_index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Terminal newline protection
 # ─────────────────────────────────────────────────────────────────────────────
 
