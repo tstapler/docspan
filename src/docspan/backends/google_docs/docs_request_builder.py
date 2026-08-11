@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import difflib
+import logging
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
@@ -29,6 +31,80 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # functions (_opcodes, _repair, _coalesce) and `list` is invariant, so an
 # inlined Literal in one signature and a bare `str` in the next do not unify.
 Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
+
+logger = logging.getLogger(__name__)
+
+# Thresholds for _bounded_opcodes. Tuned against this file's own test fixtures
+# (a 30-row table, the fenced-code-block fixtures in test_code_block_granularity.py)
+# so ordinary documents never trip the guard, while a document built from a
+# few thousand duplicate short lines/cells does.
+_MAX_COMPARISON_CELLS = 4_000_000
+_MAX_DUPLICATE_RUN = 60
+_MIN_SIZE_FOR_DUPLICATE_CHECK = 150
+
+
+class DiffTooExpensive(Exception):
+    """Raised instead of running SequenceMatcher on pathological duplicate-heavy input.
+
+    `autojunk=False` is required for correctness (see `_opcodes`'s docstring
+    and issue #54/#68) but it also reintroduces difflib's cubic-ish worst case
+    once many short keys repeat — a document with a few thousand duplicate
+    lines or table cells can otherwise hang push/pull for minutes.
+
+    Refuses loudly rather than falling back to a positional/heuristic diff:
+    `_repair` and `_prefer_structural_pairing` both depend on
+    `get_opcodes()`'s exact partition guarantee, and a lookalike-popularity
+    heuristic is exactly what reopened the headingId-mispairing bug PR #50/#67
+    fixed. "Refuse, don't guess" matches this file's existing philosophy.
+    """
+
+    def __init__(self, context: str, size: int, max_duplicate_run: int):
+        self.context = context
+        self.size = size
+        self.max_duplicate_run = max_duplicate_run
+        super().__init__(
+            f"Diff for {context} is too expensive to compute safely: {size} "
+            f"nodes include a run of {max_duplicate_run} duplicate short "
+            "lines/cells. Split the table or code block into smaller pieces "
+            "and retry."
+        )
+
+
+def _bounded_opcodes(a_keys: List[Tuple], b_keys: List[Tuple], *, context: str) -> List[Opcode]:
+    """The sole place any `autojunk=False` `SequenceMatcher` gets constructed.
+
+    `_opcodes`, `_repair`'s inner per-run matcher and `_align_for_styling`'s
+    pass-2 matcher all route through this one function so the pathological-
+    input guard can never be applied at one call site and forgotten at
+    another — the same failure class `_opcodes`'s docstring already warns
+    about for build()/diff_summary() drifting apart.
+
+    Trips (raises `DiffTooExpensive`, logging a WARNING first) on either:
+    - a comparison matrix (`len(a_keys) * len(b_keys)`) large enough that
+      even difflib's average-case cost is unsafe, or
+    - a duplicate-key run dense enough to trigger the cubic-ish worst case,
+      gated by a size floor so a handful of legitimately-repeated short
+      values (a few blank paragraphs, a short status column) never trips it.
+
+    Otherwise behaves exactly as the removed inline `SequenceMatcher(None,
+    a_keys, b_keys, autojunk=False)` calls did — `autojunk` is never
+    re-enabled and no popularity heuristic is substituted.
+    """
+    combined_len = len(a_keys) + len(b_keys)
+    max_duplicate_run = max(Counter(a_keys + b_keys).values()) if combined_len else 0
+    if len(a_keys) * len(b_keys) > _MAX_COMPARISON_CELLS or (
+        combined_len >= _MIN_SIZE_FOR_DUPLICATE_CHECK and max_duplicate_run > _MAX_DUPLICATE_RUN
+    ):
+        logger.warning(
+            "Refusing expensive diff for %s: %d + %d nodes, largest duplicate run %d",
+            context,
+            len(a_keys),
+            len(b_keys),
+            max_duplicate_run,
+        )
+        raise DiffTooExpensive(context, combined_len, max_duplicate_run)
+    matcher = difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False)
+    return matcher.get_opcodes()
 
 
 @dataclass(frozen=True)
@@ -233,13 +309,17 @@ class DocsRequestBuilder:
         but they must see identical opcodes, since push()'s safety gate
         (high_risk, derived from diff_summary()'s classification) and the
         actual write (derived from build()'s classification) must never
-        drift apart. This is the one place current_keys/target_keys/
-        SequenceMatcher get constructed.
+        drift apart. This is the one place current_keys/target_keys get
+        constructed; the matcher itself is built by `_bounded_opcodes`, the
+        shared guard against difflib's duplicate-heavy worst case (see its
+        docstring) — a `DiffTooExpensive` raised here propagates to both
+        callers identically, so they can never diverge on whether a document
+        is pathological either.
         """
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
-        matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        return self._repair(matcher.get_opcodes(), current, target)
+        opcodes = _bounded_opcodes(current_keys, target_keys, context="document")
+        return self._repair(opcodes, current, target)
 
     def _repair(
         self,
@@ -284,14 +364,13 @@ class DocsRequestBuilder:
                 continue
             cur_slice = current[i1:i2]
             tgt_slice = target[j1:j2]
-            inner = difflib.SequenceMatcher(
-                None,
+            inner_opcodes = _bounded_opcodes(
                 [self._content_key(n) for n in cur_slice],
                 [self._content_key(n) for n in tgt_slice],
-                autojunk=False,
+                context="replace-run",
             )
             pending: List[Opcode] = []
-            for itag, ci1, ci2, tj1, tj2 in inner.get_opcodes():
+            for itag, ci1, ci2, tj1, tj2 in inner_opcodes:
                 aci1, aci2 = i1 + ci1, i1 + ci2
                 atj1, atj2 = j1 + tj1, j1 + tj2
                 if itag == "equal":
@@ -1356,17 +1435,16 @@ class DocsRequestBuilder:
         # docstring) — it must reach the caller the same way the identical
         # residue kind on the original doc parse reaches plan.residue.
         current, current_residue = project(DocsStructureParser().parse(doc))
-        matcher = difflib.SequenceMatcher(
-            None,
+        opcodes = _bounded_opcodes(
             [self._alignment_key(n) for n in current],
             [self._alignment_key(n) for n in target],
-            autojunk=False,
+            context="pass-2 styling",
         )
 
         pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         aligned_target_indices = set()
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for tag, i1, i2, j1, j2 in opcodes:
             if tag != "equal":
                 continue
             for ci, ti in zip(range(i1, i2), range(j1, j2)):
