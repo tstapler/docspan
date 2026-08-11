@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 from googleapiclient.errors import HttpError
 
-from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
@@ -808,6 +808,18 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         doc = self._client.get_document(doc_id)
         return doc["revisionId"]
+
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        """Create a new, empty Google Doc and return its id/title/url."""
+        self._ensure_client()
+        assert self._client is not None
+        doc = self._client.create_document(title)
+        doc_id = doc["documentId"]
+        return CreateResult(
+            doc_id=doc_id,
+            title=doc.get("title", title),
+            url=f"https://docs.google.com/document/d/{doc_id}/edit",
+        )
 
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()

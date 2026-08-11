@@ -1200,3 +1200,22 @@ class TestPullSurfacesResidue:
         result = backend.pull("doc-1", str(local), tab_id="t.0")
 
         assert result.status == "ok", result.message
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsBackend.create() — new-doc creation for `docspan map`
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCreate:
+    def test_create_calls_client_and_returns_doc_id_title_url(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.create_document.return_value = {"documentId": "new-doc-1", "title": "My Doc"}
+
+        result = backend.create("My Doc")
+
+        client.create_document.assert_called_once_with("My Doc")
+        assert result.doc_id == "new-doc-1"
+        assert result.title == "My Doc"
+        assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
