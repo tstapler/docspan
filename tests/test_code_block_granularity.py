@@ -62,9 +62,13 @@ def _doc_of_lines(*lines: str) -> tuple[dict, int]:
 class TestGranularity:
     def test_each_line_of_a_fenced_block_is_its_own_node(self) -> None:
         nodes = markdown.parse("```yaml\nkey: value\n  indented: yes\n```\n")
-        assert [node.text for node in nodes] == ["key: value", "  indented: yes"]
-        # Every line stays monospace, so the styling survives the split.
-        assert all(node.spans[0].monospace for node in nodes)
+        # A literal, non-monospace marker line carries the fence language
+        # (issue #45 AC1) ahead of the monospace code lines.
+        assert [node.text for node in nodes] == ["```yaml", "key: value", "  indented: yes"]
+        code_nodes = nodes[1:]
+        # Every code line stays monospace, so the styling survives the split.
+        assert all(node.spans[0].monospace for node in code_nodes)
+        assert not nodes[0].spans
 
     def test_indentation_is_preserved(self) -> None:
         """`strip()` ate leading whitespace; in code that is meaning, not padding."""
@@ -105,7 +109,11 @@ class TestPushIsIdempotent:
         a document nobody had edited, and did so on every push forever.
         """
         md = "before\n\n```yaml\nkey: value\n  indented: yes\nafter\n```\n\ntail\n"
-        doc, end = _doc_of_lines("before", "key: value", "  indented: yes", "after", "tail")
+        # The literal, non-monospace "```yaml" marker line (issue #45 AC1) is
+        # itself a real paragraph in the live document, ahead of the code lines.
+        doc, end = _doc_of_lines(
+            "before", "```yaml", "key: value", "  indented: yes", "after", "tail"
+        )
 
         target, _ = project(markdown.parse(md))
         current, _ = project(structure.parse(doc))
@@ -140,7 +148,7 @@ class TestPushIsIdempotent:
             if "insertText" in request
         ]
         assert sorted(text.strip("\n") for text in texts) == [
-            "line one", "line three", "line two",
+            "```sh", "line one", "line three", "line two",
         ]
         for text in texts:
             assert text.count("\n") == 1, text

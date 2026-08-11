@@ -13,6 +13,13 @@ from docspan.backends.google_docs.docs_structure_parser import (
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
+# Literal, non-monospace marker line written ahead of a fenced block's lines to
+# carry mistune's token.attrs.info (the fence language) through the node-list
+# representation, which otherwise has nowhere to put it. Must stay in sync
+# with nodes_to_markdown.py's FENCE_MARKER, which decodes it back into a real
+# ```lang fence on render.
+FENCE_MARKER = "```"
+
 
 def _extract_text_from_token(token: dict) -> str:
     """Recursively extract plain text from a mistune AST token."""
@@ -284,6 +291,24 @@ class MarkdownToParagraphParser:
                 #
                 # `strip("\n")` rather than `strip()`: the fence's own blank edges
                 # go, indentation does not. Leading whitespace is meaning in code.
+                #
+                # The fence language (mistune's token.attrs.info) has no field
+                # on DocsParagraphNode to live in, so it's written ahead of the
+                # code lines as a literal, non-monospace marker paragraph
+                # (same approach as ADR-001's literal checklist markers and
+                # _prefix_node_text's "> " blockquote markers). Non-monospace
+                # is what makes it unambiguously decodable on the way back:
+                # every real code line below is monospace by construction, so
+                # this shape never collides with one. See
+                # nodes_to_markdown.py's _is_language_marker/_group_code_runs,
+                # which decode it back into a real ```lang fence on render.
+                info = (token.get("attrs") or {}).get("info") or ""
+                lang = info.strip()
+                if lang:
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=f"{FENCE_MARKER}{lang}",
+                        start_index=0, end_index=0, spans=[],
+                    ))
                 raw = token.get("raw", "").strip("\n")
                 for line in raw.split("\n"):
                     nodes.append(DocsParagraphNode(

@@ -6,7 +6,7 @@ Docs API never exposes a checked/unchecked bit for (see push_preview.py's
 NATIVE CHECKBOX GLYPH warning) — so both checked and unchecked native
 checkboxes render as an unchecked `- [ ]` markdown checklist item.
 """
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode, TextSpan
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 
 
@@ -14,6 +14,102 @@ def _node(**kwargs) -> DocsParagraphNode:
     defaults = dict(style="NORMAL_TEXT", text="", is_list_item=False, nesting_level=0)
     defaults.update(kwargs)
     return DocsParagraphNode(**defaults)
+
+
+def _code_line(text: str) -> DocsParagraphNode:
+    """A pure code-line node — the exact shape MarkdownToParagraphParser
+    writes for a fenced block's lines: one span, monospace, no other mark."""
+    return _node(text=text, spans=[TextSpan(text=text, monospace=True)])
+
+
+def _blank_code_line() -> DocsParagraphNode:
+    return _node(text="", spans=[])
+
+
+def _lang_marker(lang: str) -> DocsParagraphNode:
+    return _node(text=f"```{lang}")
+
+
+def test_monospace_run_renders_as_fence() -> None:
+    # AC0: consecutive full-width-monospace paragraphs become one fenced
+    # code block, not per-line inline code.
+    nodes = [_code_line("key: value"), _code_line("  indented: yes")]
+    md = render_nodes_to_markdown(nodes)
+    assert "```\nkey: value\n  indented: yes\n```" in md
+    assert "`key: value`" not in md
+
+
+def test_fence_with_language_round_trip() -> None:
+    # AC1: a language marker line ahead of a code run becomes ```lang.
+    nodes = [_lang_marker("yaml"), _code_line("key: value")]
+    md = render_nodes_to_markdown(nodes)
+    assert "```yaml\nkey: value\n```" in md
+
+
+def test_monospace_content_with_backticks_is_escaped() -> None:
+    # AC2: an isolated inline-code span's own backticks are escaped using
+    # CommonMark's longer-delimiter rule. Mixed with surrounding plain text
+    # so this isn't itself the exact pure-code-line shape (which AC0 says
+    # should become a one-line fence instead).
+    nodes = [_node(text="see a`b here",
+                    spans=[TextSpan(text="see "), TextSpan(text="a`b", monospace=True),
+                           TextSpan(text=" here")])]
+    md = render_nodes_to_markdown(nodes)
+    assert "``a`b``" in md
+
+
+def test_fence_around_grouped_run_escapes_via_longer_delimiter() -> None:
+    # AC2: the outer fence around a grouped run is picked longer than any
+    # backtick run inside the code content, rather than corrupting the fence.
+    nodes = [_code_line("has ``` inside")]
+    md = render_nodes_to_markdown(nodes)
+    assert "````\nhas ``` inside\n````" in md
+
+
+def test_isolated_inline_code_not_grouped() -> None:
+    # AC3: a single monospace span inside an otherwise plain paragraph must
+    # never be swept into a fence.
+    nodes = [_node(text="see `foo` here",
+                    spans=[TextSpan(text="see "), TextSpan(text="foo", monospace=True),
+                           TextSpan(text=" here")])]
+    md = render_nodes_to_markdown(nodes)
+    assert "```" not in md
+    assert "`foo`" in md
+
+
+def test_mixed_mark_span_not_grouped_as_fence() -> None:
+    # A monospace+bold span is not the exact code-line shape and must render
+    # as an inline (bold) code span, not get absorbed into a fence.
+    nodes = [_node(text="x", spans=[TextSpan(text="bold code", monospace=True, bold=True)])]
+    md = render_nodes_to_markdown(nodes)
+    assert "```" not in md
+    assert "**`bold code`**" in md
+
+
+def test_blank_line_inside_fence_preserved() -> None:
+    # AC5: a blank line interior to a code run stays inside the fence
+    # instead of splitting it into two fences.
+    nodes = [_code_line("one"), _blank_code_line(), _code_line("two")]
+    md = render_nodes_to_markdown(nodes)
+    assert md.count("```") == 2
+    assert "one\n\ntwo" in md
+
+
+def test_two_separate_code_blocks_stay_separate() -> None:
+    # A normal paragraph between two code runs must keep them as two fences,
+    # not merge them into one.
+    nodes = [_code_line("first"), _node(text="prose"), _code_line("second")]
+    md = render_nodes_to_markdown(nodes)
+    assert md.count("```") == 4
+
+
+def test_language_marker_without_following_code_is_not_absorbed() -> None:
+    # A literal paragraph that happens to start with ``` but isn't followed
+    # by a code run renders as plain text rather than crashing.
+    nodes = [_lang_marker("yaml"), _node(text="just prose")]
+    md = render_nodes_to_markdown(nodes)
+    assert "```yaml" in md
+    assert "just prose" in md
 
 
 def test_native_checkbox_unchecked_renders_as_markdown_checklist_item() -> None:
