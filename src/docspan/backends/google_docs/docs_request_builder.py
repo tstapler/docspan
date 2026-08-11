@@ -1066,10 +1066,11 @@ class DocsRequestBuilder:
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
-        live_tables = self._live_tables(doc, len(target_tables))
+        aligned = self._aligned(doc, target, alignment)
         missed: List[str] = []
-        for position, tnode in enumerate(target_tables):
-            table = live_tables[position] if position < len(live_tables) else None
+        paired = {id(tnode): table for table, tnode in self._paired_tables(doc, aligned.table_pairs)}
+        for tnode in target_tables:
+            table = paired.get(id(tnode))
             rows = table.get("tableRows", []) if table else []
             for r, row in enumerate(tnode.rows):
                 live_cells = rows[r].get("tableCells", []) if r < len(rows) else []
@@ -1094,20 +1095,6 @@ class DocsRequestBuilder:
                     ) > limit:
                         missed.append(cell.text)
         return missed
-
-    @staticmethod
-    def _live_tables(doc: dict, limit: int) -> List[dict]:
-        """The first `limit` tables in body order — the pairing both cell passes use."""
-        tables: List[dict] = []
-        if limit <= 0:
-            return tables
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is not None:
-                tables.append(table)
-                if len(tables) >= limit:
-                    break
-        return tables
 
     @staticmethod
     def _paired_tables(

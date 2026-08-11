@@ -281,42 +281,104 @@ def test_fill_pairs_by_document_order_not_by_emptiness_count() -> None:
 
 
 def test_fill_pairs_by_document_order_symmetric() -> None:
-    """Same bug, mirrored order: ``[empty, populated "KEEP"]``.
+    """Same bug, opposite direction: ``[populated, empty, populated]`` against
+    3 targets ``[T0, T1, T2]``.
 
-    The first (empty) live table must get target 0's text, and the populated
-    table must be left untouched even though it now consumes a pairing slot.
-    """
-    doc = {"body": {"content": [
-        {"startIndex": 1, "endIndex": 6, "table": {"rows": 1, "columns": 1, "tableRows": [
-            {"tableCells": [_empty_cell(4)]},
-        ]}},
-        {"startIndex": 6, "endIndex": 15, "table": {"rows": 1, "columns": 1, "tableRows": [
-            {"tableCells": [_populated_cell(9, "KEEP")]},
-        ]}},
-    ]}}
-    target = [DocsTableNode(rows=[["T0"]]), DocsTableNode(rows=[["T1"]])]
-    reqs = builder.build_table_fill_requests(doc, target)
-    assert reqs == [{"insertText": {"location": {"index": 4}, "text": "T0"}}]
-
-
-def test_style_pairs_tables_by_document_order() -> None:
-    """The styling side shares `table_pairs` with the fill fix above — it must
-    match each live table with its position-matched target, not swap them,
-    when both live tables are already populated (a re-run over an existing doc).
+    The old code advanced its target index only when it hit an *empty* live
+    table, silently skipping populated ones without consuming a slot — so the
+    lone empty table (2nd in document order) was paired with target 0 instead
+    of target 1. Document-order pairing must give it target 1 regardless of
+    the emptiness of the tables around it.
     """
     doc = {"body": {"content": [
         {"startIndex": 1, "endIndex": 10, "table": {"rows": 1, "columns": 1, "tableRows": [
-            {"tableCells": [_populated_cell(4, "AAA")]},
+            {"tableCells": [_populated_cell(4, "KEEP0")]},
         ]}},
-        {"startIndex": 10, "endIndex": 19, "table": {"rows": 1, "columns": 1, "tableRows": [
-            {"tableCells": [_populated_cell(13, "BBB")]},
+        {"startIndex": 10, "endIndex": 15, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_empty_cell(13)]},
+        ]}},
+        {"startIndex": 15, "endIndex": 25, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(18, "KEEP2")]},
         ]}},
     ]}}
     target = [
+        DocsTableNode(rows=[["T0"]]),
+        DocsTableNode(rows=[["T1"]]),
+        DocsTableNode(rows=[["T2"]]),
+    ]
+    reqs = builder.build_table_fill_requests(doc, target)
+    assert reqs == [{"insertText": {"location": {"index": 13}, "text": "T1"}}]
+
+
+def test_style_pairs_tables_by_document_order() -> None:
+    """The styling side shares `table_pairs` with the fill fix above, computed
+    via content alignment rather than raw table position.
+
+    The live document has an *extra* leading table (e.g. pre-existing content
+    outside the pushed markdown) before an "Intro" paragraph and the two
+    tables that actually correspond to `target`. Raw-position pairing (the
+    pre-fix behavior: zip the first N live tables with the N target tables in
+    order) grabs the extra table as if it were target 0, misaligning every
+    later table by one and losing all styling. Content-aligned `table_pairs`
+    matches "Intro" first via difflib, then correctly pairs the two tables
+    that follow it with their two targets, leaving the unrelated leading
+    table out of the pairing entirely.
+    """
+    doc = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 10, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(4, "ZZZ")]},
+        ]}},
+        {"startIndex": 10, "endIndex": 16, "paragraph": {
+            "elements": [{"textRun": {"content": "Intro\n"}}],
+        }},
+        {"startIndex": 16, "endIndex": 25, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(19, "AAA")]},
+        ]}},
+        {"startIndex": 25, "endIndex": 34, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(28, "BBB")]},
+        ]}},
+    ]}}
+    target = [
+        DocsParagraphNode(style="NORMAL_TEXT", text="Intro"),
         DocsTableNode(rows=[[TableCell(text="AAA", spans=[TextSpan(text="AAA", bold=True)])]]),
         DocsTableNode(rows=[[TableCell(text="BBB", spans=[TextSpan(text="BBB", italic=True)])]]),
     ]
     reqs = builder.build_table_cell_span_requests(doc, target)
     by_index = {r["updateTextStyle"]["range"]["startIndex"]: _text_style(r) for r in reqs}
-    assert by_index[4].get("bold") is True
-    assert by_index[13].get("italic") is True
+    assert by_index[19].get("bold") is True
+    assert by_index[28].get("italic") is True
+
+
+def test_unplaced_table_cells_uses_content_aligned_pairing() -> None:
+    """`unplaced_table_cells` must use the same `table_pairs` alignment as the
+    fill/style passes above, not the old raw-position pairing.
+
+    Same fixture as `test_style_pairs_tables_by_document_order`: an unrelated
+    leading table before the "Intro" paragraph. Raw-position pairing (the
+    pre-fix behavior, reintroduced if this function pairs tables itself
+    instead of sharing `table_pairs`) matches that leading table against
+    target 0 and shifts every later table by one, so neither "AAA" nor "BBB"
+    is ever found in its paired live cell and both get reported missed.
+    Content-aligned pairing correctly matches AAA<->AAA and BBB<->BBB, so
+    nothing is missed.
+    """
+    doc = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 10, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(4, "ZZZ")]},
+        ]}},
+        {"startIndex": 10, "endIndex": 16, "paragraph": {
+            "elements": [{"textRun": {"content": "Intro\n"}}],
+        }},
+        {"startIndex": 16, "endIndex": 25, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(19, "AAA")]},
+        ]}},
+        {"startIndex": 25, "endIndex": 34, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(28, "BBB")]},
+        ]}},
+    ]}}
+    target = [
+        DocsParagraphNode(style="NORMAL_TEXT", text="Intro"),
+        DocsTableNode(rows=[[TableCell(text="AAA", spans=[TextSpan(text="AAA", bold=True)])]]),
+        DocsTableNode(rows=[[TableCell(text="BBB", spans=[TextSpan(text="BBB", italic=True)])]]),
+    ]
+    assert builder.unplaced_table_cells(doc, target) == []
