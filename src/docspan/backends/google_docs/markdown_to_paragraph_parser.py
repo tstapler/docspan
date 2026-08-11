@@ -39,7 +39,10 @@ def _spans_from_markdown_text(text: str) -> List[TextSpan]:
 
         _inline_md = mistune.create_markdown(renderer=None, plugins=["table"])
     for token in _inline_md(text) or []:
-        if token.get("type") == "paragraph":
+        # token is `str | dict[str, Any]` per mistune's stubs; the isinstance
+        # guard narrows it for mypy (matches the pattern used elsewhere in
+        # this file for the same union).
+        if isinstance(token, dict) and token.get("type") == "paragraph":
             return _spans_from_inline(token.get("children", []))
     # Not a paragraph (e.g. text that is itself a bare "<table>" or "<br>") —
     # the whole fragment is opaque raw HTML to mistune's block parser, so keep it
@@ -431,7 +434,7 @@ class MarkdownToParagraphParser:
                 # (_render_table_html) since pipe syntax has no cell-internal
                 # break. Any other raw HTML is unsupported and silently
                 # skipped, as before.
-                raw = token.get("raw", "").strip()
+                raw = token.get("raw", "").strip() if isinstance(token, dict) else ""
                 if raw.lower().startswith("<table"):
                     nodes.append(_table_from_html_block(raw))
 
