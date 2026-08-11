@@ -62,9 +62,13 @@ def _doc_of_lines(*lines: str) -> tuple[dict, int]:
 class TestGranularity:
     def test_each_line_of_a_fenced_block_is_its_own_node(self) -> None:
         nodes = markdown.parse("```yaml\nkey: value\n  indented: yes\n```\n")
-        assert [node.text for node in nodes] == ["key: value", "  indented: yes"]
-        # Every line stays monospace, so the styling survives the split.
-        assert all(node.spans[0].monospace for node in nodes)
+        # A literal, non-monospace marker line carries the fence language
+        # (issue #45 AC1) ahead of the monospace code lines.
+        assert [node.text for node in nodes] == ["```yaml", "key: value", "  indented: yes"]
+        code_nodes = nodes[1:]
+        # Every code line stays monospace, so the styling survives the split.
+        assert all(node.spans[0].monospace for node in code_nodes)
+        assert not nodes[0].spans
 
     def test_indentation_is_preserved(self) -> None:
         """`strip()` ate leading whitespace; in code that is meaning, not padding."""
@@ -105,7 +109,11 @@ class TestPushIsIdempotent:
         a document nobody had edited, and did so on every push forever.
         """
         md = "before\n\n```yaml\nkey: value\n  indented: yes\nafter\n```\n\ntail\n"
-        doc, end = _doc_of_lines("before", "key: value", "  indented: yes", "after", "tail")
+        # The literal, non-monospace "```yaml" marker line (issue #45 AC1) is
+        # itself a real paragraph in the live document, ahead of the code lines.
+        doc, end = _doc_of_lines(
+            "before", "```yaml", "key: value", "  indented: yes", "after", "tail"
+        )
 
         target, _ = project(markdown.parse(md))
         current, _ = project(structure.parse(doc))
@@ -140,7 +148,7 @@ class TestPushIsIdempotent:
             if "insertText" in request
         ]
         assert sorted(text.strip("\n") for text in texts) == [
-            "line one", "line three", "line two",
+            "```sh", "line one", "line three", "line two",
         ]
         for text in texts:
             assert text.count("\n") == 1, text
@@ -564,8 +572,8 @@ class TestRenderPrefixParticipatesInIdentity:
 
         A separate, harder collision — where `_node_key` alone still cannot
         resolve which current node should absorb a *single* target slot — is
-        pinned and out of scope for this fix; see
-        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        exercised and resolved by
+        `test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line`
         below.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg", code_first=True)
@@ -610,33 +618,39 @@ class TestRenderPrefixParticipatesInIdentity:
                 f"a request landed on or before the render_prefix glyph: {requests}"
             )
 
-    def test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence(self) -> None:
-        """A known residual gap, pinned rather than silently left undiscovered.
+    def test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line(
+        self,
+    ) -> None:
+        """The multi-candidate correspondence gap (issue #68), now resolved.
 
-        `_node_key` now keeps a prose paragraph and a code-rendered paragraph
+        `_node_key` keeps a prose paragraph and a code-rendered paragraph
         apart *when they are the only two candidates for their own slots* (see
         `test_node_key_distinguishes_prose_from_a_code_line_with_the_same_text`).
-        It cannot resolve the harder case where a plain current paragraph and a
-        real current code-rendered paragraph both read the same text, and only
-        one target slot (also that text) exists to match against: `_node_key`
-        never marks a *target* node as code (markdown never sets
-        `render_prefix`), so the plain current paragraph — whose key equals the
-        target's — wins the correspondence, and the actual code-rendered node
-        is left an unpaired `delete`, outside the `replace` run `_repair`
-        inspects and so beyond its content-key rescue.
+        The harder case is a plain current paragraph and a real current
+        code-rendered paragraph both reading the same text, with only one
+        target slot (also that text) to match against: `_node_key` never
+        marks a *target* node as code (markdown never sets `render_prefix`),
+        so the plain current paragraph — whose key equals the target's — used
+        to win the correspondence, leaving the actual code-rendered node an
+        unpaired `delete`, outside the `replace` run `_repair` inspects and so
+        beyond its content-key rescue.
 
-        This reproduces identically on unmodified `origin/main` (confirmed
-        before this fix), so it predates issue #54 and is not something a key
-        signal alone can fix — it needs `_prefer_structural_pairing`-style
-        disambiguation lifted to the top-level correspondence matcher, which is
-        outside this fix's scope. Tracked in issue #68. Pinned here as
-        documented, not silently reintroduced.
+        `_opcodes` now runs `_prefer_structural_pairing` a second time at the
+        top level (`prefer_code_line=True`), which prefers a
+        `render_prefix`-carrying candidate for a slot whose target node is
+        itself an all-monospace fenced-code line (`_target_wants_code_line`).
+        So the code-rendered node wins the slot, and the plain prose
+        paragraph is the one deleted — asserted below both by exclusion (the
+        code-rendered node's range is untouched) and by inclusion (the prose
+        paragraph's exact range is the one that gets deleted), mirroring
+        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg")
         current, _ = project(structure.parse(doc))
         target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
 
         code_node = next(n for n in current if n.render_prefix)
+        prose_node = next(n for n in current if n.text == "cfg" and not n.render_prefix)
         requests = builder.build(current, target, end)
 
         lands_inside_code_block = any(
@@ -647,8 +661,105 @@ class TestRenderPrefixParticipatesInIdentity:
             ) < code_node.end_index
             for r in requests
         )
-        assert lands_inside_code_block, (
-            "if this starts failing, the multi-candidate correspondence gap "
-            "described above has been fixed — replace this pin with a real "
-            "assertion that the code block is left alone"
+        assert not lands_inside_code_block, (
+            "the code-rendered node's range should be left alone now that the "
+            "top-level pass prefers it for the code slot"
+        )
+
+        deletes = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert deletes == [
+            {"startIndex": prose_node.start_index, "endIndex": prose_node.end_index}
+        ], (
+            "the plain prose paragraph — not the code-rendered one — should be "
+            f"the one deleted: {requests}"
+        )
+
+    def test_target_wanting_code_degrades_gracefully_with_no_code_rendered_candidate(
+        self,
+    ) -> None:
+        """`_target_wants_code_line` can be true with nothing to prefer.
+
+        Two plain (non-`render_prefix`) duplicate paragraphs both read "cfg",
+        and the target wants that slot to be a fenced-code line, but neither
+        current candidate is actually Docs-rendered. The whole-document pass
+        added for issue #68 must not invent a winner or misbehave when its
+        `code_slot_ids` gate finds no `render_prefix` candidate for the slot —
+        it should fall back to `_repair`'s ordinary positional pairing:
+        the first "cfg" survives as the match, the second is deleted as a
+        stale duplicate.
+        """
+        doc, end = _doc_of_lines("Intro", "cfg", "cfg", "Tail")
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
+
+        first, second = (n for n in current if n.text == "cfg")
+        requests = builder.build(current, target, end)
+
+        deletes = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert deletes == [
+            {"startIndex": second.start_index, "endIndex": second.end_index}
+        ], (
+            "with no code-rendered candidate to prefer, the first duplicate "
+            f"should be kept and the second deleted: {requests}"
+        )
+
+    def test_a_code_rendered_candidate_wins_the_slot_among_three_duplicates(self) -> None:
+        """The `code_slot_ids` preference holds with more than two candidates.
+
+        Two plain "cfg" paragraphs and one real Docs-rendered "cfg" paragraph
+        (glyph-prefixed, monospace) all share the same text, with a single
+        target slot wanting code. The code-rendered candidate must win the
+        slot regardless of how many plain duplicates compete for it, and both
+        plain duplicates are deleted.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
+        paragraphs = [
+            [("Intro\n", {})],
+            [("cfg\n", {})],
+            [("cfg\n", {})],
+            [("", {}), ("cfg\n", mono)],
+            [("Tail\n", {})],
+        ]
+        content, index = [], 1
+        for runs in paragraphs:
+            raw = "".join(c for c, _ in runs)
+            end = index + len(raw.encode("utf-16-le")) // 2
+            content.append({"startIndex": index, "endIndex": end, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": c, "textStyle": st}} for c, st in runs],
+            }})
+            index = end
+        doc = {"revisionId": "rev-1", "body": {"content": content}}
+
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
+
+        code_node = next(n for n in current if n.render_prefix)
+        plain_nodes = [n for n in current if n.text == "cfg" and not n.render_prefix]
+        assert len(plain_nodes) == 2
+        requests = builder.build(current, target, index)
+
+        lands_inside_code_block = any(
+            code_node.start_index <= (
+                r.get("deleteContentRange", {}).get("range", {}).get("startIndex")
+                or r.get("insertText", {}).get("location", {}).get("index")
+                or -1
+            ) < code_node.end_index
+            for r in requests
+        )
+        assert not lands_inside_code_block, (
+            f"the code-rendered node among three candidates should be left alone: {requests}"
+        )
+
+        deletes = {
+            (r["deleteContentRange"]["range"]["startIndex"], r["deleteContentRange"]["range"]["endIndex"])
+            for r in requests if "deleteContentRange" in r
+        }
+        assert deletes == {(n.start_index, n.end_index) for n in plain_nodes}, (
+            f"both plain duplicates — not the code-rendered node — should be deleted: {requests}"
         )
