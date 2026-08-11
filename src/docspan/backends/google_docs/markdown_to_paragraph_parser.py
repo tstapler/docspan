@@ -302,6 +302,20 @@ class MarkdownToParagraphParser:
                 # this shape never collides with one. See
                 # nodes_to_markdown.py's _is_language_marker/_group_code_runs,
                 # which decode it back into a real ```lang fence on render.
+                #
+                # The marker is only emitted when there's a language to carry.
+                # A lang-less fence stays marker-less on purpose: a *native*
+                # Google Docs code block (typed in the Docs UI, not pushed by
+                # this tool) never has a marker either, and matching push's
+                # target against that live structure depends on the two
+                # shapes being identical (`:test_an_unchanged_code_block_emits_nothing`).
+                # A marker on every fence would make an unrelated,
+                # already-correct native code block look changed on every
+                # push. Two adjacent language-less fenced blocks in the same
+                # markdown file therefore remain indistinguishable from one
+                # merged block on the next pull — an accepted limitation of
+                # the same kind as the marker/prose ambiguity below, not
+                # fixed here.
                 info = (token.get("attrs") or {}).get("info") or ""
                 lang = info.strip()
                 if lang:
@@ -310,6 +324,12 @@ class MarkdownToParagraphParser:
                         start_index=0, end_index=0, spans=[],
                     ))
                 raw = token.get("raw", "").strip("\n")
+                # An empty fenced block (` ```\n```\n `) has `raw == ""`, so
+                # `"".split("\n")` yields `[""]` — one blank-shaped node right
+                # after the marker. That's deliberate: it's the signal
+                # `_group_code_runs` uses to render an explicit empty fence
+                # rather than losing the block or leaving an unterminated
+                # marker behind.
                 for line in raw.split("\n"):
                     nodes.append(DocsParagraphNode(
                         style="NORMAL_TEXT", text=line, start_index=0, end_index=0,

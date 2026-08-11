@@ -112,6 +112,53 @@ def test_language_marker_without_following_code_is_not_absorbed() -> None:
     assert "just prose" in md
 
 
+def test_adjacent_language_marked_blocks_stay_separate() -> None:
+    # Two marker+code runs with no intervening node must render as two
+    # fences, not fuse into one — the marker is what breaks the run.
+    nodes = [
+        _lang_marker("yaml"), _code_line("first"),
+        _lang_marker("sh"), _code_line("second"),
+    ]
+    md = render_nodes_to_markdown(nodes)
+    assert md.count("```") == 4
+    assert "```yaml\nfirst\n```" in md
+    assert "```sh\nsecond\n```" in md
+
+
+def test_empty_fenced_block_with_language_round_trips() -> None:
+    # A marker followed by exactly one blank-shaped line and no further code
+    # is MarkdownToParagraphParser's shape for an explicitly empty fence
+    # (`:294`), not an orphaned marker — it must render as an empty fence,
+    # not be lost or misread as plain text.
+    nodes = [_lang_marker("yaml"), _blank_code_line()]
+    md = render_nodes_to_markdown(nodes)
+    assert "```yaml\n```" in md
+
+
+def test_orphaned_marker_does_not_corrupt_reparse() -> None:
+    # A marker left behind with no matching code run renders as an escaped,
+    # inert line — reparsing the rendered markdown must not turn the
+    # following prose into monospace code content.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = [_lang_marker("yaml"), _node(text="just prose"), _node(text="more prose")]
+    md = render_nodes_to_markdown(nodes)
+    reparsed = MarkdownToParagraphParser().parse(md)
+    assert not any(span.monospace for node in reparsed for span in node.spans)
+
+
+def test_fence_delimiter_accounts_for_backticks_in_language() -> None:
+    # A run of backticks inside the language string itself must also
+    # lengthen the fence delimiter, or it fuses with the fence and corrupts
+    # the language. Three backticks in the language forces a 4-backtick
+    # fence — the code content alone (no backticks) wouldn't demand it.
+    nodes = [_lang_marker("a```b"), _code_line("plain")]
+    md = render_nodes_to_markdown(nodes)
+    assert "````a```b\nplain\n````" in md
+
+
 def test_native_checkbox_unchecked_renders_as_markdown_checklist_item() -> None:
     nodes = [_node(text="buy milk", is_list_item=True, is_native_checkbox=True)]
     md = render_nodes_to_markdown(nodes)

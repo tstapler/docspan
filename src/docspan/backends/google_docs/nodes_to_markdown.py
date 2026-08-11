@@ -211,9 +211,20 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
         node = nodes[i]
         lang: Optional[str] = None
         start = i
-        if _is_language_marker(node) and i + 1 < n and _is_pure_code_line(nodes[i + 1]):
-            lang = node.text[len(FENCE_MARKER):]
-            start = i + 1
+        if _is_language_marker(node) and i + 1 < n:
+            if _is_pure_code_line(nodes[i + 1]):
+                lang = node.text[len(FENCE_MARKER):]
+                start = i + 1
+            elif _is_blank_code_line(nodes[i + 1]) and (
+                i + 2 >= n or not _is_pure_code_line(nodes[i + 2])
+            ):
+                # A marker immediately followed by exactly one blank-shaped
+                # line, with no code line beyond it, is
+                # MarkdownToParagraphParser's shape for an explicitly empty
+                # fenced block (`:294`) — not an orphaned marker.
+                groups.append(("code", node.text[len(FENCE_MARKER):], []))
+                i += 2
+                continue
 
         if start < n and _is_pure_code_line(nodes[start]):
             run: List[Node] = []
@@ -242,12 +253,30 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
 
 def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
     code_lines = [node.text for node in code_nodes]
-    delim = _fence_delimiter(code_lines)
+    delim = _fence_delimiter([lang or "", *code_lines])
     lines = [f"{delim}{lang or ''}"]
     lines.extend(code_lines)
     lines.append(delim)
     lines.append("")
     return lines
+
+
+def _escape_leading_fence(text: str) -> str:
+    """Escape a plain paragraph line that would otherwise open a live
+    CommonMark code fence when reparsed.
+
+    Only the bare-paragraph render path needs this: headings prefix "# ",
+    list items prefix "- ", and block quotes prefix "> ", all of which
+    already keep a fence-shaped line from starting the line. Without it, a
+    marker node left behind by `_group_code_runs` (because it wasn't
+    immediately followed by a matching code run) or ordinary user prose that
+    happens to start with ``` renders as literal "```..." text that, on the
+    next parse, opens an unterminated fence and swallows every following
+    line as code until EOF instead of staying inert.
+    """
+    if text.startswith(FENCE_MARKER):
+        return "\\" + text
+    return text
 
 
 def render_nodes_to_markdown(nodes: List[Node]) -> str:
@@ -289,7 +318,7 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             else:
                 lines.append(f"{indent}- {text}")
         else:
-            lines.append(text)
+            lines.append(_escape_leading_fence(text))
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"
