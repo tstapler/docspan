@@ -479,3 +479,71 @@ def test_push_preview_render_still_shows_comment_at_risk_for_churned_paragraph()
 
     assert "⚠ COMMENT AT RISK" in rendered
     assert "~ rewritten (no text change)" in rendered
+
+
+def test_push_preview_render_distinguishes_churn_from_ordinary_entries_in_mixed_batch() -> None:
+    """`render()`'s `id()`-based `churned_removes`/`churned_adds` filtering has
+    only ever been exercised against entries=[remove, add] (just the churn
+    pair itself). Feed it a mix of a churned pair and unrelated plain
+    add/remove entries to confirm the id()-based lookup correctly leaves the
+    unrelated entries alone instead of e.g. filtering by text or position."""
+    churn_remove = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    churn_add = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
+    unrelated_remove = DiffEntry(
+        kind="remove", current_text="Other text", target_text=None, style="NORMAL_TEXT", edit_group=1
+    )
+    unrelated_add = DiffEntry(
+        kind="add", current_text=None, target_text="Other text", style="NORMAL_TEXT", edit_group=2
+    )
+    entries = [churn_remove, churn_add, unrelated_remove, unrelated_add]
+    preview = PushPreview(entries=entries, unchanged_count=0, high_risk=[], request_count=4)
+
+    rendered = preview.render()
+
+    lines = rendered.splitlines()
+    rewritten_lines = [line for line in lines if "~ rewritten (no text change)" in line]
+    remove_lines = [line for line in lines if line.strip().startswith("- ")]
+    add_lines = [line for line in lines if line.strip().startswith("+ ")]
+
+    assert len(rewritten_lines) == 1
+    assert remove_lines == ["  - Other text"]
+    assert add_lines == ["  + Other text"]
+    assert "1 removal(s)" in rendered
+    assert "1 addition(s)" in rendered
+    assert "1 rewritten (no text change)" in rendered
+
+
+def test_find_churn_pairs_1to1_matches_two_full_pairs_without_double_claiming() -> None:
+    """Extends the duplicate-text coverage above (2 removes + 1 add, one pair
+    plus a leftover) to 2 removes + 2 adds with identical text, all in the
+    same edit_group — every add must be claimed by exactly one remove, with
+    no double-claiming and no add left unpaired."""
+    remove_a = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    remove_b = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add_a = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
+    add_b = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
+    entries = [remove_a, remove_b, add_a, add_b]
+
+    pairs = find_churn_pairs(entries)
+
+    assert len(pairs) == 2
+    claimed_adds = [pair[1] for pair in pairs]
+    assert add_a in claimed_adds
+    assert add_b in claimed_adds
+    assert claimed_adds[0] is not claimed_adds[1]
+    claimed_removes = [pair[0] for pair in pairs]
+    assert remove_a in claimed_removes
+    assert remove_b in claimed_removes
+    assert claimed_removes[0] is not claimed_removes[1]
