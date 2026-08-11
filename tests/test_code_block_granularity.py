@@ -43,6 +43,64 @@ structure = DocsStructureParser()
 builder = DocsRequestBuilder()
 
 
+class TestCodeBlockLinesDoNotStealAHeadingOrBullet:
+    """Splitting fenced blocks per line (#40/#41) makes issue #42 easy to reach.
+
+    A code block contributes duplicate short lines in bulk (`}`, `);`, `EOF`,
+    `pass`), and any one matching a heading or list item's text elsewhere in
+    the document can share that node's anchor with the surrounding edit's
+    insert group. Criterion 6 of #42: this must not demote the heading or
+    steal the bullet.
+    """
+
+    def test_duplicate_short_code_lines_next_to_a_heading_edit_spare_the_heading(
+        self,
+    ) -> None:
+        """A doc-start insert (a new fenced-code line) shares its anchor with the
+        live heading's restyle group — the same collision as criterion 3/6 — while
+        several duplicate short code-flavored lines (`}`, `);`, `EOF`, `pass`)
+        sit unrelated and unchanged elsewhere in the document as decoys.
+
+        `is_heading("heading")` alone doesn't discriminate the bug: pre-fix, the
+        restyle request is still a *superset* of the heading's own range, so the
+        heading's paragraph id ends up in the covered set and gets the right style
+        regardless. What the corrupted (pre-insert) range actually does is bleed
+        the restyle onto the *newly inserted* paragraph too, and — because the
+        insert ran before the tied restyle — the live heading is left holding its
+        *old* style. Both of those are what the assertions below catch.
+        """
+        from .test_heading_identity import ParagraphReplay
+
+        replay = ParagraphReplay([
+            ("pass", "HEADING_2", "heading", False),
+            ("}", "NORMAL_TEXT", "decoyA", False),
+            (");", "NORMAL_TEXT", "decoyB", False),
+            ("EOF", "NORMAL_TEXT", "item", True),
+            ("pass", "NORMAL_TEXT", "decoyD", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        doc, end = replay.document()
+        md = "NewCode\n\n### pass\n\n}\n\n);\n\n- EOF\n\npass\n\ntail\n"
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+        replay.apply(builder.build(current, target, end))
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+        assert not replay.is_heading("inserted-1"), (
+            f"the restyle range leaked onto the newly inserted code line "
+            f"(style={replay.style.get('inserted-1')}), which means it was "
+            "computed against coordinates the insert had already shifted"
+        )
+        assert replay.alive("item") and replay.bullet["item"], (
+            "the live list item must survive as the bullet, not be swapped out "
+            "for one of the duplicate decoy lines"
+        )
+
+
 def _doc_of_lines(*lines: str) -> tuple[dict, int]:
     """A document holding one paragraph per line — how Docs actually stores it."""
     content, idx = [], 1
