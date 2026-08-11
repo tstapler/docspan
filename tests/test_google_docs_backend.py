@@ -14,6 +14,8 @@ from unittest.mock import MagicMock
 from docspan.backends.base import PushResult
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
+from docspan.backends.google_docs.cross_doc_links import CrossDocLinkResolver
+from docspan.config import Mapping
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.batch_update — writeControl.requiredRevisionId
@@ -1145,3 +1147,257 @@ class TestPullSurfacesResidue:
         result = backend.pull("doc-1", str(local), tab_id="t.0")
 
         assert result.status == "ok", result.message
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsBackend.push() — cross-document link resolution (issue #64)
+#
+# `cross_doc_links.py`'s own unit tests (tests/test_cross_doc_links.py) cover
+# `CrossDocLinkResolver.resolve()` in isolation, with a fake `fetch_headings`.
+# These tests exercise the real wiring end to end: `push()` binding its own
+# `_fetch_target_headings` onto the resolver, the target document being
+# fetched through the *same* mocked client as the source push, and the
+# unresolved/error paths surfacing through the existing
+# `unresolved_anchor_links` / `PushResult.message` machinery.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _heading_paragraph(text: str, start: int, heading_id: str, style: str = "HEADING_1") -> dict:
+    return {
+        "startIndex": start,
+        "endIndex": start + len(text) + 1,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": style, "headingId": heading_id},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _target_doc_with_headings(*texts_and_ids: tuple[str, str], revision_id: str = "rev-2") -> dict:
+    """A doc whose only content is headings, for use as a cross-doc fetch target."""
+    paragraphs = []
+    start = 1
+    for text, heading_id in texts_and_ids:
+        paragraphs.append(_heading_paragraph(text, start, heading_id))
+        start += len(text) + 1
+    return {"revisionId": revision_id, "body": {"content": paragraphs}}
+
+
+def _links_written(client: MagicMock) -> list[dict]:
+    """The `link` payloads from the last batch_update's updateTextStyle requests."""
+    requests = client.batch_update.call_args[0][1]
+    return [
+        r["updateTextStyle"]["textStyle"]["link"]
+        for r in requests
+        if "updateTextStyle" in r
+        and "link" in r["updateTextStyle"].get("textStyle", {})
+    ]
+
+
+class TestCrossDocLinkResolution:
+    def test_a_cross_doc_link_with_no_fragment_resolves_to_the_targets_edit_url(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](target.md)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(local), backend="google_docs", remote_id="doc-1"),
+                Mapping(
+                    local=str(tmp_path / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-2",
+                ),
+            ]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "ok", result.message
+        assert _links_written(client) == [
+            {"url": "https://docs.google.com/document/d/doc-2/edit"}
+        ]
+        # No fragment, so resolving this link needs no target fetch at all —
+        # only the source document is ever read.
+        assert client.get_document.call_count == 1
+
+    def test_a_cross_doc_link_with_a_fragment_resolves_against_the_targets_live_headings(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](target.md#two)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta"),
+            _target_doc_with_headings(("One", "h.1"), ("Two", "h.2")),
+        ]
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(local), backend="google_docs", remote_id="doc-1"),
+                Mapping(
+                    local=str(tmp_path / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-2",
+                ),
+            ]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "ok", result.message
+        assert _links_written(client) == [
+            {"url": "https://docs.google.com/document/d/doc-2/edit#heading=h.2"}
+        ]
+        assert client.get_document.call_count == 2
+
+    def test_a_link_to_an_unmapped_file_is_left_untouched(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](unmapped.md)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[Mapping(local=str(local), backend="google_docs", remote_id="doc-1")]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "ok", result.message
+        assert _links_written(client) == [{"url": "unmapped.md"}]
+
+    def test_a_fragment_that_does_not_match_any_target_heading_is_reported_not_errored(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](target.md#missing)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta"),
+            _target_doc_with_headings(("One", "h.1")),
+        ]
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(local), backend="google_docs", remote_id="doc-1"),
+                Mapping(
+                    local=str(tmp_path / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-2",
+                ),
+            ]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "warning", result.message
+        assert "target.md#missing" in (result.message or "")
+        # No link written at all for the dead reference, mirroring a dead
+        # same-doc anchor — not a literal `url` link the Doc cannot follow.
+        # (Nothing else about the paragraph changed either, so pass 2 issues
+        # no batch_update at all rather than one with zero link requests.)
+        client.batch_update.assert_not_called()
+
+    def test_a_target_fetch_failure_is_reported_and_the_source_push_still_completes(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](target.md#two)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta"),
+            RuntimeError("503 backend unavailable"),
+        ]
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(local), backend="google_docs", remote_id="doc-1"),
+                Mapping(
+                    local=str(tmp_path / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-2",
+                ),
+            ]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "warning", result.message
+        assert "target.md#two" in (result.message or "")
+        client.batch_update.assert_not_called()
+
+    def test_two_links_to_the_same_cross_doc_target_cost_exactly_one_fetch(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[A](target.md#one) and [B](target.md#two)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("A and B"),
+            _target_doc_with_headings(("One", "h.1"), ("Two", "h.2")),
+        ]
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(local), backend="google_docs", remote_id="doc-1"),
+                Mapping(
+                    local=str(tmp_path / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-2",
+                ),
+            ]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "ok", result.message
+        # Order of the two updateTextStyle requests isn't the contract here —
+        # only that each link resolved to the right heading in the target.
+        assert sorted(_links_written(client), key=lambda link: link["url"]) == [
+            {"url": "https://docs.google.com/document/d/doc-2/edit#heading=h.1"},
+            {"url": "https://docs.google.com/document/d/doc-2/edit#heading=h.2"},
+        ]
+        # One fetch for the source doc, one for the target doc — not one per
+        # link referencing that target.
+        assert client.get_document.call_count == 2
+
+    def test_two_mappings_colliding_on_the_same_normalized_local_path_fail_loudly(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("[Beta](target.md)\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_paragraph("Beta")
+        client.list_comments.return_value = []
+
+        resolver = CrossDocLinkResolver(
+            mappings=[
+                Mapping(local=str(local), backend="google_docs", remote_id="doc-1"),
+                Mapping(
+                    local=str(tmp_path / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-2",
+                ),
+                Mapping(
+                    local=str(tmp_path / "." / "target.md"),
+                    backend="google_docs",
+                    remote_id="doc-3",
+                ),
+            ]
+        )
+
+        result = backend.push(str(local), "doc-1", cross_doc_resolver=resolver)
+
+        assert result.status == "error", result.message
+        assert "Ambiguous cross-doc link target" in (result.message or "")
+        client.batch_update.assert_not_called()
