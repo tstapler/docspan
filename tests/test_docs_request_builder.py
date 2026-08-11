@@ -337,6 +337,24 @@ def test_render_prefix_paragraph_that_is_also_the_docs_last_paragraph_uses_befor
     assert insert_requests[0]["insertText"]["text"] == "\n# other"
 
 
+def test_replace_of_a_multi_node_range_at_doc_end_uses_the_last_node_for_bare_insert() -> None:
+    """(#62 follow-up, mirrors the #56 multi-node regression above) The
+    doc-end clamp is a property of whichever node borders the doc's mandatory
+    terminal newline — the LAST deleted node — not the first. A multi-node
+    replace must go bare when the last node reaches doc_end_index, even
+    though the first node's own end_index does not."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=9)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ"
+
+
 def test_replace_of_a_render_prefix_doc_end_paragraph_keeps_leading_newline_not_bare() -> None:
     """(#62 precedence) A node that is simultaneously the doc's last paragraph
     AND has a render_prefix trim must keep the existing leading-newline
