@@ -564,8 +564,8 @@ class TestRenderPrefixParticipatesInIdentity:
 
         A separate, harder collision — where `_node_key` alone still cannot
         resolve which current node should absorb a *single* target slot — is
-        pinned and out of scope for this fix; see
-        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        exercised and resolved by
+        `test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line`
         below.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg", code_first=True)
@@ -610,7 +610,9 @@ class TestRenderPrefixParticipatesInIdentity:
                 f"a request landed on or before the render_prefix glyph: {requests}"
             )
 
-    def test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence(self) -> None:
+    def test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line(
+        self,
+    ) -> None:
         """The multi-candidate correspondence gap (issue #68), now resolved.
 
         `_node_key` keeps a prose paragraph and a code-rendered paragraph
@@ -629,14 +631,18 @@ class TestRenderPrefixParticipatesInIdentity:
         top level (`prefer_code_line=True`), which prefers a
         `render_prefix`-carrying candidate for a slot whose target node is
         itself an all-monospace fenced-code line (`_target_wants_code_line`).
-        So the code-rendered node should now win the slot, and the plain
-        prose paragraph should be the one deleted.
+        So the code-rendered node wins the slot, and the plain prose
+        paragraph is the one deleted — asserted below both by exclusion (the
+        code-rendered node's range is untouched) and by inclusion (the prose
+        paragraph's exact range is the one that gets deleted), mirroring
+        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg")
         current, _ = project(structure.parse(doc))
         target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
 
         code_node = next(n for n in current if n.render_prefix)
+        prose_node = next(n for n in current if n.text == "cfg" and not n.render_prefix)
         requests = builder.build(current, target, end)
 
         lands_inside_code_block = any(
@@ -650,4 +656,14 @@ class TestRenderPrefixParticipatesInIdentity:
         assert not lands_inside_code_block, (
             "the code-rendered node's range should be left alone now that the "
             "top-level pass prefers it for the code slot"
+        )
+
+        deletes = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert deletes == [
+            {"startIndex": prose_node.start_index, "endIndex": prose_node.end_index}
+        ], (
+            "the plain prose paragraph — not the code-rendered one — should be "
+            f"the one deleted: {requests}"
         )

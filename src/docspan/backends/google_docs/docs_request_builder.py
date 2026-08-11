@@ -30,6 +30,11 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # inlined Literal in one signature and a bare `str` in the next do not unify.
 Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
 
+# Must exceed `_structural_score`'s maximum possible value (currently 4: 2 for
+# matching style + 1 for matching heading-ness + 1 for matching list-item-ness)
+# so a code-rendered candidate always outranks a merely structurally-similar one.
+_CODE_LINE_PREFERENCE_BONUS = 100
+
 
 @dataclass(frozen=True)
 class Pass2Alignment:
@@ -231,8 +236,10 @@ class DocsRequestBuilder:
         same text and only one target slot exists for that text, the *outer*
         `_node_key` matcher (not `_repair`) can still let the plain one win
         the correspondence and leave the code-rendered one an unpaired
-        `delete` — a pre-existing gap this fix narrows but does not close; see
-        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        `delete` — a pre-existing gap now closed by `_opcodes`'s top-level
+        `_prefer_structural_pairing(prefer_code_line=True)` pass, which
+        re-scores that exact ambiguity across the whole document; see
+        `test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line`
         in `tests/test_code_block_granularity.py` and issue #68.
         """
         if isinstance(node, DocsTableNode):
@@ -276,6 +283,15 @@ class DocsRequestBuilder:
         target_keys = [self._node_key(n) for n in target]
         matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
         repaired = self._repair(matcher.get_opcodes(), current, target)
+        # The whole-document pass below only ever has work to do when some
+        # target slot is itself a fenced-code line (`_target_wants_code_line`)
+        # — see `_prefer_structural_pairing`'s `code_slot_ids` gate, which
+        # otherwise `continue`s past every content-key group unconditionally.
+        # Skipping the `by_key` grouping entirely for documents with no code
+        # blocks avoids that whole-document-sized bookkeeping on every single
+        # `_opcodes()`/`build()` call for the common case.
+        if not any(self._target_wants_code_line(n) for n in target):
+            return self._coalesce(repaired)
         resolved = self._prefer_structural_pairing(
             repaired, current, target, 0, 0, prefer_code_line=True,
         )
@@ -357,6 +373,13 @@ class DocsRequestBuilder:
         prefer_code_line: bool = False,
     ) -> List[Opcode]:
         """Reassign ambiguous equal/delete pairings toward their structurally closest node.
+
+        Two callers, two different scope contracts: `_repair` calls this locally,
+        scoped to a single `replace` run it already identified
+        (`prefer_code_line=False`, the default); `_opcodes` calls it once more
+        over the *whole document* (`prefer_code_line=True`). `prefer_code_line`
+        is what distinguishes the two — see its own paragraph below for what it
+        changes about the scoring and the pool of eligible candidates.
 
         The inner `SequenceMatcher` in `_repair` treats every current node sharing
         a `_content_key` as interchangeable and pairs whichever ones it meets first
@@ -480,8 +503,8 @@ class DocsRequestBuilder:
                 ]
                 if not code_slot_ids:
                     continue
-                other_self_pairs = set(slot_ids) - set(code_slot_ids)
-                positions = [cid for cid in positions if cid not in other_self_pairs]
+                non_code_positions = set(slot_ids) - set(code_slot_ids)
+                positions = [cid for cid in positions if cid not in non_code_positions]
                 slot_ids = code_slot_ids
 
             slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
@@ -499,7 +522,7 @@ class DocsRequestBuilder:
                         and isinstance(candidate_node, DocsParagraphNode)
                         and self._is_code_line(candidate_node)
                     ):
-                        score += 100
+                        score += _CODE_LINE_PREFERENCE_BONUS
                     pair_scores.append((score, sid == cid, si, ci, sid, cid))
             pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
 
