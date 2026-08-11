@@ -5,6 +5,7 @@ import difflib
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
+from docspan.backends.google_docs.cross_doc_links import CrossDocLinkResolver
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
@@ -24,6 +25,48 @@ from docspan.backends.google_docs.heading_anchors import (
 from docspan.backends.google_docs.projection import Residue, project
 
 Node = Union[DocsParagraphNode, DocsTableNode]
+
+
+def _span_link_payload(
+    href: str,
+    slug_to_id: Optional[dict],
+    known_ids: Optional[set],
+    cross_doc_resolver: Optional[CrossDocLinkResolver],
+    source_path: Optional[str],
+    current_doc_id: Optional[str],
+    current_tab_id: Optional[str],
+) -> Tuple[Optional[dict], bool]:
+    """The Link payload for `href`, and whether it belongs in the unresolved-
+    anchor report if that payload is None.
+
+    Same-document `#fragment` anchors go through `heading_anchors.link_payload`
+    exactly as before `cross_doc_resolver` existed — this function only adds a
+    *second* fallback, tried only when `href` is not a same-document anchor and
+    a resolver is available. `cross_doc_resolver is None` (no mapping table in
+    play, e.g. every existing call site/test) reproduces today's unconditional
+    `{"url": href}` passthrough exactly.
+
+    A link this resolves to nothing (`unresolved` payload) is reported the
+    same way a same-document dead anchor is: no link is written, and it is
+    added to the same `unresolved_anchor_links()` list — not a second, parallel
+    report shape.
+    """
+    if is_anchor(href):
+        payload = link_payload(href, slug_to_id, known_ids)
+        return payload, payload is None
+    if cross_doc_resolver is None:
+        return {"url": href}, False
+    result = cross_doc_resolver.resolve(
+        href, source_path or "", current_doc_id or "", current_tab_id
+    )
+    if result.untouched:
+        return {"url": href}, False
+    if result.same_doc_fragment is not None:
+        payload = link_payload(f"#{result.same_doc_fragment}", slug_to_id, known_ids)
+        return payload, payload is None
+    if result.unresolved:
+        return None, True
+    return result.payload, False
 
 # difflib's opcode tuple. Named because it is now threaded through three
 # functions (_opcodes, _repair, _coalesce) and `list` is invariant, so an
@@ -992,6 +1035,10 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
+        source_path: Optional[str] = None,
+        current_doc_id: Optional[str] = None,
+        current_tab_id: Optional[str] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for inline styling inside table cells.
 
@@ -1027,6 +1074,7 @@ class DocsRequestBuilder:
                 start, limit = placed
                 requests.extend(self._span_requests_in(
                     cell.spans, start, limit, aligned.slug_to_id, aligned.known_ids,
+                    cross_doc_resolver, source_path, current_doc_id, current_tab_id,
                 ))
         return requests
 
@@ -1231,6 +1279,10 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
+        source_path: Optional[str] = None,
+        current_doc_id: Optional[str] = None,
+        current_tab_id: Optional[str] = None,
     ) -> List[dict]:
         """
         Emit updateTextStyle requests for inline styling (links/bold/italic/monospace).
@@ -1238,6 +1290,13 @@ class DocsRequestBuilder:
         Runs against the re-fetched document so ranges use real post-insert indices.
         Nodes are paired by an order-preserving *content* alignment of the re-fetched
         document against ``target`` (see _align_for_styling), never by raw position.
+
+        ``cross_doc_resolver``/``source_path``/``current_doc_id``/``current_tab_id``
+        are the cross-document counterpart to ``slug_to_id``/``known_ids``: a link
+        whose href is not a same-document anchor gets a second chance against the
+        mapping table before falling back to today's literal ``{"url": href}``. All
+        four default to None, which reproduces that unconditional passthrough
+        exactly — every existing caller/test is unaffected.
         """
         if not any(isinstance(n, DocsParagraphNode) and n.spans for n in target):
             return []
@@ -1246,7 +1305,10 @@ class DocsRequestBuilder:
         pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         requests: List[dict] = []
         for cnode, tnode in pairs:
-            requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
+            requests.extend(self._span_style_requests(
+                tnode, cnode, slug_to_id, known_ids,
+                cross_doc_resolver, source_path, current_doc_id, current_tab_id,
+            ))
         return requests
 
     def unaligned_span_targets(
@@ -1297,6 +1359,10 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
+        source_path: Optional[str] = None,
+        current_doc_id: Optional[str] = None,
+        current_tab_id: Optional[str] = None,
     ) -> List[str]:
         """Internal anchors pass 2 could not point at a heading, in use order.
 
@@ -1320,6 +1386,13 @@ class DocsRequestBuilder:
         `pairs`, because a table aligns on its whole cell grid and so does not pair
         at all once any cell changed; an anchor that names no heading is unresolved
         whether or not its table could be located.
+
+        ``cross_doc_resolver``/``source_path``/``current_doc_id``/``current_tab_id``
+        extend this to cross-document links via the same ``_span_link_payload``
+        funnel `_span_requests_in` uses, so a mapped-but-fragment-miss or a
+        target-fetch failure is reported here too — the same list, not a second
+        one. All default to None, reproducing the same-document-only behavior
+        exactly.
         """
         styled_paragraph = any(isinstance(n, DocsParagraphNode) and n.spans for n in target)
         styled_cell = any(cell.styled for n in target if isinstance(n, DocsTableNode)
@@ -1332,11 +1405,14 @@ class DocsRequestBuilder:
 
         def collect(spans: List[TextSpan]) -> None:
             for span in spans:
-                if not span.link or not is_anchor(span.link):
+                if not span.link:
                     continue
-                if link_payload(span.link, slug_to_id, known_ids) is None:
-                    if span.link not in unresolved:
-                        unresolved.append(span.link)
+                _payload, reportable = _span_link_payload(
+                    span.link, slug_to_id, known_ids,
+                    cross_doc_resolver, source_path, current_doc_id, current_tab_id,
+                )
+                if reportable and span.link not in unresolved:
+                    unresolved.append(span.link)
 
         for _cnode, tnode in pairs:
             collect(tnode.spans)
@@ -1687,6 +1763,9 @@ class DocsRequestBuilder:
         target: List[Node],
         tab_id: Optional[str] = None,
         alignment: Optional["Pass2Alignment"] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
+        source_path: Optional[str] = None,
+        current_doc_id: Optional[str] = None,
     ) -> List[dict]:
         """
         Combined pass-2 requests: table cell fills + inline text styling.
@@ -1701,9 +1780,15 @@ class DocsRequestBuilder:
                 build_table_fill_requests()/build_span_style_requests() read
                 the right tab's content; this parameter only affects which
                 tab the *requests* are addressed to.
+            cross_doc_resolver/source_path/current_doc_id: see
+                build_span_style_requests(). ``current_tab_id`` is ``tab_id``
+                itself — the doc currently being pushed's own tab, used for
+                cross-doc self-reference detection.
         """
         requests = self.build_table_fill_requests(doc, target, alignment)
-        requests += self.build_span_style_requests(doc, target, alignment)
+        requests += self.build_span_style_requests(
+            doc, target, alignment, cross_doc_resolver, source_path, current_doc_id, tab_id,
+        )
         # Cell styling reads indices from `doc`, i.e. from *before* the fills above
         # are applied. A table that already holds its text — every table on a
         # second or later push — is placed correctly. A table this push is
@@ -1713,7 +1798,9 @@ class DocsRequestBuilder:
         # brand-new table's cells needs the post-fill index, which is predictable
         # but is index arithmetic that has to be verified by replay, not reasoned
         # about — left for its own change.
-        requests += self.build_table_cell_span_requests(doc, target, alignment)
+        requests += self.build_table_cell_span_requests(
+            doc, target, alignment, cross_doc_resolver, source_path, current_doc_id, tab_id,
+        )
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
         return requests
@@ -1973,6 +2060,10 @@ class DocsRequestBuilder:
         placement: DocsParagraphNode,
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
+        source_path: Optional[str] = None,
+        current_doc_id: Optional[str] = None,
+        current_tab_id: Optional[str] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -2003,6 +2094,10 @@ class DocsRequestBuilder:
             placement.end_index - 1 if placement.end_index else None,
             slug_to_id,
             known_ids,
+            cross_doc_resolver,
+            source_path,
+            current_doc_id,
+            current_tab_id,
         )
 
     def _span_requests_in(
@@ -2012,6 +2107,10 @@ class DocsRequestBuilder:
         limit: Optional[int],
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
+        source_path: Optional[str] = None,
+        current_doc_id: Optional[str] = None,
+        current_tab_id: Optional[str] = None,
     ) -> List[dict]:
         """Place `spans` starting at `start`, never writing at or past `limit`.
 
@@ -2035,7 +2134,15 @@ class DocsRequestBuilder:
             if span.italic:
                 attrs["italic"] = True
             if span.link:
-                payload = link_payload(span.link, slug_to_id, known_ids)
+                payload, _unresolved = _span_link_payload(
+                    span.link,
+                    slug_to_id,
+                    known_ids,
+                    cross_doc_resolver,
+                    source_path,
+                    current_doc_id,
+                    current_tab_id,
+                )
                 if payload is not None:
                     attrs["link"] = payload
                 # else: the anchor names no heading in the written document, so
