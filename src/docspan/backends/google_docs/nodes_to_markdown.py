@@ -38,6 +38,11 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # sync with markdown_to_paragraph_parser.py's FENCE_MARKER.
 FENCE_MARKER = "```"
 
+# A rendered code fence can also open with tildes (see _fence_delimiter's
+# backtick-in-language fallback) — a bare paragraph starting with either
+# fence character must be escaped the same way.
+TILDE_FENCE_MARKER = "~~~"
+
 
 def _run_of_char(text: str, target: str) -> int:
     """The longest run of consecutive occurrences of `target` in text."""
@@ -268,7 +273,15 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
 def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
     code_lines = [node.text for node in code_nodes]
     delim = _fence_delimiter(lang, code_lines)
-    lines = [f"{delim}{lang or ''}"]
+    # CommonMark reads the fence's width off the *leading run* of the fence
+    # character on the opening line, not a separately-tokenized delimiter —
+    # if the info string starts with that same character (e.g. a tilde
+    # fence whose language itself starts with "~"), it silently extends the
+    # opening fence past `delim`, so the closing line we write is too short
+    # to close the block. A single space breaks the adjacency; CommonMark
+    # trims it from the info string on reparse, so it's otherwise a no-op.
+    sep = " " if lang and lang[:1] == delim[:1] else ""
+    lines = [f"{delim}{sep}{lang or ''}"]
     lines.extend(code_lines)
     lines.append(delim)
     lines.append("")
@@ -284,11 +297,11 @@ def _escape_leading_fence(text: str) -> str:
     already keep a fence-shaped line from starting the line. Without it, a
     marker node left behind by `_group_code_runs` (because it wasn't
     immediately followed by a matching code run) or ordinary user prose that
-    happens to start with ``` renders as literal "```..." text that, on the
-    next parse, opens an unterminated fence and swallows every following
-    line as code until EOF instead of staying inert.
+    happens to start with ``` or ~~~ renders as literal fence-shaped text
+    that, on the next parse, opens an unterminated fence and swallows every
+    following line as code until EOF instead of staying inert.
     """
-    if text.startswith(FENCE_MARKER):
+    if text.startswith(FENCE_MARKER) or text.startswith(TILDE_FENCE_MARKER):
         return "\\" + text
     return text
 

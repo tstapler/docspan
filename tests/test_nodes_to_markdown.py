@@ -168,6 +168,76 @@ def test_fence_delimiter_accounts_for_backticks_in_language() -> None:
     assert any(n.text == "plain" and n.spans and n.spans[0].monospace for n in reparsed)
 
 
+def test_fence_delimiter_accounts_for_leading_tilde_in_language() -> None:
+    # round-3 finding: CommonMark reads a fence's opening width off the
+    # leading run of the fence character on the opening line, not off a
+    # separately-tokenized delimiter — a language starting with the same
+    # character as a tilde-fallback fence must not silently widen the
+    # opening fence past what the closing line reproduces. Verified via
+    # full render->reparse round trip, since a too-short closing line would
+    # otherwise swallow all following content as code.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = [_lang_marker("~c`"), _code_line("x"), _code_line("y")]
+    md = render_nodes_to_markdown(nodes)
+    reparsed = MarkdownToParagraphParser().parse(md)
+    assert any(n.text == "```~c`" for n in reparsed)
+    code_lines = [n.text for n in reparsed if n.spans and n.spans[0].monospace]
+    assert code_lines == ["x", "y"]
+
+
+def test_fence_delimiter_accounts_for_tilde_runs_in_code_content() -> None:
+    # Regression lock-in: round-3 confirmed this case already works (the
+    # tilde-fallback fence is sized against tilde runs in code_lines), but it
+    # was untested. A tilde run in the code content must not be able to
+    # prematurely close the fence.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = [_lang_marker("a`b"), _code_line("has ~~~ inside")]
+    md = render_nodes_to_markdown(nodes)
+    reparsed = MarkdownToParagraphParser().parse(md)
+    assert any(n.text == "```a`b" for n in reparsed)
+    assert any(
+        n.text == "has ~~~ inside" and n.spans and n.spans[0].monospace for n in reparsed
+    )
+
+
+def test_fence_delimiter_language_with_backtick_and_tilde() -> None:
+    # A language containing both a backtick and a tilde must still fall
+    # back to a tilde fence (backticks are never allowed in a backtick
+    # fence's info string) and round-trip intact.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = [_lang_marker("a`~b"), _code_line("plain")]
+    md = render_nodes_to_markdown(nodes)
+    assert "```" not in md
+    reparsed = MarkdownToParagraphParser().parse(md)
+    assert any(n.text == "```a`~b" for n in reparsed)
+    assert any(n.text == "plain" and n.spans and n.spans[0].monospace for n in reparsed)
+
+
+def test_prose_starting_with_tilde_fence_is_escaped() -> None:
+    # round-3 MAJOR finding: _escape_leading_fence guarded only against a
+    # leading backtick fence, not a leading tilde fence — but this PR's
+    # tilde-fallback makes ~~~-shaped rendered output reachable, so ordinary
+    # prose starting with ~~~ must be escaped the same way to avoid opening
+    # a live, unterminated fence on reparse.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = [_node(text="~~~ this looks like a fence"), _node(text="more prose")]
+    md = render_nodes_to_markdown(nodes)
+    reparsed = MarkdownToParagraphParser().parse(md)
+    assert not any(span.monospace for node in reparsed for span in node.spans)
+
+
 def test_empty_fenced_block_with_language_round_trips_through_push_and_pull() -> None:
     # Pins the full push -> pull path for the empty-fence-with-language fix:
     # parsing markdown into nodes and rendering those nodes back out must
