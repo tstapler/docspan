@@ -52,20 +52,23 @@ def _cell_from_html_text(raw_cell_html: str) -> TableCell:
 
     The `\\n` between paragraphs is kept as a literal, unstyled `TextSpan` — it was
     never HTML-encoded on render (see `_render_table_html`), so there is nothing to
-    decode there; only the surrounding text needs unescaping. An interior empty
-    paragraph was rendered with `_BLANK_PARAGRAPH_MARKER` in place of the blank line
-    CommonMark would otherwise treat as ending the HTML block (see
+    decode there; only each paragraph fragment's own text needs unescaping. An
+    interior empty paragraph was rendered with `_BLANK_PARAGRAPH_MARKER` in place of
+    the blank line CommonMark would otherwise treat as ending the HTML block (see
     `_guard_blank_paragraph_lines`); strip it back to empty here.
+
+    The marker check happens *before* `html.unescape` on each fragment, not on the
+    whole string upfront: a real cell containing a literal U+200B was entity-escaped
+    to `&#8203;` on render (`_escape_html`), so it never collides with the raw
+    marker byte here — only the guard's own insertion does.
     """
-    text = html.unescape(raw_cell_html)
-    if not text:
+    if not raw_cell_html:
         return TableCell(text="", spans=[])
     spans: List[TextSpan] = []
-    for i, paragraph in enumerate(text.split("\n")):
+    for i, fragment in enumerate(raw_cell_html.split("\n")):
         if i > 0:
             spans.append(TextSpan(text="\n"))
-        if paragraph == _BLANK_PARAGRAPH_MARKER:
-            paragraph = ""
+        paragraph = "" if fragment == _BLANK_PARAGRAPH_MARKER else html.unescape(fragment)
         spans.extend(_spans_from_markdown_text(paragraph))
     full_text = "".join(s.text for s in spans)
     return TableCell(text=full_text, spans=spans if _has_styling(spans) else [])

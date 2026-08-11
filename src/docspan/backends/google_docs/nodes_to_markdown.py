@@ -63,15 +63,28 @@ def _render_cell(cell: TableCell) -> str:
     return _cell_markdown_text(cell).replace("|", "\\|")
 
 
-def _escape_html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
 _BLANK_PARAGRAPH_MARKER = "​"
 
 
-def _guard_blank_paragraph_lines(text: str) -> str:
-    """Make an interior empty paragraph non-blank as a *physical line*.
+def _escape_html(text: str) -> str:
+    """Entity-escape `&`, `<`, `>` — plus any *real* occurrence of the guard marker.
+
+    Escaping the marker here means the raw U+200B byte only ever appears in the
+    rendered HTML where `_guard_blank_paragraph_lines` deliberately put it — a real
+    cell whose text happens to contain a stray U+200B (copy-pasted from another
+    editor is a real source of these) round-trips as itself instead of being
+    mistaken for the guard and silently dropped to "" on decode.
+    """
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace(_BLANK_PARAGRAPH_MARKER, "&#8203;")
+    )
+
+
+def _guard_blank_paragraph_lines(paragraphs: List[str]) -> str:
+    """Join already-escaped paragraph fragments, guarding interior blank ones.
 
     CommonMark ends an HTML block (type 6, e.g. `<table>`) at the first blank line —
     even one produced by an empty paragraph *inside* a cell's own text (an author
@@ -80,11 +93,43 @@ def _guard_blank_paragraph_lines(text: str) -> str:
     the table (see #61). A leading/trailing empty paragraph is safe as-is: it shares
     its physical line with the `<th>`/`</th>` tag text, so it's never actually blank.
     """
-    parts = text.split("\n")
-    for i in range(1, len(parts) - 1):
-        if parts[i] == "":
-            parts[i] = _BLANK_PARAGRAPH_MARKER
-    return "\n".join(parts)
+    guarded = list(paragraphs)
+    for i in range(1, len(guarded) - 1):
+        if guarded[i] == "":
+            guarded[i] = _BLANK_PARAGRAPH_MARKER
+    return "\n".join(guarded)
+
+
+def _split_paragraph_spans(spans: List[TextSpan]) -> List[List[TextSpan]]:
+    """Split a cell's spans at each embedded "\\n" into one span-list per paragraph.
+
+    A cell's paragraph break lives inside whichever `TextSpan` happens to contain
+    it (e.g. a bold run spanning "line one\\nline two") — span boundaries are
+    styling boundaries, not paragraph boundaries. Rendering markdown syntax (e.g.
+    `**`) across a paragraph break corrupts it: each side gets an unmatched marker
+    once the fragment is later parsed on its own. Each paragraph must be rendered
+    independently instead, exactly as `_spans_from_markdown_text` on the decode
+    side expects.
+    """
+    paragraphs: List[List[TextSpan]] = [[]]
+    for span in spans:
+        parts = span.text.split("\n")
+        for i, part in enumerate(parts):
+            if i > 0:
+                paragraphs.append([])
+            if part:
+                paragraphs[-1].append(TextSpan(
+                    text=part, bold=span.bold, italic=span.italic,
+                    link=span.link, monospace=span.monospace,
+                ))
+    return paragraphs
+
+
+def _cell_html_paragraphs(cell: TableCell) -> List[str]:
+    """Each of a cell's paragraphs, independently markdown-rendered and escaped."""
+    if cell.spans:
+        return [_escape_html(_render_spans(p)) for p in _split_paragraph_spans(cell.spans)]
+    return [_escape_html(p) for p in cell.text.split("\n")]
 
 
 def _render_table_html(node: DocsTableNode) -> str:
@@ -99,15 +144,15 @@ def _render_table_html(node: DocsTableNode) -> str:
     reparses it as a row terminator. No `\\n`-encoding is needed at all, except for
     the blank-paragraph edge case `_guard_blank_paragraph_lines` handles.
 
-    Only `<`, `>`, `&` need entity-escaping; `_table_from_html_block` decodes them
-    back and re-parses each paragraph's markdown independently (bold/links survive,
-    joined across paragraphs by a literal `\\n` `TextSpan`).
+    `_table_from_html_block` decodes the entity-escaping back and re-parses each
+    paragraph's markdown independently (bold/links survive, joined across
+    paragraphs by a literal `\\n` `TextSpan`).
     """
     header, *body = node.rows
 
     def render_row(row: List[TableCell], tag: str) -> str:
         cells = "".join(
-            f"<{tag}>{_guard_blank_paragraph_lines(_escape_html(_cell_markdown_text(c)))}</{tag}>"
+            f"<{tag}>{_guard_blank_paragraph_lines(_cell_html_paragraphs(c))}</{tag}>"
             for c in row
         )
         return f"<tr>{cells}</tr>"

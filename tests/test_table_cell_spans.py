@@ -539,6 +539,49 @@ class TestRendering:
         assert len(parsed2) == 1
         assert parsed2[0].rows[0][0].text == "para one\n\npara two"
 
+    def test_a_styled_span_crossing_a_paragraph_boundary_does_not_leak_markers(self) -> None:
+        """A bold/italic/monospace run can span a paragraph break (e.g. a user bolds
+        the first line of a two-line cell) — the styling boundary and the paragraph
+        boundary don't line up.
+
+        Rendering that single span's markdown syntax (`**...**`) across the `\\n` and
+        only then splitting on `\\n` leaves an unmatched `**` on each side, which
+        mistune's inline parser can't pair — the decoded text comes back with literal
+        `**` garbage baked in instead of the styling being applied per paragraph.
+        Each paragraph must be rendered — and re-parsed — independently.
+        """
+        spans = [
+            TextSpan(text="line one\n", bold=True),
+            TextSpan(text="line two", bold=True),
+        ]
+        cell = TableCell(text="line one\nline two", spans=spans)
+        node = DocsTableNode(rows=[[cell, TableCell(text="x")]])
+        rendered = render_nodes_to_markdown([node])
+        assert "**" not in rendered.split("<table>", 1)[1].replace("**line one**", "").replace(
+            "**line two**", ""
+        )
+
+        parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+        decoded = parsed[0].rows[0][0]
+        assert decoded.text == "line one\nline two"
+        assert all(s.bold for s in decoded.spans if s.text != "\n")
+
+    def test_a_real_zero_width_space_in_cell_text_is_not_mistaken_for_the_blank_guard(
+        self,
+    ) -> None:
+        """The blank-paragraph guard (`_guard_blank_paragraph_lines`) marks an interior
+        empty paragraph with a literal U+200B so it survives as a non-blank physical
+        line. If a *real* cell paragraph is itself a stray U+200B — plausible,
+        copy-pasted content from other editors carries these — it must not collide
+        with the guard and get silently stripped to "" on decode.
+        """
+        zwsp = "​"
+        for raw_text in (f"para one\n{zwsp}\npara two", f"{zwsp}\nsecond", f"first\n{zwsp}"):
+            node = DocsTableNode(rows=[[TableCell(text=raw_text), TableCell(text="y")]])
+            rendered = render_nodes_to_markdown([node])
+            parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+            assert parsed[0].rows[0][0].text == raw_text, f"{raw_text!r} must survive unchanged"
+
     def test_a_document_mixing_pipe_and_html_tables_parses_both_correctly(self) -> None:
         """A document with a plain single-paragraph table followed by a multi-paragraph
         (HTML) table must parse both back correctly, in document order."""
