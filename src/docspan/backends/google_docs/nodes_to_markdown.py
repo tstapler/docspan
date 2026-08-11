@@ -109,14 +109,17 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
         elif node.is_list_item:
             indent = "  " * node.nesting_level
             if node.is_native_checkbox:
-                # The Docs API does not expose a native checkbox's
-                # checked/unchecked bit anywhere DocsStructureParser can read
-                # it (see push_preview.py's NATIVE CHECKBOX GLYPH warning) —
-                # DocsParagraphNode carries no checked-state field at all.
-                # Rendering unchecked is the only honest option here; this is
-                # a one-way, lossy render (never fed back through
-                # MarkdownToParagraphParser as this exact text), not a claim
-                # about the glyph's real state.
+                # This structural render (documents.get() -> DocsStructureParser
+                # -> here) is used for the tab-scoped pull path, where checked
+                # state genuinely can't be recovered: Drive's files.export
+                # can't target a single tab, and that's the only read path
+                # that exposes a native checkbox's checked bit (see
+                # checkbox_state.py, used by the default/non-tab-scoped pull
+                # path instead). DocsParagraphNode itself still carries no
+                # checked-state field. Rendering unchecked is the only honest
+                # option on this path; this is a one-way, lossy render (never
+                # fed back through MarkdownToParagraphParser as this exact
+                # text), not a claim about the glyph's real state.
                 lines.append(f"{indent}- [ ] {text}")
             else:
                 lines.append(f"{indent}- {text}")
