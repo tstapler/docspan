@@ -30,6 +30,11 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # inlined Literal in one signature and a bare `str` in the next do not unify.
 Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
 
+# Must exceed `_structural_score`'s maximum possible value (currently 4: 2 for
+# matching style + 1 for matching heading-ness + 1 for matching list-item-ness)
+# so a code-rendered candidate always outranks a merely structurally-similar one.
+_CODE_LINE_PREFERENCE_BONUS = 100
+
 
 @dataclass(frozen=True)
 class Pass2Alignment:
@@ -41,6 +46,7 @@ class Pass2Alignment:
     current: List[Node]
     pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]]
     unaligned: List[DocsParagraphNode]
+    table_pairs: List[Tuple[int, DocsTableNode]]
     slug_to_id: dict
     known_ids: set
     residue: List[Residue]
@@ -182,6 +188,25 @@ class DocsRequestBuilder:
         """
         return bool(node.render_prefix)
 
+    @staticmethod
+    def _target_wants_code_line(node: Node) -> bool:
+        """Whether a *target* paragraph is itself a fenced-code line.
+
+        `MarkdownToParagraphParser` never sets `render_prefix` (see
+        `_is_code_line`'s docstring), but it does mark every span of a fenced
+        code block's line `monospace=True`. That is the only signal available
+        on the target side that a slot is "supposed to be code" — used solely
+        to gate `_prefer_structural_pairing`'s top-level, current-side
+        duplicate preference (issue #68) toward a `render_prefix`-carrying
+        candidate. `all()` rather than `any()` so a prose paragraph that
+        merely contains an inline `` `code` `` span among ordinary text does
+        not trip this — only a paragraph that is entirely monospace, the
+        shape a fenced-code line always has.
+        """
+        if not isinstance(node, DocsParagraphNode):
+            return False
+        return bool(node.spans) and all(s.monospace for s in node.spans)
+
     def _cell_key(self, cell: TableCell) -> Tuple:
         """Hashable full identity for a table cell, including inline styling.
 
@@ -219,8 +244,10 @@ class DocsRequestBuilder:
         same text and only one target slot exists for that text, the *outer*
         `_node_key` matcher (not `_repair`) can still let the plain one win
         the correspondence and leave the code-rendered one an unpaired
-        `delete` — a pre-existing gap this fix narrows but does not close; see
-        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        `delete` — a pre-existing gap now closed by `_opcodes`'s top-level
+        `_prefer_structural_pairing(prefer_code_line=True)` pass, which
+        re-scores that exact ambiguity across the whole document; see
+        `test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line`
         in `tests/test_code_block_granularity.py` and issue #68.
         """
         if isinstance(node, DocsTableNode):
@@ -242,11 +269,41 @@ class DocsRequestBuilder:
         actual write (derived from build()'s classification) must never
         drift apart. This is the one place current_keys/target_keys/
         SequenceMatcher get constructed.
+
+        `_repair` only disambiguates duplicate-content candidates *within* a
+        single `replace` run it already identified. It cannot rescue a
+        current node that `_node_key`'s top-level `SequenceMatcher` pass
+        already bound elsewhere in the document — e.g. a plain paragraph and
+        a real code-rendered paragraph reading the same text, competing for
+        one target slot the plain paragraph wins purely because its key
+        happens to match first (issue #68). `_prefer_structural_pairing`'s
+        candidate/slot/greedy-assignment machinery generalizes to that
+        top-level case unchanged (it already takes global indices and an
+        `i1`/`j1` offset; passing `0, 0` and the whole opcode list just
+        widens its view from "one run" to "the document"), so it is reused
+        here rather than duplicated — with `prefer_code_line=True` to prefer
+        a `render_prefix`-carrying candidate for a slot the target itself
+        marks as code (`_target_wants_code_line`). `_coalesce` runs again
+        afterward since the pass may re-tag opcodes that were previously
+        merged.
         """
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
         matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        return self._repair(matcher.get_opcodes(), current, target)
+        repaired = self._repair(matcher.get_opcodes(), current, target)
+        # The whole-document pass below only ever has work to do when some
+        # target slot is itself a fenced-code line (`_target_wants_code_line`)
+        # — see `_prefer_structural_pairing`'s `code_slot_ids` gate, which
+        # otherwise `continue`s past every content-key group unconditionally.
+        # Skipping the `by_key` grouping entirely for documents with no code
+        # blocks avoids that whole-document-sized bookkeeping on every single
+        # `_opcodes()`/`build()` call for the common case.
+        if not any(self._target_wants_code_line(n) for n in target):
+            return self._coalesce(repaired)
+        resolved = self._prefer_structural_pairing(
+            repaired, current, target, 0, 0, prefer_code_line=True,
+        )
+        return self._coalesce(resolved)
 
     def _repair(
         self,
@@ -321,8 +378,16 @@ class DocsRequestBuilder:
         tgt_slice: List[Node],
         i1: int,
         j1: int,
+        prefer_code_line: bool = False,
     ) -> List[Opcode]:
         """Reassign ambiguous equal/delete pairings toward their structurally closest node.
+
+        Two callers, two different scope contracts: `_repair` calls this locally,
+        scoped to a single `replace` run it already identified
+        (`prefer_code_line=False`, the default); `_opcodes` calls it once more
+        over the *whole document* (`prefer_code_line=True`). `prefer_code_line`
+        is what distinguishes the two — see its own paragraph below for what it
+        changes about the scoring and the pool of eligible candidates.
 
         The inner `SequenceMatcher` in `_repair` treats every current node sharing
         a `_content_key` as interchangeable and pairs whichever ones it meets first
@@ -374,12 +439,30 @@ class DocsRequestBuilder:
         block (the symmetric case) is not decomposed — there is no existing
         "equal" opcode to use as the slot in that case, only a range with no
         established per-index correspondence to split by. That gap is open.
+
+        `prefer_code_line` (used only by `_opcodes`'s top-level call, issue
+        #68) adds a scoring bonus for a candidate that is itself a
+        `render_prefix`-carrying code-rendered node when the slot's target
+        node is itself a fenced-code-block line (`_target_wants_code_line`).
+        Without the target-side gate, a plain paragraph that merely shares
+        text with an unrelated code node elsewhere in the document (a
+        legitimate, already-correct pairing — see
+        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`)
+        would be wrongly outranked by that unrelated code node; gating on
+        what the target slot itself wants keeps this scoped to slots that
+        actually are code.
         """
         expanded: List[Opcode] = []
         for tag, ci1, ci2, cj1, cj2 in pending:
             if tag == "delete" and ci2 - ci1 > 1:
                 for idx in range(ci1, ci2):
                     expanded.append(("delete", idx, idx + 1, cj1, cj1))
+            elif tag == "equal" and ci2 - ci1 > 1:
+                stride = cj2 - cj1  # "equal" guarantees ci2-ci1 == cj2-cj1.
+                for offset in range(ci2 - ci1):
+                    idx = ci1 + offset
+                    jdx = cj1 + offset if stride else cj1
+                    expanded.append(("equal", idx, idx + 1, jdx, jdx + 1))
             else:
                 expanded.append((tag, ci1, ci2, cj1, cj2))
 
@@ -409,14 +492,45 @@ class DocsRequestBuilder:
             slot_ids = [cid for cid in positions if cid[0] == "pos" and expanded[cid[1]][0] == "equal"]
             if not slot_ids or len(positions) < 2:
                 continue
+
+            if prefer_code_line:
+                # The top-level call runs this over the *whole document*, not one
+                # `_repair`-scoped run — so a content-key group here can span
+                # slots `_repair` already resolved correctly and independently
+                # (e.g. a live heading and a live bullet that both happen to read
+                # "Setup"). Without this gate, re-scoring every slot in the group
+                # lets an unrelated candidate's raw `_structural_score` outrank an
+                # already-fine self-pair on a slot that was never in question
+                # (see `test_duplicate_text_on_both_sides_still_saves_every_live_node`).
+                # So only a slot whose target actually wants a code line is up for
+                # grabs; every other slot's current candidate is pulled out of the
+                # pool entirely rather than left in to compete for the code slot.
+                code_slot_ids = [
+                    sid for sid in slot_ids
+                    if self._target_wants_code_line(tgt_slice[expanded[sid[1]][3] - j1])
+                ]
+                if not code_slot_ids:
+                    continue
+                non_code_positions = set(slot_ids) - set(code_slot_ids)
+                positions = [cid for cid in positions if cid not in non_code_positions]
+                slot_ids = code_slot_ids
+
             slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
 
             pair_scores = []
             for si, sid in enumerate(slot_ids):
                 scj1, _scj2 = slot_targets[sid]
                 target_node = tgt_slice[scj1 - j1]
+                wants_code = prefer_code_line and self._target_wants_code_line(target_node)
                 for ci, cid in enumerate(positions):
-                    score = self._structural_score(cur_slice[_current_index(cid) - i1], target_node)
+                    candidate_node = cur_slice[_current_index(cid) - i1]
+                    score = self._structural_score(candidate_node, target_node)
+                    if (
+                        wants_code
+                        and isinstance(candidate_node, DocsParagraphNode)
+                        and self._is_code_line(candidate_node)
+                    ):
+                        score += _CODE_LINE_PREFERENCE_BONUS
                     pair_scores.append((score, sid == cid, si, ci, sid, cid))
             pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
 
@@ -750,24 +864,37 @@ class DocsRequestBuilder:
                 # of the one just protected, splitting the paragraph and
                 # leaving a stray empty one behind on every such edit (#56).
                 #
-                # KNOWN LIMITATION (pre-existing, not introduced here): the
-                # doc_end_index clamp in _delete_bounds also spares a
+                # The doc_end_index clamp in _delete_bounds also spares a
                 # newline — the paragraph's own terminator — when the
-                # deleted range ends at the document's last paragraph, but
-                # that case isn't checked here. A normal `text + "\n"`
-                # insert does NOT recreate the original state in that case;
-                # it duplicates the clamp-spared newline and leaves a stray
-                # blank paragraph behind. `before_newline=True` isn't a fix
-                # either — it would prepend a blank paragraph in front of
-                # that newline instead. Properly handling this needs a
-                # third insert-text mode (bare text, no newline) that this
-                # branch doesn't have yet. See #62.
+                # deleted range ends at the document's last paragraph.
+                # `before_newline=True` is not the right fix there: that
+                # writes "\ntext", which prepends a blank paragraph in
+                # front of the clamp-spared newline instead of reusing it.
+                # The insert must instead be bare text with no newline on
+                # either side, so the clamp-spared newline is reused as the
+                # new text's own terminator (see `bare_last` on
+                # _make_insert_requests). `precedes_structural_element` is
+                # mutually exclusive with this clamp (a following
+                # Table/ToC/SectionBreak means last.end_index <
+                # doc_end_index), but render_prefix is not — a render-glyph
+                # paragraph that is also the doc's last paragraph keeps the
+                # existing before_newline=True behavior (#48 takes
+                # precedence over this narrower case).
                 last = current[i2 - 1]
-                spares_newline = isinstance(last, DocsParagraphNode) and (
+                spares_structural_newline = isinstance(last, DocsParagraphNode) and (
                     bool(last.render_prefix) or last.precedes_structural_element
                 )
+                spares_terminal_newline = (
+                    not spares_structural_newline
+                    and isinstance(last, DocsParagraphNode)
+                    and bool(last.text)
+                    and last.end_index >= doc_end_index
+                )
                 requests = self._make_insert_requests(
-                    target[j1:j2], delete_start, before_newline=spares_newline
+                    target[j1:j2],
+                    delete_start,
+                    before_newline=spares_structural_newline,
+                    bare_last=spares_terminal_newline,
                 )
                 if requests:
                     # Same anchor as the first deleted node's group, and emitted
@@ -837,30 +964,33 @@ class DocsRequestBuilder:
     # Pass 2 — fill table cells from a re-fetched doc
     # ──────────────────────────────────────────────
 
-    def build_table_fill_requests(self, doc: dict, target: List[Node]) -> List[dict]:
+    def build_table_fill_requests(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
         """
         Emit insertText requests to fill empty tables created by a prior push (pass 1).
 
-        Matches the empty tables in the re-fetched document (in document order) to the
-        DocsTableNodes in ``target`` (in order), reading real cell indices from ``doc`` so
-        no index prediction is required.
+        Pairs live tables with ``target`` DocsTableNodes via `_paired_tables` — the
+        same content-aligned, document-order pairing `build_table_cell_span_requests`
+        uses — then reads real cell indices from ``doc`` so no index prediction is
+        required. A live table that pairs but is not empty (already populated by an
+        earlier push) is skipped for insertion, but still consumes its pairing slot,
+        so a mix of populated and empty tables cannot shift a later table onto the
+        wrong target.
         """
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
 
+        aligned = self._aligned(doc, target, alignment)
         inserts: List[Tuple[int, str]] = []
-        ti = 0
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is None:
-                continue
+        for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             if not self._table_is_empty(table):
                 continue  # already populated (or a pre-existing content table)
-            if ti >= len(target_tables):
-                break
-            inserts.extend(self._cell_inserts(table, target_tables[ti]))
-            ti += 1
+            inserts.extend(self._cell_inserts(table, tnode))
 
         # Insert highest index first so earlier inserts don't shift later cell indices.
         inserts.sort(key=lambda pair: pair[0], reverse=True)
@@ -900,7 +1030,7 @@ class DocsRequestBuilder:
 
         aligned = self._aligned(doc, target, alignment)
         requests: List[dict] = []
-        for table, tnode in self._paired_tables(doc, target_tables):
+        for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             for live, cell in self._paired_cells(table, tnode):
                 if not cell.styled:
                     continue
@@ -949,10 +1079,11 @@ class DocsRequestBuilder:
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
-        live_tables = self._live_tables(doc, len(target_tables))
+        aligned = self._aligned(doc, target, alignment)
         missed: List[str] = []
-        for position, tnode in enumerate(target_tables):
-            table = live_tables[position] if position < len(live_tables) else None
+        paired = {id(tnode): table for table, tnode in self._paired_tables(doc, aligned.table_pairs)}
+        for tnode in target_tables:
+            table = paired.get(id(tnode))
             rows = table.get("tableRows", []) if table else []
             for r, row in enumerate(tnode.rows):
                 live_cells = rows[r].get("tableCells", []) if r < len(rows) else []
@@ -979,50 +1110,37 @@ class DocsRequestBuilder:
         return missed
 
     @staticmethod
-    def _live_tables(doc: dict, limit: int) -> List[dict]:
-        """The first `limit` tables in body order — the pairing both cell passes use."""
-        tables: List[dict] = []
-        if limit <= 0:
-            return tables
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is not None:
-                tables.append(table)
-                if len(tables) >= limit:
-                    break
-        return tables
-
-    @staticmethod
     def _paired_tables(
-        doc: dict, target_tables: List[DocsTableNode]
+        doc: dict, table_pairs: List[Tuple[int, DocsTableNode]]
     ) -> Iterator[Tuple[dict, DocsTableNode]]:
-        """Live tables paired with target tables, in document order.
+        """Live tables paired with target tables via `_align_for_styling`'s content alignment.
 
-        Order is the only correspondence available: a table has no id, and
-        `_align_for_styling` keys a table on its whole cell grid, so a table whose
-        cells changed does not align at all.
+        The single pairing shared by `build_table_fill_requests` and
+        `build_table_cell_span_requests` — both used to compute their own
+        (one advancing only past *empty* live tables, the other advancing
+        unconditionally), which meant a live table's fill and its styling
+        could disagree about which target table it corresponded to. `doc` is
+        walked here, rather than in `_align_for_styling`, because
+        `table_pairs`' ordinals are positions among tables in the *parsed*
+        `current` list, and only the raw API dicts in `_body_content(doc)`
+        carry the real cell indices `_cell_inserts`/`_table_is_empty`/
+        `_cell_placement` need.
 
-        This is **not** the same pairing `build_table_fill_requests` uses — that one
-        advances only past *empty* live tables, so it pairs the Nth empty table with
-        the Nth target table. This pairs the Nth table outright, because by the time
-        styling runs pass 1 has filled them and "empty" no longer identifies them.
-
-        Raw body position is weaker than the content alignment
-        `build_span_style_requests` uses for paragraphs, and the gap is real: if a
-        concurrent edit adds a table between pass 1 and pass 2 the counts shift and a
-        stale table can be styled. `_cell_placement`'s text search catches that only
-        when the two tables' cell texts differ, and headers like "Status" or "Owner"
-        repeat constantly. Narrow, but the same window `_cell_placement` bails on.
+        A table has no id, and `_align_for_styling` keys every table on one
+        sentinel (`_alignment_key`), so within a content-aligned "equal" run
+        tables still pair by relative order — but that order now tracks
+        paragraphs difflib finds inserted or removed around a table, unlike
+        raw body position, which the previous version of this method used and
+        which drifts whenever a concurrent edit shifts table counts between
+        pass 1 and pass 2.
         """
-        index = 0
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is None:
+        live_tables = [
+            element["table"] for element in _body_content(doc) if element.get("table") is not None
+        ]
+        for ordinal, tnode in table_pairs:
+            if ordinal >= len(live_tables):
                 continue
-            if index >= len(target_tables):
-                return
-            yield table, target_tables[index]
-            index += 1
+            yield live_tables[ordinal], tnode
 
     @staticmethod
     def _paired_cells(
@@ -1102,12 +1220,15 @@ class DocsRequestBuilder:
         accepts ``alignment=None`` and computes its own, so a caller with only a
         document and a target — every existing test — keeps working.
         """
-        current, pairs, unaligned, heading_pairs, residue = self._align_for_styling(doc, target)
+        current, pairs, unaligned, heading_pairs, residue, table_pairs = (
+            self._align_for_styling(doc, target)
+        )
         slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
         return Pass2Alignment(
             current=current,
             pairs=pairs,
             unaligned=unaligned,
+            table_pairs=table_pairs,
             slug_to_id=slug_to_id,
             known_ids=known_ids,
             residue=residue,
@@ -1289,14 +1410,31 @@ class DocsRequestBuilder:
         List[DocsParagraphNode],
         List[Tuple[DocsParagraphNode, DocsParagraphNode]],
         List[Residue],
+        List[Tuple[int, DocsTableNode]],
     ]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(current, pairs, unaligned, heading_pairs, residue)`` — the
-        parsed document, pairs of (document node, target node) that are safe to
-        style, the target paragraphs with spans that could not be paired, the
-        same pairing restricted to target paragraphs that are headings, and any
-        residue from projecting this second, post-pass-1 parse of the document.
+        Returns ``(current, pairs, unaligned, heading_pairs, residue,
+        table_pairs)`` — the parsed document, pairs of (document node, target
+        node) that are safe to style, the target paragraphs with spans that
+        could not be paired, the same pairing restricted to target paragraphs
+        that are headings, any residue from projecting this second, post-pass-1
+        parse of the document, and the table pairing described below.
+
+        ``table_pairs`` pairs a *live table ordinal* (its position among only
+        the tables in ``current``, 0-based) with a target ``DocsTableNode``.
+        An ordinal rather than the parsed ``DocsTableNode`` itself, because
+        every table consumer (`_table_is_empty`, `_cell_inserts`,
+        `_cell_placement`) needs the raw API dict from the re-fetched ``doc``,
+        which `current` does not carry — the ordinal is what lets a caller find
+        that dict back in `_body_content(doc)`. `_alignment_key` collapses
+        every table to one sentinel key (see its docstring), so within a
+        difflib "equal" run tables pair by position exactly like duplicate
+        paragraph text does: order-preserving, but blind to which table's
+        *cells* actually match. That is still strictly better than raw body
+        position for this purpose, because it tracks paragraphs inserted or
+        removed around a table rather than assuming the table's index in the
+        body is stable.
 
         ``current`` is returned rather than re-parsed by callers because parsing
         a large document twice per push to learn the same thing is pure cost.
@@ -1376,17 +1514,31 @@ class DocsRequestBuilder:
             autojunk=False,
         )
 
+        # Ordinal of each table's position in `current`, among tables only —
+        # what `table_pairs` reports instead of the parsed DocsTableNode, since
+        # downstream table consumers need the raw dict at that ordinal in
+        # `_body_content(doc)`, not the parsed node.
+        table_ordinals: Dict[int, int] = {}
+        table_count = 0
+        for ci, node in enumerate(current):
+            if isinstance(node, DocsTableNode):
+                table_ordinals[ci] = table_count
+                table_count += 1
+
         pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
+        table_pairs: List[Tuple[int, DocsTableNode]] = []
         aligned_target_indices = set()
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != "equal":
                 continue
             for ci, ti in zip(range(i1, i2), range(j1, j2)):
                 cnode, tnode = current[ci], target[ti]
-                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
-                    continue
                 aligned_target_indices.add(ti)
+                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
+                    if isinstance(cnode, DocsTableNode) and isinstance(tnode, DocsTableNode):
+                        table_pairs.append((table_ordinals[ci], tnode))
+                    continue
                 if tnode.spans:
                     pairs.append((cnode, tnode))
                 if is_heading_style(tnode.style):
@@ -1399,7 +1551,7 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return current, pairs, unaligned, heading_pairs, current_residue
+        return current, pairs, unaligned, heading_pairs, current_residue, table_pairs
 
     def _anchor_resolution(
         self, current: List[Node], target: List[Node],
@@ -1563,7 +1715,7 @@ class DocsRequestBuilder:
                 the right tab's content; this parameter only affects which
                 tab the *requests* are addressed to.
         """
-        requests = self.build_table_fill_requests(doc, target)
+        requests = self.build_table_fill_requests(doc, target, alignment)
         requests += self.build_span_style_requests(doc, target, alignment)
         # Cell styling reads indices from `doc`, i.e. from *before* the fills above
         # are applied. A table that already holds its text — every table on a
@@ -1702,7 +1854,11 @@ class DocsRequestBuilder:
         return requests
 
     def _make_insert_requests(
-        self, nodes: List[Node], insert_at_index: int, before_newline: bool = False
+        self,
+        nodes: List[Node],
+        insert_at_index: int,
+        before_newline: bool = False,
+        bare_last: bool = False,
     ) -> List[dict]:
         """
         Emit insert requests per node.
@@ -1739,7 +1895,22 @@ class DocsRequestBuilder:
         which is what the ``+ 1`` below accounts for. Without it the
         updateParagraphStyle range begins on the preceding paragraph's newline
         and Docs applies namedStyleType to both paragraphs.
+
+        ``bare_last`` is the mirror case: ``insert_at_index`` sits on a newline
+        that terminates the *inserted* text rather than the preceding one — the
+        deleted range's own terminal newline, spared by the doc_end_index clamp
+        in ``_delete_bounds`` because it is undeletable. Writing either
+        ``"text\\n"`` or ``"\\ntext"`` there would duplicate that newline; the
+        text must go in bare, with no newline on either side, so the
+        clamp-spared newline is reused as the new text's own terminator. It
+        only ever applies to the last of ``nodes`` (the one bordering that
+        clamp-spared newline once all nodes have been inserted) — earlier
+        nodes in a multi-node replace are still followed by more inserted
+        text, not by the spared newline, so they keep their own trailing
+        ``"\\n"``. Mutually exclusive with ``before_newline``: both describe
+        the same insert point, and only one boundary condition can hold.
         """
+        assert not (before_newline and bare_last)
         requests: List[dict] = []
         for node in reversed(nodes):
             if isinstance(node, DocsTableNode):
@@ -1752,14 +1923,21 @@ class DocsRequestBuilder:
                 })
                 continue
 
-            # The paragraph's own text always ends up as node.text + "\n"; only
-            # which side of it carries the newline in the insert differs.
-            text = "\n" + node.text if before_newline else node.text + "\n"
+            is_bare = bare_last and node is nodes[-1]
+            # The paragraph's own text always ends up as node.text + "\n",
+            # except in bare mode, where the trailing "\n" already exists at
+            # the insert point and must not be duplicated.
+            if is_bare:
+                text = node.text
+            elif before_newline:
+                text = "\n" + node.text
+            else:
+                text = node.text + "\n"
             requests.append({
                 "insertText": {"location": {"index": insert_at_index}, "text": text}
             })
             paragraph_start = insert_at_index + 1 if before_newline else insert_at_index
-            text_len = _utf16_len(node.text + "\n")
+            text_len = _utf16_len(node.text) if is_bare else _utf16_len(node.text + "\n")
             paragraph_range = {
                 "startIndex": paragraph_start,
                 "endIndex": paragraph_start + text_len,
