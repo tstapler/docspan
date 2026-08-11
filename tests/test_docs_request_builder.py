@@ -265,6 +265,38 @@ def test_insert_sharing_an_anchor_with_a_list_item_bullet_change_targets_the_ori
     assert requests.index(bullet_requests[0]) < insert_index
 
 
+def test_insert_sharing_an_anchor_with_a_list_item_demotion_targets_the_original_paragraph() -> None:
+    """deleteParagraphBullets for a paragraph demoted out of a list must
+    land on the ORIGINAL paragraph's pre-insert range, and run before an
+    insert tied on the same anchor."""
+    current = [
+        _para("Heading", style="HEADING_2", start=1, end=10),
+        _para("Item", style="NORMAL_TEXT", start=10, end=15, is_list_item=True),
+    ]
+    target = [
+        _para("Heading", style="HEADING_2", start=0, end=0),
+        _para("NewPara", style="NORMAL_TEXT", start=0, end=0),
+        _para("Item", style="NORMAL_TEXT", start=0, end=0, is_list_item=False),
+    ]
+    requests = builder.build(current, target, doc_end_index=15)
+
+    # The insert group for "NewPara" also emits its own deleteParagraphBullets
+    # (it inherits the bullet of whatever paragraph it splits, per
+    # _span_style_requests's insert path) — that one is unrelated to this
+    # collision and targets NewPara's own post-shift range, not the original
+    # Item's pre-insert range.
+    original_range_bullet_requests = [
+        r
+        for r in requests
+        if "deleteParagraphBullets" in r
+        and r["deleteParagraphBullets"]["range"] == {"startIndex": 10, "endIndex": 15}
+    ]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    assert len(original_range_bullet_requests) == 1
+    assert requests.index(original_range_bullet_requests[0]) < insert_index
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Terminal newline protection
 # ─────────────────────────────────────────────────────────────────────────────
