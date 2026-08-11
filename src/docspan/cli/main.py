@@ -184,6 +184,21 @@ def _resolve(config_path: Optional[str], prefix: Optional[str]):
     return config, markgate_path, resolved_prefix
 
 
+def _resolve_with_mtime(
+    config_path: Optional[str], prefix: Optional[str]
+) -> tuple[MarkgateConfig, Optional[str], Optional[str], Optional[float]]:
+    """Like _resolve(), but also captures the config's mtime at load time.
+
+    The mtime must be sampled here — immediately after load_config() — not
+    later, right before save_config(). A caller that re-reads the mtime just
+    before writing (e.g. after a slow backend.create() network call) defeats
+    the whole point of the concurrency check: any edit that lands during that
+    window becomes the new "expected" baseline instead of being detected.
+    """
+    config, markgate_path, resolved_prefix = _resolve(config_path, prefix)
+    return config, markgate_path, resolved_prefix, config_mtime(markgate_path)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # push command
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,7 +216,7 @@ def push(
     ),
 ) -> None:
     """Push local markdown to remote docs."""
-    config, config_path, prefix = _resolve(config_path, prefix)
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
     mappings = config.mappings
 
     if files:
@@ -263,11 +278,19 @@ def push(
                 console.print("Push cancelled.")
                 had_error = True
                 continue
-            create_result = backend.create(os.path.splitext(os.path.basename(mapping.local))[0])
-            mapping.remote_id = create_result.doc_id
-            expected_mtime = config_mtime(config_path)
             try:
-                save_config(config, config_path, expected_mtime=expected_mtime)
+                create_result = backend.create(os.path.splitext(os.path.basename(mapping.local))[0])
+            except ValueError as exc:
+                err_console.print(
+                    f"{exc}\n"
+                    f"Run 'docspan map {mapping.local} --backend {mapping.backend} --space <key>' "
+                    "to create the remote doc/page with the required options."
+                )
+                had_error = True
+                continue
+            mapping.remote_id = create_result.doc_id
+            try:
+                save_config(config, config_path, expected_mtime=loaded_mtime)
             except ConfigConflictError as exc:
                 err_console.print(
                     f"{exc}\n\n"
@@ -278,6 +301,7 @@ def push(
                 )
                 had_error = True
                 continue
+            loaded_mtime = config_mtime(config_path)
             console.print(f"[green]✓[/green]  Created {mapping.backend} doc → {mapping.local}")
 
         # Story 1.2.5: ScratchVerificationMarker — a one-time confirmation
@@ -428,7 +452,7 @@ def map_(
         err_console.print("--direction must be one of: push, pull, both")
         raise typer.Exit(1)
 
-    config, config_path, prefix = _resolve(config_path, prefix)
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
 
     if any(m.local == file for m in config.mappings):
         err_console.print(
@@ -462,9 +486,8 @@ def map_(
     )
     config.mappings.append(mapping)
 
-    expected_mtime = config_mtime(config_path)
     try:
-        save_config(config, config_path, expected_mtime=expected_mtime)
+        save_config(config, config_path, expected_mtime=loaded_mtime)
     except ConfigConflictError as exc:
         err_console.print(
             f"{exc}\n\n"
@@ -479,7 +502,11 @@ def map_(
     if create_result.url:
         console.print(f"   {create_result.url}")
 
-    if mapping.direction != "pull" and os.path.exists(file):
+    # A freshly created remote doc/page is always empty. Push local content
+    # into it now regardless of `direction` — otherwise a "pull" mapping's
+    # very next pull has no prior sync state to compare against and will
+    # unconditionally overwrite the local file with that empty remote doc.
+    if os.path.exists(file):
         state_path = get_state_path(config_path, prefix)
         state_dir = get_state_dir(config_path, prefix)
         state = _load_state(state_path)

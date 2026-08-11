@@ -461,6 +461,23 @@ class TestPushAutoCreate:
         assert "new-doc-1" in result.output
         assert not backend.push_calls
 
+    def test_backend_value_error_surfaces_and_does_not_write_mapping(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), remote_id=None)
+        backend = MagicMock()
+        backend.create.side_effect = ValueError("Confluence page creation requires a space key.")
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main._can_prompt", return_value=True):
+            result = runner.invoke(app, ["push", "--config", cfg], input="y\n")
+        assert result.exit_code == 1
+        assert "space key" in result.output
+        assert "docspan map" in result.output
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        assert saved["mappings"] == []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # map
@@ -544,7 +561,11 @@ class TestMap:
         assert "new-doc-1" in result.output
         assert "https://example.com/new-doc" in result.output
 
-    def test_skips_immediate_push_for_pull_direction(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def test_pushes_immediately_even_for_pull_direction(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # A freshly created remote doc/page is empty. A pull-direction mapping
+        # must still get its initial push, otherwise the next `docspan pull`
+        # has no prior sync state and overwrites the local file with that
+        # empty remote content — see main.py's map_() comment for detail.
         local = tmp_path / "new.md"
         local.write_text("# Hello\n", encoding="utf-8")
         cfg = _cfg_file(tmp_path)
@@ -555,7 +576,7 @@ class TestMap:
                 app, ["map", str(local), "--backend", "google_docs", "--direction", "pull", "--config", cfg]
             )
         assert result.exit_code == 0
-        assert not backend.push_calls
+        assert backend.push_calls
 
     def test_skips_immediate_push_when_local_file_missing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         missing = tmp_path / "missing.md"

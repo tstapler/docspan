@@ -75,7 +75,7 @@ class Backend(ABC):
         """Fetch the remote document and write it as local markdown."""
 
     @abstractmethod
-    def create(self, title: str, **kwargs) -> CreateResult:
+    def create(self, title: str, **kwargs: object) -> CreateResult:
         """Create a new remote document/page and return its id/title/url."""
 
     @abstractmethod
