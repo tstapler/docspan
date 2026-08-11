@@ -351,7 +351,7 @@ class GoogleDocsClient:
         propagates so the caller can degrade gracefully (see
         GoogleDocsBackend.pull()).
         """
-        content = self._with_backoff(
+        content: bytes = self._with_backoff(
             lambda: self.drive_service.files()
             .export_media(fileId=doc_id, mimeType="text/markdown")
             .execute()
