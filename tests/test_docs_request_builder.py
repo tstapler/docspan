@@ -696,6 +696,28 @@ def test_guard_never_reenables_autojunk_or_a_popularity_heuristic() -> None:
     assert actual == expected
 
 
+def test_bounded_opcodes_raises_above_comparison_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The comparison-matrix branch (`len(a_keys) * len(b_keys) > _MAX_COMPARISON_CELLS`)
+    is a separate trip condition from the duplicate-run check and needs its own
+    coverage. Keys here are all unique and the combined input is well under the
+    default duplicate-run size floor, so only the comparison-cell branch can fire."""
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_COMPARISON_CELLS", 20)
+    a_keys = [(f"a{i}",) for i in range(5)]
+    b_keys = [(f"b{i}",) for i in range(5)]  # 5 * 5 = 25 > 20
+    with pytest.raises(DiffTooExpensive):
+        docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+
+
+def test_bounded_opcodes_does_not_raise_at_the_comparison_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boundary check for the comparison-cell branch: a product exactly at the
+    cap must not raise (the guard's condition is strictly `>`)."""
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_COMPARISON_CELLS", 25)
+    a_keys = [(f"a{i}",) for i in range(5)]
+    b_keys = [(f"b{i}",) for i in range(5)]  # 5 * 5 == 25, at the cap
+    result = docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+    assert result == [("replace", 0, 5, 0, 5)]
+
+
 def test_repairs_inner_matcher_shares_the_same_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC4: `_repair`'s inner per-replace-run matcher (keyed on `_content_key`,
     called from inside `_repair` rather than through `_opcodes`) trips the
