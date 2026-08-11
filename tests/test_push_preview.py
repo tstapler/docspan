@@ -23,6 +23,7 @@ from docspan.backends.google_docs.push_preview import (
     render_high_risk,
 )
 
+
 def _para(text: str, style: str = "NORMAL_TEXT", is_list_item: bool = False) -> DocsParagraphNode:
     return DocsParagraphNode(
         style=style, text=text, start_index=1, end_index=10, is_list_item=is_list_item
