@@ -10,7 +10,7 @@ itself — never by a separately-fetched CLI-layer preview.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
 from docspan.backends.google_docs.projection import Residue
@@ -134,6 +134,83 @@ def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
     return "\n".join(blocks)
 
 
+def find_churn_pairs(entries: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
+    """Pair up `remove`/`add` DiffEntry that are really one delete-and-reinsert.
+
+    A `replace` opcode run whose current/target slices differ in length (see
+    `DocsRequestBuilder.diff_summary()`'s "length mismatch" branch,
+    `docs_request_builder.py:594-611`) reports its leftovers as plain
+    `remove`/`add` entries even when the leftover text is byte-identical —
+    the paragraph was destroyed and recreated (losing headingId/anchored
+    comments) without changing what the document says. That is churn, not a
+    removal, and this function finds those pairs so `render()` can label them.
+
+    Deliberately scoped to *adjacent* remove/add entries — a maximal run of
+    consecutive "remove"/"add" entries with no "change" (or gap) between
+    them, mirroring how one replace run's leftovers land consecutively in
+    `entries`. Matching identical text anywhere in the flat list (not scoped
+    this way) is exactly the `_node_key`/`Config`-heading-collision failure
+    mode this codebase already got burned by once
+    (`docs_request_builder.py:112-150`) — two unrelated short-text entries
+    from unrelated parts of the document must never be paired.
+
+    Within a run, pairing is 1:1 (each `remove` claims at most one unclaimed
+    `add` with identical text) so duplicate short text (two blank lines, two
+    "TODO" bullets) cannot double-count or cross-pair. Table rows
+    (`style == "TABLE"`) are excluded — identical flattened row text is a
+    weaker, easier-to-get-wrong signal than paragraph text.
+    """
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    run: List[DiffEntry] = []
+
+    def flush() -> None:
+        if run:
+            pairs.extend(_match_churn_run(run))
+        run.clear()
+
+    for entry in entries:
+        if entry.kind in ("remove", "add"):
+            run.append(entry)
+        else:
+            flush()
+    flush()
+
+    return pairs
+
+
+def _match_churn_run(run: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
+    removes = [e for e in run if e.kind == "remove" and e.style != "TABLE"]
+    adds = [e for e in run if e.kind == "add" and e.style != "TABLE"]
+
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    claimed: set = set()
+    for r in removes:
+        for i, a in enumerate(adds):
+            if i in claimed:
+                continue
+            if r.current_text is not None and r.current_text == a.target_text:
+                pairs.append((r, a))
+                claimed.add(i)
+                break
+    return pairs
+
+
+def render_churn_note(pairs: List[Tuple[DiffEntry, DiffEntry]]) -> str:
+    """Render the ⓘ note for a list of churn pairs found by `find_churn_pairs()`.
+
+    Names the comment/identity loss explicitly — the resulting text is
+    unchanged, but the paragraph itself (and anything anchored to it) is
+    still destroyed and recreated, which "no text change" alone would not
+    convey.
+    """
+    n = len(pairs)
+    return (
+        f"ⓘ {n} paragraph(s) are rewritten with no text change (delete-and-reinsert) — "
+        "the wording is identical, but the paragraph is destroyed and recreated, so "
+        "any comment anchored to it is still lost."
+    )
+
+
 def _is_checklist_marker(text: Optional[str]) -> bool:
     """True if text (once stripped) starts with a literal `[ ]`/`[x]`/`[X]` marker."""
     if not text:
@@ -216,22 +293,39 @@ class PushPreview:
         if self.error is not None:
             return f"✗ dry-run failed: {self.error}"
 
-        additions = sum(1 for e in self.entries if e.kind == "add")
-        removals = sum(1 for e in self.entries if e.kind == "remove")
+        churn_pairs = find_churn_pairs(self.entries)
+        churned_removes = {id(pair[0]) for pair in churn_pairs}
+        churned_adds = {id(pair[1]) for pair in churn_pairs}
+
+        additions = sum(
+            1 for e in self.entries if e.kind == "add" and id(e) not in churned_adds
+        )
+        removals = sum(
+            1 for e in self.entries if e.kind == "remove" and id(e) not in churned_removes
+        )
         changes = sum(1 for e in self.entries if e.kind == "change")
 
         lines = [
             f"Preview: {changes} change(s), {additions} addition(s), "
-            f"{removals} removal(s), {self.unchanged_count} unchanged"
+            f"{removals} removal(s), {len(churn_pairs)} rewritten (no text change), "
+            f"{self.unchanged_count} unchanged"
         ]
 
         for entry in self.entries:
             if entry.kind == "add":
+                if id(entry) in churned_adds:
+                    continue
                 lines.append(f"  + {entry.target_text}")
             elif entry.kind == "remove":
-                lines.append(f"  - {entry.current_text}")
+                if id(entry) in churned_removes:
+                    lines.append(f"  ~ rewritten (no text change): {entry.current_text}")
+                else:
+                    lines.append(f"  - {entry.current_text}")
             elif entry.kind == "change":
                 lines.append(f"  ~ {entry.current_text} → {entry.target_text}")
+
+        if churn_pairs:
+            lines.append(render_churn_note(churn_pairs))
 
         checklist_flags = [
             _is_checklist_marker(e.current_text) or _is_checklist_marker(e.target_text)

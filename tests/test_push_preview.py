@@ -16,7 +16,9 @@ from docspan.backends.google_docs.docs_request_builder import DiffEntry
 from docspan.backends.google_docs.push_preview import (
     HighRiskParagraph,
     PushPreview,
+    find_churn_pairs,
     find_high_risk_paragraphs,
+    render_churn_note,
     render_high_risk,
 )
 
@@ -336,3 +338,100 @@ def test_push_preview_render_no_mixed_note_when_all_checklist() -> None:
     preview = PushPreview(entries=entries, unchanged_count=0, high_risk=[], request_count=2)
     rendered = preview.render()
     assert "mixes" not in rendered
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# find_churn_pairs() / render_churn_note()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_find_churn_pairs_matches_identical_text_from_same_run() -> None:
+    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
+    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    entries = [remove, add]
+
+    pairs = find_churn_pairs(entries)
+
+    assert pairs == [(remove, add)]
+
+
+def test_find_churn_pairs_ignores_unrelated_non_adjacent_entries() -> None:
+    """Mirrors the `_node_key`/`Config`-heading-collision failure mode
+    (docs_request_builder.py:112-150) — identical short text from two
+    unrelated, non-adjacent runs must never be paired."""
+    remove = DiffEntry(kind="remove", current_text="TODO", target_text=None, style="NORMAL_TEXT")
+    unrelated_change = DiffEntry(
+        kind="change", current_text="Friday", target_text="Saturday", style="NORMAL_TEXT"
+    )
+    add = DiffEntry(kind="add", current_text=None, target_text="TODO", style="NORMAL_TEXT")
+    entries = [remove, unrelated_change, add]
+
+    pairs = find_churn_pairs(entries)
+
+    assert pairs == []
+
+
+def test_find_churn_pairs_excludes_table_rows() -> None:
+    remove = DiffEntry(kind="remove", current_text="Row A", target_text=None, style="TABLE")
+    add = DiffEntry(kind="add", current_text=None, target_text="Row A", style="TABLE")
+
+    pairs = find_churn_pairs([remove, add])
+
+    assert pairs == []
+
+
+def test_find_churn_pairs_1to1_matches_duplicate_text_without_double_counting() -> None:
+    remove_a = DiffEntry(kind="remove", current_text="", target_text=None, style="NORMAL_TEXT")
+    remove_b = DiffEntry(kind="remove", current_text="", target_text=None, style="NORMAL_TEXT")
+    add_a = DiffEntry(kind="add", current_text=None, target_text="", style="NORMAL_TEXT")
+    entries = [remove_a, remove_b, add_a]
+
+    pairs = find_churn_pairs(entries)
+
+    assert len(pairs) == 1
+    assert pairs[0][1] is add_a
+
+
+def test_find_churn_pairs_empty_entries_returns_no_pairs() -> None:
+    assert find_churn_pairs([]) == []
+
+
+def test_render_churn_note_mentions_comment_and_identity_loss() -> None:
+    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
+    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+
+    note = render_churn_note([(remove, add)])
+
+    assert "comment" in note.lower()
+    assert "lost" in note.lower()
+
+
+def test_push_preview_render_reports_churn_pair_as_rewritten_not_removal() -> None:
+    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
+    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    preview = PushPreview(entries=[remove, add], unchanged_count=0, high_risk=[], request_count=2)
+
+    rendered = preview.render()
+
+    assert "~ rewritten (no text change)" in rendered
+    assert "- Same paragraph" not in rendered
+    assert "0 removal(s)" in rendered
+    assert "1 rewritten (no text change)" in rendered
+
+
+def test_push_preview_render_still_shows_comment_at_risk_for_churned_paragraph() -> None:
+    remove = DiffEntry(kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT")
+    add = DiffEntry(kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT")
+    high_risk = [
+        HighRiskParagraph(
+            paragraph_text="Same paragraph",
+            reasons=["comment"],
+            comment_quoted_text="Same paragraph",
+            comment_author="Nora Sullivan",
+        )
+    ]
+    preview = PushPreview(entries=[remove, add], unchanged_count=0, high_risk=high_risk, request_count=2)
+
+    rendered = preview.render()
+
+    assert "⚠ COMMENT AT RISK" in rendered
+    assert "~ rewritten (no text change)" in rendered
