@@ -1,6 +1,8 @@
 """Parse Markdown content into DocsParagraphNode/DocsTableNode list for Google Docs push."""
 from __future__ import annotations
 
+import html
+import re
 from typing import List, Optional, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -12,6 +14,81 @@ from docspan.backends.google_docs.docs_structure_parser import (
 )
 
 Node = Union[DocsParagraphNode, DocsTableNode]
+
+_HTML_ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
+_HTML_CELL_RE = re.compile(r"<(th|td)>(.*?)</\1>", re.S)
+
+_inline_md = None
+
+_BLANK_PARAGRAPH_MARKER = "​"
+
+
+def _spans_from_markdown_text(text: str) -> List[TextSpan]:
+    """Inline-parse one paragraph fragment of a multi-paragraph HTML table cell.
+
+    A pipe-table cell already goes through mistune's inline tokenizer as part of
+    parsing the surrounding GFM table. A `<table>` block is opaque raw HTML to
+    mistune (see `_table_from_html_block`), so each paragraph's text is re-parsed
+    here the same way, independently, to recover bold/link/monospace spans.
+    """
+    if not text:
+        return []
+    global _inline_md
+    if _inline_md is None:
+        import mistune
+
+        _inline_md = mistune.create_markdown(renderer=None, plugins=["table"])
+    for token in _inline_md(text) or []:
+        # token is `str | dict[str, Any]` per mistune's stubs; the isinstance
+        # guard narrows it for mypy (matches the pattern used elsewhere in
+        # this file for the same union).
+        if isinstance(token, dict) and token.get("type") == "paragraph":
+            return _spans_from_inline(token.get("children", []))
+    # Not a paragraph (e.g. text that is itself a bare "<table>" or "<br>") —
+    # the whole fragment is opaque raw HTML to mistune's block parser, so keep it
+    # as literal text rather than dropping it or guessing at its structure.
+    return [TextSpan(text=text)]
+
+
+def _cell_from_html_text(raw_cell_html: str) -> TableCell:
+    """A `<td>`/`<th>` inner HTML string, decoded back into a `TableCell`.
+
+    The `\\n` between paragraphs is kept as a literal, unstyled `TextSpan` — it was
+    never HTML-encoded on render (see `_render_table_html`), so there is nothing to
+    decode there; only each paragraph fragment's own text needs unescaping. An
+    interior empty paragraph was rendered with `_BLANK_PARAGRAPH_MARKER` in place of
+    the blank line CommonMark would otherwise treat as ending the HTML block (see
+    `_guard_blank_paragraph_lines`); strip it back to empty here.
+
+    The marker check happens *before* `html.unescape` on each fragment, not on the
+    whole string upfront: a real cell containing a literal U+200B was entity-escaped
+    to `&#8203;` on render (`_escape_html`), so it never collides with the raw
+    marker byte here — only the guard's own insertion does.
+    """
+    if not raw_cell_html:
+        return TableCell(text="", spans=[])
+    spans: List[TextSpan] = []
+    for i, fragment in enumerate(raw_cell_html.split("\n")):
+        if i > 0:
+            spans.append(TextSpan(text="\n"))
+        paragraph = "" if fragment == _BLANK_PARAGRAPH_MARKER else html.unescape(fragment)
+        spans.extend(_spans_from_markdown_text(paragraph))
+    full_text = "".join(s.text for s in spans)
+    return TableCell(text=full_text, spans=spans if _has_styling(spans) else [])
+
+
+def _table_from_html_block(raw: str) -> DocsTableNode:
+    """Convert a raw HTML `<table>` block (see `_render_table_html`) into a DocsTableNode."""
+    rows: List[List[TableCell]] = []
+    for row_match in _HTML_ROW_RE.finditer(raw):
+        rows.append([
+            _cell_from_html_text(cell_match.group(2))
+            for cell_match in _HTML_CELL_RE.finditer(row_match.group(1))
+        ])
+    width = max((len(r) for r in rows), default=0)
+    rows = [r + [TableCell() for _ in range(width - len(r))] for r in rows]
+    return DocsTableNode(rows=rows, start_index=0, end_index=0)
+
 
 # Literal, non-monospace marker line written ahead of a fenced block's lines to
 # carry mistune's token.attrs.info (the fence language) through the node-list
@@ -352,6 +429,15 @@ class MarkdownToParagraphParser:
             elif token_type == "blank_line":
                 pass
 
-            # thematic_break, html, etc. are silently skipped
+            elif token_type == "block_html":
+                # A multi-paragraph table cell renders as a raw <table> block
+                # (_render_table_html) since pipe syntax has no cell-internal
+                # break. Any other raw HTML is unsupported and silently
+                # skipped, as before.
+                raw = token.get("raw", "").strip() if isinstance(token, dict) else ""
+                if raw.lower().startswith("<table"):
+                    nodes.append(_table_from_html_block(raw))
+
+            # thematic_break, etc. are silently skipped
 
         return nodes
