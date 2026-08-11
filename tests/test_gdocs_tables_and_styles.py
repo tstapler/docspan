@@ -7,6 +7,8 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
     DocsTableNode,
+    TableCell,
+    TextSpan,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 
@@ -295,3 +297,26 @@ def test_fill_pairs_by_document_order_symmetric() -> None:
     target = [DocsTableNode(rows=[["T0"]]), DocsTableNode(rows=[["T1"]])]
     reqs = builder.build_table_fill_requests(doc, target)
     assert reqs == [{"insertText": {"location": {"index": 4}, "text": "T0"}}]
+
+
+def test_style_pairs_tables_by_document_order() -> None:
+    """The styling side shares `table_pairs` with the fill fix above — it must
+    match each live table with its position-matched target, not swap them,
+    when both live tables are already populated (a re-run over an existing doc).
+    """
+    doc = {"body": {"content": [
+        {"startIndex": 1, "endIndex": 10, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(4, "AAA")]},
+        ]}},
+        {"startIndex": 10, "endIndex": 19, "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [_populated_cell(13, "BBB")]},
+        ]}},
+    ]}}
+    target = [
+        DocsTableNode(rows=[[TableCell(text="AAA", spans=[TextSpan(text="AAA", bold=True)])]]),
+        DocsTableNode(rows=[[TableCell(text="BBB", spans=[TextSpan(text="BBB", italic=True)])]]),
+    ]
+    reqs = builder.build_table_cell_span_requests(doc, target)
+    by_index = {r["updateTextStyle"]["range"]["startIndex"]: _text_style(r) for r in reqs}
+    assert by_index[4].get("bold") is True
+    assert by_index[13].get("italic") is True
