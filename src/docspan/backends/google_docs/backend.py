@@ -26,6 +26,7 @@ from docspan.backends.google_docs.comments import (
     parse_reply_directives,
 )
 from docspan.backends.google_docs.converter import DocumentConverter
+from docspan.backends.google_docs.cross_doc_links import CrossDocLinkResolver
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -35,6 +36,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
 from docspan.backends.google_docs.heading_anchors import (
     available_anchor_slugs,
     heading_id_to_slug,
+    heading_slug_to_id,
     unresolved_anchors,
     upgrade_heading_id_anchors,
 )
@@ -192,8 +194,31 @@ class GoogleDocsBackend(Backend):
             residue=current_residue,
         )
 
+    def _fetch_target_headings(self, mapping: object) -> tuple:
+        """`fetch_headings` callback for CrossDocLinkResolver: live headings of
+        another mapping's target document, read fresh (never from local
+        markdown — see acceptance criterion 1 in the issue this backs).
+
+        Raises on any client failure (HttpError, network, malformed doc);
+        CrossDocLinkResolver._fetch() catches and caches the failure, so this
+        deliberately does not swallow anything itself.
+        """
+        assert self._client is not None
+        target_doc_id = mapping.remote_id
+        target_tab_id = getattr(mapping, "tab_id", None)
+        doc = self._client.get_document(target_doc_id)
+        doc, _resolved_tab_id, _warning = resolve_document_tab(doc, target_tab_id)
+        nodes = DocsStructureParser().parse(doc)
+        slug_to_id = heading_slug_to_id(nodes)
+        known_ids = set(slug_to_id.values())
+        return slug_to_id, known_ids
+
     def preview_push(
-        self, local_path: str, doc_id: str, tab_id: Optional[str] = None
+        self,
+        local_path: str,
+        doc_id: str,
+        tab_id: Optional[str] = None,
+        cross_doc_resolver: Optional[CrossDocLinkResolver] = None,
     ) -> PushPreview:
         """Build a read-only, cosmetic preview of what push() would do.
 
@@ -208,6 +233,18 @@ class GoogleDocsBackend(Backend):
         network error, malformed doc) during --dry-run returns a
         PushPreview(error=...) instead of letting the raw exception
         propagate and crash the CLI with a traceback.
+
+        `cross_doc_resolver` is accepted for signature symmetry with push()
+        (the CLI constructs one resolver and passes it to both), but is not
+        yet consulted here: `unresolved_anchors()` above only ever checked
+        same-document `#fragment`s, so a cross-document link was already
+        silently excluded from this preview before cross-doc resolution
+        existed, and it stays excluded now. That is a real gap — a mapped
+        cross-doc link with a typo'd fragment will not show up until push()
+        reports it — but it is the same direction this method's docstring
+        already promises ("under-reports and never over-reports"), not a new
+        one, and paying a live fetch per cross-doc link on every --dry-run is
+        deferred rather than done here.
         """
         self._ensure_client()
         try:
@@ -276,9 +313,21 @@ class GoogleDocsBackend(Backend):
         status is escalated to "warning" (message explains the doc is
         multi-tab and the choice was implicit) rather than silently writing
         to whichever tab happens to be first.
+
+        `cross_doc_resolver`, if passed via kwargs (the CLI constructs one per
+        run and threads it through orchestrate_push()), gets this call's own
+        client-backed `fetch_headings` bound into it on first use — see
+        `_fetch_target_headings` and `CrossDocLinkResolver.bind_fetch_headings`
+        (a no-op after the first bind, since every google_docs mapping in one
+        run shares the same client).
         """
         self._ensure_client()
         assert self._client is not None
+        cross_doc_resolver = kwargs.get("cross_doc_resolver")
+        if isinstance(cross_doc_resolver, CrossDocLinkResolver):
+            cross_doc_resolver.bind_fetch_headings(self._fetch_target_headings)
+        else:
+            cross_doc_resolver = None
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
@@ -350,7 +399,9 @@ class GoogleDocsBackend(Backend):
                 alignment = builder.align(pass2_doc, plan.target_nodes)
                 pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
-                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
+                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment,
+                    cross_doc_resolver=cross_doc_resolver,
+                    source_path=local_path, current_doc_id=doc_id,
                 )
                 # Pass 2 aligns by content and refuses to guess (see
                 # DocsRequestBuilder._align_for_styling). Anything it couldn't
@@ -373,7 +424,10 @@ class GoogleDocsBackend(Backend):
                 # every time, with nothing to suppress it. That is a known open
                 # decision, not a solved problem.
                 dead_anchors = builder.unresolved_anchor_links(
-                    pass2_doc, plan.target_nodes, alignment
+                    pass2_doc, plan.target_nodes, alignment,
+                    cross_doc_resolver=cross_doc_resolver,
+                    source_path=local_path, current_doc_id=doc_id,
+                    current_tab_id=pass2_tab_id,
                 )
                 # Styled table cells pass 2 could not place. Same trade as
                 # `unstyled` above and the same reason it has to be said out loud:

@@ -155,8 +155,12 @@ def orchestrate_push(
     state_dir: str,
     state_path: str,
     force: bool = False,
+    cross_doc_resolver: object = None,
 ) -> PushOutcome:
-    result = backend.push(mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id)
+    result = backend.push(
+        mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
+        cross_doc_resolver=cross_doc_resolver,
+    )
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):

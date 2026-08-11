@@ -16,6 +16,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from docspan.backends import BACKENDS
+from docspan.backends.google_docs.cross_doc_links import CrossDocLinkResolver
 from docspan.config import (
     MarkgateConfig,
     load_central_config,
@@ -214,6 +215,18 @@ def push(
     state_dir = get_state_dir(config_path, prefix)
     state = _load_state(state_path)
 
+    # One resolver for the whole run, shared across every mapping below, so a
+    # cross-doc link's target headings are fetched at most once per target
+    # document regardless of how many mappings/links reference it — not once
+    # per mapping-pair. _get_backend() below builds a fresh backend instance
+    # per call (no memoization), so the resolver's fetch_headings callback is
+    # bound lazily by each backend's push()/preview_push(), not here.
+    #
+    # Built from config.mappings (every configured mapping), not the possibly
+    # `files`-filtered `mappings` local: a link can target a mapping this
+    # invocation isn't pushing, and that target must still resolve.
+    cross_doc_resolver = CrossDocLinkResolver(mappings=config.mappings)
+
     had_error = False
     for mapping in mappings:
         if mapping.direction == "pull":
@@ -230,7 +243,8 @@ def push(
         if dry_run:
             if hasattr(backend, "preview_push"):
                 preview = backend.preview_push(
-                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id,
+                    cross_doc_resolver=cross_doc_resolver,
                 )
                 # escape(): preview text carries literal "[ ]"/"[x]" checklist
                 # markers, which Rich's console markup would otherwise parse
@@ -263,7 +277,10 @@ def push(
                 with open(marker_path, "w", encoding="utf-8") as fh:
                     fh.write("verified\n")
 
-        outcome = orchestrate_push(mapping, backend, state, state_dir, state_path, force=force)
+        outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force,
+            cross_doc_resolver=cross_doc_resolver,
+        )
         result = outcome.result
 
         icon, style = _status_display(result.status)
