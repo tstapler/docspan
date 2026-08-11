@@ -412,8 +412,9 @@ class TestPushAutoCreate:
              patch("docspan.cli.main._can_prompt", return_value=False):
             result = runner.invoke(app, ["push", "--config", cfg], input="")
         assert result.exit_code == 1
-        assert "no remote_id" in result.output
-        assert "docspan map" in result.output
+        output = " ".join(result.output.split())
+        assert "no remote_id" in output
+        assert "docspan map" in output
 
     def test_interactive_confirm_yes_creates_persists_and_pushes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
