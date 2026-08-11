@@ -437,31 +437,40 @@ class TestRendering:
         nodes = [n for n in structure.parse(doc) if isinstance(n, DocsTableNode)]
         assert "[A1](https://example.com)" in render_nodes_to_markdown(nodes)
 
-    def test_a_multi_paragraph_cell_fails_loudly_rather_than_quietly(self) -> None:
-        """A Docs cell holds a paragraph list; markdown's table syntax has no break.
+    def test_a_multi_paragraph_cell_round_trips_faithfully(self) -> None:
+        """A Docs cell holds a paragraph list; markdown's pipe-table syntax has no
+        cell-internal break.
 
-        There is no faithful rendering, so the choice is *which* failure. Emitting the
-        newline ends the row and the table reparses as a paragraph — visible in the
-        next diff. Emitting `<br>` keeps the table and silently destroys it on the
-        next push instead, because the table diff key includes cell text: `<br>` does
-        not parse back to a newline, so an *unmodified* push sees a change and answers
-        it by deleting and re-creating the table with every comment anchored in it.
-        Decoding `<br>` back closes that and opens the same hole for a cell whose
-        author typed `<br>` — markdown cannot tell the two apart, so neither can the
-        decode, and a cell holding only `<br>` comes back empty.
+        Two quiet encodings were tried and reverted (#51, #61): a bare `\\n` ends the
+        row early and reparses as a stray paragraph; `<br>` keeps the row but breaks
+        the diff key, so an *unmodified* push deletes and re-creates the table along
+        with every comment anchored in it — and decoding `<br>` back on parse reopens
+        the same hole for a cell whose author literally typed `<br>`.
 
-        Both quiet options were tried and reverted. This pins the loud one.
+        A table holding a multi-paragraph cell now renders as a raw HTML `<table>`
+        block instead of pipe syntax: mistune tokenizes the whole block as one opaque
+        string, so the internal `\\n` is never seen as a row terminator, and the cell
+        round-trips exactly.
         """
         node = DocsTableNode(rows=[[TableCell(text="line one\nline two"), TableCell(text="x")]])
         rendered = render_nodes_to_markdown([node])
-        assert "<br>" not in rendered, "no encoding that cannot be decoded back"
-        assert "line one\nline two" in rendered
+        assert "<table" in rendered
 
-        # And the case is announced, not merely broken: such a cell cannot be placed.
-        # A real two-paragraph cell has two `content` elements, and `_cell_placement`
-        # reads only the first — so the cell's full text is not in it and the search
-        # fails, which is the reporting path. Modelling it as one run with an embedded
-        # newline is what a Docs cell never looks like.
+        parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+        assert len(parsed) == 1
+        assert [c.text for c in parsed[0].rows[0]] == ["line one\nline two", "x"]
+
+    def test_styling_in_a_later_paragraph_of_a_multi_paragraph_cell_is_reported_not_dropped(
+        self,
+    ) -> None:
+        """`_cell_placement` only reads a live cell's first `content` element.
+
+        A real two-paragraph cell has two `content` elements; styling that belongs to
+        the second cannot be located in the first, so it must still surface via
+        `unplaced_table_cells` rather than silently vanish. This is an existing,
+        intentional limitation of the push-side placement logic (out of scope for the
+        render/parse fix), and it must not regress into a silent drop.
+        """
         two_paragraph = {"content": [
             {"startIndex": 30, "endIndex": 39, "paragraph": {
                 "elements": [{"textRun": {"content": "line one\n", "textStyle": {}}}]}},
@@ -483,6 +492,64 @@ class TestRendering:
         for raw in ("see <br> tag", "<br>", "<br/>", "<BR>"):
             cell = markdown.parse(f"| x |\n| --- |\n| {raw} |\n")[0].rows[1][0]
             assert cell.text == raw, f"{raw!r} must survive parsing unchanged"
+
+    def test_a_literal_table_tag_typed_in_a_single_paragraph_cell_survives_untouched(
+        self,
+    ) -> None:
+        """A real `<table>` block is now a recognized construct — but only as its own
+        top-level markdown block, not as text inside a pipe-table cell.
+
+        A single-paragraph cell that literally reads `<table>` must stay an ordinary
+        (escaped) pipe-table cell, not get reinterpreted as the start of an HTML table.
+        """
+        cell = markdown.parse("| x |\n| --- |\n| <table> |\n")[0].rows[1][0]
+        assert cell.text == "<table>"
+
+    def test_html_unsafe_characters_in_a_multi_paragraph_cell_round_trip(self) -> None:
+        """`<`, `>`, `&` must be entity-escaped on render and decoded back on parse,
+        with no corruption and no accidental tag injection."""
+        raw_text = "a <b> & c\n<script>&x"
+        node = DocsTableNode(rows=[[TableCell(text=raw_text), TableCell(text="y")]])
+        rendered = render_nodes_to_markdown([node])
+        assert "<script>" not in rendered.split("<table>", 1)[1].split("&x", 1)[0]
+
+        parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+        assert parsed[0].rows[0][0].text == raw_text
+
+    def test_a_cell_with_only_blank_paragraphs_round_trips_without_losing_the_table(self) -> None:
+        """A cell holding an empty paragraph between two others (or only empty
+        paragraphs) must not fracture the table's raw-HTML block.
+
+        CommonMark ends an HTML block at the first blank line, even inside otherwise
+        opaque raw HTML — an empty *interior* paragraph renders as a bare `\\n\\n`,
+        which mistune's tokenizer treats as a block boundary, splitting one
+        `block_html` token into two and silently dropping the rest of the table (see
+        `_guard_blank_paragraph_lines`). A leading/trailing empty paragraph is exempt
+        since it shares its physical line with a tag and is never actually blank.
+        """
+        node = DocsTableNode(rows=[[TableCell(text="\n\n"), TableCell(text="x")]])
+        rendered = render_nodes_to_markdown([node])
+        parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+        assert len(parsed) == 1
+        assert [c.text for c in parsed[0].rows[0]] == ["\n\n", "x"]
+
+        node2 = DocsTableNode(rows=[[TableCell(text="para one\n\npara two"), TableCell(text="y")]])
+        rendered2 = render_nodes_to_markdown([node2])
+        parsed2 = [n for n in markdown.parse(rendered2) if isinstance(n, DocsTableNode)]
+        assert len(parsed2) == 1
+        assert parsed2[0].rows[0][0].text == "para one\n\npara two"
+
+    def test_a_document_mixing_pipe_and_html_tables_parses_both_correctly(self) -> None:
+        """A document with a plain single-paragraph table followed by a multi-paragraph
+        (HTML) table must parse both back correctly, in document order."""
+        pipe_node = DocsTableNode(rows=[[TableCell(text="a"), TableCell(text="b")]])
+        html_node = DocsTableNode(rows=[[TableCell(text="c\nd"), TableCell(text="e")]])
+        rendered = render_nodes_to_markdown([pipe_node, html_node])
+
+        parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+        assert len(parsed) == 2
+        assert [c.text for c in parsed[0].rows[0]] == ["a", "b"]
+        assert [c.text for c in parsed[1].rows[0]] == ["c\nd", "e"]
 
     def test_a_parsed_cell_with_no_marks_carries_no_spans(self) -> None:
         """The parser path, not the markdown path.

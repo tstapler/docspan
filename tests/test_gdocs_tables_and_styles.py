@@ -9,6 +9,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 
 parser = MarkdownToParagraphParser()
 builder = DocsRequestBuilder()
@@ -198,6 +199,75 @@ def test_unchanged_table_is_idempotent() -> None:
     target = parser.parse(TABLE_MD)
     reqs = builder.build(current, target, 61)
     assert reqs == []
+
+
+def _multi_paragraph_table_doc() -> dict:
+    """A live table whose first cell holds two paragraphs (`content` elements),
+    as issue #61's push -> pull -> push idempotency case."""
+
+    def two_paragraph_cell(idx1: int, t1: str, idx2: int, t2: str) -> dict:
+        return {"content": [
+            {"startIndex": idx1, "endIndex": idx1 + len(t1) + 1,
+             "paragraph": {"elements": [{"textRun": {"content": t1 + "\n"}}]}},
+            {"startIndex": idx2, "endIndex": idx2 + len(t2) + 1,
+             "paragraph": {"elements": [{"textRun": {"content": t2 + "\n"}}]}},
+        ]}
+
+    def one_paragraph_cell(idx: int, text: str) -> dict:
+        return {"content": [{
+            "startIndex": idx, "endIndex": idx + len(text) + 1,
+            "paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]},
+        }]}
+
+    return {"body": {"content": [
+        {"startIndex": 1, "endIndex": 40, "table": {"rows": 1, "columns": 2, "tableRows": [
+            {"tableCells": [
+                two_paragraph_cell(4, "line one", 13, "line two"),
+                one_paragraph_cell(23, "x"),
+            ]},
+        ]}},
+        {"startIndex": 40, "endIndex": 41, "paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
+    ]}}
+
+
+def test_unchanged_multi_paragraph_table_is_idempotent() -> None:
+    """AC2: an unmodified push -> pull -> push of a multi-paragraph-cell table must
+    not generate a delete+insert (which would orphan any comment anchored in it).
+
+    The rendered HTML round trip must reparse into a target whose diff key matches
+    the live document's exactly — no requests at all.
+    """
+    current = structure.parse(_multi_paragraph_table_doc())
+    rendered = render_nodes_to_markdown([n for n in current if isinstance(n, DocsTableNode)])
+    target = parser.parse(rendered)
+    reqs = builder.build(current, target, 41)
+    assert reqs == []
+
+
+def test_unmodified_multi_paragraph_table_has_no_high_risk_diff_entry() -> None:
+    """A comment anchored inside a multi-paragraph cell must survive an unmodified
+    push: `diff_summary` must report the table as `equal`, never `remove`/`change`,
+    so `push_preview.find_high_risk_paragraphs` never even sees a delete candidate
+    to weigh the comment's quoted text against.
+    """
+    current = structure.parse(_multi_paragraph_table_doc())
+    rendered = render_nodes_to_markdown([n for n in current if isinstance(n, DocsTableNode)])
+    target = parser.parse(rendered)
+    entries, unchanged_count = builder.diff_summary(current, target)
+    # The table itself must be `equal` (folded into unchanged_count); the one
+    # remaining entry is the doc's own trailing blank paragraph, unrelated to
+    # this fix — see test_unchanged_multi_paragraph_table_is_idempotent for the
+    # request-level (build()) confirmation that no requests are ever emitted for it.
+    assert not any("line one" in (e.current_text or "") for e in entries)
+    assert unchanged_count >= 1
+
+    # And the comment's anchor text — which spans the cell's paragraph break —
+    # is still findable in the raw node text `_node_text`/DiffEntry machinery
+    # would have compared against, unbroken by the HTML round trip.
+    table_node = next(n for n in current if isinstance(n, DocsTableNode))
+    assert "line one\nline two" in "\n".join(
+        " | ".join(cell.text for cell in row) for row in table_node.rows
+    )
 
 
 def test_removed_table_emits_delete() -> None:
