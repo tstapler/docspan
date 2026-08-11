@@ -13,6 +13,13 @@ from docspan.backends.google_docs.docs_structure_parser import (
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
+# Literal, non-monospace marker line written ahead of a fenced block's lines to
+# carry mistune's token.attrs.info (the fence language) through the node-list
+# representation, which otherwise has nowhere to put it. Must stay in sync
+# with nodes_to_markdown.py's FENCE_MARKER, which decodes it back into a real
+# ```lang fence on render.
+FENCE_MARKER = "```"
+
 
 def _extract_text_from_token(token: dict) -> str:
     """Recursively extract plain text from a mistune AST token."""
@@ -284,7 +291,49 @@ class MarkdownToParagraphParser:
                 #
                 # `strip("\n")` rather than `strip()`: the fence's own blank edges
                 # go, indentation does not. Leading whitespace is meaning in code.
+                #
+                # The fence language (mistune's token.attrs.info) has no field
+                # on DocsParagraphNode to live in, so it's written ahead of the
+                # code lines as a literal, non-monospace marker paragraph
+                # (same approach as ADR-001's literal checklist markers and
+                # _prefix_node_text's "> " blockquote markers). Non-monospace
+                # is what makes it unambiguously decodable on the way back:
+                # every real code line below is monospace by construction, so
+                # this shape never collides with one. See
+                # nodes_to_markdown.py's _is_language_marker/_group_code_runs,
+                # which decode it back into a real ```lang fence on render.
+                #
+                # The marker is only emitted when there's a language to carry.
+                # A lang-less fence stays marker-less on purpose: a *native*
+                # Google Docs code block (typed in the Docs UI, not pushed by
+                # this tool) never has a marker either, and matching push's
+                # target against that live structure depends on the two
+                # shapes being identical (`:test_an_unchanged_code_block_emits_nothing`).
+                # A marker on every fence would make an unrelated,
+                # already-correct native code block look changed on every
+                # push. Two adjacent language-less fenced blocks in the same
+                # markdown file therefore remain indistinguishable from one
+                # merged block on the next pull — an accepted limitation of
+                # the same kind as the marker/prose ambiguity below, not
+                # fixed here.
+                # token is `str | dict[str, Any]` per mistune's stubs; the
+                # isinstance guard narrows it for mypy (this loop's other
+                # branches already tolerate the same union untyped).
+                attrs = token.get("attrs") if isinstance(token, dict) else None
+                info = (attrs or {}).get("info") or ""
+                lang = info.strip()
+                if lang:
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=f"{FENCE_MARKER}{lang}",
+                        start_index=0, end_index=0, spans=[],
+                    ))
                 raw = token.get("raw", "").strip("\n")
+                # An empty fenced block (` ```\n```\n `) has `raw == ""`, so
+                # `"".split("\n")` yields `[""]` — one blank-shaped node right
+                # after the marker. That's deliberate: it's the signal
+                # `_group_code_runs` uses to render an explicit empty fence
+                # rather than losing the block or leaving an unterminated
+                # marker behind.
                 for line in raw.split("\n"):
                     nodes.append(DocsParagraphNode(
                         style="NORMAL_TEXT", text=line, start_index=0, end_index=0,

@@ -107,6 +107,39 @@ def test_indented_code_block_produces_node() -> None:
     assert len(nodes) >= 1
 
 
+def test_fenced_code_block_language_emits_literal_marker_line() -> None:
+    # AC1: mistune's token.attrs.info (fence language) has no field on
+    # DocsParagraphNode, so it's carried as a literal, non-monospace marker
+    # paragraph ahead of the code lines.
+    nodes = parser.parse("```python\nprint('hi')\n```")
+    assert nodes[0].text == "```python"
+    assert nodes[0].style == "NORMAL_TEXT"
+    assert not nodes[0].spans
+    assert nodes[1].spans and nodes[1].spans[0].monospace
+    assert "print" in nodes[1].text
+
+
+def test_fenced_code_block_without_language_has_no_marker_line() -> None:
+    nodes = parser.parse("```\nplain\n```")
+    assert len(nodes) == 1
+    assert nodes[0].spans and nodes[0].spans[0].monospace
+    assert nodes[0].text == "plain"
+
+
+def test_fenced_code_block_reparses_via_block_code_not_paragraph_strip() -> None:
+    # AC4: rendering the parsed fence back out and re-parsing it must route
+    # through the block_code branch (preserving indentation), never the
+    # paragraph branch's .strip(), which would lose it.
+    from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+
+    nodes = parser.parse("```yaml\nkey: value\n  indented: yes\n```")
+    md = render_nodes_to_markdown(nodes)
+    reparsed = parser.parse(md)
+    code_lines = [n for n in reparsed if n.spans and n.spans[0].monospace]
+    assert [n.text for n in code_lines] == ["key: value", "  indented: yes"]
+    assert reparsed[0].text == "```yaml"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Block quotes (regression: block_quote tokens used to be silently dropped,
 # losing the entire paragraph on push — see issue "push paragraph-loss bug")

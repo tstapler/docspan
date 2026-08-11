@@ -11,10 +11,21 @@ existing, more mature Drive HTML export -> DocumentConverter path unchanged.
 This is a best-effort renderer, not a byte-for-byte inverse of
 MarkdownToParagraphParser — round-tripping through Markdown is inherently
 lossy (e.g. Docs' native nested-list structure vs. flat nesting_level here).
+
+The default (no-tab_id) pull path through converter.py's
+_GoogleDocsMarkdownConverter has the same per-line-inline-code symptom via a
+completely separate CSS-font-family-based mechanism and is NOT touched here
+— see issue #45's "Scope gap found late": that HTML-export pipeline has no
+render_prefix/span-shape equivalent to key fence detection off, would need
+its own detection heuristic, and was out of scope for this fix. This was
+confirmed rather than silently assumed: a live scope-confirmation request
+went unanswered, so the gap was filed as a separate, explicit follow-up
+(docspan backlog item a500ef94-2e02-499e-a628-5f843198c49e) instead of being
+folded into or dropped from this fix.
 """
 from __future__ import annotations
 
-from typing import List, Union
+from typing import List, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -25,13 +36,76 @@ from docspan.backends.google_docs.docs_structure_parser import (
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
+# The literal marker MarkdownToParagraphParser writes ahead of a fenced
+# block's lines to carry the language (mistune's token.attrs.info) through
+# the node-list representation, which has no field for it. Must stay in
+# sync with markdown_to_paragraph_parser.py's FENCE_MARKER.
+FENCE_MARKER = "```"
+
+# A rendered code fence can also open with tildes (see _fence_delimiter's
+# backtick-in-language fallback) — a bare paragraph starting with either
+# fence character must be escaped the same way.
+TILDE_FENCE_MARKER = "~~~"
+
+
+def _run_of_char(text: str, target: str) -> int:
+    """The longest run of consecutive occurrences of `target` in text."""
+    max_run = run = 0
+    for ch in text:
+        if ch == target:
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    return max_run
+
+
+def _run_of_backticks(text: str) -> int:
+    """The longest run of consecutive backticks in text."""
+    return _run_of_char(text, "`")
+
+
+def _wrap_inline_code(text: str) -> str:
+    """Wrap text as a CommonMark code span, escaping any backticks inside it.
+
+    CommonMark's rule: the delimiter must be a run of backticks longer than
+    the longest run inside the content, and if the content starts or ends
+    with a backtick (or starts and ends with a space around non-space
+    content), a single space is added inside the delimiters so the content
+    doesn't fuse with them.
+    """
+    delim = "`" * (_run_of_backticks(text) + 1)
+    needs_pad = text.startswith("`") or text.endswith("`")
+    if not needs_pad and text[:1] == " " and text[-1:] == " " and text.strip():
+        needs_pad = True
+    if needs_pad:
+        return f"{delim} {text} {delim}"
+    return f"{delim}{text}{delim}"
+
+
+def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
+    """The shortest fence (at least 3) longer than any run of its own
+    character appearing in the content, so the fence can never be confused
+    with a run of that character inside the code itself.
+
+    CommonMark forbids a backtick fence's info string from containing any
+    backtick at all — widening the fence doesn't help, since the rule isn't
+    about run length there. So a language containing a backtick forces a
+    tilde fence instead, which has no such restriction on its info string.
+    """
+    if lang and "`" in lang:
+        max_run = max((_run_of_char(line, "~") for line in code_lines), default=0)
+        return "~" * max(3, max_run + 1)
+    max_run = max((_run_of_backticks(line) for line in [lang or "", *code_lines]), default=0)
+    return "`" * max(3, max_run + 1)
+
 
 def _render_spans(spans: List[TextSpan]) -> str:
     parts = []
     for span in spans:
         text = span.text
         if span.monospace:
-            text = f"`{text}`"
+            text = _wrap_inline_code(text)
         if span.bold:
             text = f"**{text}**"
         if span.italic:
@@ -88,10 +162,173 @@ def _render_table(node: DocsTableNode) -> str:
     return "\n".join(lines)
 
 
+def _is_pure_code_line(node: Node) -> bool:
+    """Exactly the shape MarkdownToParagraphParser writes for a code line
+    (`:294`): one span, monospace, and no other mark. Deliberately narrower
+    than "contains some monospace" — a mixed-mark span (e.g. monospace+bold)
+    or an isolated inline-code span inside an otherwise normal paragraph must
+    never be swept into a fence.
+    """
+    if not isinstance(node, DocsParagraphNode):
+        return False
+    if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    spans = node.spans
+    return (
+        len(spans) == 1
+        and spans[0].monospace
+        and not spans[0].bold
+        and not spans[0].italic
+        and not spans[0].link
+    )
+
+
+def _is_blank_code_line(node: Node) -> bool:
+    """A blank line inside a fenced block (`:294`'s `spans=[]` branch).
+
+    Only ever absorbed into an already-open code run by `_group_code_runs`
+    (it looks ahead for another code line before treating one of these as
+    part of the run) — an ordinary blank paragraph between two prose
+    paragraphs has this exact shape too and must not, on its own, start or
+    extend a fence.
+    """
+    return (
+        isinstance(node, DocsParagraphNode)
+        and node.style == "NORMAL_TEXT"
+        and not node.is_list_item
+        and not node.spans
+        and node.text == ""
+    )
+
+
+def _is_language_marker(node: Node) -> bool:
+    """The literal, non-monospace marker line MarkdownToParagraphParser
+    writes ahead of a fence's lines to carry the language
+    (`markdown_to_paragraph_parser.py`'s FENCE_MARKER). Non-monospace is
+    what makes it unambiguously decodable: every real code line is
+    monospace by construction, so this shape never collides with one.
+    """
+    if not isinstance(node, DocsParagraphNode):
+        return False
+    if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    if not node.text.startswith(FENCE_MARKER):
+        return False
+    if node.spans:
+        if len(node.spans) != 1:
+            return False
+        span = node.spans[0]
+        if span.monospace or span.bold or span.italic or span.link:
+            return False
+    return True
+
+
+def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
+    """Partition nodes into ("node", node) passthroughs and
+    ("code", lang, code_nodes) runs of consecutive pure code lines
+    (optionally preceded by a language marker, and allowing interior blank
+    lines that are followed by more code before the run ends)."""
+    groups: List[Tuple] = []
+    i, n = 0, len(nodes)
+    while i < n:
+        node = nodes[i]
+        lang: Optional[str] = None
+        start = i
+        if _is_language_marker(node) and i + 1 < n:
+            # _is_language_marker already requires DocsParagraphNode; assert
+            # narrows the Node union for mypy without re-checking at runtime.
+            assert isinstance(node, DocsParagraphNode)
+            if _is_pure_code_line(nodes[i + 1]):
+                lang = node.text[len(FENCE_MARKER):]
+                start = i + 1
+            elif _is_blank_code_line(nodes[i + 1]) and (
+                i + 2 >= n or not _is_pure_code_line(nodes[i + 2])
+            ):
+                # A marker immediately followed by exactly one blank-shaped
+                # line, with no code line beyond it, is
+                # MarkdownToParagraphParser's shape for an explicitly empty
+                # fenced block (`:294`) — not an orphaned marker.
+                groups.append(("code", node.text[len(FENCE_MARKER):], []))
+                i += 2
+                continue
+
+        if start < n and _is_pure_code_line(nodes[start]):
+            run: List[Node] = []
+            j = start
+            while j < n:
+                if _is_pure_code_line(nodes[j]):
+                    run.append(nodes[j])
+                    j += 1
+                    continue
+                if _is_blank_code_line(nodes[j]):
+                    k = j
+                    while k < n and _is_blank_code_line(nodes[k]):
+                        k += 1
+                    if k < n and _is_pure_code_line(nodes[k]):
+                        run.extend(nodes[j:k])
+                        j = k
+                        continue
+                break
+            groups.append(("code", lang, run))
+            i = j
+        else:
+            groups.append(("node", node))
+            i += 1
+    return groups
+
+
+def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
+    # code_nodes are only ever populated via _is_pure_code_line/
+    # _is_blank_code_line, both of which require DocsParagraphNode; assert
+    # narrows the Node union for mypy without re-checking at runtime.
+    code_lines = []
+    for node in code_nodes:
+        assert isinstance(node, DocsParagraphNode)
+        code_lines.append(node.text)
+    delim = _fence_delimiter(lang, code_lines)
+    # CommonMark reads the fence's width off the *leading run* of the fence
+    # character on the opening line, not a separately-tokenized delimiter —
+    # if the info string starts with that same character (e.g. a tilde
+    # fence whose language itself starts with "~"), it silently extends the
+    # opening fence past `delim`, so the closing line we write is too short
+    # to close the block. A single space breaks the adjacency; CommonMark
+    # trims it from the info string on reparse, so it's otherwise a no-op.
+    sep = " " if lang and lang[:1] == delim[:1] else ""
+    lines = [f"{delim}{sep}{lang or ''}"]
+    lines.extend(code_lines)
+    lines.append(delim)
+    lines.append("")
+    return lines
+
+
+def _escape_leading_fence(text: str) -> str:
+    """Escape a plain paragraph line that would otherwise open a live
+    CommonMark code fence when reparsed.
+
+    Only the bare-paragraph render path needs this: headings prefix "# ",
+    list items prefix "- ", and block quotes prefix "> ", all of which
+    already keep a fence-shaped line from starting the line. Without it, a
+    marker node left behind by `_group_code_runs` (because it wasn't
+    immediately followed by a matching code run) or ordinary user prose that
+    happens to start with ``` or ~~~ renders as literal fence-shaped text
+    that, on the next parse, opens an unterminated fence and swallows every
+    following line as code until EOF instead of staying inert.
+    """
+    if text.startswith(FENCE_MARKER) or text.startswith(TILDE_FENCE_MARKER):
+        return "\\" + text
+    return text
+
+
 def render_nodes_to_markdown(nodes: List[Node]) -> str:
     """Render a parsed node list (document order) back into Markdown text."""
     lines: List[str] = []
-    for node in nodes:
+    for group in _group_code_runs(nodes):
+        if group[0] == "code":
+            _, lang, code_nodes = group
+            lines.extend(_render_code_group(lang, code_nodes))
+            continue
+
+        node = group[1]
         if isinstance(node, DocsTableNode):
             lines.append(_render_table(node))
             lines.append("")
@@ -121,7 +358,7 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             else:
                 lines.append(f"{indent}- {text}")
         else:
-            lines.append(text)
+            lines.append(_escape_leading_fence(text))
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"
