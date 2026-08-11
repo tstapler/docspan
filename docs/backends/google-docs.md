@@ -65,3 +65,9 @@ mappings:
       table created by the current push gets its cell styling on the *next* push —
       docspan reports both rather than failing silently.
     - **Rate limiting**: The Google Docs API allows 300 requests per minute per project. Large documents with many changed paragraphs may trigger rate limit errors.
+    - **Cross-document links (v1)**: a relative markdown link to another mapped file (e.g. `[link](../other-doc/README.md#some-heading)`) resolves to that target's Google Doc edit URL, with `#some-heading` resolved against the *target's live headings* (fetched fresh, not from local markdown) at push time. Known limits:
+        - Only works when the target is also mapped to `google_docs` — a link to a `confluence`-mapped file is reported as an unresolved anchor, not attempted.
+        - A link to a file with no mapping entry is left untouched (unchanged, no error) — same as before this feature existed.
+        - A fragment that doesn't match any heading in the target, or a target document that fails to fetch, is reported the same way as a dead same-document `#anchor` — the push still completes.
+        - Already-broken cross-doc links from a prior push are not retroactively fixed unless the paragraph containing them changes for some other reason.
+        - `docspan push --dry-run` does not resolve cross-doc links — only same-document anchors are checked in a dry run; a broken cross-doc link is caught by the real push, not the preview.

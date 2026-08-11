@@ -18,6 +18,11 @@ backends:
     username: you@yourorg.com
     # api_token: set via CONFLUENCE_API_TOKEN env var
 
+# A relative markdown link from one mapped file to another (e.g.
+# `[link](page.md#some-heading)` inside design-doc.md, below) is resolved to
+# the target's Google Doc edit URL at push time — both files need a mapping
+# entry here for that to work. See docs/backends/google-docs.md#limitations
+# for what's still out of scope in v1 (cross-backend targets, dry-run).
 mappings:
   - local: docs/design-doc.md
     backend: google_docs
