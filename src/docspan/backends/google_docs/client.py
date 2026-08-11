@@ -339,6 +339,25 @@ class GoogleDocsClient:
             logger.error(f"Error retrieving doc {doc_id}: {e}")
             raise
 
+    def fetch_markdown_export(self, doc_id: str) -> str:
+        """Get Google Doc content via Drive's markdown export.
+
+        A different renderer than `get_doc_content()`'s HTML export or
+        `documents.get()`: it is the only read path that exposes a native
+        checkbox's checked/unchecked state (as GFM `- [x]`/`- [ ]`) — see
+        checkbox_state.py. Uses `_with_backoff` (unlike `get_doc_content`'s
+        own bespoke retry loop) since this is a single idempotent read with
+        no special timeout handling to preserve; a transport failure
+        propagates so the caller can degrade gracefully (see
+        GoogleDocsBackend.pull()).
+        """
+        content: bytes = self._with_backoff(
+            lambda: self.drive_service.files()
+            .export_media(fileId=doc_id, mimeType="text/markdown")
+            .execute()
+        )
+        return content.decode("utf-8")
+
     def update_doc_content(self, doc_id: str, content: str) -> bool:
         """
         Update Google Doc content from plain text
