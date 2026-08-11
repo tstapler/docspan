@@ -39,16 +39,21 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 FENCE_MARKER = "```"
 
 
-def _run_of_backticks(text: str) -> int:
-    """The longest run of consecutive backticks in text."""
+def _run_of_char(text: str, target: str) -> int:
+    """The longest run of consecutive occurrences of `target` in text."""
     max_run = run = 0
     for ch in text:
-        if ch == "`":
+        if ch == target:
             run += 1
             max_run = max(max_run, run)
         else:
             run = 0
     return max_run
+
+
+def _run_of_backticks(text: str) -> int:
+    """The longest run of consecutive backticks in text."""
+    return _run_of_char(text, "`")
 
 
 def _wrap_inline_code(text: str) -> str:
@@ -69,11 +74,20 @@ def _wrap_inline_code(text: str) -> str:
     return f"{delim}{text}{delim}"
 
 
-def _fence_delimiter(lines: List[str]) -> str:
-    """The shortest all-backtick fence (at least 3) longer than any backtick
-    run appearing in the content, so the fence can never be confused with a
-    backtick run inside the code itself."""
-    max_run = max((_run_of_backticks(line) for line in lines), default=0)
+def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
+    """The shortest fence (at least 3) longer than any run of its own
+    character appearing in the content, so the fence can never be confused
+    with a run of that character inside the code itself.
+
+    CommonMark forbids a backtick fence's info string from containing any
+    backtick at all — widening the fence doesn't help, since the rule isn't
+    about run length there. So a language containing a backtick forces a
+    tilde fence instead, which has no such restriction on its info string.
+    """
+    if lang and "`" in lang:
+        max_run = max((_run_of_char(line, "~") for line in code_lines), default=0)
+        return "~" * max(3, max_run + 1)
+    max_run = max((_run_of_backticks(line) for line in [lang or "", *code_lines]), default=0)
     return "`" * max(3, max_run + 1)
 
 
@@ -253,7 +267,7 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
 
 def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
     code_lines = [node.text for node in code_nodes]
-    delim = _fence_delimiter([lang or "", *code_lines])
+    delim = _fence_delimiter(lang, code_lines)
     lines = [f"{delim}{lang or ''}"]
     lines.extend(code_lines)
     lines.append(delim)

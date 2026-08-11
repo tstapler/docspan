@@ -150,13 +150,35 @@ def test_orphaned_marker_does_not_corrupt_reparse() -> None:
 
 
 def test_fence_delimiter_accounts_for_backticks_in_language() -> None:
-    # A run of backticks inside the language string itself must also
-    # lengthen the fence delimiter, or it fuses with the fence and corrupts
-    # the language. Three backticks in the language forces a 4-backtick
-    # fence — the code content alone (no backticks) wouldn't demand it.
-    nodes = [_lang_marker("a```b"), _code_line("plain")]
+    # CommonMark forbids a backtick fence's info string from containing any
+    # backtick at all — widening a backtick fence can't fix that, so a
+    # language with a backtick must fall back to a tilde fence instead.
+    # Verified end to end: reparsing the rendered markdown must recover the
+    # exact language and code content, not corrupt or swallow either.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = [_lang_marker("a`b"), _code_line("plain")]
     md = render_nodes_to_markdown(nodes)
-    assert "````a```b\nplain\n````" in md
+    assert "```" not in md
+    assert "~~~a`b\nplain\n~~~" in md
+    reparsed = MarkdownToParagraphParser().parse(md)
+    assert any(n.text == "```a`b" for n in reparsed)
+    assert any(n.text == "plain" and n.spans and n.spans[0].monospace for n in reparsed)
+
+
+def test_empty_fenced_block_with_language_round_trips_through_push_and_pull() -> None:
+    # Pins the full push -> pull path for the empty-fence-with-language fix:
+    # parsing markdown into nodes and rendering those nodes back out must
+    # reproduce the same empty fence, not lose it or misread it as prose.
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    nodes = MarkdownToParagraphParser().parse("```yaml\n```\n")
+    md = render_nodes_to_markdown(nodes)
+    assert "```yaml\n```" in md
 
 
 def test_native_checkbox_unchecked_renders_as_markdown_checklist_item() -> None:
