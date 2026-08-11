@@ -611,26 +611,26 @@ class TestRenderPrefixParticipatesInIdentity:
             )
 
     def test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence(self) -> None:
-        """A known residual gap, pinned rather than silently left undiscovered.
+        """The multi-candidate correspondence gap (issue #68), now resolved.
 
-        `_node_key` now keeps a prose paragraph and a code-rendered paragraph
+        `_node_key` keeps a prose paragraph and a code-rendered paragraph
         apart *when they are the only two candidates for their own slots* (see
         `test_node_key_distinguishes_prose_from_a_code_line_with_the_same_text`).
-        It cannot resolve the harder case where a plain current paragraph and a
-        real current code-rendered paragraph both read the same text, and only
-        one target slot (also that text) exists to match against: `_node_key`
-        never marks a *target* node as code (markdown never sets
-        `render_prefix`), so the plain current paragraph — whose key equals the
-        target's — wins the correspondence, and the actual code-rendered node
-        is left an unpaired `delete`, outside the `replace` run `_repair`
-        inspects and so beyond its content-key rescue.
+        The harder case is a plain current paragraph and a real current
+        code-rendered paragraph both reading the same text, with only one
+        target slot (also that text) to match against: `_node_key` never
+        marks a *target* node as code (markdown never sets `render_prefix`),
+        so the plain current paragraph — whose key equals the target's — used
+        to win the correspondence, leaving the actual code-rendered node an
+        unpaired `delete`, outside the `replace` run `_repair` inspects and so
+        beyond its content-key rescue.
 
-        This reproduces identically on unmodified `origin/main` (confirmed
-        before this fix), so it predates issue #54 and is not something a key
-        signal alone can fix — it needs `_prefer_structural_pairing`-style
-        disambiguation lifted to the top-level correspondence matcher, which is
-        outside this fix's scope. Tracked in issue #68. Pinned here as
-        documented, not silently reintroduced.
+        `_opcodes` now runs `_prefer_structural_pairing` a second time at the
+        top level (`prefer_code_line=True`), which prefers a
+        `render_prefix`-carrying candidate for a slot whose target node is
+        itself an all-monospace fenced-code line (`_target_wants_code_line`).
+        So the code-rendered node should now win the slot, and the plain
+        prose paragraph should be the one deleted.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg")
         current, _ = project(structure.parse(doc))
@@ -647,8 +647,7 @@ class TestRenderPrefixParticipatesInIdentity:
             ) < code_node.end_index
             for r in requests
         )
-        assert lands_inside_code_block, (
-            "if this starts failing, the multi-candidate correspondence gap "
-            "described above has been fixed — replace this pin with a real "
-            "assertion that the code block is left alone"
+        assert not lands_inside_code_block, (
+            "the code-rendered node's range should be left alone now that the "
+            "top-level pass prefers it for the code slot"
         )

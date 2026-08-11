@@ -175,6 +175,25 @@ class DocsRequestBuilder:
         """
         return bool(node.render_prefix)
 
+    @staticmethod
+    def _target_wants_code_line(node: Node) -> bool:
+        """Whether a *target* paragraph is itself a fenced-code line.
+
+        `MarkdownToParagraphParser` never sets `render_prefix` (see
+        `_is_code_line`'s docstring), but it does mark every span of a fenced
+        code block's line `monospace=True`. That is the only signal available
+        on the target side that a slot is "supposed to be code" — used solely
+        to gate `_prefer_structural_pairing`'s top-level, current-side
+        duplicate preference (issue #68) toward a `render_prefix`-carrying
+        candidate. `all()` rather than `any()` so a prose paragraph that
+        merely contains an inline `` `code` `` span among ordinary text does
+        not trip this — only a paragraph that is entirely monospace, the
+        shape a fenced-code line always has.
+        """
+        if not isinstance(node, DocsParagraphNode):
+            return False
+        return bool(node.spans) and all(s.monospace for s in node.spans)
+
     def _cell_key(self, cell: TableCell) -> Tuple:
         """Hashable full identity for a table cell, including inline styling.
 
@@ -235,11 +254,32 @@ class DocsRequestBuilder:
         actual write (derived from build()'s classification) must never
         drift apart. This is the one place current_keys/target_keys/
         SequenceMatcher get constructed.
+
+        `_repair` only disambiguates duplicate-content candidates *within* a
+        single `replace` run it already identified. It cannot rescue a
+        current node that `_node_key`'s top-level `SequenceMatcher` pass
+        already bound elsewhere in the document — e.g. a plain paragraph and
+        a real code-rendered paragraph reading the same text, competing for
+        one target slot the plain paragraph wins purely because its key
+        happens to match first (issue #68). `_prefer_structural_pairing`'s
+        candidate/slot/greedy-assignment machinery generalizes to that
+        top-level case unchanged (it already takes global indices and an
+        `i1`/`j1` offset; passing `0, 0` and the whole opcode list just
+        widens its view from "one run" to "the document"), so it is reused
+        here rather than duplicated — with `prefer_code_line=True` to prefer
+        a `render_prefix`-carrying candidate for a slot the target itself
+        marks as code (`_target_wants_code_line`). `_coalesce` runs again
+        afterward since the pass may re-tag opcodes that were previously
+        merged.
         """
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
         matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        return self._repair(matcher.get_opcodes(), current, target)
+        repaired = self._repair(matcher.get_opcodes(), current, target)
+        resolved = self._prefer_structural_pairing(
+            repaired, current, target, 0, 0, prefer_code_line=True,
+        )
+        return self._coalesce(resolved)
 
     def _repair(
         self,
@@ -314,6 +354,7 @@ class DocsRequestBuilder:
         tgt_slice: List[Node],
         i1: int,
         j1: int,
+        prefer_code_line: bool = False,
     ) -> List[Opcode]:
         """Reassign ambiguous equal/delete pairings toward their structurally closest node.
 
@@ -367,12 +408,30 @@ class DocsRequestBuilder:
         block (the symmetric case) is not decomposed — there is no existing
         "equal" opcode to use as the slot in that case, only a range with no
         established per-index correspondence to split by. That gap is open.
+
+        `prefer_code_line` (used only by `_opcodes`'s top-level call, issue
+        #68) adds a scoring bonus for a candidate that is itself a
+        `render_prefix`-carrying code-rendered node when the slot's target
+        node is itself a fenced-code-block line (`_target_wants_code_line`).
+        Without the target-side gate, a plain paragraph that merely shares
+        text with an unrelated code node elsewhere in the document (a
+        legitimate, already-correct pairing — see
+        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`)
+        would be wrongly outranked by that unrelated code node; gating on
+        what the target slot itself wants keeps this scoped to slots that
+        actually are code.
         """
         expanded: List[Opcode] = []
         for tag, ci1, ci2, cj1, cj2 in pending:
             if tag == "delete" and ci2 - ci1 > 1:
                 for idx in range(ci1, ci2):
                     expanded.append(("delete", idx, idx + 1, cj1, cj1))
+            elif tag == "equal" and ci2 - ci1 > 1:
+                stride = cj2 - cj1  # "equal" guarantees ci2-ci1 == cj2-cj1.
+                for offset in range(ci2 - ci1):
+                    idx = ci1 + offset
+                    jdx = cj1 + offset if stride else cj1
+                    expanded.append(("equal", idx, idx + 1, jdx, jdx + 1))
             else:
                 expanded.append((tag, ci1, ci2, cj1, cj2))
 
@@ -402,14 +461,45 @@ class DocsRequestBuilder:
             slot_ids = [cid for cid in positions if cid[0] == "pos" and expanded[cid[1]][0] == "equal"]
             if not slot_ids or len(positions) < 2:
                 continue
+
+            if prefer_code_line:
+                # The top-level call runs this over the *whole document*, not one
+                # `_repair`-scoped run — so a content-key group here can span
+                # slots `_repair` already resolved correctly and independently
+                # (e.g. a live heading and a live bullet that both happen to read
+                # "Setup"). Without this gate, re-scoring every slot in the group
+                # lets an unrelated candidate's raw `_structural_score` outrank an
+                # already-fine self-pair on a slot that was never in question
+                # (see `test_duplicate_text_on_both_sides_still_saves_every_live_node`).
+                # So only a slot whose target actually wants a code line is up for
+                # grabs; every other slot's current candidate is pulled out of the
+                # pool entirely rather than left in to compete for the code slot.
+                code_slot_ids = [
+                    sid for sid in slot_ids
+                    if self._target_wants_code_line(tgt_slice[expanded[sid[1]][3] - j1])
+                ]
+                if not code_slot_ids:
+                    continue
+                other_self_pairs = set(slot_ids) - set(code_slot_ids)
+                positions = [cid for cid in positions if cid not in other_self_pairs]
+                slot_ids = code_slot_ids
+
             slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
 
             pair_scores = []
             for si, sid in enumerate(slot_ids):
                 scj1, _scj2 = slot_targets[sid]
                 target_node = tgt_slice[scj1 - j1]
+                wants_code = prefer_code_line and self._target_wants_code_line(target_node)
                 for ci, cid in enumerate(positions):
-                    score = self._structural_score(cur_slice[_current_index(cid) - i1], target_node)
+                    candidate_node = cur_slice[_current_index(cid) - i1]
+                    score = self._structural_score(candidate_node, target_node)
+                    if (
+                        wants_code
+                        and isinstance(candidate_node, DocsParagraphNode)
+                        and self._is_code_line(candidate_node)
+                    ):
+                        score += 100
                     pair_scores.append((score, sid == cid, si, ci, sid, cid))
             pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
 
