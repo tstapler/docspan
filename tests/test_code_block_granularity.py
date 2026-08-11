@@ -667,3 +667,91 @@ class TestRenderPrefixParticipatesInIdentity:
             "the plain prose paragraph — not the code-rendered one — should be "
             f"the one deleted: {requests}"
         )
+
+    def test_target_wanting_code_degrades_gracefully_with_no_code_rendered_candidate(
+        self,
+    ) -> None:
+        """`_target_wants_code_line` can be true with nothing to prefer.
+
+        Two plain (non-`render_prefix`) duplicate paragraphs both read "cfg",
+        and the target wants that slot to be a fenced-code line, but neither
+        current candidate is actually Docs-rendered. The whole-document pass
+        added for issue #68 must not invent a winner or misbehave when its
+        `code_slot_ids` gate finds no `render_prefix` candidate for the slot —
+        it should fall back to `_repair`'s ordinary positional pairing:
+        the first "cfg" survives as the match, the second is deleted as a
+        stale duplicate.
+        """
+        doc, end = _doc_of_lines("Intro", "cfg", "cfg", "Tail")
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
+
+        first, second = (n for n in current if n.text == "cfg")
+        requests = builder.build(current, target, end)
+
+        deletes = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert deletes == [
+            {"startIndex": second.start_index, "endIndex": second.end_index}
+        ], (
+            "with no code-rendered candidate to prefer, the first duplicate "
+            f"should be kept and the second deleted: {requests}"
+        )
+
+    def test_a_code_rendered_candidate_wins_the_slot_among_three_duplicates(self) -> None:
+        """The `code_slot_ids` preference holds with more than two candidates.
+
+        Two plain "cfg" paragraphs and one real Docs-rendered "cfg" paragraph
+        (glyph-prefixed, monospace) all share the same text, with a single
+        target slot wanting code. The code-rendered candidate must win the
+        slot regardless of how many plain duplicates compete for it, and both
+        plain duplicates are deleted.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
+        paragraphs = [
+            [("Intro\n", {})],
+            [("cfg\n", {})],
+            [("cfg\n", {})],
+            [("", {}), ("cfg\n", mono)],
+            [("Tail\n", {})],
+        ]
+        content, index = [], 1
+        for runs in paragraphs:
+            raw = "".join(c for c, _ in runs)
+            end = index + len(raw.encode("utf-16-le")) // 2
+            content.append({"startIndex": index, "endIndex": end, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": c, "textStyle": st}} for c, st in runs],
+            }})
+            index = end
+        doc = {"revisionId": "rev-1", "body": {"content": content}}
+
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
+
+        code_node = next(n for n in current if n.render_prefix)
+        plain_nodes = [n for n in current if n.text == "cfg" and not n.render_prefix]
+        assert len(plain_nodes) == 2
+        requests = builder.build(current, target, index)
+
+        lands_inside_code_block = any(
+            code_node.start_index <= (
+                r.get("deleteContentRange", {}).get("range", {}).get("startIndex")
+                or r.get("insertText", {}).get("location", {}).get("index")
+                or -1
+            ) < code_node.end_index
+            for r in requests
+        )
+        assert not lands_inside_code_block, (
+            f"the code-rendered node among three candidates should be left alone: {requests}"
+        )
+
+        deletes = {
+            (r["deleteContentRange"]["range"]["startIndex"], r["deleteContentRange"]["range"]["endIndex"])
+            for r in requests if "deleteContentRange" in r
+        }
+        assert deletes == {(n.start_index, n.end_index) for n in plain_nodes}, (
+            f"both plain duplicates — not the code-rendered node — should be deleted: {requests}"
+        )
