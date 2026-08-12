@@ -18,7 +18,28 @@ to answer this, but no OAuth credentials or test Drive account are available
 in this sandboxed environment, so no live `comments().update`/`comments().create`
 call was made. This is stated plainly, not glossed over: the finding below
 rests on documented API contract and this repo's own prior investigation,
-not a fresh live call.
+not a fresh live call. **This is a hard environmental blocker, not a gap in
+effort** — closing it for real requires a human to supply live OAuth
+credentials plus a scratch Drive document/comment outside this sandbox and
+run the two calls below; no amount of further reasoning in this environment
+can substitute for that. If/when that access exists, the spike is exactly
+two calls:
+```
+comments().update(fileId=doc_id, commentId=c.id, fields="anchor", body={"anchor": target_anchor})
+comments().create(fileId=doc_id, body={"content": c.content, "anchor": target_anchor, "quotedFileContent": {"value": snippet}})
+```
+followed by reloading the comment in the Docs UI to see whether it renders anchored.
+
+### Confidence labeling
+
+- **UNVERIFIED (this session)**: whether a live `comments().update`/`comments().create`
+  call against a real document actually behaves as documented — no such call was made here.
+- **VERIFIED (secondary source, source 1 below)**: Google's own API reference and guide
+  text, read directly from developers.google.com, states anchors are immutable and that
+  `update`'s only documented-writable field is `content`.
+- **VERIFIED (this repo's own prior work, source 2 below)**: `project_plans/bidirectional-comments/plan.md`
+  §2 already reached and recorded the same conclusion, citing a third-party reproduction
+  (`googleworkspace/cli#169`) as its own evidence, independent of this ADR.
 
 Two sources answer the question decisively without a live call:
 
