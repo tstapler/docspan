@@ -200,6 +200,19 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 spans = []
                 nodes.extend(_walk_list_items(child, nesting_level + 1))
                 continue
+            elif child.get("type") == "block_code":
+                text = _text_of(spans).strip()
+                if text:
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=text, is_list_item=True,
+                        nesting_level=nesting_level, start_index=0, end_index=0,
+                        spans=spans if _has_styling(spans) else [],
+                    ))
+                spans = []
+                nodes.extend(_nodes_from_code_block(
+                    child, is_list_item=True, nesting_level=nesting_level,
+                ))
+                continue
             else:
                 spans.extend(_spans_from_inline([child]))
         text = _text_of(spans).strip()
@@ -209,6 +222,69 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 nesting_level=nesting_level, start_index=0, end_index=0,
                 spans=spans if _has_styling(spans) else [],
             ))
+    return nodes
+
+
+def _nodes_from_code_block(
+    token: dict, *, is_list_item: bool = False, nesting_level: int = 0,
+    emit_language_marker: bool = False,
+) -> List[DocsParagraphNode]:
+    """One DocsParagraphNode per line of a fenced code block.
+
+    A Google Doc has no multi-line paragraph. Emitting the whole block as a
+    single node with embedded newlines meant `insertText` wrote "\\nline
+    one\\nline two", which Docs splits into N paragraphs — so every later diff
+    saw N document paragraphs against 1 markdown node and delete-and-reinserted
+    the whole block, on every push, forever. The text survived that; what did
+    not was idempotence, any comment anchored to a line of code, and the
+    monospace styling (pass 2 reported the block unaligned and emitted no span
+    requests at all). See issue #40 (top level) and #43 (list items and
+    blockquotes — the same token falls through to raw multi-line text at
+    those other two parse sites unless routed through this helper).
+
+    `strip("\n")` rather than `strip()`: the fence's own blank edges go,
+    indentation does not. Leading whitespace is meaning in code.
+
+    `emit_language_marker` carries mistune's `token.attrs.info` (the fence
+    language) through the node-list representation via a literal,
+    non-monospace `FENCE_MARKER + lang` line written ahead of the code lines
+    (see `FENCE_MARKER`'s docstring). Only the top-level call site
+    (`parse()`) passes True. `nodes_to_markdown.py`'s `_is_language_marker`
+    (like `_is_pure_code_line`) requires `not node.is_list_item`, so a marker
+    emitted for a list item would never decode back. A blockquote's
+    `_prefix_node_text` rewrites the marker's leading "```" into "> ```"
+    anyway, breaking the match on `FENCE_MARKER` the same way. Either way the
+    marker would just be a stray literal line, so list items and blockquotes
+    stay marker-less on purpose.
+    """
+    nodes: List[DocsParagraphNode] = []
+    if emit_language_marker:
+        # token is `str | dict[str, Any]` per mistune's stubs; the isinstance
+        # guard narrows it for mypy (this loop's other branches already
+        # tolerate the same union untyped).
+        attrs = token.get("attrs") if isinstance(token, dict) else None
+        info = (attrs or {}).get("info") or ""
+        lang = info.strip()
+        if lang:
+            nodes.append(DocsParagraphNode(
+                style="NORMAL_TEXT", text=f"{FENCE_MARKER}{lang}",
+                start_index=0, end_index=0, spans=[],
+            ))
+    raw = token.get("raw", "").strip("\n")
+    # An empty fenced block (` ```\n```\n `) has `raw == ""`, so
+    # `"".split("\n")` yields `[""]` — one blank-shaped node right after the
+    # marker (when present). That's deliberate: it's the signal
+    # `_group_code_runs` uses to render an explicit empty fence rather than
+    # losing the block or leaving an unterminated marker behind.
+    for line in raw.split("\n"):
+        nodes.append(DocsParagraphNode(
+            style="NORMAL_TEXT", text=line, is_list_item=is_list_item,
+            nesting_level=nesting_level, start_index=0, end_index=0,
+            # A blank line inside a block carries no span to style.
+            # projection.project() drops it from *both* sides, so the
+            # diff never sees it and never tries to delete it.
+            spans=[TextSpan(text=line, monospace=True)] if line else [],
+        ))
     return nodes
 
 
@@ -252,12 +328,22 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
             nodes.extend(
                 _prefix_node_text(n, prefix) for n in _walk_list_items(child, nesting_level=0)
             )
+        elif ctype == "block_code":
+            # A blank line inside the fence becomes a bare "> " line rather than
+            # being dropped: `_prefix_node_text` turns the empty text into a
+            # non-empty one, so it survives projection's blank-drop rule (which
+            # is keyed on text == "") — intentionally, so the quote's visual
+            # continuity isn't broken by a vanishing line mid-block. It carries
+            # no monospace span, matching every other blank code line.
+            nodes.extend(
+                _prefix_node_text(n, prefix) for n in _nodes_from_code_block(child)
+            )
         elif ctype == "block_quote":
             nodes.extend(_walk_block_quote(child, quote_depth + 1))
         elif ctype == "blank_line":
             continue
-        # nested tables/code inside a block quote are rare; fall back to
-        # skipping rather than mis-rendering them.
+        # nested tables inside a block quote are rare; fall back to skipping
+        # rather than mis-rendering them.
     return nodes
 
 
@@ -355,70 +441,17 @@ class MarkdownToParagraphParser:
                 nodes.extend(_walk_list_items(token, nesting_level=0))
 
             elif token_type in ("block_code", "code"):
-                # One node per line, because a Google Doc has no multi-line
-                # paragraph. Emitting the whole block as a single node with
-                # embedded newlines meant `insertText` wrote "\nline one\nline
-                # two", which Docs splits into N paragraphs — so every later diff
-                # saw N document paragraphs against 1 markdown node and
-                # delete-and-reinserted the whole block, on every push, forever.
-                # The text survived that; what did not was idempotence, any comment
-                # anchored to a line of code, and the monospace styling (pass 2
-                # reported the block unaligned and emitted no span requests at
-                # all). See issue #40.
-                #
-                # `strip("\n")` rather than `strip()`: the fence's own blank edges
-                # go, indentation does not. Leading whitespace is meaning in code.
-                #
-                # The fence language (mistune's token.attrs.info) has no field
-                # on DocsParagraphNode to live in, so it's written ahead of the
-                # code lines as a literal, non-monospace marker paragraph
-                # (same approach as ADR-001's literal checklist markers and
-                # _prefix_node_text's "> " blockquote markers). Non-monospace
-                # is what makes it unambiguously decodable on the way back:
-                # every real code line below is monospace by construction, so
-                # this shape never collides with one. See
-                # nodes_to_markdown.py's _is_language_marker/_group_code_runs,
-                # which decode it back into a real ```lang fence on render.
-                #
-                # The marker is only emitted when there's a language to carry.
-                # A lang-less fence stays marker-less on purpose: a *native*
-                # Google Docs code block (typed in the Docs UI, not pushed by
-                # this tool) never has a marker either, and matching push's
-                # target against that live structure depends on the two
-                # shapes being identical (`:test_an_unchanged_code_block_emits_nothing`).
-                # A marker on every fence would make an unrelated,
-                # already-correct native code block look changed on every
-                # push. Two adjacent language-less fenced blocks in the same
-                # markdown file therefore remain indistinguishable from one
-                # merged block on the next pull — an accepted limitation of
-                # the same kind as the marker/prose ambiguity below, not
-                # fixed here.
-                # token is `str | dict[str, Any]` per mistune's stubs; the
-                # isinstance guard narrows it for mypy (this loop's other
-                # branches already tolerate the same union untyped).
-                attrs = token.get("attrs") if isinstance(token, dict) else None
-                info = (attrs or {}).get("info") or ""
-                lang = info.strip()
-                if lang:
-                    nodes.append(DocsParagraphNode(
-                        style="NORMAL_TEXT", text=f"{FENCE_MARKER}{lang}",
-                        start_index=0, end_index=0, spans=[],
-                    ))
-                raw = token.get("raw", "").strip("\n")
-                # An empty fenced block (` ```\n```\n `) has `raw == ""`, so
-                # `"".split("\n")` yields `[""]` — one blank-shaped node right
-                # after the marker. That's deliberate: it's the signal
-                # `_group_code_runs` uses to render an explicit empty fence
-                # rather than losing the block or leaving an unterminated
-                # marker behind.
-                for line in raw.split("\n"):
-                    nodes.append(DocsParagraphNode(
-                        style="NORMAL_TEXT", text=line, start_index=0, end_index=0,
-                        # A blank line inside a block carries no span to style.
-                        # projection.project() drops it from *both* sides, so the
-                        # diff never sees it and never tries to delete it.
-                        spans=[TextSpan(text=line, monospace=True)] if line else [],
-                    ))
+                # Top level is the only one of the three `_nodes_from_code_block`
+                # call sites (here, `_walk_list_items`, `_walk_block_quote`)
+                # that carries the fence's language through a marker line —
+                # see the helper's docstring for why list items and
+                # blockquotes stay marker-less. A *native* Google Docs code
+                # block (typed in the Docs UI, not pushed by this tool) never
+                # has a marker either, and matching push's target against
+                # that live structure depends on the two shapes being
+                # identical (`:test_an_unchanged_code_block_emits_nothing`),
+                # which is also why a lang-less fence here stays marker-less.
+                nodes.extend(_nodes_from_code_block(token, emit_language_marker=True))
 
             elif token_type == "table":
                 nodes.append(_table_from_token(token))
