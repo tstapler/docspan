@@ -493,11 +493,20 @@ class GoogleDocsBackend(Backend):
         return RespondResult(posted=posted, resolved=resolved)
 
     def get_remote_version(self, doc_id: str) -> str:
-        """Return the revisionId of the Google Doc (opaque, non-empty string)."""
+        """
+        Return the revisionId of the Google Doc (opaque string, usually non-empty).
+
+        Google's API omits `revisionId` entirely for documents where the
+        caller only has view/comment access rather than edit access — seen on
+        a `direction: pull` mapping for a doc owned by someone else. Falling
+        back to "" mirrors how orchestrate_push() already treats a version
+        fetch it can't complete: sync proceeds, just without the fast-path
+        no-op check that a real revisionId would allow.
+        """
         self._ensure_client()
         assert self._client is not None
         doc = self._client.get_document(doc_id)
-        return doc["revisionId"]
+        return doc.get("revisionId", "")
 
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()
