@@ -339,6 +339,27 @@ def test_push_preview_render_notes_mixed_checklist_and_other_edits() -> None:
     assert "mixes 1 checklist toggle(s) with 1 other edit(s)" in rendered
 
 
+def test_push_preview_render_checklist_mix_note_counts_churn_pair_once() -> None:
+    """A churned checklist-marker rewrite (delete+reinsert of identical text)
+    must count as one edit toward n_checklist, not two — the pair renders as a
+    single `~ rewritten` line, so double-counting it would misreport the mix."""
+    remove = DiffEntry(
+        kind="remove", current_text="[ ] Splitwise", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="[ ] Splitwise", style="NORMAL_TEXT", edit_group=0
+    )
+    other = DiffEntry(
+        kind="change",
+        current_text="Friday 6:30pm: rehearsal dinner",
+        target_text="Friday 7pm: rehearsal dinner",
+        style="NORMAL_TEXT",
+    )
+    preview = PushPreview(entries=[remove, add, other], unchanged_count=0, high_risk=[], request_count=4)
+    rendered = preview.render()
+    assert "mixes 1 checklist toggle(s) with 1 other edit(s)" in rendered
+
+
 def test_push_preview_render_no_mixed_note_when_all_checklist() -> None:
     entries = [
         DiffEntry(kind="change", current_text="[ ] Splitwise", target_text="[x] Splitwise", style="NORMAL_TEXT"),

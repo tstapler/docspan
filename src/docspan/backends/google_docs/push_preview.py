@@ -135,35 +135,13 @@ def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
 
 
 def find_churn_pairs(entries: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
-    """Pair up `remove`/`add` DiffEntry that are really one delete-and-reinsert.
-
-    A `replace` opcode run whose current/target slices differ in length (see
-    `DocsRequestBuilder.diff_summary()`'s "length mismatch" branch,
-    `docs_request_builder.py:594-611`) reports its leftovers as plain
-    `remove`/`add` entries even when the leftover text is byte-identical —
-    the paragraph was destroyed and recreated (losing headingId/anchored
-    comments) without changing what the document says. That is churn, not a
-    removal, and this function finds those pairs so `render()` can label them.
-
-    Scoped by `DiffEntry.edit_group` — the index of the single `_opcodes()`
-    iteration in `diff_summary()` that produced the entry — never by
-    adjacency in the flat `entries` list. Adjacency looked equivalent at
-    first (one replace run's leftovers do land consecutively), but
-    `_prefer_structural_pairing` can carve a single "replace" run into a
-    winning "equal" plus a same-text-elsewhere "delete"/"insert" pair with no
-    "equal" opcode between them — two genuinely unrelated entries that would
-    sit adjacent in `entries` despite coming from different opcodes. Matching
-    on `edit_group` is exactly the `_node_key`/`Config`-heading-collision
-    failure mode this codebase already got burned by once
-    (`docs_request_builder.py:112-150`), avoided the same way: only pair
-    entries that provably came from the same edit, never entries that merely
-    look adjacent or share text.
-
-    Within a group, pairing is 1:1 (each `remove` claims at most one
-    unclaimed `add` with identical text) so duplicate short text (two blank
-    lines, two "TODO" bullets) cannot double-count or cross-pair. Table rows
-    (`style == "TABLE"`) are excluded — identical flattened row text is a
-    weaker, easier-to-get-wrong signal than paragraph text.
+    """Pair up `remove`/`add` DiffEntry that are really one delete-and-reinsert
+    of byte-identical text (a destroyed-and-recreated paragraph, not a real
+    removal). Matched by `DiffEntry.edit_group`, not list adjacency — adjacent
+    entries can come from different opcodes (see
+    `test_find_churn_pairs_ignores_adjacent_entries_from_different_edit_groups`),
+    which is the same `_node_key` collision class as `docs_request_builder.py:112-150`.
+    Table rows (`style == "TABLE"`) are excluded as a weaker text signal.
     """
     groups: Dict[int, List[DiffEntry]] = {}
     for entry in entries:
@@ -194,12 +172,8 @@ def _match_churn_run(run: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
 
 
 def render_churn_note(pairs: List[Tuple[DiffEntry, DiffEntry]]) -> str:
-    """Render the ⓘ note for a list of churn pairs found by `find_churn_pairs()`.
-
-    Names the comment/identity loss explicitly — the resulting text is
-    unchanged, but the paragraph itself (and anything anchored to it) is
-    still destroyed and recreated, which "no text change" alone would not
-    convey.
+    """Render the ⓘ note for churn pairs — text is unchanged, but the
+    paragraph itself (and anything anchored to it) was destroyed and recreated.
     """
     n = len(pairs)
     return (
@@ -325,12 +299,20 @@ class PushPreview:
         if churn_pairs:
             lines.append(render_churn_note(churn_pairs))
 
+        non_churn_entries = [
+            e
+            for e in self.entries
+            if id(e) not in churned_adds and id(e) not in churned_removes
+        ]
         checklist_flags = [
             _is_checklist_marker(e.current_text) or _is_checklist_marker(e.target_text)
-            for e in self.entries
+            for e in non_churn_entries
+        ] + [
+            _is_checklist_marker(remove.current_text) or _is_checklist_marker(add.target_text)
+            for remove, add in churn_pairs
         ]
         n_checklist = sum(checklist_flags)
-        n_other = len(self.entries) - n_checklist
+        n_other = len(non_churn_entries) + len(churn_pairs) - n_checklist
         if n_checklist > 0 and n_other > 0:
             lines.append(
                 f"ⓘ This push mixes {n_checklist} checklist toggle(s) with {n_other} "

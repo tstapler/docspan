@@ -111,11 +111,8 @@ class DiffEntry:
     style: str
     current_is_native_checkbox: bool = False
     # Which `_opcodes()` iteration in diff_summary() produced this entry.
-    # push_preview.find_churn_pairs() uses this (not list adjacency) to scope
-    # remove/add matching, since `_prefer_structural_pairing` can carve a
-    # "replace" run into an "equal" plus a same-text-elsewhere "delete"/"insert"
-    # with no "equal" opcode between them — two genuinely unrelated entries
-    # that would otherwise sit adjacent in the flat `entries` list.
+    # push_preview.find_churn_pairs() scopes remove/add matching by this,
+    # not list adjacency — adjacent entries can come from different opcodes.
     edit_group: int = -1
 
 
