@@ -14,6 +14,7 @@ from googleapiclient.errors import HttpError
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.docs_request_builder import DiffEntry
 from docspan.backends.google_docs.push_preview import (
+    AtRiskComment,
     HighRiskParagraph,
     PushPreview,
     find_high_risk_paragraphs,
@@ -120,7 +121,7 @@ def test_find_high_risk_paragraphs_flags_changed_paragraph_with_open_comment() -
             style="NORMAL_TEXT",
         )
     ]
-    comments = [{"quotedFileContent": {"value": "inner"}, "author": {"displayName": "Nora Sullivan"}}]
+    comments = [{"id": "c1", "quotedFileContent": {"value": "inner"}, "author": {"displayName": "Nora Sullivan"}}]
 
     result = find_high_risk_paragraphs(entries, comments)
 
@@ -128,8 +129,7 @@ def test_find_high_risk_paragraphs_flags_changed_paragraph_with_open_comment() -
         HighRiskParagraph(
             paragraph_text="Casual gathering for dinner at 6:30pm Friday",
             reasons=["comment"],
-            comment_quoted_text="inner",
-            comment_author="Nora Sullivan",
+            comments=[AtRiskComment(id="c1", quoted_text="inner", author="Nora Sullivan")],
         )
     ]
 
@@ -167,8 +167,6 @@ def test_find_high_risk_paragraphs_flags_native_checkbox_glyph_paragraph_even_wi
         HighRiskParagraph(
             paragraph_text="[ ] Whatsapp group",
             reasons=["native_glyph"],
-            comment_quoted_text=None,
-            comment_author=None,
         )
     ]
 
@@ -197,14 +195,13 @@ def test_find_high_risk_paragraphs_combines_both_reasons_when_paragraph_has_open
             current_is_native_checkbox=True,
         )
     ]
-    comments = [{"quotedFileContent": {"value": "group"}, "author": {"displayName": "Bekah"}}]
+    comments = [{"id": "c1", "quotedFileContent": {"value": "group"}, "author": {"displayName": "Bekah"}}]
 
     result = find_high_risk_paragraphs(entries, comments)
 
     assert len(result) == 1
     assert set(result[0].reasons) == {"comment", "native_glyph"}
-    assert result[0].comment_quoted_text == "group"
-    assert result[0].comment_author == "Bekah"
+    assert result[0].comments == [AtRiskComment(id="c1", quoted_text="group", author="Bekah")]
 
 
 def test_find_high_risk_paragraphs_only_considers_remove_and_change_kinds() -> None:
@@ -229,6 +226,33 @@ def test_find_high_risk_paragraphs_ignores_comment_with_empty_quoted_content() -
     assert find_high_risk_paragraphs(entries, comments) == []
 
 
+def test_find_high_risk_paragraphs_collects_every_matching_comment_not_just_the_first() -> None:
+    """Regression test: find_high_risk_paragraphs() must not stop at the first
+    open comment that matches a paragraph — a paragraph can carry more than
+    one open comment, and dropping the rest silently hid them from the
+    warn-before-force message."""
+    entries = [
+        DiffEntry(
+            kind="change",
+            current_text="Casual gathering for dinner at 6:30pm Friday",
+            target_text="Casual dinner at 6:30pm Friday",
+            style="NORMAL_TEXT",
+        )
+    ]
+    comments = [
+        {"id": "c1", "quotedFileContent": {"value": "gathering"}, "author": {"displayName": "Nora Sullivan"}},
+        {"id": "c2", "quotedFileContent": {"value": "6:30pm"}, "author": {"displayName": "Bekah"}},
+    ]
+
+    result = find_high_risk_paragraphs(entries, comments)
+
+    assert len(result) == 1
+    assert result[0].comments == [
+        AtRiskComment(id="c1", quoted_text="gathering", author="Nora Sullivan"),
+        AtRiskComment(id="c2", quoted_text="6:30pm", author="Bekah"),
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # render_high_risk()
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,15 +262,35 @@ def test_render_high_risk_includes_comment_block_with_author_and_quoted_text() -
         HighRiskParagraph(
             paragraph_text="Casual gathering for dinner",
             reasons=["comment"],
-            comment_quoted_text="inner",
-            comment_author="Nora Sullivan",
+            comments=[AtRiskComment(id="c1", quoted_text="inner", author="Nora Sullivan")],
         )
     ]
     rendered = render_high_risk(high_risk)
     assert "⚠ COMMENT AT RISK" in rendered
     assert "Nora Sullivan" in rendered
     assert "inner" in rendered
+    assert "c1" in rendered
     assert "--force" in rendered
+
+
+def test_render_high_risk_lists_every_at_risk_comment_not_just_the_first() -> None:
+    high_risk = [
+        HighRiskParagraph(
+            paragraph_text="Casual gathering for dinner",
+            reasons=["comment"],
+            comments=[
+                AtRiskComment(id="c1", quoted_text="gathering", author="Nora Sullivan"),
+                AtRiskComment(id="c2", quoted_text="dinner", author="Bekah"),
+            ],
+        )
+    ]
+    rendered = render_high_risk(high_risk)
+    assert "Nora Sullivan" in rendered
+    assert "Bekah" in rendered
+    assert "c1" in rendered
+    assert "c2" in rendered
+    assert "gathering" in rendered
+    assert "dinner" in rendered
 
 
 def test_render_high_risk_includes_native_glyph_block() -> None:
@@ -264,8 +308,7 @@ def test_render_high_risk_renders_both_blocks_for_combined_reasons() -> None:
         HighRiskParagraph(
             paragraph_text="[ ] Whatsapp group",
             reasons=["comment", "native_glyph"],
-            comment_quoted_text="group",
-            comment_author="Bekah",
+            comments=[AtRiskComment(id="c1", quoted_text="group", author="Bekah")],
         )
     ]
     rendered = render_high_risk(high_risk)
@@ -305,8 +348,7 @@ def test_push_preview_render_includes_high_risk_warning() -> None:
         HighRiskParagraph(
             paragraph_text="Casual gathering for dinner",
             reasons=["comment"],
-            comment_quoted_text="inner",
-            comment_author="Nora Sullivan",
+            comments=[AtRiskComment(id="c1", quoted_text="inner", author="Nora Sullivan")],
         )
     ]
     preview = PushPreview(entries=entries, unchanged_count=0, high_risk=high_risk, request_count=2)
