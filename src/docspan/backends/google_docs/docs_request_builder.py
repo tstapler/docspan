@@ -332,6 +332,20 @@ class DocsRequestBuilder:
         run's own sub-ranges. `get_opcodes()` returns a partition of both
         inputs, so this can't assign two current nodes to the same target
         node.
+
+        A native checkbox is a further wrinkle on top of that: its checked
+        state cannot be read back from the API (ADR-001), so pull always
+        renders it as `- [ ] text`, and the markdown parser reads that back
+        as a plain paragraph whose `.text` carries the literal `"[ ] "`
+        marker `_content_key` was never told to expect. That desyncs the
+        current node's key (`node.text`) from its own unedited target's key
+        (`"[ ] " + node.text`), so an untouched checkbox lands in a
+        `replace` run and gets delete-and-reinserted on every push. `_key`
+        strips that synthetic prefix — but only when the stripped remainder
+        names an actual native-checkbox paragraph on this run's current
+        side, so a genuine literal-checklist edit (`[ ]` -> `[x]`, or new
+        markdown text that merely starts with `[ ] `) still keys on its own
+        literal text and diffs as a real change.
         """
         repaired: List[Opcode] = []
         for tag, i1, i2, j1, j2 in opcodes:
@@ -340,10 +354,26 @@ class DocsRequestBuilder:
                 continue
             cur_slice = current[i1:i2]
             tgt_slice = target[j1:j2]
+            checkbox_texts = {
+                n.text for n in cur_slice
+                if isinstance(n, DocsParagraphNode) and n.is_native_checkbox
+            }
+
+            def _key(node: Node, _checkbox_texts=checkbox_texts) -> Tuple:
+                if (
+                    isinstance(node, DocsParagraphNode)
+                    and not node.is_native_checkbox
+                    and node.text.startswith("[ ] ")
+                ):
+                    stripped = node.text[len("[ ] "):]
+                    if stripped in _checkbox_texts:
+                        return ("__para__", stripped)
+                return self._content_key(node)
+
             inner = difflib.SequenceMatcher(
                 None,
-                [self._content_key(n) for n in cur_slice],
-                [self._content_key(n) for n in tgt_slice],
+                [_key(n) for n in cur_slice],
+                [_key(n) for n in tgt_slice],
                 autojunk=False,
             )
             pending: List[Opcode] = []

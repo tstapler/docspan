@@ -491,6 +491,36 @@ def test_diff_summary_copies_current_is_native_checkbox_from_current_side_only()
     assert entry.current_is_native_checkbox is True
 
 
+def test_diff_summary_zero_edit_native_checkbox_round_trip_is_unchanged() -> None:
+    """A native checkbox paragraph's checked state is unreadable via the API
+    (ADR-001), so pull always renders it as `- [ ] text` regardless of its
+    real state, and the markdown parser reads that back as a plain
+    `is_native_checkbox=False` paragraph whose text carries the literal
+    `[ ] ` marker. A zero-edit round trip must not report that as a change
+    (issue #17) — for either a checked or an unchecked box, since neither is
+    distinguishable on the current side."""
+    current = [
+        _para_ncb("Buy milk", is_native_checkbox=True, is_list_item=True),
+        _para_ncb("Walk the dog", is_native_checkbox=True, is_list_item=True),
+    ]
+    target = [
+        _para_ncb("[ ] Buy milk", is_native_checkbox=False, is_list_item=True),
+        _para_ncb("[ ] Walk the dog", is_native_checkbox=False, is_list_item=True),
+    ]
+    entries, unchanged_count = builder.diff_summary(current, target)
+    assert entries == []
+    assert unchanged_count == 2
+
+
+def test_build_zero_edit_native_checkbox_round_trip_emits_no_requests() -> None:
+    """Same scenario as the diff_summary test above, but at the request-build
+    layer — an unedited native checkbox must not produce a delete+insert."""
+    current = [_para_ncb("Buy milk", is_native_checkbox=True, is_list_item=True, start=1, end=10)]
+    target = [_para_ncb("[ ] Buy milk", is_native_checkbox=False, is_list_item=True)]
+    requests = builder.build(current, target, doc_end_index=10)
+    assert requests == []
+
+
 def test_diff_summary_handles_empty_current_and_target_without_raising() -> None:
     entries, unchanged_count = builder.diff_summary([], [])
     assert entries == []
