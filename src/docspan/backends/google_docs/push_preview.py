@@ -17,17 +17,30 @@ from docspan.backends.google_docs.projection import Residue
 
 
 @dataclass
+class AtRiskComment:
+    """One open Drive comment matched onto a HighRiskParagraph.
+
+    `id` is the Drive comment id — surfaced so a user can cross-reference the
+    `.comments.md` sidecar or the Drive UI directly, since a paragraph can
+    carry more than one open comment.
+    """
+    id: Optional[str]
+    quoted_text: Optional[str]
+    author: Optional[str]
+
+
+@dataclass
 class HighRiskParagraph:
     """A `remove`/`change` DiffEntry that is high-risk for one or both reasons.
 
     A single paragraph can carry both reasons at once (e.g. a native-glyph
-    paragraph that also has an open comment). `comment_quoted_text`/
-    `comment_author` are only populated when "comment" is among `reasons`.
+    paragraph that also has an open comment). `comments` is only populated
+    when "comment" is among `reasons`, and holds every matching comment —
+    a paragraph can be the target of more than one open comment at once.
     """
     paragraph_text: str
     reasons: List[Literal["comment", "native_glyph"]]
-    comment_quoted_text: Optional[str] = None
-    comment_author: Optional[str] = None
+    comments: List[AtRiskComment] = field(default_factory=list)
 
 
 def find_high_risk_paragraphs(
@@ -55,8 +68,7 @@ def find_high_risk_paragraphs(
             continue
 
         reasons: List[Literal["comment", "native_glyph"]] = []
-        comment_quoted_text: Optional[str] = None
-        comment_author: Optional[str] = None
+        at_risk_comments: List[AtRiskComment] = []
 
         current_text = entry.current_text or ""
         for comment in comments:
@@ -64,10 +76,15 @@ def find_high_risk_paragraphs(
             if not quoted:
                 continue
             if quoted in current_text:
-                reasons.append("comment")
-                comment_quoted_text = quoted
-                comment_author = (comment.get("author") or {}).get("displayName")
-                break
+                at_risk_comments.append(
+                    AtRiskComment(
+                        id=comment.get("id"),
+                        quoted_text=quoted,
+                        author=(comment.get("author") or {}).get("displayName"),
+                    )
+                )
+        if at_risk_comments:
+            reasons.append("comment")
 
         if entry.current_is_native_checkbox:
             reasons.append("native_glyph")
@@ -77,8 +94,7 @@ def find_high_risk_paragraphs(
                 HighRiskParagraph(
                     paragraph_text=entry.current_text or "",
                     reasons=reasons,
-                    comment_quoted_text=comment_quoted_text,
-                    comment_author=comment_author,
+                    comments=at_risk_comments,
                 )
             )
 
@@ -116,13 +132,20 @@ def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
     blocks: List[str] = []
     for hr in high_risk:
         if "comment" in hr.reasons:
-            author = hr.comment_author or "unknown"
-            blocks.append(
-                f'⚠ COMMENT AT RISK: paragraph "{hr.paragraph_text}" has an open comment\n'
-                f'  from {author} ("{hr.comment_quoted_text}") and would be changed. '
-                "Resolve manually in Google\n"
-                "  Docs, or re-run with --force to proceed anyway."
+            n = len(hr.comments)
+            plural = "an open comment" if n == 1 else f"{n} open comments"
+            lines = [
+                f'⚠ COMMENT AT RISK: paragraph "{hr.paragraph_text}" has {plural}\n'
+                "  and would be changed:"
+            ]
+            for c in hr.comments:
+                author = c.author or "unknown"
+                comment_id = c.id or "unknown id"
+                lines.append(f'    • [{comment_id}] {author}: "{c.quoted_text}"')
+            lines.append(
+                "  Resolve manually in Google Docs, or re-run with --force to proceed anyway."
             )
+            blocks.append("\n".join(lines))
         if "native_glyph" in hr.reasons:
             blocks.append(
                 f'⚠ NATIVE CHECKBOX GLYPH: paragraph "{hr.paragraph_text}" is a native Google Docs\n'

@@ -821,6 +821,44 @@ def test_diff_summary_handles_empty_current_and_target_without_raising() -> None
     assert unchanged_count == 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# build() trigger conditions: anchor-safe restyle vs. anchor-destroying rewrite
+#
+# _repair()'s docstring states the underlying contract this pins: any diff
+# opcode that doesn't collapse to "equal" becomes a literal deleteContentRange
+# + insertText, which destroys any Drive comment anchored to that paragraph.
+# DiffEntry.kind alone can't tell the two apart (both surface as "change"), so
+# this asserts on build()'s actual emitted requests instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_folds_text_identical_restyle_to_in_place_style_update() -> None:
+    """A paragraph whose text is unchanged but style differs must be repaired
+    back to an "equal" opcode: build() emits only an in-place
+    updateParagraphStyle, never a deleteContentRange/insertText pair, so any
+    comment anchored to the paragraph survives."""
+    current = [_para("Housing: Bekah has the lake house", style="NORMAL_TEXT", start=1, end=36)]
+    target = [_para("Housing: Bekah has the lake house", style="HEADING_1", start=1, end=36)]
+
+    requests = builder.build(current, target, doc_end_index=36)
+
+    assert not any("deleteContentRange" in r for r in requests)
+    assert not any("insertText" in r for r in requests)
+    assert any("updateParagraphStyle" in r for r in requests)
+
+
+def test_build_resolves_genuine_content_change_to_delete_and_insert() -> None:
+    """A paragraph whose text actually changes cannot be repaired to "equal":
+    build() must emit a deleteContentRange for the old text and an insertText
+    for the new text, which is exactly what destroys any comment anchored to
+    that paragraph (the documented, unavoidable trigger condition)."""
+    current = [_para("Old text entirely", start=1, end=20)]
+    target = [_para("Completely different text", start=1, end=20)]
+
+    requests = builder.build(current, target, doc_end_index=20)
+
+    assert any("deleteContentRange" in r for r in requests)
+    assert any("insertText" in r for r in requests)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # tab_id stamping (build()/_inject_tab_id) — multi-tab doc support
