@@ -174,6 +174,18 @@ class TestFenceInAListItem:
         )
         assert [n.text for n in nodes] == ["Steps:", "one", "two"]
 
+    def test_prose_after_a_fence_in_a_list_item_is_not_glued_or_dropped(self) -> None:
+        """The `spans = []` reset after emitting a fence's nodes must let a
+        trailing sibling line re-accumulate on its own, not vanish or merge
+        into the last code line."""
+        nodes = markdown.parse(
+            "- Steps:\n\n  ```sh\n  make build\n  ```\n\n  Done.\n"
+        )
+        assert [n.text for n in nodes] == ["Steps:", "make build", "Done."]
+        trailing = next(n for n in nodes if n.text == "Done.")
+        assert trailing.is_list_item is True
+        assert trailing.spans == []
+
     def test_a_fence_nested_two_lists_deep_carries_its_nesting_level(self) -> None:
         nodes = markdown.parse(
             "- outer\n  - inner:\n\n    ```sh\n    cmd\n    ```\n"
