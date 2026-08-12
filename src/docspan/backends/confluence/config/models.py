@@ -75,7 +75,11 @@ class PublishConfig:
         auto_fix_hierarchy: Whether to automatically fix page hierarchy based on directory structure
         auto_migrate_legacy: Whether to automatically migrate legacy editor pages to new editor before publishing
         duplicate_similarity_threshold: Threshold for considering pages as duplicates (0.0-1.0, default 0.8)
-        render_mermaid_diagrams: Whether to render mermaid diagrams as images
+        render_mermaid_diagrams: Whether to render mermaid diagrams as images. NOTE: currently a
+            no-op — no code path reads this flag. Mermaid fences are always emitted as a plain
+            ADF code block (see docs/backends/confluence.md#limitations). Kept as a reserved
+            config key for when rendering is implemented, rather than removed, so existing
+            markgate.yaml files that set it don't start failing validation.
         process_assets: Whether to process assets (images, diagrams) for embedding
         ignore_patterns: List of file patterns to ignore (supports glob patterns like **/TODO.md)
         archive_ignored: Whether to archive/delete ignored files from Confluence if they have page IDs
