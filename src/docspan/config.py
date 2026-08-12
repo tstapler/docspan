@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import os
 import pathlib
+import tempfile
 from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel
 
 CONFIG_FILENAME = "markgate.yaml"
+
+
+class ConfigConflictError(Exception):
+    """Raised when markgate.yaml changed on disk since it was loaded."""
 
 
 class GoogleDocsConfig(BaseModel):
@@ -28,6 +33,7 @@ class ConfluenceConfig(BaseModel):
     base_url: Optional[str] = None
     username: Optional[str] = None
     api_token: Optional[str] = None
+    space_key: Optional[str] = None
 
 
 class BackendsConfig(BaseModel):
@@ -38,7 +44,9 @@ class BackendsConfig(BaseModel):
 class Mapping(BaseModel):
     local: str       # relative path to local markdown file
     backend: str     # "google_docs" or "confluence"
-    remote_id: str   # Google Doc ID or Confluence page ID
+    # Google Doc ID or Confluence page ID. None means "not yet created" —
+    # push treats this as a request to create the remote doc (interactively only).
+    remote_id: Optional[str] = None
     direction: Literal["push", "pull", "both"] = "both"
     # Google Docs tab id (e.g. "t.moqlkhpwn82e") to target on a multi-tab doc.
     # None (default) targets the doc's first/default tab — preserves pre-tabs
@@ -71,6 +79,49 @@ def load_config(path: Optional[str] = None) -> MarkgateConfig:
     cf.setdefault("api_token", os.getenv("CONFLUENCE_API_TOKEN"))
 
     return MarkgateConfig(**raw)
+
+
+def config_mtime(path: Optional[str] = None) -> Optional[float]:
+    """Return markgate.yaml's current mtime, or None if it doesn't exist yet."""
+    config_path = pathlib.Path(path or CONFIG_FILENAME)
+    if not config_path.exists():
+        return None
+    return config_path.stat().st_mtime
+
+
+def save_config(
+    config: MarkgateConfig,
+    path: Optional[str] = None,
+    expected_mtime: Optional[float] = None,
+) -> None:
+    """Atomically write markgate.yaml (temp file + os.replace).
+
+    If ``expected_mtime`` is given, aborts with ConfigConflictError when the
+    file's mtime no longer matches — i.e. it was edited since it was loaded —
+    rather than silently clobbering a concurrent edit.
+    """
+    config_path = pathlib.Path(path or CONFIG_FILENAME)
+
+    if expected_mtime is not None and config_path.exists():
+        current_mtime = config_path.stat().st_mtime
+        if current_mtime != expected_mtime:
+            raise ConfigConflictError(
+                f"{config_path} was modified since it was loaded — reload and retry "
+                "to avoid overwriting a concurrent edit."
+            )
+
+    raw = config.model_dump(exclude_none=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(config_path.parent), prefix=f".{config_path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(raw, f, sort_keys=False)
+        os.replace(tmp_path, config_path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────

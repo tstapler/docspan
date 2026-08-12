@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 from googleapiclient.errors import HttpError
 
-from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
@@ -26,7 +26,7 @@ from docspan.backends.google_docs.comments import (
     parse_reply_directives,
 )
 from docspan.backends.google_docs.converter import DocumentConverter
-from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+from docspan.backends.google_docs.docs_request_builder import DiffTooExpensive, DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
@@ -229,6 +229,10 @@ class GoogleDocsBackend(Backend):
             target_residue_note = describe_target_residue(plan.target_residue)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
         except HttpError as exc:
+            return PushPreview(
+                entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
+            )
+        except DiffTooExpensive as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
             )
@@ -483,6 +487,10 @@ class GoogleDocsBackend(Backend):
                     message="The doc changed since your last pull — run `docspan pull` again",
                 )
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
+        except DiffTooExpensive as exc:
+            # A clear, actionable error rather than a multi-minute hang or an
+            # uncaught traceback — see DiffTooExpensive's docstring.
+            return PushResult(status="error", doc_id=doc_id, message=str(exc))
         except Exception as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
 
@@ -679,6 +687,12 @@ class GoogleDocsBackend(Backend):
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
         except TabNotFoundError as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
+        except DiffTooExpensive as exc:
+            # pull() does not currently run DocsRequestBuilder's diff, but this
+            # keeps the two entry points symmetric and future-proofs pull()
+            # against ever gaining a diff-based path without a clear error
+            # silently degrading into the generic Exception branch below.
+            return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
         except Exception as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
 
@@ -794,6 +808,18 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         doc = self._client.get_document(doc_id)
         return doc["revisionId"]
+
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        """Create a new, empty Google Doc and return its id/title/url."""
+        self._ensure_client()
+        assert self._client is not None
+        doc = self._client.create_document(title)
+        doc_id = doc["documentId"]
+        return CreateResult(
+            doc_id=doc_id,
+            title=doc.get("title", title),
+            url=f"https://docs.google.com/document/d/{doc_id}/edit",
+        )
 
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()

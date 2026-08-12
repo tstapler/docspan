@@ -298,6 +298,61 @@ class TestPreviewPushExceptionHandling:
         assert "Traceback" not in rendered
 
 
+class TestDiffTooExpensiveSurfacesAsUserFacingError:
+    """AC6: DiffTooExpensive raised while building a push plan must be caught
+    by push() and reported through PushResult, never an uncaught traceback —
+    same shape as the HttpError/generic-exception handling above."""
+
+    def test_push_returns_error_status_instead_of_raising(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        monkeypatch.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "error"
+        assert result.message is not None
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_error_message_is_the_diff_too_expensive_message_not_a_traceback(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        monkeypatch.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.message == str(DiffTooExpensive("document", 6000, 3000))
+        assert "Traceback" not in (result.message or "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CommentCountBackstop (plan.md Task 1.2.3c/1.2.3d)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1145,3 +1200,22 @@ class TestPullSurfacesResidue:
         result = backend.pull("doc-1", str(local), tab_id="t.0")
 
         assert result.status == "ok", result.message
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsBackend.create() — new-doc creation for `docspan map`
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCreate:
+    def test_create_calls_client_and_returns_doc_id_title_url(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.create_document.return_value = {"documentId": "new-doc-1", "title": "My Doc"}
+
+        result = backend.create("My Doc")
+
+        client.create_document.assert_called_once_with("My Doc")
+        assert result.doc_id == "new-doc-1"
+        assert result.title == "My Doc"
+        assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
