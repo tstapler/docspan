@@ -209,6 +209,47 @@ class TestTheLiveHeadingSurvives:
         )
         assert replay.text_of("heading") == "Config"
 
+    def test_a_heading_duplicated_as_body_text_survives_with_its_heading_id_intact(self) -> None:
+        """The literal repro from the bug report: a doc-start insert shares an
+        anchor with the restyled live heading, and the document also has the
+        heading's text duplicated as an unrelated body line.
+
+        Document: `HEADING_2 'Overview'` / `NORMAL_TEXT 'Overview'` (the
+        duplicate) / `'tail'`. Markdown restyles the heading to `###` and adds
+        a new line above it, so the insert (anchored at doc-start, index 1)
+        ties with the heading's `equal`-restyle group (also anchored at index
+        1). `is_heading("heading")` alone doesn't discriminate the bug: even
+        pre-fix, the restyle request still lands on the heading's paragraph id
+        because it's a *superset* of the corrupted (pre-insert) range. What
+        the corrupted range actually does is bleed the restyle onto the
+        *newly inserted* paragraph too — asserting that paragraph is not also
+        a heading is what catches it.
+        """
+        replay = ParagraphReplay([
+            ("Overview", "HEADING_2", "heading", False),
+            ("Overview", "NORMAL_TEXT", "dup", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        _push(replay, "NewLine\n\n### Overview\n\nOverview\n\ntail\n")
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+        assert not replay.is_heading("inserted-1"), (
+            f"the restyle range leaked onto the newly inserted paragraph "
+            f"(style={replay.style.get('inserted-1')}), which means it was "
+            "computed against coordinates the insert had already shifted"
+        )
+        doc, _ = replay.document()
+        headings = [
+            p["paragraph"]["paragraphStyle"]["headingId"]
+            for p in doc["body"]["content"]
+            if p["paragraph"]["paragraphStyle"].get("namedStyleType") == "HEADING_3"
+        ]
+        assert headings == ["h.heading"], "the original headingId must survive unchanged"
+
     def test_the_heading_is_restyled_in_place_rather_than_retyped(self) -> None:
         """A genuine restyle must stay an in-place edit.
 

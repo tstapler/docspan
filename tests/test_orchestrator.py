@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.config import Mapping
 from docspan.core.orchestrator import (
     get_base_content,
@@ -41,6 +41,9 @@ class FakeBackend(Backend):
 
     def get_remote_version(self, doc_id: str) -> str:
         return self.remote_version
+
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        return CreateResult(doc_id="new-doc-1", title=title, url="https://example.com/new-doc")
 
     def auth_setup(self) -> None:
         pass

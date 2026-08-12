@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import difflib
+import logging
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
@@ -30,10 +32,84 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # inlined Literal in one signature and a bare `str` in the next do not unify.
 Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
 
+logger = logging.getLogger(__name__)
+
+# Thresholds for _bounded_opcodes. Tuned against this file's own test fixtures
+# (a 30-row table, the fenced-code-block fixtures in test_code_block_granularity.py)
+# so ordinary documents never trip the guard, while a document built from a
+# few thousand duplicate short lines/cells does.
+_MAX_COMPARISON_CELLS = 4_000_000
+_MAX_DUPLICATE_RUN = 60
+_MIN_SIZE_FOR_DUPLICATE_CHECK = 150
+
 # Must exceed `_structural_score`'s maximum possible value (currently 4: 2 for
 # matching style + 1 for matching heading-ness + 1 for matching list-item-ness)
 # so a code-rendered candidate always outranks a merely structurally-similar one.
 _CODE_LINE_PREFERENCE_BONUS = 100
+
+
+class DiffTooExpensive(Exception):
+    """Raised instead of running SequenceMatcher on pathological duplicate-heavy input.
+
+    `autojunk=False` is required for correctness (see `_opcodes`'s docstring
+    and issue #54/#68) but it also reintroduces difflib's cubic-ish worst case
+    once many short keys repeat — a document with a few thousand duplicate
+    lines or table cells can otherwise hang push/pull for minutes.
+
+    Refuses loudly rather than falling back to a positional/heuristic diff:
+    `_repair` and `_prefer_structural_pairing` both depend on
+    `get_opcodes()`'s exact partition guarantee, and a lookalike-popularity
+    heuristic is exactly what reopened the headingId-mispairing bug PR #50/#67
+    fixed. "Refuse, don't guess" matches this file's existing philosophy.
+    """
+
+    def __init__(self, context: str, size: int, max_duplicate_run: int):
+        self.context = context
+        self.size = size
+        self.max_duplicate_run = max_duplicate_run
+        super().__init__(
+            f"Diff for {context} is too expensive to compute safely: {size} "
+            f"nodes include a run of {max_duplicate_run} duplicate short "
+            "lines/cells. Split the table or code block into smaller pieces "
+            "and retry."
+        )
+
+
+def _bounded_opcodes(a_keys: List[Tuple], b_keys: List[Tuple], *, context: str) -> List[Opcode]:
+    """The sole place any `autojunk=False` `SequenceMatcher` gets constructed.
+
+    `_opcodes`, `_repair`'s inner per-run matcher and `_align_for_styling`'s
+    pass-2 matcher all route through this one function so the pathological-
+    input guard can never be applied at one call site and forgotten at
+    another — the same failure class `_opcodes`'s docstring already warns
+    about for build()/diff_summary() drifting apart.
+
+    Trips (raises `DiffTooExpensive`, logging a WARNING first) on either:
+    - a comparison matrix (`len(a_keys) * len(b_keys)`) large enough that
+      even difflib's average-case cost is unsafe, or
+    - a duplicate-key run dense enough to trigger the cubic-ish worst case,
+      gated by a size floor so a handful of legitimately-repeated short
+      values (a few blank paragraphs, a short status column) never trips it.
+
+    Otherwise behaves exactly as the removed inline `SequenceMatcher(None,
+    a_keys, b_keys, autojunk=False)` calls did — `autojunk` is never
+    re-enabled and no popularity heuristic is substituted.
+    """
+    combined_len = len(a_keys) + len(b_keys)
+    max_duplicate_run = max(Counter(a_keys + b_keys).values()) if combined_len else 0
+    if len(a_keys) * len(b_keys) > _MAX_COMPARISON_CELLS or (
+        combined_len >= _MIN_SIZE_FOR_DUPLICATE_CHECK and max_duplicate_run > _MAX_DUPLICATE_RUN
+    ):
+        logger.warning(
+            "Refusing expensive diff for %s: %d + %d nodes, largest duplicate run %d",
+            context,
+            len(a_keys),
+            len(b_keys),
+            max_duplicate_run,
+        )
+        raise DiffTooExpensive(context, combined_len, max_duplicate_run)
+    matcher = difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False)
+    return matcher.get_opcodes()
 
 
 @dataclass(frozen=True)
@@ -50,6 +126,23 @@ class Pass2Alignment:
     slug_to_id: dict
     known_ids: set
     residue: List[Residue]
+
+
+@dataclass(frozen=True)
+class DeleteBounds:
+    """The range a node's deleteContentRange may actually cover, and why it was trimmed.
+
+    ``trimmed`` keeps its original meaning ("some trim happened"), covering
+    both the render_prefix/precedes_structural_element cases and the doc-end
+    clamp. ``doc_end_clamped`` narrows to the last of those specifically — the
+    body's terminal newline was what survived — so callers that need to tell
+    the doc-end case apart from the other two (see the "replace" branch of
+    build(), #62) don't have to re-derive it from node attributes.
+    """
+    start: int
+    end: int
+    trimmed: bool
+    doc_end_clamped: bool
 
 
 def _utf16_len(text: str) -> int:
@@ -264,8 +357,12 @@ class DocsRequestBuilder:
         but they must see identical opcodes, since push()'s safety gate
         (high_risk, derived from diff_summary()'s classification) and the
         actual write (derived from build()'s classification) must never
-        drift apart. This is the one place current_keys/target_keys/
-        SequenceMatcher get constructed.
+        drift apart. This is the one place current_keys/target_keys get
+        constructed; the matcher itself is built by `_bounded_opcodes`, the
+        shared guard against difflib's duplicate-heavy worst case (see its
+        docstring) — a `DiffTooExpensive` raised here propagates to both
+        callers identically, so they can never diverge on whether a document
+        is pathological either.
 
         `_repair` only disambiguates duplicate-content candidates *within* a
         single `replace` run it already identified. It cannot rescue a
@@ -286,8 +383,8 @@ class DocsRequestBuilder:
         """
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
-        matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        repaired = self._repair(matcher.get_opcodes(), current, target)
+        opcodes = _bounded_opcodes(current_keys, target_keys, context="document")
+        repaired = self._repair(opcodes, current, target)
         # The whole-document pass below only ever has work to do when some
         # target slot is itself a fenced-code line (`_target_wants_code_line`)
         # — see `_prefer_structural_pairing`'s `code_slot_ids` gate, which
@@ -345,14 +442,13 @@ class DocsRequestBuilder:
                 continue
             cur_slice = current[i1:i2]
             tgt_slice = target[j1:j2]
-            inner = difflib.SequenceMatcher(
-                None,
+            inner_opcodes = _bounded_opcodes(
                 [self._content_key(n) for n in cur_slice],
                 [self._content_key(n) for n in tgt_slice],
-                autojunk=False,
+                context="replace-run",
             )
             pending: List[Opcode] = []
-            for itag, ci1, ci2, tj1, tj2 in inner.get_opcodes():
+            for itag, ci1, ci2, tj1, tj2 in inner_opcodes:
                 aci1, aci2 = i1 + ci1, i1 + ci2
                 atj1, atj2 = j1 + tj1, j1 + tj2
                 if itag == "equal":
@@ -767,13 +863,25 @@ class DocsRequestBuilder:
         """
         opcodes = self._opcodes(current, target)
 
-        # (anchor_index, requests) — the requests for one node or one insert
-        # group, and the document index they are all written against.
+        # (anchor_index, is_insert, requests) — the requests for one node or
+        # one insert group, the document index they are all written against,
+        # and whether this group is an insert (vs. a restyle/delete against
+        # pre-existing content).
         #
         # Ordering rule, stated once here because getting it wrong is silent:
         # groups are applied highest-anchor-first (so every edit runs against
-        # coordinates nothing has shifted yet), and within a group in emission
-        # order (so an insert precedes the styling of what it inserted).
+        # coordinates nothing has shifted yet). Within a *tied* anchor,
+        # non-insert groups (equal-restyle, delete) go first and insert
+        # groups go last: every non-insert group's range was computed from
+        # `current[...].start_index`, a pre-insert coordinate, so an insert
+        # sharing that anchor must not run first — it would shift the range
+        # out from under the paragraph it was meant for, corrupting whichever
+        # node happens to land in the old range instead (e.g. #42: a live
+        # heading demoted and the new paragraph promoted in its place, or a
+        # bullet request landing on the wrong paragraph). The `replace`
+        # opcode's delete-then-insert pair already got this right by
+        # emission order alone; `is_insert` makes that same rule explicit
+        # and general instead of accidental.
         #
         # This used to be one flat sort over every request's own startIndex,
         # which is only equivalent while every request in a group shares the
@@ -782,20 +890,20 @@ class DocsRequestBuilder:
         # carried a higher startIndex than the insertText it depends on and
         # sorted ahead of it — a style request against a range that did not
         # exist yet. The anchor is now carried explicitly instead of inferred.
-        groups: List[Tuple[int, List[dict]]] = []
+        groups: List[Tuple[int, int, List[dict]]] = []
 
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
                 for ci, ti in zip(range(i1, i2), range(j1, j2)):
                     requests = self._make_style_update_requests(current[ci], target[ti])
                     if requests:
-                        groups.append((current[ci].start_index, requests))
+                        groups.append((current[ci].start_index, 0, requests))
 
             elif tag == "delete":
                 for node in current[i1:i2]:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
-                        groups.append((node.start_index, requests))
+                        groups.append((node.start_index, 0, requests))
 
             elif tag == "insert":
                 previous = current[i1 - 1] if i1 > 0 else None
@@ -837,14 +945,14 @@ class DocsRequestBuilder:
                     before_newline=at_body_end or before_boundary,
                 )
                 if requests:
-                    groups.append((insert_at, requests))
+                    groups.append((insert_at, 1, requests))
 
             elif tag == "replace":
                 delete_start = current[i1].start_index
                 for node in current[i1:i2]:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
-                        groups.append((node.start_index, requests))
+                        groups.append((node.start_index, 0, requests))
                 # render_prefix and precedes_structural_element both stop the
                 # last deleted node's delete range short of a newline that
                 # belongs to something else — chrome shared with a following
@@ -864,49 +972,56 @@ class DocsRequestBuilder:
                 # The doc_end_index clamp in _delete_bounds also spares a
                 # newline — the paragraph's own terminator — when the
                 # deleted range ends at the document's last paragraph.
-                # `before_newline=True` is not the right fix there: that
-                # writes "\ntext", which prepends a blank paragraph in
-                # front of the clamp-spared newline instead of reusing it.
-                # The insert must instead be bare text with no newline on
-                # either side, so the clamp-spared newline is reused as the
-                # new text's own terminator (see `bare_last` on
-                # _make_insert_requests). `precedes_structural_element` is
-                # mutually exclusive with this clamp (a following
-                # Table/ToC/SectionBreak means last.end_index <
-                # doc_end_index), but render_prefix is not — a render-glyph
-                # paragraph that is also the doc's last paragraph keeps the
-                # existing before_newline=True behavior (#48 takes
-                # precedence over this narrower case).
+                # Unlike the render_prefix/structural cases above, there is
+                # no following paragraph to open: the spared newline is the
+                # last node's own terminator, so the replacement text goes
+                # in bare, with no newline on either side (#62). This is
+                # checked only when `spares_structural_newline` above is
+                # False — a node can in principle satisfy both (a
+                # render-glyph paragraph that also happens to be the doc's
+                # last paragraph), and the leading-newline mode already has
+                # passing coverage for that case.
+                #
+                # `last_bounds.start < last_bounds.end` excludes the #21
+                # masking case: when `last` is already the doc's empty
+                # terminal placeholder paragraph (nothing left to delete —
+                # start == end after the clamp), the spared "newline" is
+                # that placeholder's *entire* content. Bare mode there would
+                # glue the new text onto that untouched terminator instead
+                # of opening a fresh paragraph in front of it, collapsing
+                # the trailing blank paragraph every doc must keep.
                 last = current[i2 - 1]
                 spares_structural_newline = isinstance(last, DocsParagraphNode) and (
                     bool(last.render_prefix) or last.precedes_structural_element
                 )
-                spares_terminal_newline = (
+                last_bounds = self._delete_bounds(last, doc_end_index)
+                doc_end_clamped = (
                     not spares_structural_newline
-                    and isinstance(last, DocsParagraphNode)
-                    and bool(last.text)
-                    and last.end_index >= doc_end_index
+                    and last_bounds.doc_end_clamped
+                    and last_bounds.start < last_bounds.end
                 )
                 requests = self._make_insert_requests(
                     target[j1:j2],
                     delete_start,
                     before_newline=spares_structural_newline,
-                    bare_last=spares_terminal_newline,
+                    bare_last=doc_end_clamped,
                 )
                 if requests:
-                    # Same anchor as the first deleted node's group, and emitted
-                    # after it, so the delete runs before the insert that
-                    # replaces it.
-                    groups.append((delete_start, requests))
+                    # Same anchor as the first deleted node's group. is_insert=1
+                    # places it after that delete group in the sort below, so
+                    # the delete still runs before the insert that replaces it.
+                    groups.append((delete_start, 1, requests))
 
-        # Stable, so groups sharing an anchor keep the order above.
-        groups.sort(key=lambda group: group[0], reverse=True)
-        all_requests = [request for _anchor, requests in groups for request in requests]
+        # Descending by anchor so later edits never shift an earlier one's
+        # coordinates; at a tied anchor, non-insert groups (is_insert=0)
+        # before insert groups (is_insert=1) — see the comment above.
+        groups.sort(key=lambda group: (-group[0], group[1]))
+        all_requests = [request for _anchor, _is_insert, requests in groups for request in requests]
         self._inject_tab_id(all_requests, tab_id)
         return all_requests
 
     @staticmethod
-    def _delete_bounds(node: Node, doc_end_index: int) -> Tuple[int, int, bool]:
+    def _delete_bounds(node: Node, doc_end_index: int) -> DeleteBounds:
         """The range a node's deleteContentRange may actually cover, and whether it was trimmed.
 
         Single source of truth for the two undeletable-newline rules described
@@ -952,10 +1067,12 @@ class DocsRequestBuilder:
         elif isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
             end -= 1
             trimmed = True
+        doc_end_clamped = False
         if end >= doc_end_index:
             end = doc_end_index - 1
             trimmed = True
-        return start, end, trimmed
+            doc_end_clamped = True
+        return DeleteBounds(start, end, trimmed, doc_end_clamped)
 
     # ──────────────────────────────────────────────
     # Pass 2 — fill table cells from a re-fetched doc
@@ -1504,11 +1621,10 @@ class DocsRequestBuilder:
         # docstring) — it must reach the caller the same way the identical
         # residue kind on the original doc parse reaches plan.residue.
         current, current_residue = project(DocsStructureParser().parse(doc))
-        matcher = difflib.SequenceMatcher(
-            None,
+        opcodes = _bounded_opcodes(
             [self._alignment_key(n) for n in current],
             [self._alignment_key(n) for n in target],
-            autojunk=False,
+            context="pass-2 styling",
         )
 
         # Ordinal of each table's position in `current`, among tables only —
@@ -1526,7 +1642,7 @@ class DocsRequestBuilder:
         heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         table_pairs: List[Tuple[int, DocsTableNode]] = []
         aligned_target_indices = set()
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for tag, i1, i2, j1, j2 in opcodes:
             if tag != "equal":
                 continue
             for ci, ti in zip(range(i1, i2), range(j1, j2)):
@@ -1801,18 +1917,18 @@ class DocsRequestBuilder:
         """
         requests = []
         for node in nodes:
-            start, end, trimmed = self._delete_bounds(node, doc_end_index)
-            if start >= end:
+            bounds = self._delete_bounds(node, doc_end_index)
+            if bounds.start >= bounds.end:
                 # Nothing left to delete — an already-empty paragraph pinned by
                 # a boundary or by the body's terminal newline. Emitting the
                 # normalisation alone would make every push rewrite a paragraph
                 # it can never remove, so push would never be idempotent.
                 continue
-            if trimmed and isinstance(node, DocsParagraphNode):
+            if bounds.trimmed and isinstance(node, DocsParagraphNode):
                 requests.extend(self._residue_normalize_requests(node))
             requests.append({
                 "deleteContentRange": {
-                    "range": {"startIndex": start, "endIndex": end}
+                    "range": {"startIndex": bounds.start, "endIndex": bounds.end}
                 }
             })
         return requests

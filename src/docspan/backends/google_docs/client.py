@@ -12,7 +12,7 @@ import random
 import socket
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, cast
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -142,6 +142,20 @@ class GoogleDocsClient:
             lambda: self.docs_service.documents()
             .get(documentId=doc_id, includeTabsContent=include_tabs_content)
             .execute()
+        )
+
+    def create_document(self, title: str) -> dict:
+        """
+        Create a new, empty Google Doc.
+
+        Returns:
+            dict: the created document resource (at minimum `documentId`, `title`).
+        """
+        return cast(
+            dict,
+            self._with_backoff(
+                lambda: self.docs_service.documents().create(body={"title": title}).execute()
+            ),
         )
 
     def batch_update(
