@@ -133,7 +133,7 @@ def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
     for hr in high_risk:
         if "comment" in hr.reasons:
             n = len(hr.comments)
-            plural = "comment" if n == 1 else f"{n} open comments"
+            plural = "an open comment" if n == 1 else f"{n} open comments"
             lines = [
                 f'⚠ COMMENT AT RISK: paragraph "{hr.paragraph_text}" has {plural}\n'
                 "  and would be changed:"

@@ -28,18 +28,13 @@ Service account credentials can also be provided inline via `ACCOUNT_A_CREDENTIA
 
 ## Required Scopes
 
-docspan requests different scopes depending on the operation:
+Every credential path (`GoogleAuthenticator`, `OAuthAuthenticator`) requests the same read/write scopes (`PUSH_SCOPES`, aliased as `SCOPES`/`DEFAULT_SCOPES`), whether the operation is push or pull:
 
-- **Push** (`PUSH_SCOPES`) needs write access, since it can create/update Docs content and comments:
-  - `https://www.googleapis.com/auth/documents` — read and write Google Docs
-  - `https://www.googleapis.com/auth/drive` — read/write Drive (comment reads/writes, file metadata; not just export)
-  - `https://www.googleapis.com/auth/spreadsheets.readonly` — read Sheets embedded/linked in a Doc
-- **Pull** (`PULL_SCOPES`) is read-only:
-  - `https://www.googleapis.com/auth/documents.readonly`
-  - `https://www.googleapis.com/auth/drive.readonly`
-  - `https://www.googleapis.com/auth/spreadsheets.readonly`
+- `https://www.googleapis.com/auth/documents` — read and write Google Docs
+- `https://www.googleapis.com/auth/drive` — read/write Drive (comment reads/writes, file metadata; not just export)
+- `https://www.googleapis.com/auth/spreadsheets.readonly` — read Sheets embedded/linked in a Doc
 
-No scope beyond the full `drive` scope above is added for comment operations — comment reads/writes reuse the same `PUSH_SCOPES` grant.
+`auth.py` also defines a narrower read-only `PULL_SCOPES`, but nothing in the codebase wires it up today — pull requests the same full grant as push, not a readonly subset. Comment reads/writes reuse this same grant too; no separate scope is added for them.
 
 ## `markgate.yaml` Example
 

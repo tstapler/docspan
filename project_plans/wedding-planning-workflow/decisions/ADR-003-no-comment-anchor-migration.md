@@ -6,9 +6,10 @@
 ## Context
 
 `docspan` issue #92 asks whether a comment anchored to a paragraph that push
-resolves to delete+insert (ADR-001's `_repair` docstring: any diff opcode
-that doesn't collapse to `"equal"` becomes a literal `deleteContentRange` +
-`insertText`) can be preserved across that push, either by mutating the
+resolves to delete+insert (per `_repair`'s docstring in
+`docs_request_builder.py`: any diff opcode that doesn't collapse to `"equal"`
+becomes a literal `deleteContentRange` + `insertText`) can be preserved
+across that push, either by mutating the
 Drive comment's existing `anchor`/`quotedFileContent` via `comments().update`,
 or by creating a replacement comment via `comments().create` with a custom
 `anchor`/`quotedFileContent` pointing at the reinserted paragraph.
@@ -55,9 +56,9 @@ Two sources answer the question decisively without a live call:
    comment renders as 'Original content deleted' / no highlight," citing
    Google's guide plus a reproduced case at
    [googleworkspace/cli#169](https://github.com/googleworkspace/cli/issues/169).
-   That plan's ADR-004 already reached the same conclusion for *new*
-   top-level comments (ship unanchored-only, v1); this ADR extends the same
-   finding to the *migrate-an-existing-comment* case #92 asks about.
+   That plan already reached the same conclusion for *new* top-level
+   comments (ship unanchored-only, v1); this ADR extends the same finding
+   to the *migrate-an-existing-comment* case #92 asks about.
 
 Both sources agree, from two different angles (official docs; independent
 reproduction), that neither `comments().update` nor `comments().create` can
