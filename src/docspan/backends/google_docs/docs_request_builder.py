@@ -758,6 +758,28 @@ class DocsRequestBuilder:
                         and self._is_code_line(candidate_node)
                     ):
                         score += _CODE_LINE_PREFERENCE_BONUS
+                    if score == 0 and cid != self_cid:
+                        # AC6 (issue #52 backlog): a candidate that shares
+                        # nothing structurally with this slot's target — not
+                        # even coincidentally, since `_structural_score` is 0
+                        # only when style, heading-ness, and list-item-ness
+                        # *all* differ — is excluded from competing for this
+                        # slot. Without this, a `_content_key` group with
+                        # exactly one slot and one candidate coalesces them
+                        # unconditionally (no rejection floor previously
+                        # existed), so a genuinely deleted node and an
+                        # unrelated inserted node sharing text (e.g. "TODO")
+                        # get merged into a false in-place restyle purely by
+                        # coincidence, with the widened whole-document pool
+                        # giving them a chance to meet at all. A slot's own
+                        # pre-existing candidate (`cid == self_cid`) is never
+                        # excluded here — that pairing already exists
+                        # upstream (a real content-matched restyle can
+                        # legitimately change style, heading-ness, and
+                        # list-item-ness all at once, scoring 0 despite being
+                        # correct) and losing it here would falsely turn it
+                        # into a spurious delete+insert.
+                        continue
                     same_origin = _candidate_origin(cid) == slot_origin
                     pair_scores.append(
                         (same_origin, score, cid == self_cid, si, ci, spos, self_cid, cid)

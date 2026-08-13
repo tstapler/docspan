@@ -799,3 +799,51 @@ class TestNoHeadingIsDemoted:
         assert noisy == [], f"{len(noisy)} unchanged documents emitted requests:\n" + "\n".join(
             noisy[:10]
         )
+
+
+class TestUnrelatedDuplicateTextIsNotFalselyRestyled:
+    """AC6: a coincidental `_content_key` match must not fabricate a restyle.
+
+    PR #70's whole-document pooling (see `_prefer_structural_pairing`'s
+    docstring) lets a standalone `insert` and a standalone `delete` from
+    completely unrelated edits meet in the same `_content_key` group, since
+    the pool is no longer scoped to one `replace` run. When a group has
+    exactly one slot and one candidate, the greedy assignment previously had
+    no rejection floor — it paired them unconditionally, even at
+    `_structural_score` 0 (no shared style, heading-ness, or list-item-ness
+    at all), turning a real delete-then-insert into a false in-place restyle
+    that hands the deleted node's identity (and thus its comments/anchors) to
+    the unrelated inserted node instead.
+    """
+
+    def test_a_genuinely_deleted_node_is_not_merged_with_an_unrelated_insert(self) -> None:
+        # "TODO" as a live HEADING_2 is genuinely deleted; a brand new,
+        # unrelated "TODO" bullet is inserted elsewhere. They share nothing
+        # structurally (style, heading-ness, and list-item-ness all differ),
+        # so `_structural_score` is 0 for this pair.
+        current = [
+            DocsParagraphNode(text="TODO", style="HEADING_2", is_list_item=False),
+            DocsParagraphNode(text="Notes", style="NORMAL_TEXT", is_list_item=False),
+        ]
+        target = [
+            DocsParagraphNode(text="Notes", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="TODO", style="BULLET", is_list_item=True),
+        ]
+        assert builder._structural_score(current[0], target[1]) == 0
+
+        opcodes = builder._opcodes(current, target)
+
+        deleted = [(tag, ci1, ci2) for tag, ci1, ci2, _cj1, _cj2 in opcodes
+                   if tag == "delete" and ci1 <= 0 < ci2]
+        inserted = [(tag, cj1, cj2) for tag, _ci1, _ci2, cj1, cj2 in opcodes
+                    if tag == "insert" and cj1 <= 1 < cj2]
+        assert deleted, (
+            f"the live 'TODO' heading (current index 0) was not deleted — it "
+            f"was falsely paired with the unrelated inserted 'TODO' bullet "
+            f"instead of being removed: {opcodes}"
+        )
+        assert inserted, (
+            f"the unrelated 'TODO' bullet (target index 1) was not inserted "
+            f"— it was falsely paired with the genuinely deleted 'TODO' "
+            f"heading instead of being added fresh: {opcodes}"
+        )
