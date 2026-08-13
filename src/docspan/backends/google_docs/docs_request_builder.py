@@ -5,7 +5,7 @@ import difflib
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Literal, Optional, Set, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -420,7 +420,7 @@ class DocsRequestBuilder:
                 if isinstance(n, DocsParagraphNode) and n.is_native_checkbox
             }
 
-            def _key(node: Node, _checkbox_texts=checkbox_texts) -> Tuple:
+            def _key(node: Node, _checkbox_texts: Set[str] = checkbox_texts) -> Tuple:
                 if (
                     isinstance(node, DocsParagraphNode)
                     and not node.is_native_checkbox
