@@ -9,8 +9,42 @@ from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 CONFIG_FILENAME = "markgate.yaml"
+
+# Round-trip YAML: preserves comments/formatting across load→mutate→save so
+# save_config() doesn't have to blow away a hand-annotated markgate.yaml just
+# to persist one changed field (e.g. a newly-created remote_id).
+_ryaml = YAML()
+_ryaml.indent(mapping=2, sequence=4, offset=2)
+_ryaml.preserve_quotes = True
+
+
+def _merge_into(raw: object, new: object) -> object:
+    """Recursively apply ``new`` onto ``raw`` in place, preserving ``raw``'s
+    comments/order for keys and list items that are unchanged."""
+    if isinstance(new, dict):
+        if not isinstance(raw, dict):
+            return new
+        for key in list(raw.keys()):
+            if key not in new:
+                del raw[key]
+        for key, value in new.items():
+            raw[key] = _merge_into(raw[key], value) if key in raw else value
+        return raw
+    if isinstance(new, list):
+        if not isinstance(raw, list):
+            return new
+        for i, value in enumerate(new):
+            if i < len(raw):
+                raw[i] = _merge_into(raw[i], value)
+            else:
+                raw.append(value)
+        del raw[len(new):]
+        return raw
+    return new
 
 
 class ConfigConflictError(Exception):
@@ -110,14 +144,23 @@ def save_config(
                 "to avoid overwriting a concurrent edit."
             )
 
-    raw = config.model_dump(exclude_none=True)
+    new_raw = config.model_dump(exclude_none=True)
+
+    doc: object = CommentedMap()
+    if config_path.exists():
+        with open(config_path) as f:
+            loaded = _ryaml.load(f)
+        if loaded is not None:
+            doc = loaded
+    doc = _merge_into(doc, new_raw)
+
     config_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(config_path.parent), prefix=f".{config_path.name}.", suffix=".tmp"
     )
     try:
         with os.fdopen(fd, "w") as f:
-            yaml.safe_dump(raw, f, sort_keys=False)
+            _ryaml.dump(doc, f)
         os.replace(tmp_path, config_path)
     except Exception:
         os.unlink(tmp_path)
