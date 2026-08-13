@@ -211,6 +211,34 @@ def test_heading_inside_a_table_cell_is_excluded() -> None:
     assert heading_ids_by_tab(doc) == {}
 
 
+def test_a_table_cell_heading_does_not_make_a_real_heading_ambiguous() -> None:
+    # h.shared is a real heading in t.first and *also* the id of a heading-shaped
+    # paragraph buried in a table cell in t.second. The table occurrence is
+    # already excluded on its own (test_heading_inside_a_table_cell_is_excluded)
+    # — this proves exclusion happens *before* ambiguity detection, not after,
+    # so the real heading in t.first still resolves instead of being dropped.
+    table_content = [
+        {
+            "table": {
+                "tableRows": [
+                    {
+                        "tableCells": [
+                            {"content": [_heading_paragraph("h.shared")]},
+                        ]
+                    }
+                ]
+            }
+        }
+    ]
+    doc = {
+        "tabs": [
+            _tab_with_content("t.first", "Overview", [_heading_paragraph("h.shared")]),
+            _tab_with_content("t.second", "Details", table_content),
+        ]
+    }
+    assert heading_ids_by_tab(doc) == {"h.shared": "t.first"}
+
+
 def test_is_pure_and_does_not_mutate_the_input_document() -> None:
     doc = {
         "tabs": [

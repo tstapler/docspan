@@ -220,6 +220,34 @@ class TestWriteDirection:
     def test_unresolvable_anchor_is_never_downgraded_to_a_url(self) -> None:
         assert link_payload("#nope", {"intro": "h.abc"}) is None
 
+    def test_same_tab_resolution_wins_over_an_identical_id_in_a_foreign_tab(
+        self,
+    ) -> None:
+        # h.dup is resolvable in this tab (known_ids) *and* claimed by a sibling
+        # tab in foreign_ids. Same-tab must win outright — callers pre-filter
+        # foreign_ids to drop ids known_ids already owns, but link_payload must
+        # not depend on that filtering to get this right on its own.
+        assert link_payload(
+            "#h.dup",
+            {},
+            known_ids={"h.dup"},
+            foreign_ids={"h.dup": "t.other"},
+        ) == {"headingId": "h.dup"}
+
+    def test_a_percent_encoded_anchor_resolves_through_the_foreign_ids_fallback(
+        self,
+    ) -> None:
+        # The same decode-before-lookup behaviour same-tab resolution already
+        # has must also apply on the foreign_ids path, not just the flat
+        # headingId one. slug_to_id/known_ids are deliberately empty so this
+        # can only pass via the foreign_ids branch — a same-tab match here
+        # would prove nothing about that branch's decoding.
+        assert link_payload(
+            "#caf%C3%A9-notes",
+            {},
+            foreign_ids={"café-notes": "t.other"},
+        ) == {"heading": {"id": "café-notes", "tabId": "t.other"}}
+
     def test_pass_two_writes_a_heading_id_link_for_an_anchor(self) -> None:
         doc = _doc(
             _paragraph("Intro", 1, "HEADING_1", "h.intro"),
