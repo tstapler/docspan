@@ -642,6 +642,144 @@ class TestPushReporting:
         assert {"headingId": "h.current"} in links, links
 
 
+class TestCrossTabAnchors:
+    """Push-side resolution of an anchor into a *sibling* tab's heading.
+
+    `resolve_document_tab` narrows to one tab before anything is parsed, so
+    without `heading_ids_by_tab(whole_doc)` these anchors have no target in
+    the tab-scoped `known_ids` and were reported dead forever, even though the
+    Docs API's tabs-aware `Link.heading={id,tabId}` can express exactly this.
+    """
+
+    def _local(self, tmp_path, text: str) -> str:
+        path = tmp_path / "doc.md"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def _multi_tab_doc(self) -> dict:
+        return {
+            "revisionId": "rev-1",
+            "tabs": [
+                {
+                    "tabProperties": {"tabId": "t.cur", "title": "Current"},
+                    "documentTab": {
+                        "body": {
+                            "content": [
+                                _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+                                _paragraph("see it", 16, runs=[
+                                    {"textRun": {"content": "see it\n", "textStyle": {}}}
+                                ]),
+                            ]
+                        },
+                        "lists": {},
+                    },
+                    "childTabs": [],
+                },
+                {
+                    "tabProperties": {"tabId": "t.other", "title": "Other"},
+                    "documentTab": {
+                        "body": {
+                            "content": [
+                                _paragraph("Other heading", 1, "HEADING_2", "h.other"),
+                            ]
+                        },
+                        "lists": {},
+                    },
+                    "childTabs": [],
+                },
+            ],
+        }
+
+    def test_an_anchor_into_a_sibling_tab_writes_the_tabs_aware_heading_link(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = self._multi_tab_doc()
+        local = self._local(tmp_path, "## Current state\n\nsee [it](#h.other)\n")
+
+        result = backend.push(local, "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for call in fake_client.batch_update.call_args_list
+            for request in call.args[1]
+            if "updateTextStyle" in request
+            and "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert {"heading": {"id": "h.other", "tabId": "t.other"}} in links, links
+        assert "#h.other" not in (result.message or "")
+
+    def test_a_same_tab_anchor_still_emits_the_flat_heading_id_form(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        backend, fake_client = make_backend()
+        doc = self._multi_tab_doc()
+        # Add a second unstyled paragraph, already matching what the target
+        # markdown will render, so pass 1 has no structural edit to make and
+        # pass 2 runs against this same fetched doc (no second get_document).
+        doc["tabs"][0]["documentTab"]["body"]["content"].append(
+            _paragraph("see other it", 30, runs=[
+                {"textRun": {"content": "see other it\n", "textStyle": {}}}
+            ])
+        )
+        fake_client.get_document.return_value = doc
+        local = self._local(
+            tmp_path,
+            "## Current state\n\nsee [it](#current-state)\n\nsee other [it](#h.other)\n",
+        )
+
+        result = backend.push(local, "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for call in fake_client.batch_update.call_args_list
+            for request in call.args[1]
+            if "updateTextStyle" in request
+            and "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert {"headingId": "h.cur"} in links, links
+        assert {"heading": {"id": "h.other", "tabId": "t.other"}} in links, links
+
+    def test_a_heading_id_ambiguous_across_sibling_tabs_is_reported_dead_not_resolved(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        """An id present in more than one *other* tab must resolve to neither
+        — silently picking one would make the reader's landing spot depend on
+        tab ordering."""
+        backend, fake_client = make_backend()
+        doc = self._multi_tab_doc()
+        # A third tab whose heading shares "Other"'s id, so h.other is now
+        # ambiguous between two tabs neither of which is the current one.
+        doc["tabs"].append({
+            "tabProperties": {"tabId": "t.third", "title": "Third"},
+            "documentTab": {
+                "body": {"content": [_paragraph("Third heading", 1, "HEADING_2", "h.other")]},
+                "lists": {},
+            },
+            "childTabs": [],
+        })
+        fake_client.get_document.return_value = doc
+        local = self._local(tmp_path, "## Current state\n\nsee [it](#h.other)\n")
+
+        result = backend.push(local, "doc-1")
+
+        assert result.status == "warning", result.message
+        assert "#h.other" in result.message
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for call in fake_client.batch_update.call_args_list
+            for request in call.args[1]
+            if "updateTextStyle" in request
+            and "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert not any(
+            (isinstance(link.get("heading"), dict) and link["heading"].get("id") == "h.other")
+            for link in links
+        ), links
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Never a link to the WRONG heading
 #

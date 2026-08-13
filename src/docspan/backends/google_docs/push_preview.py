@@ -246,6 +246,12 @@ class PushPlan:
     # cannot carry it (today: a blank line inside a fenced code block). Unlike
     # `residue` this is author content that will NOT be written, so push reports it.
     target_residue: List[Residue] = field(default_factory=list)
+    # The full get_document() response, before tabs.resolve_document_tab narrows
+    # `doc` to one tab. Kept because a cross-tab anchor can only be resolved
+    # against every tab's headings, and narrowing throws the others away.
+    # _build_push_plan always sets it; only a plan built by hand leaves it empty,
+    # which costs cross-tab resolution and nothing else.
+    whole_doc: dict = field(default_factory=dict)
 
 
 @dataclass

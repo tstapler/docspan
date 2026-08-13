@@ -1,10 +1,13 @@
 """Unit tests for tabs.py — resolve_document_tab()/list_tabs() (no network)."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from docspan.backends.google_docs.tabs import (
     TabNotFoundError,
+    heading_ids_by_tab,
     list_tabs,
     resolve_document_tab,
 )
@@ -118,3 +121,102 @@ def test_list_tabs_returns_all_tabs_in_document_order() -> None:
     infos = list_tabs(MULTI_TAB_DOC)
     assert [i.tab_id for i in infos] == ["t.first", "t.second"]
     assert [i.title for i in infos] == ["Overview", "Details"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# heading_ids_by_tab
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _heading_paragraph(heading_id: str) -> dict:
+    return {"paragraph": {"paragraphStyle": {"headingId": heading_id}, "elements": []}}
+
+
+def _tab_with_content(tab_id: str, title: str, content: list, child_tabs: list | None = None) -> dict:
+    return {
+        "tabProperties": {"tabId": tab_id, "title": title},
+        "documentTab": {"body": {"content": content}, "lists": {}},
+        "childTabs": child_tabs or [],
+    }
+
+
+def test_no_tabs_key_returns_empty_map() -> None:
+    assert heading_ids_by_tab({"body": {"content": []}}) == {}
+
+
+def test_heading_in_a_sibling_tab_is_discoverable() -> None:
+    doc = {
+        "tabs": [
+            _tab_with_content("t.first", "Overview", [_heading_paragraph("h.a")]),
+            _tab_with_content("t.second", "Details", [_heading_paragraph("h.b")]),
+        ]
+    }
+    assert heading_ids_by_tab(doc) == {"h.a": "t.first", "h.b": "t.second"}
+
+
+def test_heading_id_present_in_more_than_one_tab_is_dropped_not_won() -> None:
+    doc = {
+        "tabs": [
+            _tab_with_content("t.first", "Overview", [_heading_paragraph("h.dup")]),
+            _tab_with_content("t.second", "Details", [_heading_paragraph("h.dup")]),
+        ]
+    }
+    assert heading_ids_by_tab(doc) == {}
+
+
+def test_duplicate_heading_id_is_dropped_regardless_of_tab_order() -> None:
+    forward = {
+        "tabs": [
+            _tab_with_content("t.a", "A", [_heading_paragraph("h.dup")]),
+            _tab_with_content("t.b", "B", [_heading_paragraph("h.dup")]),
+        ]
+    }
+    backward = {
+        "tabs": [
+            _tab_with_content("t.b", "B", [_heading_paragraph("h.dup")]),
+            _tab_with_content("t.a", "A", [_heading_paragraph("h.dup")]),
+        ]
+    }
+    assert heading_ids_by_tab(forward) == heading_ids_by_tab(backward) == {}
+
+
+def test_heading_in_a_nested_child_tab_is_discoverable() -> None:
+    doc = {
+        "tabs": [
+            _tab_with_content(
+                "t.parent",
+                "Parent",
+                [_heading_paragraph("h.parent")],
+                child_tabs=[_tab_with_content("t.child", "Child", [_heading_paragraph("h.child")])],
+            )
+        ]
+    }
+    assert heading_ids_by_tab(doc) == {"h.parent": "t.parent", "h.child": "t.child"}
+
+
+def test_heading_inside_a_table_cell_is_excluded() -> None:
+    table_content = [
+        {
+            "table": {
+                "tableRows": [
+                    {
+                        "tableCells": [
+                            {"content": [_heading_paragraph("h.in-cell")]},
+                        ]
+                    }
+                ]
+            }
+        }
+    ]
+    doc = {"tabs": [_tab_with_content("t.only", "Only", table_content)]}
+    assert heading_ids_by_tab(doc) == {}
+
+
+def test_is_pure_and_does_not_mutate_the_input_document() -> None:
+    doc = {
+        "tabs": [
+            _tab_with_content("t.first", "Overview", [_heading_paragraph("h.a")]),
+        ]
+    }
+    before = json.loads(json.dumps(doc))
+    heading_ids_by_tab(doc)
+    assert doc == before
