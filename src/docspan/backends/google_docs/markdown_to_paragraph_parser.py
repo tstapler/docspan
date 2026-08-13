@@ -6,6 +6,7 @@ import re
 from typing import List, Optional, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
     TableCell,
@@ -13,7 +14,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     _trim_spans_to_cell_text,
 )
 
-Node = Union[DocsParagraphNode, DocsTableNode]
+Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
 
 _HTML_ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
 _HTML_CELL_RE = re.compile(r"<(th|td)>(.*?)</\1>", re.S)
@@ -109,9 +110,34 @@ def _extract_text_from_token(token: dict) -> str:
 
 
 def _link_url(token: dict) -> str:
-    """Return the URL of a mistune link token across attr shapes."""
+    """Return the URL of a mistune link/image token across attr shapes."""
     attrs = token.get("attrs") or {}
     return attrs.get("url") or token.get("link") or ""
+
+
+def _image_only_token(children: List[dict]) -> Optional[dict]:
+    """Return the sole `image` token if `children` has no other meaningful content.
+
+    v1 scope: an image mixed into a paragraph alongside real running text
+    falls through to the plain-paragraph path (recursing into the image's
+    alt-text children as plain spans, losing `src`) rather than becoming a
+    `DocsImageNode` — see `DocsImageNode`'s docstring for why interleaved
+    image+text is out of scope.
+    """
+    image_tok: Optional[dict] = None
+    for tok in children or []:
+        ttype = tok.get("type")
+        if ttype == "image":
+            if image_tok is not None:
+                return None
+            image_tok = tok
+        elif ttype in ("text", "raw") and not tok.get("raw", "").strip():
+            continue
+        elif ttype in ("linebreak", "softbreak"):
+            continue
+        else:
+            return None
+    return image_tok
 
 
 def _spans_from_inline(
@@ -430,12 +456,20 @@ class MarkdownToParagraphParser:
                 ))
 
             elif token_type == "paragraph":
-                spans = _spans_from_inline(token.get("children", []))
-                nodes.append(DocsParagraphNode(
-                    style="NORMAL_TEXT", text=_text_of(spans).strip(),
-                    start_index=0, end_index=0,
-                    spans=spans if _has_styling(spans) else [],
-                ))
+                image_tok = _image_only_token(token.get("children", []))
+                if image_tok is not None:
+                    nodes.append(DocsImageNode(
+                        src=_link_url(image_tok),
+                        alt=_extract_text_from_token(image_tok),
+                        start_index=0, end_index=0,
+                    ))
+                else:
+                    spans = _spans_from_inline(token.get("children", []))
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=_text_of(spans).strip(),
+                        start_index=0, end_index=0,
+                        spans=spans if _has_styling(spans) else [],
+                    ))
 
             elif token_type == "list":
                 nodes.extend(_walk_list_items(token, nesting_level=0))

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, List, Literal, Optional, Set, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsStructureParser,
     DocsTableNode,
@@ -25,7 +26,7 @@ from docspan.backends.google_docs.heading_anchors import (
 )
 from docspan.backends.google_docs.projection import Residue, project
 
-Node = Union[DocsParagraphNode, DocsTableNode]
+Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
 
 # difflib's opcode tuple. Named because it is now threaded through three
 # functions (_opcodes, _repair, _coalesce) and `list` is invariant, so an
@@ -253,6 +254,8 @@ class DocsRequestBuilder:
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(self._cell_key(c) for c in row) for row in node.rows))
+        if isinstance(node, DocsImageNode):
+            return ("__image__", node.src, node.alt, node.width_pt, node.height_pt)
         return (
             "__para__",
             node.style,
@@ -335,6 +338,8 @@ class DocsRequestBuilder:
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(c.text for c in row) for row in node.rows))
+        if isinstance(node, DocsImageNode):
+            return ("__image__", node.src)
         return ("__para__", node.text)
 
     def _opcodes(
@@ -1450,6 +1455,8 @@ class DocsRequestBuilder:
         """
         if isinstance(node, DocsTableNode):
             return ("__table__",)
+        if isinstance(node, DocsImageNode):
+            return ("__image__", node.src)
         return ("__para__", node.text)
 
     def _align_for_styling(
@@ -1584,7 +1591,9 @@ class DocsRequestBuilder:
             for ci, ti in zip(range(i1, i2), range(j1, j2)):
                 cnode, tnode = current[ci], target[ti]
                 aligned_target_indices.add(ti)
-                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
+                if isinstance(cnode, (DocsTableNode, DocsImageNode)) or isinstance(
+                    tnode, (DocsTableNode, DocsImageNode)
+                ):
                     if isinstance(cnode, DocsTableNode) and isinstance(tnode, DocsTableNode):
                         table_pairs.append((table_ordinals[ci], tnode))
                     continue
@@ -1972,6 +1981,50 @@ class DocsRequestBuilder:
                 })
                 continue
 
+            if isinstance(node, DocsImageNode):
+                # An image is its own paragraph (v1 scope: never mixed with
+                # running text), built from two requests instead of one —
+                # insertInlineImage inserts only the image element (1 UTF-16
+                # unit), not a paragraph boundary, so the boundary newline
+                # is a separate insertText. Whichever of the two runs second
+                # must target insert_at_index + 1: the first already shifted
+                # the document by the 1 unit it inserted at insert_at_index.
+                image_body: dict = {"uri": node.src}
+                if node.width_pt and node.height_pt:
+                    image_body["objectSize"] = {
+                        "height": {"magnitude": node.height_pt, "unit": "PT"},
+                        "width": {"magnitude": node.width_pt, "unit": "PT"},
+                    }
+                is_bare_image = bare_last and node is nodes[-1]
+                if is_bare_image:
+                    requests.append({
+                        "insertInlineImage": {
+                            "location": {"index": insert_at_index},
+                            **image_body,
+                        }
+                    })
+                elif before_newline:
+                    requests.append({
+                        "insertText": {"location": {"index": insert_at_index}, "text": "\n"}
+                    })
+                    requests.append({
+                        "insertInlineImage": {
+                            "location": {"index": insert_at_index + 1},
+                            **image_body,
+                        }
+                    })
+                else:
+                    requests.append({
+                        "insertInlineImage": {
+                            "location": {"index": insert_at_index},
+                            **image_body,
+                        }
+                    })
+                    requests.append({
+                        "insertText": {"location": {"index": insert_at_index + 1}, "text": "\n"}
+                    })
+                continue
+
             is_bare = bare_last and node is nodes[-1]
             # The paragraph's own text always ends up as node.text + "\n",
             # except in bare mode, where the trailing "\n" already exists at
@@ -2125,7 +2178,10 @@ class DocsRequestBuilder:
         definition is what stops the preview and the write from disagreeing about
         whether anything is happening.
         """
-        if isinstance(current_node, DocsTableNode) or isinstance(target_node, DocsTableNode):
+        if (
+            isinstance(current_node, (DocsTableNode, DocsImageNode))
+            or isinstance(target_node, (DocsTableNode, DocsImageNode))
+        ):
             return False
         # Deliberately NOT nesting_level. CreateParagraphBulletsRequest derives
         # the level from leading tabs in the paragraph's *text*, not from any
@@ -2160,7 +2216,10 @@ class DocsRequestBuilder:
         Changing nesting is a text edit, and it stays a known gap rather than a
         no-op dressed up as a fix.
         """
-        if isinstance(current_node, DocsTableNode) or isinstance(target_node, DocsTableNode):
+        if (
+            isinstance(current_node, (DocsTableNode, DocsImageNode))
+            or isinstance(target_node, (DocsTableNode, DocsImageNode))
+        ):
             return []
 
         requests: List[dict] = []

@@ -190,6 +190,53 @@ class GoogleDocsClient:
             ).execute()
         )
 
+    def upload_temp_image(self, data: bytes, filename: str, mime_type: str) -> Dict[str, str]:
+        """Upload image bytes to Drive as a temp file, shared publicly for Docs to fetch.
+
+        `insertInlineImage`'s `uri` must be fetchable by Google's own servers
+        at insert time — a `drive.file`-scoped private upload isn't reachable
+        from there, hence the explicit `role="reader", type="anyone"` share
+        (the `drive` scope, already in PUSH_SCOPES, is what makes this call
+        itself permitted).
+
+        Returns:
+            dict: {"file_id": ..., "uri": ...} — `file_id` for later
+            `delete_temp_upload`, `uri` for the `insertInlineImage` request.
+        """
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
+        file = self._with_backoff(
+            lambda: self.drive_service.files().create(
+                body={"name": filename},
+                media_body=media,
+                fields="id",
+            ).execute()
+        )
+        file_id = file["id"]
+        self._with_backoff(
+            lambda: self.drive_service.permissions().create(
+                fileId=file_id,
+                body={"role": "reader", "type": "anyone"},
+            ).execute()
+        )
+        return {
+            "file_id": file_id,
+            "uri": f"https://drive.google.com/uc?export=view&id={file_id}",
+        }
+
+    def delete_temp_upload(self, file_id: str) -> None:
+        """Delete a temp Drive upload made by `upload_temp_image`.
+
+        Tolerates the file already being gone (a retried cleanup after a
+        partial failure) rather than raising on a 404.
+        """
+        try:
+            self._with_backoff(
+                lambda: self.drive_service.files().delete(fileId=file_id).execute()
+            )
+        except HttpError as e:
+            if e.resp.status != 404:
+                raise
+
     def list_comments(self, doc_id: str) -> List[dict]:
         """
         Return open (not resolved) comments on a Drive file, read-only.

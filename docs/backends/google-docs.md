@@ -55,7 +55,7 @@ mappings:
 
 !!! warning
     - **Comments destroyed on push for edited paragraphs**: The structural diff preserves comments on unchanged paragraphs, but any paragraph that is deleted and reinserted loses its comments. This is a known v0.1.0 limitation.
-    - **No image push support**: Local image files cannot be pushed. Images require publicly accessible URLs and additional Drive upload scope.
+    - **Images push and pull**: `![alt](./local.png)` uploads the local file to Drive and references it by URI; an `https://` URL is referenced directly, bypassing upload. Only a standalone image on its own line is supported — one mixed into a paragraph alongside running text is left as plain text. Missing files, files over 50MB, and unsupported formats (SVG) are reported as push warnings rather than blocking the write or crashing.
     - **Table cells hold one paragraph**: a markdown table cell is pushed as a single
       paragraph, and inline formatting inside it (bold, monospace, links, internal
       `#anchor` references) is applied on the second pass. Two limits follow: a cell

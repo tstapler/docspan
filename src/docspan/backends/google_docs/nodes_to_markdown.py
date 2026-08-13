@@ -28,13 +28,14 @@ from __future__ import annotations
 from typing import List, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
     TableCell,
     TextSpan,
 )
 
-Node = Union[DocsParagraphNode, DocsTableNode]
+Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
 
 # The literal marker MarkdownToParagraphParser writes ahead of a fenced
 # block's lines to carry the language (mistune's token.attrs.info) through
@@ -418,6 +419,11 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
         node = group[1]
         if isinstance(node, DocsTableNode):
             lines.append(_render_table(node))
+            lines.append("")
+            continue
+
+        if isinstance(node, DocsImageNode):
+            lines.append(f"![{node.alt}]({node.src})")
             lines.append("")
             continue
 

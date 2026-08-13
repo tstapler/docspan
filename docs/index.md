@@ -57,7 +57,8 @@ See the [Install](install.md) page for full auth setup instructions and the [Com
 
 !!! warning "Known limitations in v0.1.0"
     - Google Docs: comments on edited paragraphs are lost on push (paragraph-level structural diff; comments on unchanged paragraphs are preserved)
-    - Push: no image support — local images cannot be pushed to Google Docs or Confluence
+    - Google Docs: images push and pull (local files upload to Drive; `https://` URLs are referenced directly)
+    - Push: no image support for Confluence — local images cannot be pushed
     - Push: no table support — markdown tables are not rendered in Google Docs
     - Confluence: requires an Atlassian API token; no OAuth flow
     - Confluence: the comment sidecar (`{file}.comments.md`) is informational only; comments cannot be pushed back

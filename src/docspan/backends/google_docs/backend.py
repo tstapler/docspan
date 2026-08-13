@@ -28,6 +28,7 @@ from docspan.backends.google_docs.comments import (
 from docspan.backends.google_docs.converter import DocumentConverter
 from docspan.backends.google_docs.docs_request_builder import DiffTooExpensive, DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsStructureParser,
     DocsTableNode,
@@ -38,6 +39,7 @@ from docspan.backends.google_docs.heading_anchors import (
     unresolved_anchors,
     upgrade_heading_id_anchors,
 )
+from docspan.backends.google_docs.image_source import resolve_document_images
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
@@ -137,6 +139,26 @@ class GoogleDocsBackend(Backend):
         content = pathlib.Path(local_path).read_text()
 
         target_nodes = MarkdownToParagraphParser().parse(content)
+
+        # Local images must be uploaded to Drive (and unresolved ones dropped
+        # with a warning) before the diff/build below ever sees them --
+        # DocsRequestBuilder emits insertInlineImage from node.src verbatim,
+        # so a bare relative markdown path reaching it would produce a
+        # request the Docs API rejects.
+        image_nodes = [n for n in target_nodes if isinstance(n, DocsImageNode)]
+        image_warnings: list[str] = []
+        temp_drive_file_ids: list[str] = []
+        if image_nodes:
+            resolved_images, image_warnings, temp_drive_file_ids = resolve_document_images(
+                image_nodes, local_path, self._client.upload_temp_image
+            )
+            resolved_iter = iter(resolved_images)
+            target_nodes = [
+                next(resolved_iter) if isinstance(n, DocsImageNode) else n
+                for n in target_nodes
+            ]
+            target_nodes = [n for n in target_nodes if n is not None]
+
         doc = self._client.get_document(doc_id)
         doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
         current_nodes = DocsStructureParser().parse(doc)
@@ -190,6 +212,8 @@ class GoogleDocsBackend(Backend):
             tab_warning=tab_warning,
             resolved_tab_id=resolved_tab_id,
             residue=current_residue,
+            temp_drive_file_ids=temp_drive_file_ids,
+            image_warnings=image_warnings,
         )
 
     def preview_push(
@@ -283,6 +307,7 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         assert self._client is not None
+        plan: Optional[PushPlan] = None
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
@@ -291,6 +316,7 @@ class GoogleDocsBackend(Backend):
                     status="blocked",
                     doc_id=doc_id,
                     message=render_high_risk(plan.high_risk),
+                    retryable_temp_drive_file_ids=plan.temp_drive_file_ids,
                 )
 
             if plan.requests:
@@ -411,16 +437,26 @@ class GoogleDocsBackend(Backend):
                 # is not a failure — it is state markdown does not describe, and
                 # the document is as close to the local file as markdown can
                 # express.
+                for file_id in plan.temp_drive_file_ids:
+                    self._client.delete_temp_upload(file_id)
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
                     message=(f"⚠ {plan.tab_warning}" if plan.tab_warning else None)
                     or describe_residue(plan.residue)
                     or describe_residue(pass2_residue)
+                    or ("\n".join(plan.image_warnings) if plan.image_warnings else None)
                     or "No changes detected",
                 )
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
+
+            # The write(s) succeeded, so any Drive files uploaded for images in
+            # this push are now referenced by the document -- nothing left to
+            # retry, so they're cleaned up rather than left as orphaned temp
+            # files (criterion 5/7).
+            for file_id in plan.temp_drive_file_ids:
+                self._client.delete_temp_upload(file_id)
 
             # Every warning signal is collected, not raced. Returning on the
             # first one meant whichever fired earliest hid the rest: a single
@@ -463,6 +499,14 @@ class GoogleDocsBackend(Backend):
                     # `plan.residue` cannot see, since it comes from a parse
                     # `_build_push_plan` never runs.
                     describe_residue(pass2_residue) or None,
+                    # Per-image resolution failures (missing file, oversized,
+                    # unsupported format) from the pre-pass in
+                    # _build_push_plan -- the image node was dropped from the
+                    # write rather than crashing the whole push, so this is
+                    # the only place that failure is visible.
+                    ("\n".join(f"⚠ {w}" for w in plan.image_warnings))
+                    if plan.image_warnings
+                    else None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation
@@ -478,21 +522,41 @@ class GoogleDocsBackend(Backend):
                 )
             return PushResult(status="ok", doc_id=doc_id, url=url)
         except TabNotFoundError as exc:
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=str(exc),
+                retryable_temp_drive_file_ids=plan.temp_drive_file_ids if plan else [],
+            )
         except HttpError as exc:
+            retryable = plan.temp_drive_file_ids if plan else []
             if exc.resp.status == 400 and "requiredRevisionId" in str(exc):
                 return PushResult(
                     status="conflict",
                     doc_id=doc_id,
                     message="The doc changed since your last pull — run `docspan pull` again",
+                    retryable_temp_drive_file_ids=retryable,
                 )
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error", doc_id=doc_id, message=str(exc),
+                retryable_temp_drive_file_ids=retryable,
+            )
         except DiffTooExpensive as exc:
             # A clear, actionable error rather than a multi-minute hang or an
             # uncaught traceback — see DiffTooExpensive's docstring.
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=str(exc),
+                retryable_temp_drive_file_ids=plan.temp_drive_file_ids if plan else [],
+            )
         except Exception as exc:
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=str(exc),
+                retryable_temp_drive_file_ids=plan.temp_drive_file_ids if plan else [],
+            )
 
     @staticmethod
     def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:
