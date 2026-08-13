@@ -232,12 +232,16 @@ def test_confluence_validate_config_passes_via_env_vars(monkeypatch) -> None:  #
     ConfluenceBackend(ConfluenceConfig()).validate_config()  # must not raise
 
 
-def test_google_docs_validate_config_raises_without_credentials(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_google_docs_validate_config_raises_without_credentials(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.delenv("ACCOUNT_A_CREDENTIALS_PATH", raising=False)
     monkeypatch.delenv("ACCOUNT_A_CREDENTIALS", raising=False)
 
     from docspan.backends.google_docs.backend import GoogleDocsBackend
-    backend = GoogleDocsBackend(GoogleDocsConfig())
+    # Isolate from a real cached OAuth token that may exist at the default
+    # XDG path on the machine running the tests (_has_any_credentials()
+    # checks that file's existence, not just env vars).
+    cfg = GoogleDocsConfig(token_path=str(tmp_path / "no_such_token.json"))
+    backend = GoogleDocsBackend(cfg)
     with pytest.raises(ValueError, match="Missing Google Docs credentials"):
         backend.validate_config()
 

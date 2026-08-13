@@ -252,6 +252,13 @@ class PushPlan:
     # _build_push_plan always sets it; only a plan built by hand leaves it empty,
     # which costs cross-tab resolution and nothing else.
     whole_doc: dict = field(default_factory=dict)
+    # Drive file ids for images this plan already uploaded (image_source.py's
+    # resolve_document_images), so push() can delete them on success or
+    # surface them as PushResult.retryable_temp_drive_file_ids on failure.
+    temp_drive_file_ids: List[str] = field(default_factory=list)
+    # Per-image resolution failures (missing file, oversized, unsupported
+    # format) -- reported the same way target_residue is, never a crash.
+    image_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass

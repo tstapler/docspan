@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from googleapiclient.errors import HttpError
 
@@ -29,6 +30,7 @@ from docspan.backends.google_docs.comments import (
 from docspan.backends.google_docs.converter import DocumentConverter
 from docspan.backends.google_docs.docs_request_builder import DiffTooExpensive, DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsStructureParser,
     DocsTableNode,
@@ -39,6 +41,7 @@ from docspan.backends.google_docs.heading_anchors import (
     unresolved_anchors,
     upgrade_heading_id_anchors,
 )
+from docspan.backends.google_docs.image_source import resolve_document_images
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
@@ -71,6 +74,8 @@ from docspan.core.paths import COMMENTS_SUFFIX
 
 if TYPE_CHECKING:
     from docspan.config import GoogleDocsConfig, MarkgateConfig
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleDocsBackend(Backend):
@@ -116,6 +121,54 @@ class GoogleDocsBackend(Backend):
             "Run: docspan auth setup google_docs"
         )
 
+    def _cleanup_temp_uploads(self, file_ids: List[str]) -> List[str]:
+        """Best-effort delete of temp Drive uploads; returns ids that could not be deleted.
+
+        Called from push()'s error paths so `retryable_temp_drive_file_ids`
+        actually reflects files still orphaned on Drive, rather than the
+        full upload list regardless of whether cleanup was ever attempted.
+        """
+        assert self._client is not None
+        still_orphaned = []
+        for file_id in file_ids:
+            try:
+                self._client.delete_temp_upload(file_id)
+            except Exception:
+                still_orphaned.append(file_id)
+        return still_orphaned
+
+    def _cleanup_temp_uploads_logged(self, file_ids: List[str]) -> List[str]:
+        """Same as `_cleanup_temp_uploads`, but logs when cleanup fails.
+
+        The four exception-handling paths in push() surface a cleanup
+        failure via `PushResult.retryable_temp_drive_file_ids` — the
+        caller sees it. The success/skipped paths used to discard the
+        return value entirely, so a cleanup failure there was completely
+        silent: no log, no signal, and the temp file stayed public on
+        Drive indefinitely. This wraps the same best-effort cleanup with a
+        warning log so that invisibility doesn't depend on which push
+        outcome triggered it.
+        """
+        still_orphaned = self._cleanup_temp_uploads(file_ids)
+        if still_orphaned:
+            logger.warning(
+                "Failed to delete %d temp Drive upload(s) after push; "
+                "still public and orphaned: %s",
+                len(still_orphaned),
+                still_orphaned,
+            )
+        return still_orphaned
+
+    def _cleanup_plan_temp_uploads(self, plan: Optional[PushPlan]) -> List[str]:
+        """`_cleanup_temp_uploads_logged`, tolerating a plan that never got built.
+
+        Every exception path in push() reaches its cleanup call with `plan`
+        possibly still None (the exception fired before `_build_push_plan`
+        returned) — this is the one line each of those four `except`
+        clauses would otherwise duplicate.
+        """
+        return self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids if plan else [])
+
     def _build_push_plan(
         self, local_path: str, doc_id: str, tab_id: Optional[str] = None
     ) -> PushPlan:
@@ -142,45 +195,90 @@ class GoogleDocsBackend(Backend):
         content = pathlib.Path(local_path).read_text()
 
         target_nodes = MarkdownToParagraphParser().parse(content)
-        whole_doc = self._client.get_document(doc_id)
-        doc, resolved_tab_id, tab_warning = resolve_document_tab(whole_doc, tab_id)
-        current_nodes = DocsStructureParser().parse(doc)
 
-        # Both sides of the diff pass through the same projection, so the diff
-        # only ever sees what markdown can faithfully represent. Without this,
-        # an empty paragraph in the document has no counterpart on the markdown
-        # side (blank lines are separators, so the parser never emits one) and
-        # the diff read that asymmetry as "the user deleted this" — issue #17.
-        # See projection.project for the rule and the trade it makes.
-        current_nodes, current_residue = project(current_nodes)
-        # Projecting the target is NOT a no-op any more. This comment used to say
-        # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
-        # nothing on this side to drop" — splitting fenced code blocks per line
-        # falsified that: a blank line inside a block, an empty fence and a
-        # blank-only fence all produce `text=""`.
-        #
-        # So this drops author content — not the #17 trade, which *preserves* a
-        # blank paragraph the Doc already has. A blank code line exists only in the
-        # markdown and is never written.
-        #
-        # Reported rather than fixed, deliberately. Writing it needs projection to
-        # tell a blank *code* line (content) from a stray empty *prose* paragraph
-        # (not content), and the node model cannot express that distinction — a
-        # design change, not a patch. Until then the author is told, which is the
-        # difference between a known limitation and silent data loss.
-        target_nodes, target_residue = project(target_nodes)
+        # Local images must be uploaded to Drive (and unresolved ones dropped
+        # with a warning) before the diff/build below ever sees them --
+        # DocsRequestBuilder emits insertInlineImage from node.src verbatim,
+        # so a bare relative markdown path reaching it would produce a
+        # request the Docs API rejects.
+        image_nodes = [n for n in target_nodes if isinstance(n, DocsImageNode)]
+        image_warnings: list[str] = []
+        temp_drive_file_ids: list[str] = []
+        if image_nodes:
+            resolved_images, image_warnings, temp_drive_file_ids = resolve_document_images(
+                image_nodes, local_path, self._client.upload_temp_image
+            )
+            # A failed resolution (renamed/unreadable/oversized file, a
+            # transient upload error) must NOT drop the node from
+            # target_nodes: DocsRequestBuilder.build() treats "present in
+            # current, absent in target" as a delete, so dropping it here
+            # would silently delete a previously-synced image from the live
+            # doc on the very push that failed to re-resolve it. Substitute
+            # the original (unresolved) DocsImageNode instead — its
+            # alt/width_pt/height_pt are untouched, which is exactly the
+            # identity _node_key/_content_key use for images (src is
+            # deliberately excluded from both, see their docstrings), so the
+            # diff sees "same image, no change" rather than "removed".
+            substituted_images = [
+                resolved if resolved is not None else original
+                for resolved, original in zip(resolved_images, image_nodes)
+            ]
+            subst_iter = iter(substituted_images)
+            target_nodes = [
+                next(subst_iter) if isinstance(n, DocsImageNode) else n
+                for n in target_nodes
+            ]
 
-        body_content = doc.get("body", {}).get("content", [])
-        doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
+        try:
+            whole_doc = self._client.get_document(doc_id)
+            doc, resolved_tab_id, tab_warning = resolve_document_tab(whole_doc, tab_id)
+            current_nodes = DocsStructureParser().parse(doc)
 
-        request_builder = DocsRequestBuilder()
-        requests = request_builder.build(
-            current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
-        )
-        entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
+            # Both sides of the diff pass through the same projection, so the diff
+            # only ever sees what markdown can faithfully represent. Without this,
+            # an empty paragraph in the document has no counterpart on the markdown
+            # side (blank lines are separators, so the parser never emits one) and
+            # the diff read that asymmetry as "the user deleted this" — issue #17.
+            # See projection.project for the rule and the trade it makes.
+            current_nodes, current_residue = project(current_nodes)
+            # Projecting the target is NOT a no-op any more. This comment used to say
+            # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
+            # nothing on this side to drop" — splitting fenced code blocks per line
+            # falsified that: a blank line inside a block, an empty fence and a
+            # blank-only fence all produce `text=""`.
+            #
+            # So this drops author content — not the #17 trade, which *preserves* a
+            # blank paragraph the Doc already has. A blank code line exists only in the
+            # markdown and is never written.
+            #
+            # Reported rather than fixed, deliberately. Writing it needs projection to
+            # tell a blank *code* line (content) from a stray empty *prose* paragraph
+            # (not content), and the node model cannot express that distinction — a
+            # design change, not a patch. Until then the author is told, which is the
+            # difference between a known limitation and silent data loss.
+            target_nodes, target_residue = project(target_nodes)
 
-        comments = self._client.list_comments(doc_id)
-        high_risk = find_high_risk_paragraphs(entries, comments)
+            body_content = doc.get("body", {}).get("content", [])
+            doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
+
+            request_builder = DocsRequestBuilder()
+            requests = request_builder.build(
+                current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
+            )
+            entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
+
+            comments = self._client.list_comments(doc_id)
+            high_risk = find_high_risk_paragraphs(entries, comments)
+        except Exception:
+            # Images (if any) were already uploaded to Drive above -- anything
+            # that fails from here on must not leave them orphaned. Best-effort:
+            # a cleanup failure must not mask the original exception.
+            for file_id in temp_drive_file_ids:
+                try:
+                    self._client.delete_temp_upload(file_id)
+                except Exception:
+                    pass
+            raise
 
         return PushPlan(
             current_nodes=current_nodes,
@@ -196,6 +294,8 @@ class GoogleDocsBackend(Backend):
             resolved_tab_id=resolved_tab_id,
             residue=current_residue,
             whole_doc=whole_doc,
+            temp_drive_file_ids=temp_drive_file_ids,
+            image_warnings=image_warnings,
         )
 
     def preview_push(
@@ -239,6 +339,13 @@ class GoogleDocsBackend(Backend):
             )
             target_residue_note = describe_target_residue(plan.target_residue)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
+            # --dry-run never inserts anything, so any image just uploaded to
+            # build this preview must be deleted now -- PushPreview has no
+            # field to carry temp_drive_file_ids forward for a later cleanup.
+            # Routed through the same best-effort helper push() uses, so a
+            # cleanup failure never turns a successful preview into a
+            # reported error.
+            self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids)
         except HttpError as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
@@ -294,6 +401,7 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         assert self._client is not None
+        plan: Optional[PushPlan] = None
         mappings = kwargs.get("mappings")
         cross_doc_cache = kwargs.get("cross_doc_cache")
         resolver: Optional[cross_doc_links.CrossDocLinkResolver] = None
@@ -312,10 +420,16 @@ class GoogleDocsBackend(Backend):
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
             if plan.requests and plan.high_risk and not force:
+                # A blocked push is not going to be auto-retried, so cleanup
+                # is unconditional and best-effort here, same as the
+                # skipped/success paths below -- not "retryable" reporting.
                 return PushResult(
                     status="blocked",
                     doc_id=doc_id,
                     message=render_high_risk(plan.high_risk),
+                    retryable_temp_drive_file_ids=self._cleanup_temp_uploads_logged(
+                        plan.temp_drive_file_ids
+                    ),
                 )
 
             if plan.requests:
@@ -470,16 +584,30 @@ class GoogleDocsBackend(Backend):
                 # is not a failure — it is state markdown does not describe, and
                 # the document is as close to the local file as markdown can
                 # express.
+                skipped_retryable = self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids)
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
                     message=(f"⚠ {plan.tab_warning}" if plan.tab_warning else None)
                     or describe_residue(plan.residue)
                     or describe_residue(pass2_residue)
+                    or ("\n".join(plan.image_warnings) if plan.image_warnings else None)
                     or "No changes detected",
+                    retryable_temp_drive_file_ids=skipped_retryable,
                 )
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
+
+            # The write(s) succeeded, so any Drive files uploaded for images in
+            # this push are now referenced by the document -- nothing left to
+            # retry, so they're cleaned up rather than left as orphaned temp
+            # files (criterion 5/7). Best-effort: a transient delete failure
+            # here must not turn a successful push into a reported error, but
+            # it must not be silent either -- _cleanup_temp_uploads_logged logs
+            # a warning and its return value is threaded into both PushResults
+            # below so a failure here is visible the same way it is on every
+            # exception path.
+            success_retryable = self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids)
 
             # Every warning signal is collected, not raced. Returning on the
             # first one meant whichever fired earliest hid the rest: a single
@@ -525,6 +653,14 @@ class GoogleDocsBackend(Backend):
                     # `plan.residue` cannot see, since it comes from a parse
                     # `_build_push_plan` never runs.
                     describe_residue(pass2_residue) or None,
+                    # Per-image resolution failures (missing file, oversized,
+                    # unsupported format) from the pre-pass in
+                    # _build_push_plan -- the image node was dropped from the
+                    # write rather than crashing the whole push, so this is
+                    # the only place that failure is visible.
+                    ("\n".join(f"⚠ {w}" for w in plan.image_warnings))
+                    if plan.image_warnings
+                    else None,
                     # ⚠-prefixed here as well. Every other collected message
                     # carries one, and PushPreview.render() adds one to this same
                     # string — without it the tab warning read as a continuation
@@ -536,25 +672,54 @@ class GoogleDocsBackend(Backend):
             ]
             if messages:
                 return PushResult(
-                    status="warning", doc_id=doc_id, url=url, message="\n".join(messages)
+                    status="warning",
+                    doc_id=doc_id,
+                    url=url,
+                    message="\n".join(messages),
+                    retryable_temp_drive_file_ids=success_retryable,
                 )
-            return PushResult(status="ok", doc_id=doc_id, url=url)
+            return PushResult(
+                status="ok",
+                doc_id=doc_id,
+                url=url,
+                retryable_temp_drive_file_ids=success_retryable,
+            )
         except TabNotFoundError as exc:
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=str(exc),
+                retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
+            )
         except HttpError as exc:
+            retryable = self._cleanup_plan_temp_uploads(plan)
             if exc.resp.status == 400 and "requiredRevisionId" in str(exc):
                 return PushResult(
                     status="conflict",
                     doc_id=doc_id,
                     message="The doc changed since your last pull — run `docspan pull` again",
+                    retryable_temp_drive_file_ids=retryable,
                 )
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error", doc_id=doc_id, message=str(exc),
+                retryable_temp_drive_file_ids=retryable,
+            )
         except DiffTooExpensive as exc:
             # A clear, actionable error rather than a multi-minute hang or an
             # uncaught traceback — see DiffTooExpensive's docstring.
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=str(exc),
+                retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
+            )
         except Exception as exc:
-            return PushResult(status="error", doc_id=doc_id, message=str(exc))
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=str(exc),
+                retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
+            )
 
     @staticmethod
     def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:

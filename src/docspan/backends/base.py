@@ -2,9 +2,9 @@
 
 import inspect
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 
 class SyncDirection(str, Enum):
@@ -29,6 +29,10 @@ class PushResult:
     doc_id: str
     message: Optional[str] = None
     url: Optional[str] = None
+    # Drive file ids for images uploaded as part of this push but not yet
+    # deleted -- populated only when push failed after upload, so a retry
+    # can clean them up or reuse them instead of leaking orphaned files.
+    retryable_temp_drive_file_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
