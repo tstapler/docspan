@@ -650,3 +650,24 @@ class TestRendering:
         assert [c.text for c in markdown.parse(
             rendered + "\n| --- | --- |\n"
         )[0].rows[0]] == ["a|b", "c"]
+
+    def test_a_cell_monospace_span_with_a_backtick_escapes_via_a_longer_fence(self) -> None:
+        """issue #44: a cell's monospace span goes through the same `_render_cell`
+        (-> `_render_spans`) path as a paragraph, so the fence-escaping fix applies
+        here with no separate code change."""
+        cell = TableCell(text="A=`date`", spans=[TextSpan(text="A=`date`", monospace=True)])
+        node = DocsTableNode(rows=[[cell, TableCell(text="y")]])
+        rendered = render_nodes_to_markdown([node])
+        assert rendered.splitlines()[0] == "| `` A=`date` `` | y |"
+
+        parsed = [n for n in markdown.parse(rendered) if isinstance(n, DocsTableNode)]
+        assert len(parsed) == 1
+        assert [c.text for c in parsed[0].rows[0]] == ["A=`date`", "y"]
+
+    def test_a_cell_monospace_span_with_backtick_and_pipe_escapes_both(self) -> None:
+        """Fence-escaping runs before pipe-escaping, so the fence's own backticks
+        are never mistaken for row-splitting pipes and the `|` is still escaped."""
+        cell = TableCell(text="a`b|c", spans=[TextSpan(text="a`b|c", monospace=True)])
+        node = DocsTableNode(rows=[[cell, TableCell(text="y")]])
+        rendered = render_nodes_to_markdown([node])
+        assert rendered.splitlines()[0] == r"| ``a`b\|c`` | y |"

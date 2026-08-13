@@ -11,6 +11,8 @@ import urllib.parse
 
 from markdownify import MarkdownConverter, chomp
 
+from docspan.backends.google_docs.nodes_to_markdown import _wrap_inline_code
+
 logger = logging.getLogger(__name__)
 
 # Increase recursion limit for deeply nested lists
@@ -61,7 +63,7 @@ class _GoogleDocsMarkdownConverter(MarkdownConverter):
         is_italic = 'font-style:italic' in style.replace(' ', '')
         is_monospace = bool(_FONT_FAMILY_RE.search(style))
         if is_monospace:
-            text = f'`{text}`'
+            text = _wrap_inline_code(text)
         if is_bold:
             text = f'**{text}**'
         if is_italic:

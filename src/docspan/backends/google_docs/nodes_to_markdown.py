@@ -75,7 +75,13 @@ def _wrap_inline_code(text: str) -> str:
     with a backtick (or starts and ends with a space around non-space
     content), a single space is added inside the delimiters so the content
     doesn't fuse with them.
+
+    Empty text is left unwrapped: a 1-backtick fence around no content is
+    two adjacent backticks, which CommonMark parses as literal text, not an
+    empty code span — wrapping would silently produce that ambiguous output.
     """
+    if not text:
+        return text
     delim = "`" * (_run_of_backticks(text) + 1)
     needs_pad = text.startswith("`") or text.endswith("`")
     if not needs_pad and text[:1] == " " and text[-1:] == " " and text.strip():

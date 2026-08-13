@@ -28,6 +28,15 @@ def test_monospace_font_family_span_becomes_code_span() -> None:
     assert DocumentConverter.html_to_markdown(html) == "`code text`"
 
 
+def test_monospace_span_with_backtick_escapes_via_a_longer_fence() -> None:
+    # issue #44: the naive `f'`{text}`'` wrap on this (default, non-tab-scoped)
+    # pull path corrupted a monospace span whose own text contains a backtick.
+    # It must use the same CommonMark longer-fence/padding rule as the
+    # tab-scoped path's `_render_spans`.
+    html = '<p><span style="font-family:\'Courier New\'">A=`date`</span></p>'
+    assert DocumentConverter.html_to_markdown(html) == "`` A=`date` ``"
+
+
 def test_bold_and_italic_span_combine() -> None:
     html = '<p><span style="font-weight:700;font-style:italic">both</span></p>'
     assert DocumentConverter.html_to_markdown(html) == "***both***"
