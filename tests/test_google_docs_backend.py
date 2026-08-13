@@ -505,6 +505,80 @@ class TestPullTabId:
         assert result.message is None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Default (non-tab) path — checkbox round trip regression (AC4, issue #17).
+#
+# The tab-scoped path's zero-edit corruption came from DocsRequestBuilder's
+# diff key not accounting for the synthetic "[ ] " prefix that the
+# *structural* renderer (nodes_to_markdown.py) puts on a native checkbox
+# paragraph. The default path never goes through that renderer at all: it
+# exports via Drive's HTML API and DocumentConverter.html_to_markdown(),
+# which has no glyph/checkbox awareness whatsoever (verified: no "checkbox"
+# or bracket handling anywhere in converter.py) and renders any <li> — a
+# native checkbox item included — as a plain "- text" bullet with no
+# bracket marker. So the bug this ticket fixes cannot occur on this path;
+# this test locks that in as a regression guard.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _native_checkbox_doc(revision_id: str = "rev-default-checkbox") -> dict:
+    """A doc with one clean (uncorrupted) native BULLET_CHECKBOX paragraph —
+    text is just "Whatsapp group", with checkbox state carried only by the
+    bullet's glyph type, never as literal bracket text."""
+    return {
+        "revisionId": revision_id,
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 16,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "Whatsapp group\n"}}],
+                        "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                    },
+                }
+            ]
+        },
+        "lists": {
+            "kix.abc": {
+                "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+            }
+        },
+    }
+
+
+class TestDefaultPathCheckboxRoundTrip:
+    def test_pull_then_push_zero_edit_round_trip_is_a_noop_for_native_checkbox(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _native_checkbox_doc()
+        fake_client.list_comments.return_value = []
+        # Drive's HTML export for a native checkbox list item — no bracket
+        # marker, no checkbox-specific class the converter interprets.
+        fake_client.get_doc_content.return_value = (
+            '<ul class="c1 lst-kix_abc-0 start">'
+            '<li class="c2 li-bullet-0"><span>Whatsapp group</span></li>'
+            "</ul>"
+        )
+
+        local = tmp_path / "doc.md"
+        pull_result = backend.pull("doc-1", str(local))
+
+        assert pull_result.status == "ok"
+        pulled = local.read_text(encoding="utf-8")
+        assert pulled == "- Whatsapp group"
+        # The synthetic "[ ] " prefix that triggers the tab-scoped bug is
+        # never produced here — proving the two paths are structurally
+        # different, not just coincidentally passing today.
+        assert "[" not in pulled
+
+        push_result = backend.push(str(local), "doc-1")
+
+        assert push_result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
 class TestPushTabId:
     def test_push_with_tab_id_targets_that_tab_in_batch_update_requests(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
