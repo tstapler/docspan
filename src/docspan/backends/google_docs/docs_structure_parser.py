@@ -247,10 +247,32 @@ class DocsTableNode:
         return max((len(r) for r in self.rows), default=0)
 
 
+@dataclass
+class DocsImageNode:
+    """Represents a standalone (block-level) inline image in a Google Doc.
+
+    v1 scope only covers an image that is the sole content of its own
+    paragraph — not one interleaved with running text — mirroring
+    DocsTableNode's own paragraph-shaped footprint. `src` holds a URI: on the
+    push side, a resolved image URL (http(s):// or a temp Drive share link,
+    see image_source.py); on the pull side, the Docs API's `contentUri` for
+    the embeddedObject. `object_id` is the Docs `inlineObjectId`, present only
+    when parsed from a live document (pull) — never set on a node built from
+    markdown (push), since Docs assigns it on insert.
+    """
+    src: str = ""
+    alt: str = ""
+    start_index: int = 0
+    end_index: int = 0
+    object_id: Optional[str] = None
+    width_pt: Optional[float] = None
+    height_pt: Optional[float] = None
+
+
 class DocsStructureParser:
     """Parse a Google Docs document dict into a list of DocsParagraphNode."""
 
-    def parse(self, doc: dict) -> List[Union[DocsParagraphNode, DocsTableNode]]:
+    def parse(self, doc: dict) -> List[Union[DocsParagraphNode, DocsTableNode, DocsImageNode]]:
         """
         Parse a Google Docs document dict.
 
@@ -271,16 +293,22 @@ class DocsStructureParser:
             tab_doc = doc["tabs"][0].get("documentTab", doc)
             body = tab_doc.get("body", {})
             lists = tab_doc.get("lists", {})
+            inline_objects = tab_doc.get("inlineObjects", {})
         elif "body" in doc:
             body = doc["body"]
             lists = doc.get("lists", {})
+            inline_objects = doc.get("inlineObjects", {})
         else:
             raise KeyError("Document has neither 'tabs' nor 'body' key")
 
         content = body.get("content", [])
-        nodes: List[Union[DocsParagraphNode, DocsTableNode]] = []
+        nodes: List[Union[DocsParagraphNode, DocsTableNode, DocsImageNode]] = []
         for position, element in enumerate(content):
             if "paragraph" in element:
+                image_node = self._parse_image_paragraph(element, inline_objects)
+                if image_node is not None:
+                    nodes.append(image_node)
+                    continue
                 node = self._parse_paragraph(element, lists)
                 if node is None:
                     continue
@@ -298,7 +326,65 @@ class DocsStructureParser:
         return nodes
 
     @staticmethod
-    def _resolve_heading_links(nodes: List[Union[DocsParagraphNode, DocsTableNode]]) -> None:
+    def _parse_image_paragraph(
+        element: dict, inline_objects: dict
+    ) -> Optional[DocsImageNode]:
+        """Detect a paragraph whose only content is a single inline image.
+
+        Docs represents an inline image as an `inlineObjectElement` inside
+        `paragraph.elements`, never as its own top-level structural element
+        (unlike a table). v1 only recognizes an image that is the paragraph's
+        sole content — any other textRun with non-whitespace content means
+        this is an image interleaved with real text, out of v1 scope, and the
+        paragraph falls through to `_parse_paragraph` (where the image's
+        1-code-unit footprint is currently dropped from `.text`, a known,
+        pre-existing gap — see the off-by-one comment on `_cell_placement` in
+        docs_request_builder.py).
+        """
+        elements = element.get("paragraph", {}).get("elements", [])
+        image_element: Optional[dict] = None
+        for pe in elements:
+            inline_object_element = pe.get("inlineObjectElement")
+            if inline_object_element is not None:
+                if image_element is not None:
+                    return None  # more than one image in the paragraph: out of v1 scope
+                image_element = inline_object_element
+                continue
+            text_run = pe.get("textRun")
+            if text_run is not None:
+                if text_run.get("content", "").strip("\n"):
+                    return None  # real text alongside the image: out of v1 scope
+                continue
+            return None  # person chip, richLink, etc. alongside the image
+        if image_element is None:
+            return None
+
+        object_id = image_element.get("inlineObjectId")
+        embedded = (
+            inline_objects.get(object_id, {})
+            .get("inlineObjectProperties", {})
+            .get("embeddedObject", {})
+        )
+        src = embedded.get("contentUri") or embedded.get("imageProperties", {}).get(
+            "contentUri", ""
+        )
+        size = embedded.get("size", {})
+        width_pt = size.get("width", {}).get("magnitude")
+        height_pt = size.get("height", {}).get("magnitude")
+        return DocsImageNode(
+            src=src or "",
+            alt=embedded.get("description", "") or embedded.get("title", ""),
+            start_index=element.get("startIndex", 0),
+            end_index=element.get("endIndex", 0),
+            object_id=object_id,
+            width_pt=width_pt,
+            height_pt=height_pt,
+        )
+
+    @staticmethod
+    def _resolve_heading_links(
+        nodes: List[Union[DocsParagraphNode, DocsTableNode, DocsImageNode]],
+    ) -> None:
         """Rewrite `headingId` links into markdown anchors, in place.
 
         Runs after the whole body is parsed because a heading link can point

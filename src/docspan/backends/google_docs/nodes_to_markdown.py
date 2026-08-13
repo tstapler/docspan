@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import List, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
     TableCell,
@@ -35,7 +36,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
 )
 from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
 
-Node = Union[DocsParagraphNode, DocsTableNode]
+Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
 
 # The literal marker MarkdownToParagraphParser writes ahead of a fenced
 # block's lines to carry the language (mistune's token.attrs.info) through
@@ -258,6 +259,8 @@ def _dispatch_key(node: Node) -> str:
     """Synthesize a dispatch key — DocsParagraphNode/DocsTableNode carry no `.type` field."""
     if isinstance(node, DocsTableNode):
         return "table"
+    if isinstance(node, DocsImageNode):
+        return "image"
     if node.style.startswith("HEADING_"):
         return "heading"
     if node.is_list_item:
@@ -489,12 +492,20 @@ class ParagraphNodeRenderer(MarkdownNodeRenderer):
         return _escape_leading_fence(_node_text(node))
 
 
+class ImageNodeRenderer(MarkdownNodeRenderer):
+    node_key = "image"
+
+    def render(self, node: DocsImageNode) -> str:
+        return f"![{node.alt}]({node.src})"
+
+
 def _build_pull_registry() -> MarkdownRenderRegistry:
     registry = MarkdownRenderRegistry()
     registry.register("table", TableNodeRenderer())
     registry.register("heading", HeadingNodeRenderer())
     registry.register("list_item", ListItemNodeRenderer())
     registry.register("paragraph", ParagraphNodeRenderer())
+    registry.register("image", ImageNodeRenderer())
     return registry
 
 

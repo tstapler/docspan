@@ -24,6 +24,7 @@ from dataclasses import dataclass, replace
 from typing import Dict, List, Literal, Sequence, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
     _is_all_private_use,
@@ -33,7 +34,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
 # The same alias DocsRequestBuilder uses. Declared here rather than imported
 # from there so this module stays a leaf — the builder will eventually depend on
 # it, not the other way round.
-Node = Union[DocsParagraphNode, DocsTableNode]
+Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
 
 ResidueKind = Literal[
     "empty_paragraph", "paragraph_style", "private_use_glyph", "ambiguous_code_prefix"

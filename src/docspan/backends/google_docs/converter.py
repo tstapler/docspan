@@ -460,8 +460,9 @@ class DocumentConverter:
         Returns:
             str: Cleaned markdown
         """
-        # Remove empty links
-        markdown = re.sub(r'\[\]\(.*?\)', '', markdown)
+        # Remove empty links, but not an image's `![](...)` -- that `!` is
+        # meaningful markdown syntax, not a stray Google Docs empty hyperlink.
+        markdown = re.sub(r'(?<!!)\[\]\(.*?\)', '', markdown)
 
         # Clean up excessive spacing in lists
         markdown = re.sub(r'(\n-\s+)\n+', r'\1', markdown)

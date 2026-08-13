@@ -246,6 +246,13 @@ class PushPlan:
     # cannot carry it (today: a blank line inside a fenced code block). Unlike
     # `residue` this is author content that will NOT be written, so push reports it.
     target_residue: List[Residue] = field(default_factory=list)
+    # Drive file ids for images this plan already uploaded (image_source.py's
+    # resolve_document_images), so push() can delete them on success or
+    # surface them as PushResult.retryable_temp_drive_file_ids on failure.
+    temp_drive_file_ids: List[str] = field(default_factory=list)
+    # Per-image resolution failures (missing file, oversized, unsupported
+    # format) -- reported the same way target_residue is, never a crash.
+    image_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
