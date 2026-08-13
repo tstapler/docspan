@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional
 from googleapiclient.errors import HttpError
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
+from docspan.backends.google_docs import cross_doc_links
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
@@ -26,7 +27,6 @@ from docspan.backends.google_docs.comments import (
     parse_reply_directives,
 )
 from docspan.backends.google_docs.converter import DocumentConverter
-from docspan.backends.google_docs import cross_doc_links
 from docspan.backends.google_docs.docs_request_builder import DiffTooExpensive, DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -287,6 +287,9 @@ class GoogleDocsBackend(Backend):
         mappings = kwargs.get("mappings")
         resolver: Optional[cross_doc_links.CrossDocLinkResolver] = None
         if mappings:
+            assert isinstance(mappings, list), (
+                f"push() 'mappings' kwarg must be a list, got {type(mappings).__name__}"
+            )
             resolver = cross_doc_links.CrossDocLinkResolver(
                 mappings, self._fetch_target_headings
             )

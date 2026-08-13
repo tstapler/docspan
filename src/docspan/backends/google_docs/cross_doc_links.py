@@ -34,8 +34,10 @@ from urllib.parse import urlsplit
 
 from docspan.backends.google_docs.heading_anchors import (
     is_anchor,
-    link_payload as _same_doc_link_payload,
     resolve_anchor,
+)
+from docspan.backends.google_docs.heading_anchors import (
+    link_payload as _same_doc_link_payload,
 )
 
 if TYPE_CHECKING:
@@ -264,4 +266,6 @@ def link_payload(
             return None, resolution.detail
         # "not_cross_doc" falls through below.
 
+    if href is None:
+        return None, None
     return _same_doc_link_payload(href, slug_to_id, known_ids), None

@@ -582,8 +582,7 @@ def test_push_preview_render_still_shows_comment_at_risk_for_churned_paragraph()
         HighRiskParagraph(
             paragraph_text="Same paragraph",
             reasons=["comment"],
-            comment_quoted_text="Same paragraph",
-            comment_author="Nora Sullivan",
+            comments=[AtRiskComment(id="c1", quoted_text="Same paragraph", author="Nora Sullivan")],
         )
     ]
     preview = PushPreview(entries=[remove, add], unchanged_count=0, high_risk=high_risk, request_count=2)

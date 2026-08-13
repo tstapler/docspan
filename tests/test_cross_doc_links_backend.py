@@ -13,8 +13,6 @@ from __future__ import annotations
 from typing import Callable
 from unittest.mock import MagicMock
 
-import pytest
-
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.config import Mapping
 

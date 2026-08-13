@@ -15,10 +15,10 @@ from docspan.backends.google_docs.cross_doc_links import (
     AmbiguousMappingError,
     CrossDocHref,
     CrossDocLinkResolver,
+    link_payload,
     normalize_local_path,
     parse_cross_doc_href,
     resolve_local_mapping,
-    link_payload,
 )
 from docspan.config import Mapping
 
