@@ -2,10 +2,17 @@
 
 from dataclasses import replace
 
-from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+import pytest
+
+from docspan.backends.google_docs import docs_request_builder as docs_request_builder_module
+from docspan.backends.google_docs.docs_request_builder import (
+    DiffTooExpensive,
+    DocsRequestBuilder,
+)
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsTableNode,
+    TableCell,
     TextSpan,
 )
 
@@ -138,6 +145,168 @@ def test_requests_sorted_descending_by_start_index() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Same-anchor tie-break: insert vs. equal-restyle / delete / bullets (#42)
+#
+# When an insert group and a same-anchor equal-restyle/delete/bullet group tie
+# on start_index, the restyle/delete must be computed and emitted against the
+# ORIGINAL (pre-insert) coordinates and ordered before the insert — otherwise
+# the insert shifts those coordinates out from under it and the wrong
+# paragraph gets restyled/deleted/bulleted.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_insert_sharing_an_anchor_with_a_following_equal_restyle_targets_the_original_paragraph() -> None:
+    """A HEADING_2 paragraph followed by a NORMAL_TEXT paragraph; the target
+    inserts a new paragraph between them and promotes the second (original)
+    paragraph to HEADING_2. The insert's anchor (10, the end of "Heading")
+    coincides with the restyle's anchor (10, the start of "Body") — the
+    restyle must use the pre-insert range [10, 15) and run before the insert,
+    not restyle the newly-inserted paragraph."""
+    current = [
+        _para("Heading", style="HEADING_2", start=1, end=10),
+        _para("Body", style="NORMAL_TEXT", start=10, end=15),
+    ]
+    target = [
+        _para("Heading", style="HEADING_2", start=0, end=0),
+        _para("NewPara", style="NORMAL_TEXT", start=0, end=0),
+        _para("Body", style="HEADING_2", start=0, end=0),
+    ]
+    requests = builder.build(current, target, doc_end_index=15)
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    original_body_restyle = next(
+        r for r in style_requests if r["updateParagraphStyle"]["range"] == {"startIndex": 10, "endIndex": 15}
+    )
+    assert original_body_restyle["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+    assert requests.index(original_body_restyle) < insert_index
+
+    # The newly inserted paragraph must not be the one carrying the promotion.
+    assert not any(
+        r["updateParagraphStyle"]["range"] == {"startIndex": 10, "endIndex": 10}
+        for r in style_requests
+    )
+
+
+def test_insert_sharing_an_anchor_with_an_unrelated_delete_deletes_the_correct_paragraph() -> None:
+    """An insert opcode (anchored at the preceding kept paragraph's
+    end_index) and a later, unrelated delete opcode (anchored at the
+    deleted paragraph's own start_index) tie on anchor 10 — the delete's
+    node is positioned *after* the insert in traversal order, so the old
+    stable sort appended the insert to `groups` first. The delete must
+    still run first so it removes the original "Victim" paragraph rather
+    than colliding with content the insert has already shifted into
+    place."""
+    current = [
+        _para("Keep1", start=1, end=10),
+        _para("Filler", start=20, end=30),
+        _para("Victim", start=10, end=15),
+    ]
+    target = [
+        _para("Keep1", start=1, end=10),
+        _para("NewLine", start=0, end=0),
+        _para("Filler", start=20, end=30),
+    ]
+    requests = builder.build(current, target, doc_end_index=30)
+
+    delete_index = next(i for i, r in enumerate(requests) if "deleteContentRange" in r)
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    assert requests[delete_index]["deleteContentRange"]["range"] == {"startIndex": 10, "endIndex": 15}
+    assert delete_index < insert_index
+
+
+def test_doc_start_insert_colliding_with_restyle_of_original_first_paragraph() -> None:
+    """previous is None for the doc-start insert, so insert_at=1 — the same
+    value as the original first paragraph's start_index. The restyle of that
+    original paragraph must still target its own (pre-insert) range and run
+    before the insert."""
+    current = [_para("Body", style="NORMAL_TEXT", start=1, end=10)]
+    target = [
+        _para("NewFirst", style="NORMAL_TEXT", start=0, end=0),
+        _para("Body", style="HEADING_2", start=0, end=0),
+    ]
+    requests = builder.build(current, target, doc_end_index=10)
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    original_body_restyle = next(
+        r for r in style_requests if r["updateParagraphStyle"]["range"] == {"startIndex": 1, "endIndex": 10}
+    )
+    assert original_body_restyle["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] == "HEADING_2"
+    assert requests.index(original_body_restyle) < insert_index
+
+
+def test_replace_delete_before_insert_ordering_unchanged_by_sort_key_fix() -> None:
+    """Non-regression: the existing replace opcode's delete-before-insert
+    same-anchor ordering (already correct pre-fix) must be unchanged now that
+    the sort key is explicit rather than incidental."""
+    current = [_para("Old text", start=1, end=9)]
+    target = [_para("New text", start=1, end=9)]
+    requests = builder.build(current, target, DOC_END)
+
+    delete_index = next(i for i, r in enumerate(requests) if "deleteContentRange" in r)
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+    assert delete_index < insert_index
+
+
+def test_insert_sharing_an_anchor_with_a_list_item_bullet_change_targets_the_original_paragraph() -> None:
+    """createParagraphBullets for a paragraph promoted to a list item must
+    land on the ORIGINAL paragraph's pre-insert range, and run before an
+    insert tied on the same anchor."""
+    current = [
+        _para("Heading", style="HEADING_2", start=1, end=10),
+        _para("Item", style="NORMAL_TEXT", start=10, end=15),
+    ]
+    target = [
+        _para("Heading", style="HEADING_2", start=0, end=0),
+        _para("NewPara", style="NORMAL_TEXT", start=0, end=0),
+        _para("Item", style="NORMAL_TEXT", start=0, end=0, is_list_item=True),
+    ]
+    requests = builder.build(current, target, doc_end_index=15)
+
+    bullet_requests = [r for r in requests if "createParagraphBullets" in r]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    assert len(bullet_requests) == 1
+    assert bullet_requests[0]["createParagraphBullets"]["range"] == {"startIndex": 10, "endIndex": 15}
+    assert requests.index(bullet_requests[0]) < insert_index
+
+
+def test_insert_sharing_an_anchor_with_a_list_item_demotion_targets_the_original_paragraph() -> None:
+    """deleteParagraphBullets for a paragraph demoted out of a list must
+    land on the ORIGINAL paragraph's pre-insert range, and run before an
+    insert tied on the same anchor."""
+    current = [
+        _para("Heading", style="HEADING_2", start=1, end=10),
+        _para("Item", style="NORMAL_TEXT", start=10, end=15, is_list_item=True),
+    ]
+    target = [
+        _para("Heading", style="HEADING_2", start=0, end=0),
+        _para("NewPara", style="NORMAL_TEXT", start=0, end=0),
+        _para("Item", style="NORMAL_TEXT", start=0, end=0, is_list_item=False),
+    ]
+    requests = builder.build(current, target, doc_end_index=15)
+
+    # The insert group for "NewPara" also emits its own deleteParagraphBullets
+    # (it inherits the bullet of whatever paragraph it splits, per
+    # _span_style_requests's insert path) — that one is unrelated to this
+    # collision and targets NewPara's own post-shift range, not the original
+    # Item's pre-insert range.
+    original_range_bullet_requests = [
+        r
+        for r in requests
+        if "deleteParagraphBullets" in r
+        and r["deleteParagraphBullets"]["range"] == {"startIndex": 10, "endIndex": 15}
+    ]
+    insert_index = next(i for i, r in enumerate(requests) if "insertText" in r)
+
+    assert len(original_range_bullet_requests) == 1
+    assert requests.index(original_range_bullet_requests[0]) < insert_index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Terminal newline protection
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -218,9 +387,30 @@ def test_delete_bounds_does_not_compound_render_prefix_and_structural_trim() -> 
     node = _para("# cfg", start=8, end=14, precedes_structural_element=True)
     node = replace(node, render_prefix="")
 
-    start, end, trimmed = DocsRequestBuilder._delete_bounds(node, doc_end_index=100)
+    bounds = DocsRequestBuilder._delete_bounds(node, doc_end_index=100)
 
-    assert (start, end, trimmed) == (8, 13, True)
+    assert (bounds.start, bounds.end, bounds.trimmed) == (8, 13, True)
+    assert bounds.doc_end_clamped is False
+
+
+def test_delete_bounds_reports_doc_end_clamped_only_when_end_reaches_doc_end() -> None:
+    """`doc_end_clamped` (#62) must distinguish "the doc-end clamp is what
+    spared this node's newline" from the render_prefix/structural trims,
+    which set `trimmed` too but leave `doc_end_clamped` False."""
+    at_doc_end = _para("Last", start=10, end=15)
+    bounds = DocsRequestBuilder._delete_bounds(at_doc_end, doc_end_index=15)
+    assert bounds.trimmed is True
+    assert bounds.doc_end_clamped is True
+
+    not_at_doc_end = _para("Mid", start=10, end=15)
+    bounds = DocsRequestBuilder._delete_bounds(not_at_doc_end, doc_end_index=100)
+    assert bounds.trimmed is False
+    assert bounds.doc_end_clamped is False
+
+    structural_not_doc_end = _para("Boundary", start=10, end=15, precedes_structural_element=True)
+    bounds = DocsRequestBuilder._delete_bounds(structural_not_doc_end, doc_end_index=100)
+    assert bounds.trimmed is True
+    assert bounds.doc_end_clamped is False
 
 
 def test_replace_of_a_render_prefix_paragraph_does_not_add_a_second_newline() -> None:
@@ -274,6 +464,125 @@ def test_replace_of_a_multi_node_range_does_not_spare_newline_when_only_first_no
     assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ\n"
 
 
+def test_replace_of_the_docs_last_paragraph_does_not_add_a_second_newline() -> None:
+    """Regression (#62): the doc_end_index clamp in _delete_bounds spares the
+    terminal newline of the document's true last paragraph (undeletable), but
+    build()'s replace branch used to write `target_text + "\\n"` regardless,
+    duplicating that newline and leaving a stray empty paragraph behind on
+    every edit to the doc's last line."""
+    current = [_para("Old text", start=8, end=17)]
+    target = [_para("New text", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=17)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "New text"
+
+
+def test_replace_of_the_doc_end_paragraph_inserts_bare_text_with_no_stray_newline() -> None:
+    """(#62) Replacing a document's last paragraph must not duplicate the
+    newline the doc-end clamp already spared: the insert goes in bare, with
+    no leading or trailing "\\n", and the doc reconstructs to exactly one
+    paragraph."""
+    current = [_para("Old text", start=1, end=10)]
+    target = [_para("New text", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=10)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "New text"
+
+
+def test_render_prefix_paragraph_that_is_also_the_docs_last_paragraph_uses_before_newline() -> None:
+    """Mutual-exclusivity guard: when a node is BOTH a render_prefix paragraph
+    (#48) and the document's last paragraph (#62), the existing
+    before_newline=True path wins, not the new bare mode."""
+    current = [replace(_para("# cfg", start=8, end=14), render_prefix='\ue907')]
+    target = [_para("# other", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=14)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\n# other"
+
+
+def test_replace_of_a_multi_node_range_at_doc_end_uses_the_last_node_for_bare_insert() -> None:
+    """(#62 follow-up, mirrors the #56 multi-node regression above) The
+    doc-end clamp is a property of whichever node borders the doc's mandatory
+    terminal newline — the LAST deleted node — not the first. A multi-node
+    replace must go bare when the last node reaches doc_end_index, even
+    though the first node's own end_index does not."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9),
+    ]
+    target = [_para("ZZZZZZ", start=0, end=0)]
+    requests = builder.build(current, target, doc_end_index=9)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "ZZZZZZ"
+
+
+def test_replace_of_a_render_prefix_doc_end_paragraph_keeps_leading_newline_not_bare() -> None:
+    """(#62 precedence) A node that is simultaneously the doc's last paragraph
+    AND has a render_prefix trim must keep the existing leading-newline
+    behavior (#56) — the render_prefix/structural case takes priority over
+    the newer doc-end-clamp bare mode per plan.md's precedence decision."""
+    current = [replace(_para("# cfg", start=1, end=7), render_prefix="")]
+    target = [_para("# other", start=0, end=0)]
+    # doc_end_index=6 makes the render_prefix-trimmed end (1 + len("# cfg")
+    # == 6) also satisfy the doc-end clamp, so without the precedence gate
+    # `doc_end_clamped` would be True too — this pins that `spares_structural_newline`
+    # wins.
+    requests = builder.build(current, target, doc_end_index=6)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    assert insert_requests[0]["insertText"]["text"] == "\n# other"
+
+
+def test_replace_of_a_multi_node_range_at_doc_end_only_bares_the_last_node() -> None:
+    """Multi-node replace ending at doc end: only the last deleted node
+    borders the clamp-spared terminal newline, so only the last TARGET node
+    gets bare treatment — earlier target nodes keep their own trailing
+    newline since they're followed by more inserted text, not by the spared
+    newline."""
+    current = [
+        _para("AAAA", start=1, end=6),
+        _para("BB", start=6, end=9),
+    ]
+    target = [
+        _para("XXXXXX", start=0, end=0),
+        _para("YYYYYY", start=0, end=0),
+    ]
+    requests = builder.build(current, target, doc_end_index=9)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 2
+    # Both inserts share the same location; Docs applies them in array order,
+    # so the array-first (YYYYYY, bare) is inserted first and then pushed
+    # right by the array-second (XXXXXX\n) insert landing at the same index —
+    # yielding "XXXXXX\nYYYYYY" in the final document.
+    assert insert_requests[0]["insertText"]["text"] == "YYYYYY"
+    assert insert_requests[1]["insertText"]["text"] == "XXXXXX\n"
+
+
+def test_bare_last_insert_computes_correct_paragraph_range() -> None:
+    """updateParagraphStyle/createParagraphBullets ranges in bare mode must
+    exclude the trailing newline the insert doesn't write, or the computed
+    range extends one UTF-16 unit past the actual inserted text."""
+    node = _para("New text", start=0, end=0)
+    requests = DocsRequestBuilder()._make_insert_requests(
+        [node], insert_at_index=8, bare_last=True
+    )
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert len(style_requests) == 1
+    assert style_requests[0]["updateParagraphStyle"]["range"] == {
+        "startIndex": 8,
+        "endIndex": 16,
+    }
 # ─────────────────────────────────────────────────────────────────────────────
 # Style-only change
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,14 +613,17 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
     written as a native checkbox glyph)."""
     current = [_para("[ ] Splitwise", start=50, end=65, is_list_item=True)]
     target = [_para("[x] Splitwise", start=50, end=65, is_list_item=True)]
-    # doc_end_index == current node's end_index so the terminal-newline
-    # clamp in _make_delete_requests applies, matching plan.md Story 2.1.3's
-    # worked example: deleteContentRange clamps to [50, 64).
+    # doc_end_index == current node's end_index so both the terminal-newline
+    # clamp in _make_delete_requests (deleteContentRange clamps to [50, 64))
+    # and the mirror bare-insert clamp (#62) apply: this node is the doc's
+    # last paragraph, so the insert must not re-add the newline the delete
+    # already spared.
     requests = builder.build(current, target, doc_end_index=65)
 
     delete_requests = [r for r in requests if "deleteContentRange" in r]
     insert_requests = [r for r in requests if "insertText" in r]
     bullet_requests = [r for r in requests if "createParagraphBullets" in r]
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
 
     assert len(delete_requests) == 1
     assert delete_requests[0]["deleteContentRange"]["range"] == {
@@ -320,9 +632,19 @@ def test_checklist_toggle_produces_replace_with_disc_bullet_not_checkbox() -> No
     }
 
     assert len(insert_requests) == 1
-    assert insert_requests[0]["insertText"]["text"] == "[x] Splitwise\n"
+    assert insert_requests[0]["insertText"]["text"] == "[x] Splitwise"
+
+    assert len(style_requests) == 1
+    assert style_requests[0]["updateParagraphStyle"]["range"] == {
+        "startIndex": 50,
+        "endIndex": 63,
+    }
 
     assert len(bullet_requests) == 1
+    assert bullet_requests[0]["createParagraphBullets"]["range"] == {
+        "startIndex": 50,
+        "endIndex": 63,
+    }
     assert bullet_requests[0]["createParagraphBullets"]["bulletPreset"] == "BULLET_DISC_CIRCLE_SQUARE"
     assert not any(
         r.get("createParagraphBullets", {}).get("bulletPreset") == "BULLET_CHECKBOX"
@@ -387,7 +709,9 @@ def test_edited_paragraph_with_link_style_loses_text_style_request_confirming_ga
         )
     ]
 
-    requests = builder.build(current, target, doc_end_index=31)
+    # doc_end_index must be >= the node's end_index (34) — this paragraph is
+    # not the document's last, so the #62 bare-insert clamp must not apply.
+    requests = builder.build(current, target, doc_end_index=DOC_END)
 
     insert_requests = [r for r in requests if "insertText" in r]
     style_requests = [r for r in requests if "updateTextStyle" in r]
@@ -527,6 +851,44 @@ def test_diff_summary_handles_empty_current_and_target_without_raising() -> None
     assert unchanged_count == 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# build() trigger conditions: anchor-safe restyle vs. anchor-destroying rewrite
+#
+# _repair()'s docstring states the underlying contract this pins: any diff
+# opcode that doesn't collapse to "equal" becomes a literal deleteContentRange
+# + insertText, which destroys any Drive comment anchored to that paragraph.
+# DiffEntry.kind alone can't tell the two apart (both surface as "change"), so
+# this asserts on build()'s actual emitted requests instead.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_folds_text_identical_restyle_to_in_place_style_update() -> None:
+    """A paragraph whose text is unchanged but style differs must be repaired
+    back to an "equal" opcode: build() emits only an in-place
+    updateParagraphStyle, never a deleteContentRange/insertText pair, so any
+    comment anchored to the paragraph survives."""
+    current = [_para("Housing: Bekah has the lake house", style="NORMAL_TEXT", start=1, end=36)]
+    target = [_para("Housing: Bekah has the lake house", style="HEADING_1", start=1, end=36)]
+
+    requests = builder.build(current, target, doc_end_index=36)
+
+    assert not any("deleteContentRange" in r for r in requests)
+    assert not any("insertText" in r for r in requests)
+    assert any("updateParagraphStyle" in r for r in requests)
+
+
+def test_build_resolves_genuine_content_change_to_delete_and_insert() -> None:
+    """A paragraph whose text actually changes cannot be repaired to "equal":
+    build() must emit a deleteContentRange for the old text and an insertText
+    for the new text, which is exactly what destroys any comment anchored to
+    that paragraph (the documented, unavoidable trigger condition)."""
+    current = [_para("Old text entirely", start=1, end=20)]
+    target = [_para("Completely different text", start=1, end=20)]
+
+    requests = builder.build(current, target, doc_end_index=20)
+
+    assert any("deleteContentRange" in r for r in requests)
+    assert any("insertText" in r for r in requests)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # tab_id stamping (build()/_inject_tab_id) — multi-tab doc support
@@ -579,3 +941,228 @@ def test_replace_with_unequal_current_and_target_length_does_not_raise() -> None
     kinds = sorted(e.kind for e in entries)
     assert kinds == ["add", "change"]
     assert unchanged_count == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DiffTooExpensive guard — duplicate-heavy documents (backlog: bound difflib's
+# SequenceMatcher(autojunk=False) blowup)
+#
+# These tests override the module's thresholds to small values so they stay
+# fast and deterministic (count/complexity-based, not wall-clock timing) while
+# still exercising the exact branch that trips on real few-thousand-line
+# documents.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _small_thresholds(monkeypatch: pytest.MonkeyPatch, *, max_duplicate_run: int = 5, min_size: int = 10) -> None:
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_DUPLICATE_RUN", max_duplicate_run)
+    monkeypatch.setattr(docs_request_builder_module, "_MIN_SIZE_FOR_DUPLICATE_CHECK", min_size)
+
+
+def _duplicate_paragraphs(text: str, count: int, *, start: int = 1) -> list:
+    nodes = []
+    cursor = start
+    for _ in range(count):
+        end = cursor + len(text) + 1
+        nodes.append(_para(text, start=cursor, end=end))
+        cursor = end
+    return nodes
+
+
+def test_build_raises_diff_too_expensive_above_duplicate_run_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC0: a document whose duplicate-line run exceeds the threshold raises a
+    clear error from build() instead of constructing the expensive matcher."""
+    _small_thresholds(monkeypatch)
+    current = _duplicate_paragraphs("dup", 6)
+    target = _duplicate_paragraphs("dup", 6)
+    with pytest.raises(DiffTooExpensive) as excinfo:
+        builder.build(current, target, DOC_END)
+    assert "too expensive" in str(excinfo.value)
+
+
+def test_build_does_not_raise_below_duplicate_run_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC5 (lower half of the boundary): a duplicate run short of the
+    threshold must diff normally, not raise. `_bounded_opcodes` counts
+    duplicates across `a_keys + b_keys` combined, so with equal current/target
+    the combined run is 2x each side's paragraph count — use a small
+    `min_size` so the duplicate-run branch is actually exercised rather than
+    short-circuited by the size floor."""
+    _small_thresholds(monkeypatch, max_duplicate_run=10, min_size=2)
+    current = _duplicate_paragraphs("dup", 4)
+    target = _duplicate_paragraphs("dup", 4)
+    assert builder.build(current, target, DOC_END) == []
+
+
+def test_threshold_boundary_n_minus_one_vs_n_only_changes_latency_not_quality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5: crossing the boundary must only ever add a raise — the diff
+    produced just below threshold must be the same *kind* of result (a plain,
+    successful diff) whether the run is far below or exactly at threshold,
+    with no discontinuity in what gets reported. `_bounded_opcodes` counts the
+    duplicate run across `a_keys + b_keys` combined, so passing the same list
+    as both current and target means N identical paragraphs on each side
+    produce a combined run of 2N — the guard's condition is
+    `max_duplicate_run > _MAX_DUPLICATE_RUN`, so N = floor(_MAX_DUPLICATE_RUN / 2)
+    sits at the boundary and N+1 crosses it. `min_size` is set to 2 (well
+    below every N used here) so the duplicate-run branch is always live,
+    isolating the assertions to the boundary itself."""
+    _small_thresholds(monkeypatch, max_duplicate_run=10, min_size=2)
+    max_duplicate_run = docs_request_builder_module._MAX_DUPLICATE_RUN
+    n_at_boundary = max_duplicate_run // 2
+
+    far_below = _duplicate_paragraphs("dup", 1)
+    entries_far_below, unchanged_far_below = builder.diff_summary(far_below, far_below)
+    assert entries_far_below == []
+    assert unchanged_far_below == len(far_below)
+
+    at_boundary = _duplicate_paragraphs("dup", n_at_boundary)
+    entries_at, unchanged_at = builder.diff_summary(at_boundary, at_boundary)
+    assert entries_at == []
+    assert unchanged_at == len(at_boundary)
+
+    over = _duplicate_paragraphs("dup", n_at_boundary + 1)
+    with pytest.raises(DiffTooExpensive):
+        builder.diff_summary(over, over)
+
+
+def test_ordinary_table_and_code_block_never_trip_guard() -> None:
+    """AC1: realistic documents (a 30-row table, a normal-sized fenced code
+    block) never trip the guard, using the real production thresholds."""
+    table_current = DocsTableNode(
+        rows=[[TableCell(text=f"Row {i} value", spans=[]) for _ in range(3)] for i in range(30)],
+        start_index=1,
+        end_index=500,
+    )
+    table_target = DocsTableNode(
+        rows=[[TableCell(text=f"Row {i} value!", spans=[]) for _ in range(3)] for i in range(30)],
+        start_index=1,
+        end_index=500,
+    )
+    code_current = [
+        _para(f"line {i} of code", start=500 + i * 20, end=500 + i * 20 + 18)
+        for i in range(40)
+    ]
+    code_target = [
+        _para(f"line {i} of code!", start=500 + i * 20, end=500 + i * 20 + 19)
+        for i in range(40)
+    ]
+
+    # No DiffTooExpensive raised at production thresholds.
+    builder.build([table_current] + code_current, [table_target] + code_target, DOC_END + 2000)
+    builder.diff_summary([table_current] + code_current, [table_target] + code_target)
+
+
+def test_build_and_diff_summary_raise_identically_on_pathological_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2: build() and diff_summary() both route through the same _opcodes(),
+    so they must never diverge on whether a document is pathological."""
+    _small_thresholds(monkeypatch)
+    current = _duplicate_paragraphs("dup", 6)
+    target = _duplicate_paragraphs("dup", 6)
+
+    with pytest.raises(DiffTooExpensive):
+        builder.build(current, target, DOC_END)
+    with pytest.raises(DiffTooExpensive):
+        builder.diff_summary(current, target)
+
+
+def test_guard_never_reenables_autojunk_or_a_popularity_heuristic() -> None:
+    """AC3: below threshold, `_bounded_opcodes` must produce byte-identical
+    opcodes to a direct `SequenceMatcher(None, ..., autojunk=False)` call —
+    proof no popularity heuristic or autojunk=True fallback was substituted."""
+    import difflib
+
+    a_keys = [("a",), ("b",), ("a",), ("c",), ("a",)]
+    b_keys = [("a",), ("a",), ("c",), ("b",), ("a",)]
+
+    expected = difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False).get_opcodes()
+    actual = docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+    assert actual == expected
+
+
+def test_bounded_opcodes_raises_above_comparison_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The comparison-matrix branch (`len(a_keys) * len(b_keys) > _MAX_COMPARISON_CELLS`)
+    is a separate trip condition from the duplicate-run check and needs its own
+    coverage. Keys here are all unique and the combined input is well under the
+    default duplicate-run size floor, so only the comparison-cell branch can fire."""
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_COMPARISON_CELLS", 20)
+    a_keys = [(f"a{i}",) for i in range(5)]
+    b_keys = [(f"b{i}",) for i in range(5)]  # 5 * 5 = 25 > 20
+    with pytest.raises(DiffTooExpensive):
+        docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+
+
+def test_bounded_opcodes_does_not_raise_at_the_comparison_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boundary check for the comparison-cell branch: a product exactly at the
+    cap must not raise (the guard's condition is strictly `>`)."""
+    monkeypatch.setattr(docs_request_builder_module, "_MAX_COMPARISON_CELLS", 25)
+    a_keys = [(f"a{i}",) for i in range(5)]
+    b_keys = [(f"b{i}",) for i in range(5)]  # 5 * 5 == 25, at the cap
+    result = docs_request_builder_module._bounded_opcodes(a_keys, b_keys, context="test")
+    assert result == [("replace", 0, 5, 0, 5)]
+
+
+def test_repairs_inner_matcher_shares_the_same_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4: `_repair`'s inner per-replace-run matcher (keyed on `_content_key`,
+    called from inside `_repair` rather than through `_opcodes`) trips the
+    same guard as the outer matcher. Calling `_repair` directly with a single
+    synthetic `replace` opcode isolates the inner `_bounded_opcodes` call from
+    the outer one, so this proves the inner call site itself is guarded, not
+    just that the outer call raised first."""
+    _small_thresholds(monkeypatch)
+    dup_current = _duplicate_paragraphs("dup", 6)
+    dup_target = _duplicate_paragraphs("dup!", 6)
+    opcodes = [("replace", 0, len(dup_current), 0, len(dup_target))]
+
+    with pytest.raises(DiffTooExpensive):
+        builder._repair(opcodes, dup_current, dup_target)
+
+
+def test_align_for_styling_shares_the_same_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4: `_align_for_styling`'s pass-2 matcher trips the same guard as the
+    other two call sites."""
+    _small_thresholds(monkeypatch)
+    dup_text = "dup line\n"
+    content = []
+    index = 1
+    for _ in range(6):
+        content.append({
+            "startIndex": index,
+            "endIndex": index + len(dup_text),
+            "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": dup_text, "textStyle": {}}}],
+            },
+        })
+        index += len(dup_text)
+    doc = {"revisionId": "rev-1", "body": {"content": content}}
+
+    target = _duplicate_paragraphs("dup line!", 6)
+
+    with pytest.raises(DiffTooExpensive):
+        builder.align(doc, target)
+
+
+# AC6 (push()/pull() surface DiffTooExpensive as PushResult(status="error"),
+# never an uncaught traceback) is covered end-to-end in
+# tests/test_google_docs_backend.py::TestDiffTooExpensiveSurfacesAsUserFacingError,
+# which has the make_backend/fake_client fixtures needed to drive push()
+# through its full call path.
+
+
+def test_guard_overhead_is_sub_quadratic_in_input_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC7: the guard's own pre-check (Counter + a multiply) must be cheap
+    enough that both a document at the threshold and one four times larger
+    raise immediately — proof this is a count-based guard, not something that
+    itself scales like the algorithm it is protecting against."""
+    _small_thresholds(monkeypatch)
+    max_duplicate_run = docs_request_builder_module._MAX_DUPLICATE_RUN
+
+    small = _duplicate_paragraphs("dup", max_duplicate_run + 1)
+    large = _duplicate_paragraphs("dup", (max_duplicate_run + 1) * 4)
+
+    for doc in (small, large):
+        with pytest.raises(DiffTooExpensive) as excinfo:
+            builder.build(doc, doc, DOC_END + 10000)
+        assert excinfo.value.size == len(doc) * 2

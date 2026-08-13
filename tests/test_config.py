@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import yaml
 
 from docspan.config import (
+    ConfigConflictError,
     ConfluenceConfig,
     GoogleDocsConfig,
     Mapping,
     MarkgateConfig,
+    config_mtime,
     load_config,
+    save_config,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -20,6 +25,11 @@ from docspan.config import (
 def test_mapping_direction_defaults_to_both() -> None:
     m = Mapping(local="a.md", backend="confluence", remote_id="123")
     assert m.direction == "both"
+
+
+def test_mapping_remote_id_optional_defaults_to_none() -> None:
+    m = Mapping(local="a.md", backend="google_docs")
+    assert m.remote_id is None
 
 
 @pytest.mark.parametrize("direction", ["push", "pull", "both"])
@@ -101,6 +111,69 @@ def test_load_config_yaml_takes_precedence_over_env(tmp_path, monkeypatch) -> No
 def test_load_config_no_sync_interval_field() -> None:
     """sync_interval was removed; ensure it doesn't appear on MarkgateConfig."""
     assert not hasattr(MarkgateConfig(), "sync_interval")
+
+
+def test_load_config_mapping_without_remote_id(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    config_file = tmp_path / "markgate.yaml"
+    config_file.write_text(
+        yaml.dump({"mappings": [{"local": "docs/page.md", "backend": "google_docs"}]})
+    )
+    cfg = load_config(str(config_file))
+    assert cfg.mappings[0].remote_id is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# save_config / config_mtime
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_save_config_writes_atomically_and_round_trips(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    config_file = tmp_path / "markgate.yaml"
+    cfg = MarkgateConfig(mappings=[Mapping(local="a.md", backend="google_docs", remote_id="doc1")])
+    save_config(cfg, str(config_file))
+
+    assert config_file.exists()
+    # no leftover temp files
+    assert list(tmp_path.glob(".*.tmp")) == []
+    reloaded = load_config(str(config_file))
+    assert reloaded.mappings[0].remote_id == "doc1"
+
+
+def test_save_config_omits_none_remote_id(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    config_file = tmp_path / "markgate.yaml"
+    cfg = MarkgateConfig(mappings=[Mapping(local="a.md", backend="google_docs")])
+    save_config(cfg, str(config_file))
+    raw = yaml.safe_load(config_file.read_text())
+    assert "remote_id" not in raw["mappings"][0]
+
+
+def test_config_mtime_none_when_missing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    assert config_mtime(str(tmp_path / "missing.yaml")) is None
+
+
+def test_save_config_detects_concurrent_edit(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    import time
+
+    config_file = tmp_path / "markgate.yaml"
+    cfg = MarkgateConfig(mappings=[Mapping(local="a.md", backend="google_docs", remote_id="doc1")])
+    save_config(cfg, str(config_file))
+    mtime_before = config_mtime(str(config_file))
+
+    # Simulate a concurrent edit by another process changing mtime.
+    time.sleep(0.01)
+    config_file.write_text(config_file.read_text() + "\n# edited concurrently\n")
+    os.utime(config_file, (time.time() + 5, time.time() + 5))
+
+    with pytest.raises(ConfigConflictError):
+        save_config(cfg, str(config_file), expected_mtime=mtime_before)
+
+
+def test_save_config_succeeds_when_mtime_matches(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    config_file = tmp_path / "markgate.yaml"
+    cfg = MarkgateConfig(mappings=[Mapping(local="a.md", backend="google_docs", remote_id="doc1")])
+    save_config(cfg, str(config_file))
+    mtime_before = config_mtime(str(config_file))
+
+    save_config(cfg, str(config_file), expected_mtime=mtime_before)  # must not raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────

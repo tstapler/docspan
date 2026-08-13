@@ -8,12 +8,16 @@ from typing import TYPE_CHECKING, Optional
 
 from googleapiclient.errors import HttpError
 
-from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
     OAuthAuthenticator,
     default_token_path,
+)
+from docspan.backends.google_docs.checkbox_state import (
+    extract_checkbox_states,
+    patch_checkbox_lines,
 )
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.comments import (
@@ -22,7 +26,7 @@ from docspan.backends.google_docs.comments import (
     parse_reply_directives,
 )
 from docspan.backends.google_docs.converter import DocumentConverter
-from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+from docspan.backends.google_docs.docs_request_builder import DiffTooExpensive, DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
@@ -225,6 +229,10 @@ class GoogleDocsBackend(Backend):
             target_residue_note = describe_target_residue(plan.target_residue)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
         except HttpError as exc:
+            return PushPreview(
+                entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
+            )
+        except DiffTooExpensive as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
             )
@@ -479,6 +487,10 @@ class GoogleDocsBackend(Backend):
                     message="The doc changed since your last pull — run `docspan pull` again",
                 )
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
+        except DiffTooExpensive as exc:
+            # A clear, actionable error rather than a multi-minute hang or an
+            # uncaught traceback — see DiffTooExpensive's docstring.
+            return PushResult(status="error", doc_id=doc_id, message=str(exc))
         except Exception as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
 
@@ -645,10 +657,15 @@ class GoogleDocsBackend(Backend):
             # emits the slug; this gives the default path the same upgrade, using
             # the document fetched just above for the tab check. Ids the document
             # does not know are left exactly as they are.
+            structural_nodes, _residue = project(DocsStructureParser().parse(resolved_doc))
             markdown_content = upgrade_heading_id_anchors(
-                markdown_content,
-                heading_id_to_slug(project(DocsStructureParser().parse(resolved_doc))[0]),
+                markdown_content, heading_id_to_slug(structural_nodes)
             )
+
+            markdown_content, checkbox_warning = self._recover_checkbox_state(
+                doc_id, structural_nodes, markdown_content
+            )
+
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
@@ -659,18 +676,82 @@ class GoogleDocsBackend(Backend):
             # table-cell link — the parse above serves only the id->slug map. Only
             # the tab-scoped path can report what the file lacks, because there the
             # parser's output *is* the file.
-            if warning:
+            messages = [w for w in (warning, checkbox_warning) if w]
+            if messages:
                 return PullResult(
                     status="warning",
                     doc_id=doc_id,
                     local_path=local_path,
-                    message=f"⚠ {warning}",
+                    message="⚠ " + "\n⚠ ".join(messages),
                 )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
         except TabNotFoundError as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
+        except DiffTooExpensive as exc:
+            # pull() does not currently run DocsRequestBuilder's diff, but this
+            # keeps the two entry points symmetric and future-proofs pull()
+            # against ever gaining a diff-based path without a clear error
+            # silently degrading into the generic Exception branch below.
+            return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
         except Exception as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
+
+    def _recover_checkbox_state(
+        self, doc_id: str, structural_nodes: list, markdown_content: str
+    ) -> tuple:
+        """Recover native-checkbox checked/unchecked state for the default pull path.
+
+        `documents.get()` never exposes a checkbox's checked bit (see ADR-001),
+        but Drive's markdown export does. This pairs the ordered
+        is_native_checkbox paragraphs from `structural_nodes` (already parsed
+        just above, for the heading-slug map) against the ordered checklist
+        lines from that export, and patches them into `markdown_content`.
+
+        Fails closed: a doc with no native checkboxes, an export transport
+        failure, a checkbox-count mismatch, or any unmatched line all leave
+        `markdown_content` byte-identical to today's rendering (the glyph text,
+        with no checked/unchecked signal) — never a partial or guessed patch.
+        Returns (markdown_content, warning_or_None).
+        """
+        checkbox_nodes = [
+            n
+            for n in structural_nodes
+            if isinstance(n, DocsParagraphNode) and n.is_native_checkbox
+        ]
+        if not checkbox_nodes:
+            return markdown_content, None
+
+        assert self._client is not None
+        try:
+            export_text = self._client.fetch_markdown_export(doc_id)
+        except Exception:
+            return (
+                markdown_content,
+                "Could not recover native checkbox checked/unchecked state "
+                "(markdown export failed) — all checkboxes pulled as unchecked.",
+            )
+
+        states = extract_checkbox_states(export_text)
+        if len(states) != len(checkbox_nodes):
+            return (
+                markdown_content,
+                "Native checkbox count from the markdown export "
+                f"({len(states)}) didn't match the document's checkbox "
+                f"paragraphs ({len(checkbox_nodes)}) — all checkboxes pulled "
+                "as unchecked rather than risk a wrong match.",
+            )
+
+        patched, all_found = patch_checkbox_lines(
+            markdown_content, [(n.text, checked) for n, checked in zip(checkbox_nodes, states)]
+        )
+        if not all_found:
+            return (
+                markdown_content,
+                "Could not confidently locate every native checkbox's line in "
+                "the pulled markdown — all checkboxes pulled as unchecked "
+                "rather than risk a wrong match.",
+            )
+        return patched, None
 
     def _write_comment_sidecar(self, doc_id: str, local_path: str) -> None:
         """Write a {file}.comments.md sidecar of the doc's comments (best-effort)."""
@@ -727,6 +808,18 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         doc = self._client.get_document(doc_id)
         return doc["revisionId"]
+
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        """Create a new, empty Google Doc and return its id/title/url."""
+        self._ensure_client()
+        assert self._client is not None
+        doc = self._client.create_document(title)
+        doc_id = doc["documentId"]
+        return CreateResult(
+            doc_id=doc_id,
+            title=doc.get("title", title),
+            url=f"https://docs.google.com/document/d/{doc_id}/edit",
+        )
 
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()

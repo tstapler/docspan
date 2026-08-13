@@ -255,7 +255,7 @@ docspan generates these files in your project directory after first sync:
 > [!NOTE]
 > **Known limitations in v0.1.0**
 >
-> - Google Docs: comments on edited paragraphs are lost on push (paragraph-level structural diff; comments on unchanged paragraphs are preserved). `docspan push --dry-run` and a default fail-closed `--force`-gated block now warn before this happens — it is still not prevented.
+> - Google Docs: comments on edited paragraphs are lost on push (paragraph-level structural diff; comments on unchanged paragraphs are preserved). `docspan push --dry-run` and a default fail-closed `--force`-gated block now warn before this happens, naming every at-risk comment (id, author, quoted snippet) per flagged paragraph — it is still not prevented. Re-anchoring or recreating the comment was investigated and rejected: neither `comments().update` nor `comments().create` can produce a comment Google Docs' own UI renders as anchored to arbitrary text (see [ADR-003](project_plans/wedding-planning-workflow/decisions/ADR-003-no-comment-anchor-migration.md)), so no migration ships.
 > - Push: no image support — local images cannot be pushed to Google Docs or Confluence
 > - Push: no table support — markdown tables are not rendered in Google Docs
 > - Confluence: requires an Atlassian API token; no OAuth flow

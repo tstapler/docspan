@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Optional
 
 import markdownify as md_lib
 
-from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.confluence.adf.converter import AdfConverter
 from docspan.backends.confluence.config.models import ConfluenceConfig as InternalConfluenceConfig
 from docspan.backends.confluence.markdown.parser import MarkdownParser
@@ -192,6 +192,26 @@ class ConfluenceBackend(Backend):
         assert self._client is not None
         page = self._client.get_page(doc_id)
         return str(page["version"]["number"])
+
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        """Create a new, empty Confluence page and return its id/title/url."""
+        self._ensure_client()
+        assert self._client is not None
+        space_key = kwargs.get("space") or self.config.space_key
+        if not space_key:
+            raise ValueError(
+                "Confluence page creation requires a space key (--space or backends.confluence.space_key)."
+            )
+        empty_adf = AdfConverter().convert(MarkdownParser().parse(""))
+        page = ConfluencePage(title=title, content=empty_adf, parent_id="", space_key=str(space_key))
+        result = self._client.create_page(page)
+        page_id = result["id"]
+        base_url = self.config.base_url or ""
+        return CreateResult(
+            doc_id=page_id,
+            title=result.get("title", title),
+            url=f"{base_url}/pages/{page_id}",
+        )
 
     def auth_setup(self, config_path: "Optional[str]" = None) -> None:
         """Interactive Confluence auth setup — prompts for credentials and prints YAML snippet."""

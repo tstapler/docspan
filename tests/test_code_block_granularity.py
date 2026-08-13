@@ -43,6 +43,64 @@ structure = DocsStructureParser()
 builder = DocsRequestBuilder()
 
 
+class TestCodeBlockLinesDoNotStealAHeadingOrBullet:
+    """Splitting fenced blocks per line (#40/#41) makes issue #42 easy to reach.
+
+    A code block contributes duplicate short lines in bulk (`}`, `);`, `EOF`,
+    `pass`), and any one matching a heading or list item's text elsewhere in
+    the document can share that node's anchor with the surrounding edit's
+    insert group. Criterion 6 of #42: this must not demote the heading or
+    steal the bullet.
+    """
+
+    def test_duplicate_short_code_lines_next_to_a_heading_edit_spare_the_heading(
+        self,
+    ) -> None:
+        """A doc-start insert (a new fenced-code line) shares its anchor with the
+        live heading's restyle group — the same collision as criterion 3/6 — while
+        several duplicate short code-flavored lines (`}`, `);`, `EOF`, `pass`)
+        sit unrelated and unchanged elsewhere in the document as decoys.
+
+        `is_heading("heading")` alone doesn't discriminate the bug: pre-fix, the
+        restyle request is still a *superset* of the heading's own range, so the
+        heading's paragraph id ends up in the covered set and gets the right style
+        regardless. What the corrupted (pre-insert) range actually does is bleed
+        the restyle onto the *newly inserted* paragraph too, and — because the
+        insert ran before the tied restyle — the live heading is left holding its
+        *old* style. Both of those are what the assertions below catch.
+        """
+        from .test_heading_identity import ParagraphReplay
+
+        replay = ParagraphReplay([
+            ("pass", "HEADING_2", "heading", False),
+            ("}", "NORMAL_TEXT", "decoyA", False),
+            (");", "NORMAL_TEXT", "decoyB", False),
+            ("EOF", "NORMAL_TEXT", "item", True),
+            ("pass", "NORMAL_TEXT", "decoyD", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        doc, end = replay.document()
+        md = "NewCode\n\n### pass\n\n}\n\n);\n\n- EOF\n\npass\n\ntail\n"
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+        replay.apply(builder.build(current, target, end))
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+        assert not replay.is_heading("inserted-1"), (
+            f"the restyle range leaked onto the newly inserted code line "
+            f"(style={replay.style.get('inserted-1')}), which means it was "
+            "computed against coordinates the insert had already shifted"
+        )
+        assert replay.alive("item") and replay.bullet["item"], (
+            "the live list item must survive as the bullet, not be swapped out "
+            "for one of the duplicate decoy lines"
+        )
+
+
 def _doc_of_lines(*lines: str) -> tuple[dict, int]:
     """A document holding one paragraph per line — how Docs actually stores it."""
     content, idx = [], 1
@@ -62,9 +120,13 @@ def _doc_of_lines(*lines: str) -> tuple[dict, int]:
 class TestGranularity:
     def test_each_line_of_a_fenced_block_is_its_own_node(self) -> None:
         nodes = markdown.parse("```yaml\nkey: value\n  indented: yes\n```\n")
-        assert [node.text for node in nodes] == ["key: value", "  indented: yes"]
-        # Every line stays monospace, so the styling survives the split.
-        assert all(node.spans[0].monospace for node in nodes)
+        # A literal, non-monospace marker line carries the fence language
+        # (issue #45 AC1) ahead of the monospace code lines.
+        assert [node.text for node in nodes] == ["```yaml", "key: value", "  indented: yes"]
+        code_nodes = nodes[1:]
+        # Every code line stays monospace, so the styling survives the split.
+        assert all(node.spans[0].monospace for node in code_nodes)
+        assert not nodes[0].spans
 
     def test_indentation_is_preserved(self) -> None:
         """`strip()` ate leading whitespace; in code that is meaning, not padding."""
@@ -74,27 +136,138 @@ class TestGranularity:
     def test_no_top_level_node_carries_an_embedded_newline(self) -> None:
         """The invariant the bug violated. A Doc paragraph cannot hold a newline.
 
-        Scoped to **top-level** blocks on purpose. `block_code` is parsed in three
-        places and only this one is fixed: a fence inside a list item still yields
-        one node with newlines (and concatenates onto the list text), and one
-        inside a blockquote is dropped entirely. Both are byte-identical before
-        this change, so neither is a regression — but an unqualified `all(...)`
-        over a document with no list in it reads as a guarantee that does not hold,
-        which is worse than no test.
+        `block_code` is parsed at three sites (top level, list items,
+        blockquotes) and all three now share `_nodes_from_code_block` — see
+        `TestFenceInAListItem` and `TestFenceInABlockQuote` below for the other
+        two.
         """
         nodes = markdown.parse(
             "before\n\n```sh\none\ntwo\nthree\n```\n\n```py\nfour\n```\n\nafter\n"
         )
         assert all("\n" not in node.text for node in nodes if hasattr(node, "text"))
 
-    def test_a_fence_in_a_list_item_is_still_unsplit(self) -> None:
-        """Pins the known gap so it cannot be mistaken for fixed.
 
-        Delete this test when the split moves into a helper shared by all three
-        parse sites; until then it is the honest statement of scope.
-        """
+class TestFenceInAListItem:
+    def test_a_fence_in_a_list_item_is_split_per_line(self) -> None:
         nodes = markdown.parse("- Steps:\n\n  ```sh\n  make build\n  make test\n  ```\n")
-        assert any("\n" in node.text for node in nodes if hasattr(node, "text"))
+
+        heading = next(n for n in nodes if n.text == "Steps:")
+        assert heading.is_list_item is True
+
+        code_lines = [n for n in nodes if n.text in ("make build", "make test")]
+        assert [n.text for n in code_lines] == ["make build", "make test"]
+        for line in code_lines:
+            assert line.is_list_item is True
+            assert line.nesting_level == 0
+            assert line.spans[0].monospace is True
+
+        assert all("\n" not in n.text for n in nodes)
+
+    def test_a_fence_at_the_start_of_a_list_item_emits_no_stray_node(self) -> None:
+        """No prose precedes the fence — nothing should flush an empty node."""
+        nodes = markdown.parse("- ```sh\n  make build\n  ```\n")
+        assert [n.text for n in nodes] == ["make build"]
+
+    def test_multiple_fences_in_one_list_item_stay_separate(self) -> None:
+        nodes = markdown.parse(
+            "- Steps:\n\n  ```sh\n  one\n  ```\n\n  ```sh\n  two\n  ```\n"
+        )
+        assert [n.text for n in nodes] == ["Steps:", "one", "two"]
+
+    def test_prose_after_a_fence_in_a_list_item_is_not_glued_or_dropped(self) -> None:
+        """The `spans = []` reset after emitting a fence's nodes must let a
+        trailing sibling line re-accumulate on its own, not vanish or merge
+        into the last code line."""
+        nodes = markdown.parse(
+            "- Steps:\n\n  ```sh\n  make build\n  ```\n\n  Done.\n"
+        )
+        assert [n.text for n in nodes] == ["Steps:", "make build", "Done."]
+        trailing = next(n for n in nodes if n.text == "Done.")
+        assert trailing.is_list_item is True
+        assert trailing.spans == []
+
+    def test_a_fence_nested_two_lists_deep_carries_its_nesting_level(self) -> None:
+        nodes = markdown.parse(
+            "- outer\n  - inner:\n\n    ```sh\n    cmd\n    ```\n"
+        )
+        code = next(n for n in nodes if n.text == "cmd")
+        assert code.is_list_item is True
+        assert code.nesting_level == 1
+
+    def test_pushing_an_unchanged_document_with_a_listed_fence_emits_no_requests(self) -> None:
+        """Mirrors #40's idempotence regression test, for the list-item site.
+
+        Before this fix the fence fell through `_walk_list_items` as raw
+        multi-line text glued onto the list item's own text, which pushed a
+        `deleteContentRange` + `insertText` pair on every sync of an untouched
+        document.
+        """
+        md = "- Steps:\n\n  ```sh\n  make build\n  make test\n  ```\n"
+        doc, end = _doc_of_lines("Steps:", "make build", "make test")
+        for element in doc["body"]["content"]:
+            element["paragraph"]["bullet"] = {"listId": "list-1"}
+
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+
+        assert builder.build(current, target, end) == []
+
+
+class TestFenceInABlockQuote:
+    def test_a_fence_in_a_block_quote_is_prefixed_per_line(self) -> None:
+        nodes = markdown.parse("> Note:\n>\n> ```sh\n> kubectl get pods\n> kubectl logs -f\n> ```\n")
+
+        note = next(n for n in nodes if n.text == "> Note:")
+        code_lines = [n for n in nodes if n.text.startswith("> kubectl")]
+        assert [n.text for n in code_lines] == ["> kubectl get pods", "> kubectl logs -f"]
+        for line in code_lines:
+            assert line.spans and line.spans[-1].monospace is True
+        assert note.text == "> Note:"
+
+    def test_a_fence_two_quote_levels_deep_gets_the_doubled_prefix(self) -> None:
+        nodes = markdown.parse("> > ```sh\n> > cmd\n> > ```\n")
+        assert [n.text for n in nodes] == ["> > cmd"]
+
+    def test_pushing_a_document_with_a_quoted_fence_does_not_delete_it(self) -> None:
+        """The item's core repro: a quoted fence already in the live doc must
+        survive an unchanged push, not be diffed away as a removal.
+        """
+        md = "intro\n\n> Note:\n>\n> ```sh\n> kubectl get pods\n> kubectl logs -f\n> ```\n\ntail\n"
+        doc, end = _doc_of_lines(
+            "intro", "> Note:", "> kubectl get pods", "> kubectl logs -f", "tail",
+        )
+
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+
+        assert builder.build(current, target, end) == []
+
+    def test_a_list_item_inside_a_block_quote_containing_a_fence(self) -> None:
+        """Composition: fence -> list item -> blockquote, all three fixes at once."""
+        nodes = markdown.parse(
+            "> - Steps:\n>\n>   ```sh\n>   make build\n>   ```\n"
+        )
+        code = next(n for n in nodes if n.text == "> make build")
+        assert code.is_list_item is True
+        assert code.spans and code.spans[-1].monospace is True
+
+    def test_a_blank_line_in_a_quoted_fence_still_renders_as_a_bare_quote_marker(
+        self,
+    ) -> None:
+        """Deliberate choice, not an accident of `_prefix_node_text`.
+
+        The top-level fix drops a blank code line entirely (empty text, no
+        span — `projection.py` removes it from both sides on `text == ""`).
+        Prefixing that same blank line inside a quote turns it into `"> "`,
+        which is no longer empty, so it survives projection instead of being
+        dropped. That is intentional here: a vanishing line mid-quote would
+        break the blockquote's visual continuity, so a blank fenced line
+        renders as a bare quote marker instead.
+        """
+        nodes = markdown.parse("> ```sh\n> one\n>\n> two\n> ```\n")
+        assert [n.text for n in nodes] == ["> one", "> ", "> two"]
+        blank = nodes[1]
+        assert blank.spans == []
 
 
 class TestPushIsIdempotent:
@@ -105,7 +278,11 @@ class TestPushIsIdempotent:
         a document nobody had edited, and did so on every push forever.
         """
         md = "before\n\n```yaml\nkey: value\n  indented: yes\nafter\n```\n\ntail\n"
-        doc, end = _doc_of_lines("before", "key: value", "  indented: yes", "after", "tail")
+        # The literal, non-monospace "```yaml" marker line (issue #45 AC1) is
+        # itself a real paragraph in the live document, ahead of the code lines.
+        doc, end = _doc_of_lines(
+            "before", "```yaml", "key: value", "  indented: yes", "after", "tail"
+        )
 
         target, _ = project(markdown.parse(md))
         current, _ = project(structure.parse(doc))
@@ -140,7 +317,7 @@ class TestPushIsIdempotent:
             if "insertText" in request
         ]
         assert sorted(text.strip("\n") for text in texts) == [
-            "line one", "line three", "line two",
+            "```sh", "line one", "line three", "line two",
         ]
         for text in texts:
             assert text.count("\n") == 1, text

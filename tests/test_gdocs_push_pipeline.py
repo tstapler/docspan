@@ -767,6 +767,23 @@ def test_appending_past_the_last_node_stays_inside_the_body() -> None:
     ]
 
 
+def test_replacing_the_doc_end_paragraph_does_not_leave_a_stray_blank_paragraph() -> None:
+    """(#62) Replacing a document's last paragraph must not duplicate the
+    newline the doc-end clamp already spares. Unlike the #21 masking case
+    above, this document has no trailing empty Para("") — the "Alpha"
+    paragraph itself IS the doc's last paragraph, so the replace's bare-text
+    insert must not leave a stray "" paragraph behind it."""
+    model = DocModel([Para("Intro"), Para("Alpha")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nReplaced\n")
+
+    after = model.apply(builder.build(current, target, model.end_index()))
+    assert [p.text for p in structure.parse(after.doc())] == [
+        "Intro",
+        "Replaced",
+    ]
+
+
 def test_an_appended_heading_does_not_restyle_the_paragraph_above_it() -> None:
     """The tail insert's paragraph range must cover only the new paragraph.
 
@@ -813,6 +830,72 @@ def test_appending_to_a_document_that_ends_with_a_blank_paragraph_still_works() 
 
     after = model.apply(builder.build(current, target, model.end_index()))
     assert [p.text for p in structure.parse(after.doc())] == [
+        "Intro",
+        "Alpha",
+        "Appended",
+        "",
+    ]
+
+
+def test_editing_the_documents_true_last_paragraph_does_not_add_a_newline() -> None:
+    """#62 — a single replace of the doc's true last paragraph stays flat.
+
+    No trailing blank paragraph exists here: `Old text` is itself the body's
+    last paragraph. The old code inserted `target_text + "\\n"` on top of the
+    terminal newline `_delete_bounds` already spares, splitting this one
+    paragraph into two ("New text", "").
+    """
+    model = DocModel([Para("Intro"), Para("Old text")])
+    current = structure.parse(model.doc())
+    target = parser.parse("Intro\n\nNew text\n")
+
+    after = model.apply(builder.build(current, target, model.end_index()))
+    assert [p.text for p in structure.parse(after.doc())] == ["Intro", "New text"]
+
+
+def test_editing_the_last_paragraph_stays_flat_across_repeated_push_cycles() -> None:
+    """#62 criterion 2 — a document with no trailing blank paragraph, whose
+    true last paragraph is edited on every push, must not grow without bound.
+
+    Replays several fetch -> diff -> push cycles through DocModel.apply(),
+    re-parsing the live document each time exactly as the real backend does.
+    """
+    model = DocModel([Para("Intro"), Para("Old text")])
+    for revision in range(1, 5):
+        current = structure.parse(model.doc())
+        target = parser.parse(f"Intro\n\nRevision {revision}\n")
+        model = model.apply(builder.build(current, target, model.end_index()))
+        assert [p.text for p in structure.parse(model.doc())] == [
+            "Intro",
+            f"Revision {revision}",
+        ]
+
+
+def test_trailing_blank_paragraph_growth_self_limits_and_does_not_recompound() -> None:
+    """#62 criterion 3 — a document that already has a trailing blank paragraph
+    grows by exactly +1 on the append that creates a new last paragraph, and
+    pushing the same target again afterward must not add another blank.
+    """
+    model = DocModel([Para("Intro"), Para("Alpha"), Para("")])
+    target_markdown = "Intro\n\nAlpha\n\nAppended\n"
+
+    current = structure.parse(model.doc())
+    target = parser.parse(target_markdown)
+    model = model.apply(builder.build(current, target, model.end_index()))
+    assert [p.text for p in structure.parse(model.doc())] == [
+        "Intro",
+        "Alpha",
+        "Appended",
+        "",
+    ]
+
+    # Pushing the identical target again must be a no-op — no recompounding.
+    current = structure.parse(model.doc())
+    target = parser.parse(target_markdown)
+    requests = builder.build(current, target, model.end_index())
+    assert requests == []
+    model = model.apply(requests)
+    assert [p.text for p in structure.parse(model.doc())] == [
         "Intro",
         "Alpha",
         "Appended",

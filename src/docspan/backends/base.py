@@ -39,6 +39,13 @@ class PullResult:
     message: Optional[str] = None
 
 
+@dataclass
+class CreateResult:
+    doc_id: str
+    title: str
+    url: Optional[str] = None
+
+
 class Backend(ABC):
     """
     Base class for all docspan platform backends.
@@ -66,6 +73,10 @@ class Backend(ABC):
     @abstractmethod
     def pull(self, doc_id: str, local_path: str, **kwargs) -> PullResult:
         """Fetch the remote document and write it as local markdown."""
+
+    @abstractmethod
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        """Create a new remote document/page and return its id/title/url."""
 
     @abstractmethod
     def auth_setup(self, config_path: Optional[str] = None) -> None:
