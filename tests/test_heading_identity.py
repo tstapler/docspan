@@ -897,3 +897,86 @@ class TestUnrelatedDuplicateTextIsNotFalselyRestyled:
             f"— it was falsely paired with the genuinely deleted 'TODO' "
             f"heading instead of being added fresh: {opcodes}"
         )
+
+
+class TestCommentsAndAnchorsSurviveTheInsertDeleteShape:
+    """AC8: a comment or `#anchor` pinned to a restyled paragraph must
+    survive the push, in the exact insert+delete shape this backlog item
+    is about.
+
+    Neither is modeled directly by `ParagraphReplay` — it tracks paragraph
+    identity (`headingId`) but not comment threads. What both actually rest
+    on at the Google Docs API level is the same thing: a comment or a
+    heading anchor is pinned to a paragraph's *text range*, and survives a
+    `updateParagraphStyle` request touching that range, but does not survive
+    a `deleteContentRange` there — the API treats the range as gone and
+    orphans (or drops) anything anchored to it, no matter what gets
+    `insertText`-ed back in its place afterward. So the request-level proof
+    that identity survived is not "the text looks the same after replay" —
+    it is "no request ever deleted the surviving paragraph's original
+    range." This checks that directly against the raw requests `build()`
+    emits for the AC0 repro shape, one level below `ParagraphReplay`.
+    """
+
+    def test_the_repro_emits_a_style_update_with_no_delete_or_reinsert(self) -> None:
+        replay = ParagraphReplay([
+            ("A", "HEADING_2", "first", False),
+            ("A", "HEADING_2", "second", False),
+        ])
+        doc, end = replay.document()
+        target, _ = project(markdown.parse("### A\n\n## A\n"))
+        current, _ = project(structure.parse(doc))
+
+        requests = builder.build(current, target, end)
+
+        assert not any("deleteContentRange" in r for r in requests), (
+            f"a restyle-only push deleted content — any comment or anchor "
+            f"pinned to that range is now orphaned: {requests}"
+        )
+        assert not any("insertText" in r for r in requests), (
+            f"a restyle-only push inserted text — this is delete-and-"
+            f"reinsert wearing an insert, not the in-place restyle the "
+            f"paragraph's identity depends on: {requests}"
+        )
+        style_updates = [r["updateParagraphStyle"] for r in requests if "updateParagraphStyle" in r]
+        restyled = [
+            u for u in style_updates
+            if u["paragraphStyle"].get("namedStyleType") == "HEADING_3"
+        ]
+        assert restyled, (
+            f"expected an in-place restyle to HEADING_3 among the requests, "
+            f"found none: {requests}"
+        )
+
+    def test_a_comment_anchored_to_the_restyled_paragraph_keeps_its_range(self) -> None:
+        """Same repro, but with an explicit synthetic comment range pinned to
+        one of the two identical "A" paragraphs — the scenario a real
+        Google Doc comment thread is in. The comment's range must fall
+        entirely inside a range that only ever receives `updateParagraphStyle`,
+        never `deleteContentRange`.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_2", "first", False),
+            ("A", "HEADING_2", "second", False),
+        ])
+        doc, end = replay.document()
+        # A comment anchored to whichever paragraph occupies the *second*
+        # "A" — same node the backlog's repro shape leaves for `_repair` to
+        # resolve via the standalone insert+equal+delete pairing, not a
+        # same-run replace.
+        second_para = doc["body"]["content"][1]
+        comment_range = (second_para["startIndex"], second_para["endIndex"] - 1)
+
+        target, _ = project(markdown.parse("### A\n\n## A\n"))
+        current, _ = project(structure.parse(doc))
+        requests = builder.build(current, target, end)
+
+        for request in requests:
+            if "deleteContentRange" not in request:
+                continue
+            rng = request["deleteContentRange"]["range"]
+            overlaps = rng["startIndex"] < comment_range[1] and rng["endIndex"] > comment_range[0]
+            assert not overlaps, (
+                f"a deleteContentRange {rng} overlapped the comment's anchor "
+                f"range {comment_range} — the comment is orphaned: {requests}"
+            )
