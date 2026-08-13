@@ -172,6 +172,8 @@ def _node_text(node: Node) -> str:
     """
     if isinstance(node, DocsTableNode):
         return "\n".join(" | ".join(cell.text for cell in row) for row in node.rows)
+    if isinstance(node, DocsImageNode):
+        return f"![{node.alt}]({node.src})"
     return node.text
 
 
@@ -179,6 +181,8 @@ def _node_style(node: Node) -> str:
     """Style label for a node, for DiffEntry/preview rendering."""
     if isinstance(node, DocsTableNode):
         return "TABLE"
+    if isinstance(node, DocsImageNode):
+        return "IMAGE"
     return node.style
 
 

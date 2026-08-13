@@ -127,6 +127,21 @@ def test_insert_image_before_appended_paragraph_does_not_desync_indices() -> Non
     assert following_indices[0] == image_index + 1
 
 
+def test_diff_summary_does_not_crash_on_image_node() -> None:
+    """Regression: diff_summary() calls _node_text()/_node_style() on every
+    node, including images, which have no .text/.style attribute -- a live
+    push crashed with AttributeError before these were taught about
+    DocsImageNode (docs_request_builder.py's _node_text/_node_style)."""
+    builder = DocsRequestBuilder()
+    current = [_para("Intro", start=1, end=7)]
+    target = [
+        _para("Intro", start=1, end=7),
+        DocsImageNode(src="https://example.com/x.png", alt="x"),
+    ]
+    entries, _unchanged_count = builder.diff_summary(current, target)
+    assert any("x.png" in entry.target_text for entry in entries)
+
+
 def test_insert_inline_image_group_ordered_against_an_unrelated_later_edit() -> None:
     """A batch with an image-insert group anchored earlier than an unrelated
     restyle group must write the later (higher-index) group first, so the

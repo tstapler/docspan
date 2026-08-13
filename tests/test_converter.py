@@ -49,3 +49,12 @@ def test_google_redirect_link_is_unwrapped() -> None:
 def test_plain_link_is_left_unchanged() -> None:
     html = '<p><a href="https://example.com/target">link text</a></p>'
     assert DocumentConverter.html_to_markdown(html) == "[link text](https://example.com/target)"
+
+
+def test_empty_link_is_removed_but_image_with_empty_alt_is_kept() -> None:
+    """Regression: Drive's HTML export gives inline images an empty alt
+    attribute, which markdownify renders as `![](src)`. The "remove empty
+    Google Docs links" cleanup used to match that `[](src)` substring too,
+    stripping everything but a bare `!` and losing the image entirely."""
+    html = '<p><a href=""></a><img alt="" src="https://example.com/x.png"></p>'
+    assert DocumentConverter.html_to_markdown(html) == "![](https://example.com/x.png)"
