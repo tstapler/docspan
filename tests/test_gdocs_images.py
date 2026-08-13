@@ -6,9 +6,11 @@ the pre-existing request-builder/pipeline test files:
   1/2/3 request-builder insertInlineImage shape + ordering + index math
   4/8 image_source.py resolution: local upload, URL bypass, missing/oversized/
       unsupported-format rejection
+  5. temp-file cleanup/retry: resolve_images() partial-batch-failure behavior,
+     _read_local()'s size pre-check, and node/content-key stability against a
+     rotating Drive/contentUri src (see TestTempUploadCleanupAndIdentity below)
   7. pull round-trip: inlineObjectElement -> DocsImageNode -> markdown
-Criterion 5 (temp-file cleanup/retry) and 6 (gated live integration) live in
-tests/test_google_docs_backend.py and are out of default-CI scope respectively.
+Criterion 6 (gated live integration) is out of default-CI scope.
 """
 
 from dataclasses import replace
@@ -322,3 +324,91 @@ def test_pulled_image_node_round_trips_to_markdown() -> None:
     nodes = DocsStructureParser().parse(_doc_with_inline_image())
     markdown = render_nodes_to_markdown(nodes)
     assert "![a diagram](https://docs.google.com/image-content-uri)" in markdown
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Criterion 5: temp-file cleanup/retry
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_unchanged_image_with_rotated_src_is_not_reinserted() -> None:
+    """A pulled image's contentUri can change between pulls even when the
+    image itself hasn't (Google's API docs call it account-tied, not
+    stable) -- a push must not treat that src drift alone as a real change,
+    or it deletes and reinserts the paragraph, destroying any comment
+    anchored to it."""
+    builder = DocsRequestBuilder()
+    same_image = DocsImageNode(
+        src="https://docs.google.com/old-content-uri",
+        alt="a diagram",
+        width_pt=100.0,
+        height_pt=50.0,
+    )
+    rotated_src_image = replace(same_image, src="https://docs.google.com/new-content-uri")
+
+    requests = builder.build([same_image], [rotated_src_image], DOC_END)
+
+    assert not any("insertInlineImage" in r for r in requests)
+    assert not any("deleteContentRange" in r for r in requests)
+
+
+def test_changing_alt_text_still_reinserts_the_image() -> None:
+    """Unlike src, alt/width/height are the accepted stand-in for image
+    identity -- a real change to any of them must still trigger a
+    delete-and-reinsert, so this isn't a case of the fix silently
+    disabling image change detection altogether."""
+    builder = DocsRequestBuilder()
+    original = DocsImageNode(src="https://docs.google.com/x.png", alt="old alt", width_pt=100.0)
+    changed_alt = replace(original, alt="new alt")
+
+    requests = builder.build([original], [changed_alt], DOC_END)
+
+    assert any("insertInlineImage" in r for r in requests)
+
+
+def test_resolve_images_preserves_partial_success_on_generic_uploader_exception(tmp_path) -> None:
+    """`uploader` is the Drive API and can raise anything, not just
+    _ResolutionFailure -- a failure resolving one key must not discard
+    images already resolved earlier in the same batch."""
+    ok_png = tmp_path / "ok.png"
+    ok_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    other_png = tmp_path / "other.png"
+    other_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+    def flaky_uploader(data: bytes, filename: str, mime_type: str) -> dict:
+        if filename == "other.png":
+            raise ConnectionError("drive api unavailable")
+        return {"file_id": "drive-1", "uri": "https://drive.example.com/drive-1"}
+
+    sources = {
+        "a": LocalPathSource(path=str(ok_png)),
+        "b": LocalPathSource(path=str(other_png)),
+    }
+    resolved, errors = resolve_images(sources, flaky_uploader)
+
+    assert resolved["a"].uri == "https://drive.example.com/drive-1"
+    assert "b" not in resolved
+    assert len(errors) == 1
+    assert errors[0].key == "b"
+    assert "drive api unavailable" in errors[0].reason
+
+
+def test_oversized_local_file_is_rejected_before_reading_bytes(tmp_path, monkeypatch) -> None:
+    """The size check must happen from a cheap stat(), not after reading the
+    whole oversized file into memory -- if read_bytes() is ever called for a
+    file this large, that's the bug the stat() pre-check exists to avoid."""
+    from docspan.backends.google_docs.image_source import MAX_IMAGE_BYTES
+    from docspan.backends.google_docs import image_source as image_source_module
+
+    big = tmp_path / "big.png"
+    big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (MAX_IMAGE_BYTES + 1))
+
+    def fail_if_called(self):
+        raise AssertionError("read_bytes() must not be called for an oversized file")
+
+    monkeypatch.setattr(image_source_module.Path, "read_bytes", fail_if_called)
+
+    sources = {"a": LocalPathSource(path=str(big))}
+    resolved, errors = resolve_images(sources, uploader=lambda *_: {"file_id": "x", "uri": "x"})
+    assert not resolved
+    assert "exceeds" in errors[0].reason

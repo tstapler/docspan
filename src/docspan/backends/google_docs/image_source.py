@@ -119,6 +119,12 @@ def resolve_images(
             resolved[key] = _resolve_one(source, uploader)
         except _ResolutionFailure as exc:
             errors.append(ImageResolutionError(key=key, reason=str(exc)))
+        except Exception as exc:
+            # `uploader` (Drive API) can raise anything, not just
+            # _ResolutionFailure -- letting that propagate would discard
+            # every already-resolved image in this same batch instead of
+            # just reporting this one key as a warning.
+            errors.append(ImageResolutionError(key=key, reason=f"upload failed: {exc}"))
     return resolved, errors
 
 
@@ -155,6 +161,17 @@ def _read_local(path: str) -> Tuple[bytes, str]:
     p = Path(path)
     if not p.is_file():
         raise _ResolutionFailure(f"image file not found: {path}")
+    try:
+        size = p.stat().st_size
+    except OSError as exc:
+        raise _ResolutionFailure(f"could not read image file {path}: {exc}") from exc
+    if size > MAX_IMAGE_BYTES:
+        # Reject on the cheap stat() size before reading the whole file into
+        # memory -- an oversized file has no other reason to be read at all.
+        raise _ResolutionFailure(
+            f"image exceeds {MAX_IMAGE_BYTES // (1024 * 1024)}MB limit "
+            f"({size} bytes): {p.name}"
+        )
     try:
         data = p.read_bytes()
     except OSError as exc:

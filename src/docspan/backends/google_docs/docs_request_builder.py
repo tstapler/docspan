@@ -251,11 +251,21 @@ class DocsRequestBuilder:
 
         Only `_node_key` carries this signal, not `_content_key` — see the
         latter's docstring for why the split is necessary.
+
+        Deliberately excludes `node.src` for an image. `src` is a Drive
+        upload URI (re-uploaded fresh on every push, per
+        `resolve_document_images`) or a pulled `contentUri`, which Google's
+        API docs say may change over time even when nothing about the image
+        changed — so keying identity on it made every push after a pull
+        misdetect the image as changed and delete-and-reinsert it, destroying
+        any comment anchored to that paragraph. `alt`/`width_pt`/`height_pt`
+        are the closest stand-in for "same image slot"; a same-alt-text swap
+        to a different picture is the accepted trade-off (see `_content_key`).
         """
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(self._cell_key(c) for c in row) for row in node.rows))
         if isinstance(node, DocsImageNode):
-            return ("__image__", node.src, node.alt, node.width_pt, node.height_pt)
+            return ("__image__", node.alt, node.width_pt, node.height_pt)
         return (
             "__para__",
             node.style,
@@ -339,7 +349,9 @@ class DocsRequestBuilder:
         if isinstance(node, DocsTableNode):
             return ("__table__", tuple(tuple(c.text for c in row) for row in node.rows))
         if isinstance(node, DocsImageNode):
-            return ("__image__", node.src)
+            # Same rationale as `_node_key`: `src` is a volatile Drive/contentUri
+            # value, not a stable identity, so it cannot participate here either.
+            return ("__image__", node.alt)
         return ("__para__", node.text)
 
     def _opcodes(

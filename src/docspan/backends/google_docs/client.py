@@ -212,12 +212,18 @@ class GoogleDocsClient:
             ).execute()
         )
         file_id = file["id"]
-        self._with_backoff(
-            lambda: self.drive_service.permissions().create(
-                fileId=file_id,
-                body={"role": "reader", "type": "anyone"},
-            ).execute()
-        )
+        try:
+            self._with_backoff(
+                lambda: self.drive_service.permissions().create(
+                    fileId=file_id,
+                    body={"role": "reader", "type": "anyone"},
+                ).execute()
+            )
+        except Exception:
+            # files().create() already succeeded; without this the caller
+            # never learns file_id and that Drive file is orphaned forever.
+            self.delete_temp_upload(file_id)
+            raise
         return {
             "file_id": file_id,
             "uri": f"https://drive.google.com/uc?export=view&id={file_id}",

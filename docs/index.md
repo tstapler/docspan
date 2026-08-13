@@ -58,6 +58,7 @@ See the [Install](install.md) page for full auth setup instructions and the [Com
 !!! warning "Known limitations in v0.1.0"
     - Google Docs: comments on edited paragraphs are lost on push (paragraph-level structural diff; comments on unchanged paragraphs are preserved)
     - Google Docs: images push and pull (local files upload to Drive; `https://` URLs are referenced directly)
+    - Google Docs: a pulled image's markdown link is Google's `contentUri`, which can change over time even when the image hasn't — push doesn't misdetect this as a real change, but the stale URI in your local file can still show up as a one-sided edit during conflict resolution
     - Push: no image support for Confluence — local images cannot be pushed
     - Push: no table support — markdown tables are not rendered in Google Docs
     - Confluence: requires an Atlassian API token; no OAuth flow

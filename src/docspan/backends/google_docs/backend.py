@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import pathlib
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from googleapiclient.errors import HttpError
 
@@ -113,6 +113,22 @@ class GoogleDocsBackend(Backend):
             "Run: docspan auth setup google_docs"
         )
 
+    def _cleanup_temp_uploads(self, file_ids: List[str]) -> List[str]:
+        """Best-effort delete of temp Drive uploads; returns ids that could not be deleted.
+
+        Called from push()'s error paths so `retryable_temp_drive_file_ids`
+        actually reflects files still orphaned on Drive, rather than the
+        full upload list regardless of whether cleanup was ever attempted.
+        """
+        assert self._client is not None
+        still_orphaned = []
+        for file_id in file_ids:
+            try:
+                self._client.delete_temp_upload(file_id)
+            except Exception:
+                still_orphaned.append(file_id)
+        return still_orphaned
+
     def _build_push_plan(
         self, local_path: str, doc_id: str, tab_id: Optional[str] = None
     ) -> PushPlan:
@@ -159,45 +175,56 @@ class GoogleDocsBackend(Backend):
             ]
             target_nodes = [n for n in target_nodes if n is not None]
 
-        doc = self._client.get_document(doc_id)
-        doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
-        current_nodes = DocsStructureParser().parse(doc)
+        try:
+            doc = self._client.get_document(doc_id)
+            doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
+            current_nodes = DocsStructureParser().parse(doc)
 
-        # Both sides of the diff pass through the same projection, so the diff
-        # only ever sees what markdown can faithfully represent. Without this,
-        # an empty paragraph in the document has no counterpart on the markdown
-        # side (blank lines are separators, so the parser never emits one) and
-        # the diff read that asymmetry as "the user deleted this" — issue #17.
-        # See projection.project for the rule and the trade it makes.
-        current_nodes, current_residue = project(current_nodes)
-        # Projecting the target is NOT a no-op any more. This comment used to say
-        # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
-        # nothing on this side to drop" — splitting fenced code blocks per line
-        # falsified that: a blank line inside a block, an empty fence and a
-        # blank-only fence all produce `text=""`.
-        #
-        # So this drops author content — not the #17 trade, which *preserves* a
-        # blank paragraph the Doc already has. A blank code line exists only in the
-        # markdown and is never written.
-        #
-        # Reported rather than fixed, deliberately. Writing it needs projection to
-        # tell a blank *code* line (content) from a stray empty *prose* paragraph
-        # (not content), and the node model cannot express that distinction — a
-        # design change, not a patch. Until then the author is told, which is the
-        # difference between a known limitation and silent data loss.
-        target_nodes, target_residue = project(target_nodes)
+            # Both sides of the diff pass through the same projection, so the diff
+            # only ever sees what markdown can faithfully represent. Without this,
+            # an empty paragraph in the document has no counterpart on the markdown
+            # side (blank lines are separators, so the parser never emits one) and
+            # the diff read that asymmetry as "the user deleted this" — issue #17.
+            # See projection.project for the rule and the trade it makes.
+            current_nodes, current_residue = project(current_nodes)
+            # Projecting the target is NOT a no-op any more. This comment used to say
+            # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
+            # nothing on this side to drop" — splitting fenced code blocks per line
+            # falsified that: a blank line inside a block, an empty fence and a
+            # blank-only fence all produce `text=""`.
+            #
+            # So this drops author content — not the #17 trade, which *preserves* a
+            # blank paragraph the Doc already has. A blank code line exists only in the
+            # markdown and is never written.
+            #
+            # Reported rather than fixed, deliberately. Writing it needs projection to
+            # tell a blank *code* line (content) from a stray empty *prose* paragraph
+            # (not content), and the node model cannot express that distinction — a
+            # design change, not a patch. Until then the author is told, which is the
+            # difference between a known limitation and silent data loss.
+            target_nodes, target_residue = project(target_nodes)
 
-        body_content = doc.get("body", {}).get("content", [])
-        doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
+            body_content = doc.get("body", {}).get("content", [])
+            doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
 
-        request_builder = DocsRequestBuilder()
-        requests = request_builder.build(
-            current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
-        )
-        entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
+            request_builder = DocsRequestBuilder()
+            requests = request_builder.build(
+                current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
+            )
+            entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
 
-        comments = self._client.list_comments(doc_id)
-        high_risk = find_high_risk_paragraphs(entries, comments)
+            comments = self._client.list_comments(doc_id)
+            high_risk = find_high_risk_paragraphs(entries, comments)
+        except Exception:
+            # Images (if any) were already uploaded to Drive above -- anything
+            # that fails from here on must not leave them orphaned. Best-effort:
+            # a cleanup failure must not mask the original exception.
+            for file_id in temp_drive_file_ids:
+                try:
+                    self._client.delete_temp_upload(file_id)
+                except Exception:
+                    pass
+            raise
 
         return PushPlan(
             current_nodes=current_nodes,
@@ -252,6 +279,16 @@ class GoogleDocsBackend(Backend):
             unresolved = unresolved_anchors(plan.target_nodes, document_nodes)
             target_residue_note = describe_target_residue(plan.target_residue)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
+            # --dry-run never inserts anything, so any image just uploaded to
+            # build this preview must be deleted now -- PushPreview has no
+            # field to carry temp_drive_file_ids forward for a later cleanup.
+            # Best-effort: a cleanup failure must not turn a successful
+            # preview into a reported error.
+            for file_id in plan.temp_drive_file_ids:
+                try:
+                    self._client.delete_temp_upload(file_id)
+                except Exception:
+                    pass
         except HttpError as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)
@@ -526,10 +563,12 @@ class GoogleDocsBackend(Backend):
                 status="error",
                 doc_id=doc_id,
                 message=str(exc),
-                retryable_temp_drive_file_ids=plan.temp_drive_file_ids if plan else [],
+                retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
+                    plan.temp_drive_file_ids if plan else []
+                ),
             )
         except HttpError as exc:
-            retryable = plan.temp_drive_file_ids if plan else []
+            retryable = self._cleanup_temp_uploads(plan.temp_drive_file_ids if plan else [])
             if exc.resp.status == 400 and "requiredRevisionId" in str(exc):
                 return PushResult(
                     status="conflict",
@@ -548,14 +587,18 @@ class GoogleDocsBackend(Backend):
                 status="error",
                 doc_id=doc_id,
                 message=str(exc),
-                retryable_temp_drive_file_ids=plan.temp_drive_file_ids if plan else [],
+                retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
+                    plan.temp_drive_file_ids if plan else []
+                ),
             )
         except Exception as exc:
             return PushResult(
                 status="error",
                 doc_id=doc_id,
                 message=str(exc),
-                retryable_temp_drive_file_ids=plan.temp_drive_file_ids if plan else [],
+                retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
+                    plan.temp_drive_file_ids if plan else []
+                ),
             )
 
     @staticmethod
