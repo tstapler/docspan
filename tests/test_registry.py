@@ -9,7 +9,6 @@ from docspan.backends.google_docs.registry import (
     MarkdownTokenRegistry,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MarkdownTokenRegistry (push direction)
 # ─────────────────────────────────────────────────────────────────────────────

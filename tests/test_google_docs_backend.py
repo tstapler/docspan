@@ -349,7 +349,7 @@ class TestDryRunCrossTabParity:
 
         assert preview.unresolved_anchors == [], preview.unresolved_anchors
 
-        push_result = backend.push(str(local), "doc-1")
+        backend.push(str(local), "doc-1")
         links = [
             request["updateTextStyle"]["textStyle"]["link"]
             for call in fake_client.batch_update.call_args_list
