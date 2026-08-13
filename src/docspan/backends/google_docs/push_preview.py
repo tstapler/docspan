@@ -127,9 +127,9 @@ def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
             blocks.append(
                 f'⚠ NATIVE CHECKBOX GLYPH: paragraph "{hr.paragraph_text}" is a native Google Docs\n'
                 "  checkbox (checked/unchecked state not readable via the API) — editing it here\n"
-                "  would layer literal [x]/[ ] text on top of the existing glyph. Toggle this\n"
-                "  line by hand in Google Docs UI instead, or re-run with --force to proceed\n"
-                "  anyway."
+                "  would delete the paragraph's existing text and reinsert literal [x]/[ ] text in\n"
+                "  its place; the checkbox glyph itself is untouched by that edit. Toggle this line\n"
+                "  by hand in Google Docs UI instead, or re-run with --force to proceed anyway."
             )
     return "\n".join(blocks)
 
