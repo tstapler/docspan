@@ -15,8 +15,6 @@ Criterion 6 (gated live integration) is out of default-CI scope.
 
 from dataclasses import replace
 
-import pytest
-
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsImageNode,
@@ -412,8 +410,8 @@ def test_oversized_local_file_is_rejected_before_reading_bytes(tmp_path, monkeyp
     """The size check must happen from a cheap stat(), not after reading the
     whole oversized file into memory -- if read_bytes() is ever called for a
     file this large, that's the bug the stat() pre-check exists to avoid."""
-    from docspan.backends.google_docs.image_source import MAX_IMAGE_BYTES
     from docspan.backends.google_docs import image_source as image_source_module
+    from docspan.backends.google_docs.image_source import MAX_IMAGE_BYTES
 
     big = tmp_path / "big.png"
     big.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * (MAX_IMAGE_BYTES + 1))

@@ -331,13 +331,10 @@ class GoogleDocsBackend(Backend):
             # --dry-run never inserts anything, so any image just uploaded to
             # build this preview must be deleted now -- PushPreview has no
             # field to carry temp_drive_file_ids forward for a later cleanup.
-            # Best-effort: a cleanup failure must not turn a successful
-            # preview into a reported error.
-            for file_id in plan.temp_drive_file_ids:
-                try:
-                    self._client.delete_temp_upload(file_id)
-                except Exception:
-                    pass
+            # Routed through the same best-effort helper push() uses, so a
+            # cleanup failure never turns a successful preview into a
+            # reported error.
+            self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids)
         except HttpError as exc:
             return PushPreview(
                 entries=[], unchanged_count=0, high_risk=[], request_count=0, error=str(exc)

@@ -644,7 +644,11 @@ class DocsRequestBuilder:
 
         Used only to rank candidates in `_prefer_structural_pairing`.
         """
-        if isinstance(node, DocsTableNode) or isinstance(target_node, DocsTableNode):
+        # Tables and images carry none of the style/is_list_item attributes this
+        # heuristic compares, so neither can score a structural match here.
+        if isinstance(node, (DocsTableNode, DocsImageNode)) or isinstance(
+            target_node, (DocsTableNode, DocsImageNode)
+        ):
             return 0
         score = 0
         if node.style == target_node.style:

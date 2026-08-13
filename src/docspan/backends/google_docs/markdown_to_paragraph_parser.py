@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import html
 import re
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, cast
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsImageNode,
@@ -440,7 +440,10 @@ class MarkdownToParagraphParser:
         # checklist state is kept as literal text (ADR-001); that plugin would
         # strip the [ ]/[x] marker into attrs.checked and lose it from .text.
         md = mistune.create_markdown(renderer=None, plugins=["table"])
-        tokens = md(content) or []
+        # mistune's stub types create_markdown()'s call result as `str |
+        # list[dict]` because with a renderer it returns a rendered string —
+        # renderer=None means this call always returns the AST token list.
+        tokens = cast(List[Dict[str, Any]], md(content) or [])
 
         nodes: List[Node] = []
         for token in tokens:

@@ -382,7 +382,9 @@ class DocsStructureParser:
         )
 
     @staticmethod
-    def _resolve_heading_links(nodes: List[Union[DocsParagraphNode, DocsTableNode]]) -> None:
+    def _resolve_heading_links(
+        nodes: List[Union[DocsParagraphNode, DocsTableNode, DocsImageNode]],
+    ) -> None:
         """Rewrite `headingId` links into markdown anchors, in place.
 
         Runs after the whole body is parsed because a heading link can point
