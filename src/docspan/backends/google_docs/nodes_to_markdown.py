@@ -171,7 +171,10 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
     """Render a parsed node list (document order) back into Markdown text."""
     lines: List[str] = []
     for node in nodes:
-        renderer = _PULL_REGISTRY.get(_dispatch_key(node))
+        key = _dispatch_key(node)
+        renderer = _PULL_REGISTRY.get(key)
+        if renderer is None:
+            raise ValueError(f"no renderer registered for dispatch key {key!r}")
         lines.append(renderer.render(node))
         lines.append("")
 

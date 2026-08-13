@@ -13,6 +13,14 @@ def test_empty_string_returns_empty_list() -> None:
     assert parser.parse("") == []
 
 
+def test_unregistered_token_types_are_silently_skipped() -> None:
+    """thematic_break (---) and block_html (<div>) have no registered converter;
+    parse() must skip them rather than raise, keeping the surrounding paragraphs."""
+    nodes = parser.parse("Before\n\n---\n\n<div>raw html</div>\n\nAfter")
+    texts = [n.text for n in nodes]
+    assert texts == ["Before", "After"]
+
+
 def test_single_paragraph() -> None:
     nodes = parser.parse("Hello world")
     assert len(nodes) == 1
