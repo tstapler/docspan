@@ -405,8 +405,9 @@ class DocsRequestBuilder:
         heading "paired" with an unrelated line gets deleted-and-reinserted,
         destroying its headingId). A native checkbox's checked state can't be
         read back from the API (ADR-001), so pull always round-trips it as
-        `- [ ] text`; `_key` strips that synthetic `"[ ] "` marker before keying
-        so an unedited checkbox doesn't look changed and get retyped on every push.
+        `- [ ] text`; `_target_key` strips that synthetic `"[ ] "` marker
+        before keying the target side only, so an unedited checkbox doesn't
+        look changed and get retyped on every push.
         """
         repaired: List[Opcode] = []
         for tag, i1, i2, j1, j2 in opcodes:
@@ -420,7 +421,12 @@ class DocsRequestBuilder:
                 if isinstance(n, DocsParagraphNode) and n.is_native_checkbox
             }
 
-            def _key(node: Node, _checkbox_texts: Set[str] = checkbox_texts) -> Tuple:
+            def _target_key(node: Node, _checkbox_texts: Set[str] = checkbox_texts) -> Tuple:
+                # Only the target (markdown) side ever carries pull's synthetic
+                # "[ ] " marker for an unedited checkbox — stripping it on the
+                # current (live-doc) side too would let an unrelated plain
+                # paragraph that merely *starts with* literal "[ ] " text
+                # collide with a real checkbox's key and steal its pairing.
                 if (
                     isinstance(node, DocsParagraphNode)
                     and not node.is_native_checkbox
@@ -432,8 +438,8 @@ class DocsRequestBuilder:
                 return self._content_key(node)
 
             inner_opcodes = _bounded_opcodes(
-                [_key(n) for n in cur_slice],
-                [_key(n) for n in tgt_slice],
+                [self._content_key(n) for n in cur_slice],
+                [_target_key(n) for n in tgt_slice],
                 context="replace-run",
             )
             pending: List[Opcode] = []
