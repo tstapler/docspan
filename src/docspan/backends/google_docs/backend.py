@@ -349,11 +349,16 @@ class GoogleDocsBackend(Backend):
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
             if plan.requests and plan.high_risk and not force:
+                # A blocked push is not going to be auto-retried, so cleanup
+                # is unconditional and best-effort here, same as the
+                # skipped/success paths below -- not "retryable" reporting.
                 return PushResult(
                     status="blocked",
                     doc_id=doc_id,
                     message=render_high_risk(plan.high_risk),
-                    retryable_temp_drive_file_ids=plan.temp_drive_file_ids,
+                    retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
+                        plan.temp_drive_file_ids
+                    ),
                 )
 
             if plan.requests:
@@ -474,8 +479,7 @@ class GoogleDocsBackend(Backend):
                 # is not a failure — it is state markdown does not describe, and
                 # the document is as close to the local file as markdown can
                 # express.
-                for file_id in plan.temp_drive_file_ids:
-                    self._client.delete_temp_upload(file_id)
+                self._cleanup_temp_uploads(plan.temp_drive_file_ids)
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
@@ -491,9 +495,9 @@ class GoogleDocsBackend(Backend):
             # The write(s) succeeded, so any Drive files uploaded for images in
             # this push are now referenced by the document -- nothing left to
             # retry, so they're cleaned up rather than left as orphaned temp
-            # files (criterion 5/7).
-            for file_id in plan.temp_drive_file_ids:
-                self._client.delete_temp_upload(file_id)
+            # files (criterion 5/7). Best-effort: a transient delete failure
+            # here must not turn a successful push into a reported error.
+            self._cleanup_temp_uploads(plan.temp_drive_file_ids)
 
             # Every warning signal is collected, not raced. Returning on the
             # first one meant whichever fired earliest hid the rest: a single

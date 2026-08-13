@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 from docspan.backends.base import PushResult
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
+from docspan.backends.google_docs.push_preview import HighRiskParagraph, PushPlan
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.batch_update — writeControl.requiredRevisionId
@@ -263,6 +264,146 @@ class TestPushHighRiskGate:
         # requests sent to Docs — proves the escape hatch actually replaced
         # the literal text rather than layering on top of it.
         assert not any("[ ] Whatsapp group" in json.dumps(r) for r in requests)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# push()'s temp-Drive-upload cleanup — blocked/skipped/success paths all
+# route through the same best-effort _cleanup_temp_uploads() helper (round-2
+# review finding: two of these previously called client.delete_temp_upload()
+# in a bare loop with no exception handling, so a single transient Drive
+# delete failure turned an otherwise-successful/skipped push into a reported
+# "error", and the blocked path reported the full upload list as retryable
+# even when cleanup succeeded).
+#
+# _build_push_plan is monkeypatched to return a hand-built PushPlan so each
+# test isolates push()'s cleanup handling from the diff/build logic that
+# produces temp_drive_file_ids in the first place (covered elsewhere, e.g.
+# tests/test_gdocs_images.py).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _canned_plan(
+    *, requests, high_risk=None, target_nodes=None, temp_drive_file_ids=None
+) -> "PushPlan":
+    return PushPlan(
+        current_nodes=[],
+        target_nodes=target_nodes or [],
+        requests=requests,
+        doc={"revisionId": "rev-1"},
+        entries=[],
+        unchanged_count=0,
+        comments=[],
+        high_risk=high_risk or [],
+        temp_drive_file_ids=temp_drive_file_ids or [],
+    )
+
+
+class TestPushTempDriveCleanup:
+    def test_blocked_push_cleans_up_and_reports_none_retryable_on_success(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        backend._build_push_plan = lambda *a, **kw: _canned_plan(  # type: ignore[method-assign]
+            requests=[{"insertText": {"location": {"index": 1}, "text": "x"}}],
+            high_risk=[HighRiskParagraph(paragraph_text="p", reasons=["native_glyph"])],
+            temp_drive_file_ids=["file-1", "file-2"],
+        )
+        local = tmp_path / "doc.md"
+        local.write_text("hi\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "blocked"
+        assert fake_client.delete_temp_upload.call_count == 2
+        assert result.retryable_temp_drive_file_ids == []
+
+    def test_blocked_push_still_reports_files_delete_temp_upload_failed_on(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        backend._build_push_plan = lambda *a, **kw: _canned_plan(  # type: ignore[method-assign]
+            requests=[{"insertText": {"location": {"index": 1}, "text": "x"}}],
+            high_risk=[HighRiskParagraph(paragraph_text="p", reasons=["native_glyph"])],
+            temp_drive_file_ids=["file-1"],
+        )
+        fake_client.delete_temp_upload.side_effect = Exception("transient Drive error")
+        local = tmp_path / "doc.md"
+        local.write_text("hi\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "blocked"
+        assert result.retryable_temp_drive_file_ids == ["file-1"]
+
+    def test_skipped_push_cleans_up_temp_uploads(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        backend._build_push_plan = lambda *a, **kw: _canned_plan(  # type: ignore[method-assign]
+            requests=[], temp_drive_file_ids=["file-1"]
+        )
+        local = tmp_path / "doc.md"
+        local.write_text("hi\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "skipped"
+        fake_client.delete_temp_upload.assert_called_once_with("file-1")
+
+    def test_skipped_push_is_not_downgraded_to_error_when_cleanup_fails(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        backend._build_push_plan = lambda *a, **kw: _canned_plan(  # type: ignore[method-assign]
+            requests=[], temp_drive_file_ids=["file-1"]
+        )
+        fake_client.delete_temp_upload.side_effect = Exception("transient Drive error")
+        local = tmp_path / "doc.md"
+        local.write_text("hi\n", encoding="utf-8")
+
+        # This is the actual regression: a bare delete_temp_upload loop with
+        # no exception handling used to let this propagate out of push() as
+        # an uncaught exception (or get misreported as status="error"),
+        # turning a true no-op into a false failure.
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "skipped"
+
+    def test_successful_push_cleans_up_temp_uploads(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.list_comments.return_value = []
+        backend._build_push_plan = lambda *a, **kw: _canned_plan(  # type: ignore[method-assign]
+            requests=[{"insertText": {"location": {"index": 1}, "text": "x"}}],
+            temp_drive_file_ids=["file-1"],
+        )
+        local = tmp_path / "doc.md"
+        local.write_text("hi\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "ok"
+        fake_client.delete_temp_upload.assert_called_once_with("file-1")
+
+    def test_successful_push_is_not_downgraded_to_error_when_cleanup_fails(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.list_comments.return_value = []
+        backend._build_push_plan = lambda *a, **kw: _canned_plan(  # type: ignore[method-assign]
+            requests=[{"insertText": {"location": {"index": 1}, "text": "x"}}],
+            temp_drive_file_ids=["file-1"],
+        )
+        fake_client.delete_temp_upload.side_effect = Exception("transient Drive error")
+        local = tmp_path / "doc.md"
+        local.write_text("hi\n", encoding="utf-8")
+
+        # The other actual regression: a batch_update that genuinely
+        # succeeded must not be reported as "error" just because the
+        # best-effort Drive cleanup that follows it hit a transient failure.
+        result = backend.push(str(local), "doc-1", force=False)
+
+        assert result.status == "ok"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
