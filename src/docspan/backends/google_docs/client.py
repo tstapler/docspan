@@ -216,7 +216,11 @@ class GoogleDocsClient:
             self._with_backoff(
                 lambda: self.drive_service.permissions().create(
                     fileId=file_id,
-                    body={"role": "reader", "type": "anyone"},
+                    body={
+                        "role": "reader",
+                        "type": "anyone",
+                        "allowFileDiscovery": False,
+                    },
                 ).execute()
             )
         except Exception:

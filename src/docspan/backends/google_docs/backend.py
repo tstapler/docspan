@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 from typing import TYPE_CHECKING, List, Optional
@@ -69,6 +70,8 @@ from docspan.core.paths import COMMENTS_SUFFIX
 if TYPE_CHECKING:
     from docspan.config import GoogleDocsConfig, MarkgateConfig
 
+logger = logging.getLogger(__name__)
+
 
 class GoogleDocsBackend(Backend):
     name = "google_docs"
@@ -129,6 +132,38 @@ class GoogleDocsBackend(Backend):
                 still_orphaned.append(file_id)
         return still_orphaned
 
+    def _cleanup_temp_uploads_logged(self, file_ids: List[str]) -> List[str]:
+        """Same as `_cleanup_temp_uploads`, but logs when cleanup fails.
+
+        The four exception-handling paths in push() surface a cleanup
+        failure via `PushResult.retryable_temp_drive_file_ids` — the
+        caller sees it. The success/skipped paths used to discard the
+        return value entirely, so a cleanup failure there was completely
+        silent: no log, no signal, and the temp file stayed public on
+        Drive indefinitely. This wraps the same best-effort cleanup with a
+        warning log so that invisibility doesn't depend on which push
+        outcome triggered it.
+        """
+        still_orphaned = self._cleanup_temp_uploads(file_ids)
+        if still_orphaned:
+            logger.warning(
+                "Failed to delete %d temp Drive upload(s) after push; "
+                "still public and orphaned: %s",
+                len(still_orphaned),
+                still_orphaned,
+            )
+        return still_orphaned
+
+    def _cleanup_plan_temp_uploads(self, plan: Optional[PushPlan]) -> List[str]:
+        """`_cleanup_temp_uploads_logged`, tolerating a plan that never got built.
+
+        Every exception path in push() reaches its cleanup call with `plan`
+        possibly still None (the exception fired before `_build_push_plan`
+        returned) — this is the one line each of those four `except`
+        clauses would otherwise duplicate.
+        """
+        return self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids if plan else [])
+
     def _build_push_plan(
         self, local_path: str, doc_id: str, tab_id: Optional[str] = None
     ) -> PushPlan:
@@ -168,12 +203,26 @@ class GoogleDocsBackend(Backend):
             resolved_images, image_warnings, temp_drive_file_ids = resolve_document_images(
                 image_nodes, local_path, self._client.upload_temp_image
             )
-            resolved_iter = iter(resolved_images)
+            # A failed resolution (renamed/unreadable/oversized file, a
+            # transient upload error) must NOT drop the node from
+            # target_nodes: DocsRequestBuilder.build() treats "present in
+            # current, absent in target" as a delete, so dropping it here
+            # would silently delete a previously-synced image from the live
+            # doc on the very push that failed to re-resolve it. Substitute
+            # the original (unresolved) DocsImageNode instead — its
+            # alt/width_pt/height_pt are untouched, which is exactly the
+            # identity _node_key/_content_key use for images (src is
+            # deliberately excluded from both, see their docstrings), so the
+            # diff sees "same image, no change" rather than "removed".
+            substituted_images = [
+                resolved if resolved is not None else original
+                for resolved, original in zip(resolved_images, image_nodes)
+            ]
+            subst_iter = iter(substituted_images)
             target_nodes = [
-                next(resolved_iter) if isinstance(n, DocsImageNode) else n
+                next(subst_iter) if isinstance(n, DocsImageNode) else n
                 for n in target_nodes
             ]
-            target_nodes = [n for n in target_nodes if n is not None]
 
         try:
             doc = self._client.get_document(doc_id)
@@ -356,7 +405,7 @@ class GoogleDocsBackend(Backend):
                     status="blocked",
                     doc_id=doc_id,
                     message=render_high_risk(plan.high_risk),
-                    retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
+                    retryable_temp_drive_file_ids=self._cleanup_temp_uploads_logged(
                         plan.temp_drive_file_ids
                     ),
                 )
@@ -479,7 +528,7 @@ class GoogleDocsBackend(Backend):
                 # is not a failure — it is state markdown does not describe, and
                 # the document is as close to the local file as markdown can
                 # express.
-                self._cleanup_temp_uploads(plan.temp_drive_file_ids)
+                skipped_retryable = self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids)
                 return PushResult(
                     status="skipped",
                     doc_id=doc_id,
@@ -488,6 +537,7 @@ class GoogleDocsBackend(Backend):
                     or describe_residue(pass2_residue)
                     or ("\n".join(plan.image_warnings) if plan.image_warnings else None)
                     or "No changes detected",
+                    retryable_temp_drive_file_ids=skipped_retryable,
                 )
 
             url = f"https://docs.google.com/document/d/{doc_id}/edit"
@@ -496,8 +546,12 @@ class GoogleDocsBackend(Backend):
             # this push are now referenced by the document -- nothing left to
             # retry, so they're cleaned up rather than left as orphaned temp
             # files (criterion 5/7). Best-effort: a transient delete failure
-            # here must not turn a successful push into a reported error.
-            self._cleanup_temp_uploads(plan.temp_drive_file_ids)
+            # here must not turn a successful push into a reported error, but
+            # it must not be silent either -- _cleanup_temp_uploads_logged logs
+            # a warning and its return value is threaded into both PushResults
+            # below so a failure here is visible the same way it is on every
+            # exception path.
+            success_retryable = self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids)
 
             # Every warning signal is collected, not raced. Returning on the
             # first one meant whichever fired earliest hid the rest: a single
@@ -559,20 +613,27 @@ class GoogleDocsBackend(Backend):
             ]
             if messages:
                 return PushResult(
-                    status="warning", doc_id=doc_id, url=url, message="\n".join(messages)
+                    status="warning",
+                    doc_id=doc_id,
+                    url=url,
+                    message="\n".join(messages),
+                    retryable_temp_drive_file_ids=success_retryable,
                 )
-            return PushResult(status="ok", doc_id=doc_id, url=url)
+            return PushResult(
+                status="ok",
+                doc_id=doc_id,
+                url=url,
+                retryable_temp_drive_file_ids=success_retryable,
+            )
         except TabNotFoundError as exc:
             return PushResult(
                 status="error",
                 doc_id=doc_id,
                 message=str(exc),
-                retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
-                    plan.temp_drive_file_ids if plan else []
-                ),
+                retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
             )
         except HttpError as exc:
-            retryable = self._cleanup_temp_uploads(plan.temp_drive_file_ids if plan else [])
+            retryable = self._cleanup_plan_temp_uploads(plan)
             if exc.resp.status == 400 and "requiredRevisionId" in str(exc):
                 return PushResult(
                     status="conflict",
@@ -591,18 +652,14 @@ class GoogleDocsBackend(Backend):
                 status="error",
                 doc_id=doc_id,
                 message=str(exc),
-                retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
-                    plan.temp_drive_file_ids if plan else []
-                ),
+                retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
             )
         except Exception as exc:
             return PushResult(
                 status="error",
                 doc_id=doc_id,
                 message=str(exc),
-                retryable_temp_drive_file_ids=self._cleanup_temp_uploads(
-                    plan.temp_drive_file_ids if plan else []
-                ),
+                retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
             )
 
     @staticmethod

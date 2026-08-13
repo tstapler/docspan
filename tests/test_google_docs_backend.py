@@ -12,6 +12,8 @@ import json
 from typing import Callable
 from unittest.mock import MagicMock
 
+import pytest
+
 from docspan.backends.base import PushResult
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
@@ -517,6 +519,290 @@ class TestDiffTooExpensiveSurfacesAsUserFacingError:
 
         assert result.message == str(DiffTooExpensive("document", 6000, 3000))
         assert "Traceback" not in (result.message or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BLOCKER regression: a failed local-image resolution must not read as
+# "image deleted" to the diff. `_build_push_plan` substitutes the original
+# (pre-resolution) DocsImageNode for a slot that failed to resolve instead
+# of dropping it, so `_node_key`/`_content_key` (which key images on
+# alt/width_pt/height_pt, never src) still see "unchanged" against the
+# image already live in the doc.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _doc_with_existing_image() -> dict:
+    """A live doc that already has one inline image, matching how a
+    previous, successful push would have left it. No `size` -- the
+    markdown parser never produces width_pt/height_pt (see
+    MarkdownToParagraphParser), so the current doc's image must also have
+    none of its own for the substituted node's identity to match."""
+    return {
+        "revisionId": "ALm37abc",
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 2,
+                    "paragraph": {
+                        "elements": [
+                            {"inlineObjectElement": {"inlineObjectId": "kix.obj1"}},
+                        ]
+                    },
+                },
+                {
+                    "startIndex": 2,
+                    "endIndex": 3,
+                    "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+                },
+            ]
+        },
+        "inlineObjects": {
+            "kix.obj1": {
+                "inlineObjectProperties": {
+                    "embeddedObject": {
+                        "contentUri": "https://docs.google.com/existing-content-uri",
+                        "description": "a diagram",
+                    }
+                }
+            }
+        },
+    }
+
+
+class TestFailedImageResolutionDoesNotDeleteExistingImage:
+    def test_build_push_plan_emits_no_delete_when_local_image_is_missing(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_existing_image()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        # References a local file that does not exist -- simulates the
+        # local image having been renamed/deleted (or a transient upload
+        # error) on a push that happens *after* the image was already
+        # synced to the live doc once.
+        local.write_text("![a diagram](./missing.png)\n", encoding="utf-8")
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert plan.image_warnings and "missing.png" in plan.image_warnings[0]
+        # The real bug: dropping the unresolved node from target_nodes made
+        # the diff see "present in current, absent in target" and emit a
+        # delete for the image already in the doc.
+        assert not any("deleteContentRange" in r for r in plan.requests)
+        assert not any("insertInlineImage" in r for r in plan.requests)
+        fake_client.upload_temp_image.assert_not_called()
+
+    def test_push_reports_skipped_not_a_delete_when_local_image_is_missing(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_existing_image()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("![a diagram](./missing.png)\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsClient.upload_temp_image / delete_temp_upload -- direct coverage
+# against a mocked docs_service/drive_service (previously untested at this
+# boundary; see TestBatchUpdateRevisionGuard above for the same pattern).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestUploadTempImage:
+    def test_returns_file_id_and_uri(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        client.drive_service.files.return_value.create.return_value.execute.return_value = {
+            "id": "file-1"
+        }
+        client.drive_service.permissions.return_value.create.return_value.execute.return_value = {}
+
+        result = client.upload_temp_image(b"pngbytes", "diagram.png", "image/png")
+
+        assert result == {
+            "file_id": "file-1",
+            "uri": "https://drive.google.com/uc?export=view&id=file-1",
+        }
+
+    def test_uploads_with_given_filename(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        client.drive_service.files.return_value.create.return_value.execute.return_value = {
+            "id": "file-1"
+        }
+        client.drive_service.permissions.return_value.create.return_value.execute.return_value = {}
+
+        client.upload_temp_image(b"pngbytes", "diagram.png", "image/png")
+
+        _, kwargs = client.drive_service.files.return_value.create.call_args
+        assert kwargs["body"] == {"name": "diagram.png"}
+
+    def test_shares_publicly_with_allow_file_discovery_false(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        """MAJOR security fix: a public-with-discovery share on a Drive file
+        makes it turn up in search for anyone, not just holders of the link
+        insertInlineImage needs. `allowFileDiscovery: False` keeps it
+        link-only for the temp file's brief public window."""
+        client = make_client()
+        client.drive_service.files.return_value.create.return_value.execute.return_value = {
+            "id": "file-1"
+        }
+        client.drive_service.permissions.return_value.create.return_value.execute.return_value = {}
+
+        client.upload_temp_image(b"pngbytes", "diagram.png", "image/png")
+
+        _, kwargs = client.drive_service.permissions.return_value.create.call_args
+        assert kwargs["fileId"] == "file-1"
+        assert kwargs["body"] == {
+            "role": "reader",
+            "type": "anyone",
+            "allowFileDiscovery": False,
+        }
+
+    def test_deletes_orphan_and_reraises_when_share_fails(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        client.drive_service.files.return_value.create.return_value.execute.return_value = {
+            "id": "file-1"
+        }
+        client.drive_service.permissions.return_value.create.return_value.execute.side_effect = (
+            RuntimeError("share failed")
+        )
+        client.drive_service.files.return_value.delete.return_value.execute.return_value = {}
+
+        with pytest.raises(RuntimeError, match="share failed"):
+            client.upload_temp_image(b"pngbytes", "diagram.png", "image/png")
+
+        _, kwargs = client.drive_service.files.return_value.delete.call_args
+        assert kwargs["fileId"] == "file-1"
+
+
+class TestDeleteTempUpload:
+    def test_deletes_by_file_id(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        client.drive_service.files.return_value.delete.return_value.execute.return_value = {}
+
+        client.delete_temp_upload("file-1")
+
+        _, kwargs = client.drive_service.files.return_value.delete.call_args
+        assert kwargs["fileId"] == "file-1"
+
+    def test_tolerates_404(
+        self,
+        make_client: Callable[[], GoogleDocsClient],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:
+        client = make_client()
+        client.drive_service.files.return_value.delete.return_value.execute.side_effect = (
+            make_http_error(404, "File not found")
+        )
+
+        client.delete_temp_upload("file-1")  # must not raise
+
+    def test_reraises_non_404_errors(
+        self,
+        make_client: Callable[[], GoogleDocsClient],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:
+        client = make_client()
+        client.drive_service.files.return_value.delete.return_value.execute.side_effect = (
+            make_http_error(500, "Internal error")
+        )
+
+        with pytest.raises(Exception):
+            client.delete_temp_upload("file-1")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICAL: _build_push_plan's own exception-cleanup path and preview_push's
+# dry-run cleanup path, exercised through a real local image reference
+# rather than a monkeypatched _build_push_plan (TestPushTempDriveCleanup
+# above never runs the code inside _build_push_plan/preview_push at all).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestBuildPushPlanCleansUpOnException:
+    def test_exception_after_upload_deletes_the_temp_upload(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.upload_temp_image.return_value = {
+            "file_id": "file-1",
+            "uri": "https://drive.example.com/file-1",
+        }
+        # get_document is the first thing _build_push_plan does after
+        # resolving images -- raising here lands squarely inside the
+        # try/except that's supposed to clean up temp_drive_file_ids.
+        fake_client.get_document.side_effect = RuntimeError("network exploded")
+
+        png = tmp_path / "diagram.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        local = tmp_path / "doc.md"
+        local.write_text("![a diagram](./diagram.png)\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="network exploded"):
+            backend._build_push_plan(str(local), "doc-1")
+
+        fake_client.delete_temp_upload.assert_called_once_with("file-1")
+
+    def test_cleanup_failure_does_not_mask_the_original_exception(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.upload_temp_image.return_value = {
+            "file_id": "file-1",
+            "uri": "https://drive.example.com/file-1",
+        }
+        fake_client.get_document.side_effect = RuntimeError("network exploded")
+        fake_client.delete_temp_upload.side_effect = Exception("drive delete also failed")
+
+        png = tmp_path / "diagram.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        local = tmp_path / "doc.md"
+        local.write_text("![a diagram](./diagram.png)\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="network exploded"):
+            backend._build_push_plan(str(local), "doc-1")
+
+
+class TestPreviewPushDeletesTempUploadsAfterDryRun:
+    def test_preview_push_deletes_temp_upload_it_made(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.upload_temp_image.return_value = {
+            "file_id": "file-1",
+            "uri": "https://drive.example.com/file-1",
+        }
+        fake_client.get_document.return_value = _empty_doc()
+        fake_client.list_comments.return_value = []
+
+        png = tmp_path / "diagram.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        local = tmp_path / "doc.md"
+        local.write_text("![a diagram](./diagram.png)\n", encoding="utf-8")
+
+        preview = backend.preview_push(str(local), "doc-1")
+
+        assert preview.error is None
+        fake_client.delete_temp_upload.assert_called_once_with("file-1")
+        fake_client.batch_update.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
