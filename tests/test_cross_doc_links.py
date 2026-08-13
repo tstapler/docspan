@@ -59,6 +59,13 @@ class TestParseCrossDocHref:
             path="../assets/diagram.png", fragment=None
         )
 
+    def test_absolute_path_is_not_a_candidate(self):
+        # An href starting with "/" isn't "relative to the pushing file" —
+        # resolve_local_mapping's posixpath.join would otherwise silently
+        # discard source_dir for such a path.
+        assert parse_cross_doc_href("/other/README.md") is None
+        assert parse_cross_doc_href("/other/README.md#some-heading") is None
+
 
 class TestNormalizeLocalPath:
     def test_dot_dot_traversal(self):
@@ -134,6 +141,15 @@ class TestCrossDocLinkResolverResolve:
         res = resolver.resolve("docs/source.md", "#local-anchor")
         assert res.kind == "not_cross_doc"
 
+    def test_absolute_path_href_falls_through_not_cross_doc(self):
+        # Guards against posixpath.join("docs", "/other/target.md") silently
+        # discarding "docs" and matching a mapping the href never actually
+        # named relative to the pushing file.
+        mappings = [make_mapping("other/target.md", remote_id="TARGETID")]
+        resolver = CrossDocLinkResolver(mappings, lambda d, t: [])
+        res = resolver.resolve("docs/source.md", "/other/target.md")
+        assert res.kind == "not_cross_doc"
+
     def test_unmapped_link_is_left_untouched(self):
         resolver = CrossDocLinkResolver([], lambda d, t: [])
         res = resolver.resolve("docs/source.md", "../nope.md")
@@ -179,6 +195,18 @@ class TestCrossDocLinkResolverResolve:
         res = resolver.resolve("docs/source.md", "target.md#some-heading")
         assert res.kind == "fetch_failed"
         assert res.detail is not None
+
+    def test_target_fetch_failure_detail_includes_original_error(self):
+        # A real bug in the fetch/parse path should be distinguishable from a
+        # transient network failure, not swallowed into a generic message.
+        mappings = [make_mapping("docs/target.md", remote_id="TARGETID")]
+
+        def fetch(doc_id, tab_id):
+            raise RuntimeError("403 forbidden")
+
+        resolver = CrossDocLinkResolver(mappings, fetch)
+        res = resolver.resolve("docs/source.md", "target.md#some-heading")
+        assert "403 forbidden" in res.detail
 
     def test_ambiguous_mapping_is_reported(self):
         mappings = [

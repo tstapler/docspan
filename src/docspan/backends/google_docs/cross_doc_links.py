@@ -26,6 +26,7 @@ cross-doc link is reported (via the returned "kind"), not silently written.
 """
 from __future__ import annotations
 
+import logging
 import posixpath
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
@@ -39,6 +40,8 @@ from docspan.backends.google_docs.heading_anchors import (
 
 if TYPE_CHECKING:
     from docspan.config import Mapping
+
+logger = logging.getLogger(__name__)
 
 
 class AmbiguousMappingError(Exception):
@@ -56,17 +59,21 @@ class CrossDocHref:
 def parse_cross_doc_href(href: Optional[str]) -> Optional[CrossDocHref]:
     """Split `href` into (path, fragment) if it is a same-file-system relative
     reference, or None if it's a same-document anchor, an absolute URL
-    (`http(s)://`, `mailto:`, ...), or otherwise not a cross-doc candidate.
+    (`http(s)://`, `mailto:`, ...), an absolute filesystem path, or otherwise
+    not a cross-doc candidate.
 
-    Deliberately conservative: any scheme or network location rules a link
-    out, so an absolute URL is never misclassified as a cross-doc reference
-    (criterion 8). A path-only href with no fragment is still a candidate —
-    fragment resolution is optional, the path is not.
+    Deliberately conservative: any scheme, network location, or leading `/`
+    rules a link out, so an absolute URL or absolute path is never
+    misclassified as a cross-doc reference (criterion 8) — this module's
+    contract is "relative to the pushing file," and `resolve_local_mapping`'s
+    `posixpath.join` would silently discard that relativity for a
+    root-relative href otherwise. A path-only href with no fragment is still
+    a candidate — fragment resolution is optional, the path is not.
     """
     if not href or is_anchor(href):
         return None
     parts = urlsplit(href)
-    if parts.scheme or parts.netloc or not parts.path:
+    if parts.scheme or parts.netloc or not parts.path or parts.path.startswith("/"):
         return None
     return CrossDocHref(path=parts.path, fragment=parts.fragment or None)
 
@@ -158,6 +165,7 @@ class CrossDocLinkResolver:
         self._mappings = mappings
         self._fetch_headings = fetch_headings
         self._cache: Dict[tuple, Optional[TargetHeadings]] = {}
+        self._fetch_errors: Dict[tuple, str] = {}
 
     def resolve(self, source_local_path: str, href: str) -> CrossDocResolution:
         parsed = parse_cross_doc_href(href)
@@ -189,10 +197,11 @@ class CrossDocLinkResolver:
 
         headings = self._headings_for(mapping.remote_id, mapping.tab_id)
         if headings is None:
-            return CrossDocResolution(
-                kind="fetch_failed",
-                detail=f"{href!r} — could not fetch target document {mapping.remote_id!r} to resolve its heading",
-            )
+            detail = f"{href!r} — could not fetch target document {mapping.remote_id!r} to resolve its heading"
+            error = self._fetch_errors.get((mapping.remote_id, mapping.tab_id))
+            if error:
+                detail += f": {error}"
+            return CrossDocResolution(kind="fetch_failed", detail=detail)
 
         heading_id = resolve_anchor("#" + parsed.fragment, headings.slug_to_id, headings.known_ids)
         if heading_id is None:
@@ -214,7 +223,12 @@ class CrossDocLinkResolver:
 
         try:
             nodes = self._fetch_headings(doc_id, tab_id)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "cross-doc link resolution: failed to fetch target document %r (tab %r): %s",
+                doc_id, tab_id, exc,
+            )
+            self._fetch_errors[(doc_id, tab_id)] = str(exc)
             return None
         slug_to_id = heading_slug_to_id(nodes)
         return TargetHeadings(slug_to_id=slug_to_id, known_ids=set(slug_to_id.values()))
