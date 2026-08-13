@@ -21,6 +21,7 @@ and is not specific to code.
 """
 from __future__ import annotations
 
+import difflib
 import random
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
@@ -473,6 +474,39 @@ class TestTheLiveHeadingSurvives:
         _push(replay, "### A\n\n## A\n")
 
         self._assert_no_destruction(replay, ["first", "second"], ["HEADING_2", "HEADING_3"])
+
+    def test_the_repro_actually_produces_the_insert_equal_delete_shape(self) -> None:
+        """AC1: confirm the backlog's claimed difflib shape at the `_opcodes()`
+        level, not just its `build()`-level symptom.
+
+        Without this, `test_a_duplicated_heading_survives_restyle_of_the_first_copy`
+        above could pass for the wrong reason — e.g. if the outer matcher never
+        produced the `insert`+`equal`+`delete` shape to begin with, `_repair`
+        would have nothing to fix and the test would be vacuous.
+        """
+        current = [
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=False),
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=False),
+        ]
+        target = [
+            DocsParagraphNode(text="A", style="HEADING_3", is_list_item=False),
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=False),
+        ]
+
+        a_keys = [builder._node_key(n) for n in current]
+        b_keys = [builder._node_key(n) for n in target]
+        raw_opcodes = difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False).get_opcodes()
+        assert raw_opcodes == [
+            ("insert", 0, 0, 0, 1),
+            ("equal", 0, 1, 1, 2),
+            ("delete", 1, 2, 2, 2),
+        ], f"backlog's claimed pre-repair shape did not reproduce: {raw_opcodes}"
+
+        fixed_opcodes = builder._opcodes(current, target)
+        assert all(tag == "equal" for tag, *_ in fixed_opcodes), (
+            f"_repair left a destructive insert/delete instead of an in-place "
+            f"restyle: {fixed_opcodes}"
+        )
 
     def test_restyle_only_shape_a_survives(self) -> None:
         """Minimal L=2 destructive shape from the issue #52 measurement.
