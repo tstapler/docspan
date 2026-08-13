@@ -173,6 +173,34 @@ def test_find_high_risk_paragraphs_flags_native_checkbox_glyph_paragraph_even_wi
     ]
 
 
+def test_find_high_risk_paragraphs_does_not_flag_unchanged_native_checkbox_after_zero_edit_round_trip() -> None:
+    """End-to-end AC: a native checkbox paragraph that round-trips unedited
+    through pull's `- [ ] text` rendering and back must not reach
+    find_high_risk_paragraphs at all — DocsRequestBuilder.diff_summary()
+    folds it back to unchanged before it ever becomes a DiffEntry (issue #17).
+    """
+    from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+    from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+    current = [
+        DocsParagraphNode(
+            style="NORMAL_TEXT", text="Buy milk", start_index=1, end_index=10,
+            is_list_item=True, is_native_checkbox=True,
+        )
+    ]
+    target = [
+        DocsParagraphNode(
+            style="NORMAL_TEXT", text="[ ] Buy milk", start_index=1, end_index=10,
+            is_list_item=True, is_native_checkbox=False,
+        )
+    ]
+    entries, unchanged_count = DocsRequestBuilder().diff_summary(current, target)
+
+    assert entries == []
+    assert unchanged_count == 1
+    assert find_high_risk_paragraphs(entries, comments=[]) == []
+
+
 def test_find_high_risk_paragraphs_does_not_flag_ordinary_literal_checklist_paragraph() -> None:
     entries = [
         DiffEntry(
