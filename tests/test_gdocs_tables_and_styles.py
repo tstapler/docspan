@@ -300,9 +300,16 @@ def _empty_table_doc() -> dict:
 def test_build_table_fill_requests_targets_cell_indices() -> None:
     target = [DocsTableNode(rows=[["A", "B"], ["1", "2"]])]
     reqs = builder.build_table_fill_requests(_empty_table_doc(), target)
-    pairs = [(r["insertText"]["location"]["index"], r["insertText"]["text"]) for r in reqs]
+    inserts = [r for r in reqs if "insertText" in r]
+    pairs = [(r["insertText"]["location"]["index"], r["insertText"]["text"]) for r in inserts]
     # Sorted descending by index so earlier inserts don't shift later ones.
     assert pairs == [(15, "2"), (12, "1"), (8, "B"), (5, "A")]
+    # Every filled cell also gets its paragraph style forced back to NORMAL_TEXT —
+    # insertTable lets a new cell inherit the namedStyleType of an adjacent
+    # heading, which otherwise renders table body text at heading size.
+    style_resets = [r["updateParagraphStyle"] for r in reqs if "updateParagraphStyle" in r]
+    assert all(r["paragraphStyle"] == {"namedStyleType": "NORMAL_TEXT"} for r in style_resets)
+    assert {r["range"]["startIndex"] for r in style_resets} == {5, 8, 12, 15}
 
 
 def test_fill_skips_when_no_target_tables() -> None:
@@ -347,7 +354,16 @@ def test_fill_pairs_by_document_order_not_by_emptiness_count() -> None:
     ]}}
     target = [DocsTableNode(rows=[["T0"]]), DocsTableNode(rows=[["T1"]])]
     reqs = builder.build_table_fill_requests(doc, target)
-    assert reqs == [{"insertText": {"location": {"index": 13}, "text": "T1"}}]
+    assert reqs == [
+        {"insertText": {"location": {"index": 13}, "text": "T1"}},
+        {
+            "updateParagraphStyle": {
+                "range": {"startIndex": 13, "endIndex": 14},
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType",
+            }
+        },
+    ]
 
 
 def test_fill_pairs_by_document_order_symmetric() -> None:
@@ -377,7 +393,16 @@ def test_fill_pairs_by_document_order_symmetric() -> None:
         DocsTableNode(rows=[["T2"]]),
     ]
     reqs = builder.build_table_fill_requests(doc, target)
-    assert reqs == [{"insertText": {"location": {"index": 13}, "text": "T1"}}]
+    assert reqs == [
+        {"insertText": {"location": {"index": 13}, "text": "T1"}},
+        {
+            "updateParagraphStyle": {
+                "range": {"startIndex": 13, "endIndex": 14},
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType",
+            }
+        },
+    ]
 
 
 def test_style_pairs_tables_by_document_order() -> None:

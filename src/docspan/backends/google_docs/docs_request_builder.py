@@ -1389,6 +1389,11 @@ class DocsRequestBuilder:
         earlier push) is skipped for insertion, but still consumes its pairing slot,
         so a mix of populated and empty tables cannot shift a later table onto the
         wrong target.
+
+        Also resets every cell's paragraph style to NORMAL_TEXT: `insertTable`
+        has new cells inherit the `namedStyleType` of the paragraph the table was
+        inserted next to (e.g. a heading), so a table dropped after a heading
+        renders its body text at heading size unless corrected here.
         """
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
@@ -1396,18 +1401,31 @@ class DocsRequestBuilder:
 
         aligned = self._aligned(doc, target, alignment)
         inserts: List[Tuple[int, str]] = []
+        style_resets: List[Tuple[int, int]] = []
         for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             if not self._table_is_empty(table):
                 continue  # already populated (or a pre-existing content table)
             inserts.extend(self._cell_inserts(table, tnode))
+            style_resets.extend(self._cell_style_resets(table))
 
         # Insert highest index first so earlier inserts don't shift later cell indices.
         inserts.sort(key=lambda pair: pair[0], reverse=True)
-        return [
+        requests: List[dict] = [
             {"insertText": {"location": {"index": idx}, "text": text}}
             for idx, text in inserts
             if text
         ]
+        requests.extend(
+            {
+                "updateParagraphStyle": {
+                    "range": {"startIndex": start, "endIndex": end},
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "fields": "namedStyleType",
+                }
+            }
+            for start, end in style_resets
+        )
+        return requests
 
     def build_table_cell_span_requests(
         self,
@@ -2249,6 +2267,22 @@ class DocsRequestBuilder:
                 if text:
                     pairs.append((idx, text))
         return pairs
+
+    @staticmethod
+    def _cell_style_resets(table: dict) -> List[Tuple[int, int]]:
+        """Every cell's first-paragraph (start, start+1) range, for an
+        updateParagraphStyle that overlaps — and so resets — the whole paragraph."""
+        ranges: List[Tuple[int, int]] = []
+        for row in table.get("tableRows", []):
+            for cell in row.get("tableCells", []):
+                content = cell.get("content", [])
+                if not content:
+                    continue
+                idx = content[0].get("startIndex")
+                if idx is None:
+                    continue
+                ranges.append((idx, idx + 1))
+        return ranges
 
     # ──────────────────────────────────────────────
     # Request factories
