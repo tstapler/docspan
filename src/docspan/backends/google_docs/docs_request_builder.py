@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 
+from docspan.backends.google_docs import cross_doc_links
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
@@ -1119,6 +1120,8 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for inline styling inside table cells.
 
@@ -1154,6 +1157,7 @@ class DocsRequestBuilder:
                 start, limit = placed
                 requests.extend(self._span_requests_in(
                     cell.spans, start, limit, aligned.slug_to_id, aligned.known_ids,
+                    resolver, local_path,
                 ))
         return requests
 
@@ -1358,6 +1362,8 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """
         Emit updateTextStyle requests for inline styling (links/bold/italic/monospace).
@@ -1373,7 +1379,9 @@ class DocsRequestBuilder:
         pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         requests: List[dict] = []
         for cnode, tnode in pairs:
-            requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
+            requests.extend(self._span_style_requests(
+                tnode, cnode, slug_to_id, known_ids, resolver, local_path,
+            ))
         return requests
 
     def unaligned_span_targets(
@@ -1473,6 +1481,51 @@ class DocsRequestBuilder:
                     for cell in row:
                         collect(cell.spans)
         return unresolved
+
+    def cross_doc_link_issues(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
+    ) -> List[str]:
+        """Cross-document links pass 2 could not resolve, as human-readable detail strings.
+
+        Parallel to unresolved_anchor_links() for same-document `#fragment`
+        anchors, but a cross-doc failure's cause (ambiguous mapping,
+        unsupported target, fetch failure, missing heading) differs by kind
+        and `cross_doc_links.CrossDocResolution` already carries that detail,
+        so this returns the detail strings directly rather than bare hrefs.
+        """
+        if resolver is None or local_path is None:
+            return []
+        styled_paragraph = any(isinstance(n, DocsParagraphNode) and n.spans for n in target)
+        styled_cell = any(cell.styled for n in target if isinstance(n, DocsTableNode)
+                          for row in n.rows for cell in row)
+        if not styled_paragraph and not styled_cell:
+            return []
+        aligned = self._aligned(doc, target, alignment)
+        issues: List[str] = []
+
+        def collect(spans: List[TextSpan]) -> None:
+            for span in spans:
+                if not span.link:
+                    continue
+                _payload, detail = cross_doc_links.link_payload(
+                    span.link, local_path, resolver, aligned.slug_to_id, aligned.known_ids,
+                )
+                if detail is not None and detail not in issues:
+                    issues.append(detail)
+
+        for _cnode, tnode in aligned.pairs:
+            collect(tnode.spans)
+        for node in target:
+            if isinstance(node, DocsTableNode):
+                for row in node.rows:
+                    for cell in row:
+                        collect(cell.spans)
+        return issues
 
     @staticmethod
     def _spans_overflow(node: DocsParagraphNode, placement: DocsParagraphNode) -> bool:
@@ -1813,6 +1866,8 @@ class DocsRequestBuilder:
         target: List[Node],
         tab_id: Optional[str] = None,
         alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """
         Combined pass-2 requests: table cell fills + inline text styling.
@@ -1829,7 +1884,7 @@ class DocsRequestBuilder:
                 tab the *requests* are addressed to.
         """
         requests = self.build_table_fill_requests(doc, target, alignment)
-        requests += self.build_span_style_requests(doc, target, alignment)
+        requests += self.build_span_style_requests(doc, target, alignment, resolver, local_path)
         # Cell styling reads indices from `doc`, i.e. from *before* the fills above
         # are applied. A table that already holds its text — every table on a
         # second or later push — is placed correctly. A table this push is
@@ -1839,7 +1894,7 @@ class DocsRequestBuilder:
         # brand-new table's cells needs the post-fill index, which is predictable
         # but is index arithmetic that has to be verified by replay, not reasoned
         # about — left for its own change.
-        requests += self.build_table_cell_span_requests(doc, target, alignment)
+        requests += self.build_table_cell_span_requests(doc, target, alignment, resolver, local_path)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
         return requests
@@ -2099,6 +2154,8 @@ class DocsRequestBuilder:
         placement: DocsParagraphNode,
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -2129,6 +2186,8 @@ class DocsRequestBuilder:
             placement.end_index - 1 if placement.end_index else None,
             slug_to_id,
             known_ids,
+            resolver,
+            local_path,
         )
 
     def _span_requests_in(
@@ -2138,6 +2197,8 @@ class DocsRequestBuilder:
         limit: Optional[int],
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """Place `spans` starting at `start`, never writing at or past `limit`.
 
@@ -2161,7 +2222,9 @@ class DocsRequestBuilder:
             if span.italic:
                 attrs["italic"] = True
             if span.link:
-                payload = link_payload(span.link, slug_to_id, known_ids)
+                payload, _detail = cross_doc_links.link_payload(
+                    span.link, local_path, resolver, slug_to_id, known_ids,
+                )
                 if payload is not None:
                     attrs["link"] = payload
                 # else: the anchor names no heading in the written document, so

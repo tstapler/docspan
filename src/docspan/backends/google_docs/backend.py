@@ -26,6 +26,7 @@ from docspan.backends.google_docs.comments import (
     parse_reply_directives,
 )
 from docspan.backends.google_docs.converter import DocumentConverter
+from docspan.backends.google_docs import cross_doc_links
 from docspan.backends.google_docs.docs_request_builder import DiffTooExpensive, DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -283,6 +284,12 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         assert self._client is not None
+        mappings = kwargs.get("mappings")
+        resolver: Optional[cross_doc_links.CrossDocLinkResolver] = None
+        if mappings:
+            resolver = cross_doc_links.CrossDocLinkResolver(
+                mappings, self._fetch_target_headings
+            )
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
 
@@ -324,6 +331,7 @@ class GoogleDocsBackend(Backend):
             unstyled: list[DocsParagraphNode] = []
             unplaced_cells: list[str] = []
             dead_anchors: list[str] = []
+            cross_doc_issues: list[str] = []
             # Residue from the second, post-pass-1 parse `align()` does inside
             # `_align_for_styling` — distinct from plan.residue (the *first*
             # parse's residue) and reported the same way for the same reason:
@@ -354,7 +362,8 @@ class GoogleDocsBackend(Backend):
                 alignment = builder.align(pass2_doc, plan.target_nodes)
                 pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
-                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
+                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment,
+                    resolver=resolver, local_path=local_path,
                 )
                 # Pass 2 aligns by content and refuses to guess (see
                 # DocsRequestBuilder._align_for_styling). Anything it couldn't
@@ -379,6 +388,17 @@ class GoogleDocsBackend(Backend):
                 dead_anchors = builder.unresolved_anchor_links(
                     pass2_doc, plan.target_nodes, alignment
                 )
+                # Cross-document links (a relative path to another mapped file)
+                # that resolve() could not turn into a URL: an ambiguous mapping,
+                # a target that isn't a pushed Google Doc yet, a fetch failure, or
+                # a fragment naming no heading in the target. Reported the same
+                # way as dead_anchors and for the same reason — this is the only
+                # thing standing between such a link and a written `url` holding
+                # the original (broken) relative path.
+                cross_doc_issues = builder.cross_doc_link_issues(
+                    pass2_doc, plan.target_nodes, alignment,
+                    resolver=resolver, local_path=local_path,
+                )
                 # Styled table cells pass 2 could not place. Same trade as
                 # `unstyled` above and the same reason it has to be said out loud:
                 # the cell got no styling rather than styling aimed at whatever sat
@@ -399,7 +419,7 @@ class GoogleDocsBackend(Backend):
                     )
 
             if (not plan.requests and not second and not unstyled
-                    and not dead_anchors and not unplaced_cells):
+                    and not dead_anchors and not unplaced_cells and not cross_doc_issues):
                 # Nothing was applied by either pass. That is now a true
                 # statement about the document rather than an inference from an
                 # empty request list: projection.project() removes the one class
@@ -448,6 +468,9 @@ class GoogleDocsBackend(Backend):
                         dead_anchors, sorted(s for s in alignment.slug_to_id if s)
                     )
                     if dead_anchors
+                    else None,
+                    self._render_cross_doc_issues(cross_doc_issues)
+                    if cross_doc_issues
                     else None,
                     describe_target_residue(plan.target_residue) or None,
                     # Doc-side residue (e.g. an ambiguous code-block prefix) is only
@@ -524,6 +547,28 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
+    def _render_cross_doc_issues(issues: list[str]) -> str:
+        """Report cross-document links pass 2 could not resolve to a target URL.
+
+        Distinct from _render_dead_anchors: a same-document anchor names no
+        heading in this document, whereas these name another mapped file whose
+        mapping is ambiguous, isn't a pushed Google Doc yet, could not be
+        fetched, or whose fragment names no heading in *that* document. Each
+        detail string already explains its own cause (see
+        cross_doc_links.CrossDocResolution), so this only formats the list.
+        """
+        shown = issues[:5]
+        more = len(issues) - len(shown)
+        lines = [
+            f"⚠ {len(issues)} cross-document link(s) have no link — docspan could "
+            f"not resolve what they point at:",
+        ]
+        lines += [f"    • {issue}" for issue in shown]
+        if more:
+            lines.append(f"    • … and {more} more")
+        return "\n".join(lines)
+
+    @staticmethod
     def _render_unplaced_cells(cells: list[str]) -> str:
         """Styled table cells whose styling was not written.
 
@@ -565,6 +610,20 @@ class GoogleDocsBackend(Backend):
         if more > 0:
             lines.append(f"    • …and {more} more")
         return "\n".join(lines)
+
+    def _fetch_target_headings(self, doc_id: str, tab_id: Optional[str]) -> list:
+        """CrossDocLinkResolver's FetchHeadings callback for this backend.
+
+        Fetches and parses a *target* document — not the one being pushed —
+        purely to read its headings for fragment resolution. Raises on
+        failure; CrossDocLinkResolver.resolve() catches that and reports
+        "fetch_failed" rather than this bubbling up and failing the source
+        document's own push (criterion 5).
+        """
+        assert self._client is not None
+        raw = self._client.get_document(doc_id)
+        resolved_doc, _resolved_tab_id, _ = resolve_document_tab(raw, tab_id)
+        return DocsStructureParser().parse(resolved_doc)
 
     def _comment_backstop_message(self, doc_id: str, before_count: int) -> Optional[str]:
         """CommentCountBackstop — orthogonal, exact check independent of the

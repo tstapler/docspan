@@ -156,9 +156,18 @@ def orchestrate_push(
     state_dir: str,
     state_path: str,
     force: bool = False,
+    mappings: Optional[list] = None,
 ) -> PushOutcome:
+    """`mappings` is the full markgate.yaml mapping list (not just this one) —
+    threaded through to backend.push() as a kwarg so a Google Docs push can
+    resolve relative cross-document links to other mapped files' remote URLs.
+    None (the default) preserves old behavior: no cross-doc resolution.
+    """
     assert mapping.remote_id is not None, "orchestrate_push requires a mapping with a created remote doc/page"
-    result = backend.push(mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id)
+    result = backend.push(
+        mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
+        mappings=mappings,
+    )
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):

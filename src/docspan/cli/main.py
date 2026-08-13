@@ -323,7 +323,9 @@ def push(
                 with open(marker_path, "w", encoding="utf-8") as fh:
                     fh.write("verified\n")
 
-        outcome = orchestrate_push(mapping, backend, state, state_dir, state_path, force=force)
+        outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+        )
         result = outcome.result
 
         icon, style = _status_display(result.status)
@@ -510,7 +512,9 @@ def map_(
         state_path = get_state_path(config_path, prefix)
         state_dir = get_state_dir(config_path, prefix)
         state = _load_state(state_path)
-        outcome = orchestrate_push(mapping, backend_instance, state, state_dir, state_path)
+        outcome = orchestrate_push(
+            mapping, backend_instance, state, state_dir, state_path, mappings=config.mappings,
+        )
         result = outcome.result
         icon, style = _status_display(result.status)
         console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
