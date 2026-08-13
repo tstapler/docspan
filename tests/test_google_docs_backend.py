@@ -1034,6 +1034,88 @@ class TestBlankParagraphAdjacentToCheckboxRoundTrip:
         client.batch_update.assert_not_called()
 
 
+def _tabbed_doc_with_prior_force_push_text(revision_id: str = "rev-force-2") -> dict:
+    """A native-checkbox paragraph whose text is already the literal
+    "[x] ..." left behind by a prior force-push escape-hatch edit (AC2/AC3)
+    — the bullet glyph is untouched, so is_native_checkbox is still True."""
+    return {
+        "revisionId": revision_id,
+        "tabs": [
+            {
+                "tabProperties": {"tabId": "t.0"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 20,
+                                "paragraph": {
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                    "elements": [{"textRun": {"content": "[x] Whatsapp group\n"}}],
+                                    "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                                },
+                            },
+                        ]
+                    },
+                    "lists": {
+                        "kix.abc": {
+                            "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+                        }
+                    },
+                },
+            }
+        ],
+    }
+
+
+class TestSecondRoundTripAfterForcePush:
+    """AC6 (issue #17): a doc that already carries literal bracket text
+    baked in by a prior force-push must not have that state compound on a
+    second pull→push cycle.
+
+    render_nodes_to_markdown() unconditionally prepends the synthetic
+    "- [ ] " marker to any is_native_checkbox paragraph regardless of what
+    its text already contains, so pulling this doc renders the cosmetically
+    doubled "- [ ] [x] Whatsapp group" rather than "- [x] Whatsapp group".
+    That's a separate, narrower defect from this ticket's push-corruption
+    bug: DocsRequestBuilder's _key() fix (commit 83cdb99) strips exactly one
+    literal "[ ] " prefix off a target and matches the remainder against the
+    real native-checkbox text, which folds this doubled text back to "no
+    change" — so the push side stays safe, and a second round trip doesn't
+    grow a third bracket.
+    """
+
+    def test_pull_push_pull_push_does_not_compound_prior_force_push_brackets(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_prior_force_push_text()
+        client.list_comments.return_value = []
+
+        first_pull = backend.pull("doc-1", str(local), tab_id="t.0")
+        assert first_pull.status == "ok", first_pull.message
+        first_content = local.read_text(encoding="utf-8")
+
+        first_push = backend.push(str(local), "doc-1", tab_id="t.0", force=True)
+        assert first_push.status == "skipped", first_push.message
+        client.batch_update.assert_not_called()
+
+        second_pull = backend.pull("doc-1", str(local), tab_id="t.0")
+        assert second_pull.status == "ok", second_pull.message
+        second_content = local.read_text(encoding="utf-8")
+
+        # No compounding: the second pull renders identically to the first
+        # (no extra brackets piled on), because push never sent a request
+        # that could have changed the live doc's text in between.
+        assert second_content == first_content
+        assert second_content.count("[") == 2  # exactly "[ ]" + "[x]", never a third
+
+        second_push = backend.push(str(local), "doc-1", tab_id="t.0", force=True)
+        assert second_push.status == "skipped", second_push.message
+        client.batch_update.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # pull() renders TITLE as a heading, so pull → push is a fixpoint
 # ─────────────────────────────────────────────────────────────────────────────
