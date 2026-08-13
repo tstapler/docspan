@@ -5,7 +5,7 @@ import difflib
 import logging
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Literal, Optional, Set, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
@@ -282,16 +282,9 @@ class DocsRequestBuilder:
     def _target_wants_code_line(node: Node) -> bool:
         """Whether a *target* paragraph is itself a fenced-code line.
 
-        `MarkdownToParagraphParser` never sets `render_prefix` (see
-        `_is_code_line`'s docstring), but it does mark every span of a fenced
-        code block's line `monospace=True`. That is the only signal available
-        on the target side that a slot is "supposed to be code" — used solely
-        to gate `_prefer_structural_pairing`'s top-level, current-side
-        duplicate preference (issue #68) toward a `render_prefix`-carrying
-        candidate. `all()` rather than `any()` so a prose paragraph that
-        merely contains an inline `` `code` `` span among ordinary text does
-        not trip this — only a paragraph that is entirely monospace, the
-        shape a fenced-code line always has.
+        Markdown targets never carry `render_prefix`, so `monospace=True` on
+        every span (`all()`, not `any()`, to exclude prose with just an
+        inline `` `code` `` span) is the only signal available.
         """
         if not isinstance(node, DocsParagraphNode):
             return False
@@ -407,33 +400,14 @@ class DocsRequestBuilder:
     ) -> List[Opcode]:
         """Re-classify text-identical pairs inside a `replace` run as `equal`.
 
-        `_node_key` includes style and bullet, so a paragraph that was only
-        *restyled* now lands in a `replace` run — and `build()` answers a replace
-        with delete-then-insert, which retypes the paragraph and destroys any
-        comment anchored to it. That behaviour is what the old text-only key
-        avoided, at the cost of correspondence (see `_node_key`).
-
-        So the two concerns are separated: the key decides *correspondence*, and
-        this decides *classification*. Where a replace run pairs nodes with equal
-        `_content_key`, the edit is an in-place restyle and the opcode becomes
-        `equal`, which `_make_style_update_requests` turns into the two or three
-        in-place requests it actually needs.
-
-        Leftovers on either side stay a `replace`/`insert`/`delete` for the part
-        that genuinely differs, so nothing is silently dropped.
-
-        Pairing nodes by their position within the run (same offset from the
-        run's start on both sides) is not a correspondence relation — it just
-        assumes the run has no internal insert/delete of its own. Where it
-        does (e.g. a restyle sitting next to an unrelated deletion in the same
-        run), a positional walk mispairs nodes: a live heading can end up
-        "paired" with an unrelated line, so the heading looks like a rewrite
-        and gets deleted-and-reinserted, destroying its headingId. So instead
-        of walking positionally, a second SequenceMatcher (keyed on
-        `_content_key`) finds the actual content correspondence within the
-        run's own sub-ranges. `get_opcodes()` returns a partition of both
-        inputs, so this can't assign two current nodes to the same target
-        node.
+        Pairs nodes within the run by content, not position — a positional walk
+        mispairs when the run has its own internal insert/delete (e.g. a live
+        heading "paired" with an unrelated line gets deleted-and-reinserted,
+        destroying its headingId). A native checkbox's checked state can't be
+        read back from the API (ADR-001), so pull always round-trips it as
+        `- [ ] text`; `_target_key` strips that synthetic `"[ ] "` marker
+        before keying the target side only, so an unedited checkbox doesn't
+        look changed and get retyped on every push.
         """
         repaired: List[Opcode] = []
         for tag, i1, i2, j1, j2 in opcodes:
@@ -442,9 +416,30 @@ class DocsRequestBuilder:
                 continue
             cur_slice = current[i1:i2]
             tgt_slice = target[j1:j2]
+            checkbox_texts = {
+                n.text for n in cur_slice
+                if isinstance(n, DocsParagraphNode) and n.is_native_checkbox
+            }
+
+            def _target_key(node: Node, _checkbox_texts: Set[str] = checkbox_texts) -> Tuple:
+                # Only the target (markdown) side ever carries pull's synthetic
+                # "[ ] " marker for an unedited checkbox — stripping it on the
+                # current (live-doc) side too would let an unrelated plain
+                # paragraph that merely *starts with* literal "[ ] " text
+                # collide with a real checkbox's key and steal its pairing.
+                if (
+                    isinstance(node, DocsParagraphNode)
+                    and not node.is_native_checkbox
+                    and node.text.startswith("[ ] ")
+                ):
+                    stripped = node.text[len("[ ] "):]
+                    if stripped in _checkbox_texts:
+                        return ("__para__", stripped)
+                return self._content_key(node)
+
             inner_opcodes = _bounded_opcodes(
                 [self._content_key(n) for n in cur_slice],
-                [self._content_key(n) for n in tgt_slice],
+                [_target_key(n) for n in tgt_slice],
                 context="replace-run",
             )
             pending: List[Opcode] = []
@@ -475,75 +470,15 @@ class DocsRequestBuilder:
     ) -> List[Opcode]:
         """Reassign ambiguous equal/delete pairings toward their structurally closest node.
 
-        Two callers, two different scope contracts: `_repair` calls this locally,
-        scoped to a single `replace` run it already identified
-        (`prefer_code_line=False`, the default); `_opcodes` calls it once more
-        over the *whole document* (`prefer_code_line=True`). `prefer_code_line`
-        is what distinguishes the two — see its own paragraph below for what it
-        changes about the scoring and the pool of eligible candidates.
-
-        The inner `SequenceMatcher` in `_repair` treats every current node sharing
-        a `_content_key` as interchangeable and pairs whichever ones it meets first
-        with the target — typically by position. When several current nodes share
-        text (a stale body paragraph and a live heading both reading "Setup"),
-        that can restyle-in-place the wrong one and delete the live heading
-        instead, destroying its `headingId`. Same thing happens, worse, when the
-        *target* side also repeats the text (e.g. restyling one duplicate up to a
-        heading and another down to a bullet): each ambiguous target then needs
-        its own best-matching current node, not just the first one considered.
-
-        So for every `_content_key` shared by more than one current node in this
-        run, this treats it as a small assignment problem: each target position
-        that currently has an "equal" pairing is a slot, every current node
-        sharing the key (whether currently paired or currently "delete") is a
-        candidate, and slots claim candidates greedily by structural similarity
-        (style, heading-ness, list-item-ness), highest score first, ties going to
-        a candidate's own existing slot so an already-fine pairing is not
-        needlessly perturbed. Whichever candidates no slot claims become deletes.
-
-        This only ever reassigns which current index a given target range maps
-        to — the target ranges themselves, and every other opcode's indices, are
-        untouched — so it cannot double-book or drop a target index. There is no
-        list-order requirement to preserve: `build()` and `diff_summary()` both
-        consume each opcode by its own absolute (i1, i2, j1, j2), and `_coalesce`
-        only merges entries whose indices are exactly contiguous, so reordering
-        which candidate owns which target range cannot corrupt either consumer.
-
-        Generalization: a duplicate-content current node does not stop being a
-        candidate just because the inner matcher happened to fold it into a
-        multi-node "replace" block alongside other, genuinely different content
-        in the same run (e.g. a live heading sitting next to an edited sentence,
-        with the actual duplicate target slot won by a stray paragraph
-        elsewhere in the run). Every current index inside a "replace" opcode is
-        registered as a candidate the same way a singleton "delete" is; if one
-        wins a slot, its parent "replace" opcode is structurally split
-        afterward — the winning index is carved out as its own "equal", and
-        whatever current indices remain keep the original, untouched target
-        range (attached to the first surviving contiguous run; any other
-        surviving run becomes a plain "delete", since the target content is
-        already spoken for). If every current index in the block is claimed,
-        the target range becomes a fresh "insert" anchored where the block used
-        to be. This never touches a target index more than once and never
-        drops one, so it cannot corrupt `build()`/`diff_summary()` the same way
-        the singleton case cannot (see above).
-
-        Scope note: only the *current* side of "replace"/"insert" opcodes is
-        considered here. A duplicate *target* slot trapped inside a multi-node
-        block (the symmetric case) is not decomposed — there is no existing
-        "equal" opcode to use as the slot in that case, only a range with no
-        established per-index correspondence to split by. That gap is open.
-
-        `prefer_code_line` (used only by `_opcodes`'s top-level call, issue
-        #68) adds a scoring bonus for a candidate that is itself a
-        `render_prefix`-carrying code-rendered node when the slot's target
-        node is itself a fenced-code-block line (`_target_wants_code_line`).
-        Without the target-side gate, a plain paragraph that merely shares
-        text with an unrelated code node elsewhere in the document (a
-        legitimate, already-correct pairing — see
-        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`)
-        would be wrongly outranked by that unrelated code node; gating on
-        what the target slot itself wants keeps this scoped to slots that
-        actually are code.
+        When current/target nodes share duplicate text, naive positional pairing
+        can restyle-in-place the wrong duplicate — e.g. deleting a live heading
+        instead of a stale paragraph, destroying its `headingId`. This treats
+        each such duplicate group as a small assignment problem, scoring every
+        candidate against every open slot by structural similarity and assigning
+        greedily, highest score first. `prefer_code_line=True` (issue #68) is
+        used only by `_opcodes`'s single whole-document call: it widens the pool
+        from one `_repair`-scoped `replace` run to the whole document, restricted
+        to slots whose target itself wants a code line (`_target_wants_code_line`).
         """
         expanded: List[Opcode] = []
         for tag, ci1, ci2, cj1, cj2 in pending:
@@ -551,10 +486,11 @@ class DocsRequestBuilder:
                 for idx in range(ci1, ci2):
                     expanded.append(("delete", idx, idx + 1, cj1, cj1))
             elif tag == "equal" and ci2 - ci1 > 1:
-                stride = cj2 - cj1  # "equal" guarantees ci2-ci1 == cj2-cj1.
+                # "equal" guarantees ci2-ci1 == cj2-cj1, so the stride below is
+                # always > 1 (never falsy) here.
                 for offset in range(ci2 - ci1):
                     idx = ci1 + offset
-                    jdx = cj1 + offset if stride else cj1
+                    jdx = cj1 + offset
                     expanded.append(("equal", idx, idx + 1, jdx, jdx + 1))
             else:
                 expanded.append((tag, ci1, ci2, cj1, cj2))
