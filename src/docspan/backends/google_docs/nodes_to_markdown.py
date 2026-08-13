@@ -22,6 +22,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TableCell,
     TextSpan,
 )
+from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -88,40 +89,90 @@ def _render_table(node: DocsTableNode) -> str:
     return "\n".join(lines)
 
 
+def _node_text(node: DocsParagraphNode) -> str:
+    return _render_spans(node.spans) if node.spans else node.text
+
+
+def _dispatch_key(node: Node) -> str:
+    """Synthesize a dispatch key — DocsParagraphNode/DocsTableNode carry no `.type` field."""
+    if isinstance(node, DocsTableNode):
+        return "table"
+    if node.style.startswith("HEADING_"):
+        return "heading"
+    if node.is_list_item:
+        return "list_item"
+    return "paragraph"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pull-direction renderers — one class per synthesized dispatch key,
+# registered in _build_pull_registry(). To add a new node kind, register a
+# renderer there; render_nodes_to_markdown()'s dispatch loop needs no changes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TableNodeRenderer(MarkdownNodeRenderer):
+    node_key = "table"
+
+    def render(self, node: DocsTableNode) -> str:
+        return _render_table(node)
+
+
+class HeadingNodeRenderer(MarkdownNodeRenderer):
+    node_key = "heading"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        try:
+            level = int(node.style.split("_", 1)[1])
+        except ValueError:
+            level = 1
+        level = max(1, min(level, 6))
+        return f"{'#' * level} {_node_text(node)}"
+
+
+class ListItemNodeRenderer(MarkdownNodeRenderer):
+    node_key = "list_item"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        indent = "  " * node.nesting_level
+        text = _node_text(node)
+        if node.is_native_checkbox:
+            # The Docs API does not expose a native checkbox's
+            # checked/unchecked bit anywhere DocsStructureParser can read
+            # it (see push_preview.py's NATIVE CHECKBOX GLYPH warning) —
+            # DocsParagraphNode carries no checked-state field at all.
+            # Rendering unchecked is the only honest option here; this is
+            # a one-way, lossy render (never fed back through
+            # MarkdownToParagraphParser as this exact text), not a claim
+            # about the glyph's real state.
+            return f"{indent}- [ ] {text}"
+        return f"{indent}- {text}"
+
+
+class ParagraphNodeRenderer(MarkdownNodeRenderer):
+    node_key = "paragraph"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        return _node_text(node)
+
+
+def _build_pull_registry() -> MarkdownRenderRegistry:
+    registry = MarkdownRenderRegistry()
+    registry.register("table", TableNodeRenderer())
+    registry.register("heading", HeadingNodeRenderer())
+    registry.register("list_item", ListItemNodeRenderer())
+    registry.register("paragraph", ParagraphNodeRenderer())
+    return registry
+
+
+_PULL_REGISTRY = _build_pull_registry()
+
+
 def render_nodes_to_markdown(nodes: List[Node]) -> str:
     """Render a parsed node list (document order) back into Markdown text."""
     lines: List[str] = []
     for node in nodes:
-        if isinstance(node, DocsTableNode):
-            lines.append(_render_table(node))
-            lines.append("")
-            continue
-
-        text = _render_spans(node.spans) if node.spans else node.text
-
-        if node.style.startswith("HEADING_"):
-            try:
-                level = int(node.style.split("_", 1)[1])
-            except ValueError:
-                level = 1
-            level = max(1, min(level, 6))
-            lines.append(f"{'#' * level} {text}")
-        elif node.is_list_item:
-            indent = "  " * node.nesting_level
-            if node.is_native_checkbox:
-                # The Docs API does not expose a native checkbox's
-                # checked/unchecked bit anywhere DocsStructureParser can read
-                # it (see push_preview.py's NATIVE CHECKBOX GLYPH warning) —
-                # DocsParagraphNode carries no checked-state field at all.
-                # Rendering unchecked is the only honest option here; this is
-                # a one-way, lossy render (never fed back through
-                # MarkdownToParagraphParser as this exact text), not a claim
-                # about the glyph's real state.
-                lines.append(f"{indent}- [ ] {text}")
-            else:
-                lines.append(f"{indent}- {text}")
-        else:
-            lines.append(text)
+        renderer = _PULL_REGISTRY.get(_dispatch_key(node))
+        lines.append(renderer.render(node))
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"

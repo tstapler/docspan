@@ -10,6 +10,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TextSpan,
     _trim_spans_to_cell_text,
 )
+from docspan.backends.google_docs.registry import MarkdownTokenConverter, MarkdownTokenRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -227,6 +228,115 @@ def _table_from_token(token: dict) -> DocsTableNode:
     return DocsTableNode(rows=rows, start_index=0, end_index=0)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Push-direction converters — one class per mistune token_type, registered in
+# _build_push_registry(). To add a new node type (e.g. a mermaid fence),
+# register a converter there; parse()'s dispatch loop needs no changes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HeadingTokenConverter(MarkdownTokenConverter):
+    token_type = "heading"
+
+    def convert(self, token: dict) -> List[Node]:
+        level = token.get("attrs", {}).get("level", token.get("level", 1))
+        spans = _spans_from_inline(token.get("children", []))
+        return [DocsParagraphNode(
+            style=f"HEADING_{level}", text=_text_of(spans).strip(),
+            start_index=0, end_index=0,
+            spans=spans if _has_styling(spans) else [],
+        )]
+
+
+class ParagraphTokenConverter(MarkdownTokenConverter):
+    token_type = "paragraph"
+
+    def convert(self, token: dict) -> List[Node]:
+        spans = _spans_from_inline(token.get("children", []))
+        return [DocsParagraphNode(
+            style="NORMAL_TEXT", text=_text_of(spans).strip(),
+            start_index=0, end_index=0,
+            spans=spans if _has_styling(spans) else [],
+        )]
+
+
+class ListTokenConverter(MarkdownTokenConverter):
+    token_type = "list"
+
+    def convert(self, token: dict) -> List[Node]:
+        return _walk_list_items(token, nesting_level=0)
+
+
+class CodeTokenConverter(MarkdownTokenConverter):
+    # mistune has referred to this token as both "block_code" and "code"
+    # across versions; _build_push_registry() registers this one converter
+    # instance under both keys so neither aliasing silently drops the block.
+    token_type = "block_code"
+
+    def convert(self, token: dict) -> List[Node]:
+        # One node per line, because a Google Doc has no multi-line
+        # paragraph. Emitting the whole block as a single node with
+        # embedded newlines meant `insertText` wrote "\nline one\nline
+        # two", which Docs splits into N paragraphs — so every later diff
+        # saw N document paragraphs against 1 markdown node and
+        # delete-and-reinserted the whole block, on every push, forever.
+        # The text survived that; what did not was idempotence, any comment
+        # anchored to a line of code, and the monospace styling (pass 2
+        # reported the block unaligned and emitted no span requests at
+        # all). See issue #40.
+        #
+        # `strip("\n")` rather than `strip()`: the fence's own blank edges
+        # go, indentation does not. Leading whitespace is meaning in code.
+        raw = token.get("raw", "").strip("\n")
+        nodes: List[Node] = []
+        for line in raw.split("\n"):
+            nodes.append(DocsParagraphNode(
+                style="NORMAL_TEXT", text=line, start_index=0, end_index=0,
+                # A blank line inside a block carries no span to style.
+                # projection.project() drops it from *both* sides, so the
+                # diff never sees it and never tries to delete it.
+                spans=[TextSpan(text=line, monospace=True)] if line else [],
+            ))
+        return nodes
+
+
+class TableTokenConverter(MarkdownTokenConverter):
+    token_type = "table"
+
+    def convert(self, token: dict) -> List[Node]:
+        return [_table_from_token(token)]
+
+
+class BlockQuoteTokenConverter(MarkdownTokenConverter):
+    token_type = "block_quote"
+
+    def convert(self, token: dict) -> List[Node]:
+        return _walk_block_quote(token)
+
+
+class BlankLineTokenConverter(MarkdownTokenConverter):
+    token_type = "blank_line"
+
+    def convert(self, token: dict) -> List[Node]:
+        return []
+
+
+def _build_push_registry() -> MarkdownTokenRegistry:
+    registry = MarkdownTokenRegistry()
+    registry.register("heading", HeadingTokenConverter())
+    registry.register("paragraph", ParagraphTokenConverter())
+    registry.register("list", ListTokenConverter())
+    code_converter = CodeTokenConverter()
+    registry.register("block_code", code_converter)
+    registry.register("code", code_converter)
+    registry.register("table", TableTokenConverter())
+    registry.register("block_quote", BlockQuoteTokenConverter())
+    registry.register("blank_line", BlankLineTokenConverter())
+    return registry
+
+
+_PUSH_REGISTRY = _build_push_registry()
+
+
 class MarkdownToParagraphParser:
     """
     Parse Markdown content into a list of DocsParagraphNode / DocsTableNode.
@@ -248,61 +358,10 @@ class MarkdownToParagraphParser:
 
         nodes: List[Node] = []
         for token in tokens:
-            token_type = token.get("type")
-
-            if token_type == "heading":
-                level = token.get("attrs", {}).get("level", token.get("level", 1))
-                spans = _spans_from_inline(token.get("children", []))
-                nodes.append(DocsParagraphNode(
-                    style=f"HEADING_{level}", text=_text_of(spans).strip(),
-                    start_index=0, end_index=0,
-                    spans=spans if _has_styling(spans) else [],
-                ))
-
-            elif token_type == "paragraph":
-                spans = _spans_from_inline(token.get("children", []))
-                nodes.append(DocsParagraphNode(
-                    style="NORMAL_TEXT", text=_text_of(spans).strip(),
-                    start_index=0, end_index=0,
-                    spans=spans if _has_styling(spans) else [],
-                ))
-
-            elif token_type == "list":
-                nodes.extend(_walk_list_items(token, nesting_level=0))
-
-            elif token_type in ("block_code", "code"):
-                # One node per line, because a Google Doc has no multi-line
-                # paragraph. Emitting the whole block as a single node with
-                # embedded newlines meant `insertText` wrote "\nline one\nline
-                # two", which Docs splits into N paragraphs — so every later diff
-                # saw N document paragraphs against 1 markdown node and
-                # delete-and-reinserted the whole block, on every push, forever.
-                # The text survived that; what did not was idempotence, any comment
-                # anchored to a line of code, and the monospace styling (pass 2
-                # reported the block unaligned and emitted no span requests at
-                # all). See issue #40.
-                #
-                # `strip("\n")` rather than `strip()`: the fence's own blank edges
-                # go, indentation does not. Leading whitespace is meaning in code.
-                raw = token.get("raw", "").strip("\n")
-                for line in raw.split("\n"):
-                    nodes.append(DocsParagraphNode(
-                        style="NORMAL_TEXT", text=line, start_index=0, end_index=0,
-                        # A blank line inside a block carries no span to style.
-                        # projection.project() drops it from *both* sides, so the
-                        # diff never sees it and never tries to delete it.
-                        spans=[TextSpan(text=line, monospace=True)] if line else [],
-                    ))
-
-            elif token_type == "table":
-                nodes.append(_table_from_token(token))
-
-            elif token_type == "block_quote":
-                nodes.extend(_walk_block_quote(token))
-
-            elif token_type == "blank_line":
-                pass
-
-            # thematic_break, html, etc. are silently skipped
+            converter = _PUSH_REGISTRY.get(token.get("type"))
+            if converter is None:
+                # thematic_break, html, etc. are silently skipped
+                continue
+            nodes.extend(converter.convert(token))
 
         return nodes
