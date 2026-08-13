@@ -234,6 +234,12 @@ def push(
     state = _load_state(state_path)
 
     had_error = False
+    # Shared across every mapping's push() call below (criterion 11): each
+    # mapping gets its own backend instance via _get_backend(), so without a
+    # cache threaded in from here a push --all run with N documents linking
+    # to the same target would fetch that target N times, once per pushing
+    # backend instance, instead of once for the whole run.
+    cross_doc_cache: dict = {}
     for mapping in mappings:
         if mapping.direction == "pull":
             console.print(f"[dim]Skipping {mapping.local} (pull-only)[/dim]")
@@ -323,7 +329,10 @@ def push(
                 with open(marker_path, "w", encoding="utf-8") as fh:
                     fh.write("verified\n")
 
-        outcome = orchestrate_push(mapping, backend, state, state_dir, state_path, force=force)
+        outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+            cross_doc_cache=cross_doc_cache,
+        )
         result = outcome.result
 
         icon, style = _status_display(result.status)
@@ -510,7 +519,9 @@ def map_(
         state_path = get_state_path(config_path, prefix)
         state_dir = get_state_dir(config_path, prefix)
         state = _load_state(state_path)
-        outcome = orchestrate_push(mapping, backend_instance, state, state_dir, state_path)
+        outcome = orchestrate_push(
+            mapping, backend_instance, state, state_dir, state_path, mappings=config.mappings,
+        )
         result = outcome.result
         icon, style = _status_display(result.status)
         console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
