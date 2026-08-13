@@ -209,6 +209,42 @@ class TestCrossDocLinkResolutionThroughPush:
         links = _link_requests(fake_client)
         assert not any("some-heading" in str(link) for link in links)
 
+    def test_ambiguous_mapping_is_reported_not_silently_resolved(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        # Criterion 8: two mapping entries that normalize to the same local
+        # path must produce a loud ambiguous-match failure through the real
+        # push() path, not just in the resolver unit tests
+        # (test_cross_doc_links.py's test_ambiguous_mapping_is_reported).
+        backend, fake_client = make_backend()
+        source_local = self._local(
+            tmp_path, "source.md", "see [it](target.md)\n"
+        )
+        source_doc = _doc(
+            _paragraph("see it", 1, runs=[
+                {"textRun": {"content": "see it\n", "textStyle": {}}}
+            ]),
+            revision_id="rev-1",
+        )
+        fake_client.get_document.side_effect = lambda doc_id, **_: {
+            "doc-1": source_doc,
+        }[doc_id]
+        target_local = str(tmp_path / "target.md")
+        mappings = [
+            Mapping(local=source_local, backend="google_docs", remote_id="doc-1"),
+            Mapping(local=target_local, backend="google_docs", remote_id="doc-2"),
+            Mapping(local=target_local, backend="google_docs", remote_id="doc-3"),
+        ]
+
+        result = backend.push(source_local, "doc-1", mappings=mappings)
+
+        assert result.status == "warning"
+        assert target_local in result.message or "target.md" in result.message
+        links = _link_requests(fake_client)
+        assert not any(
+            link.get("url", "").endswith(("doc-2/edit", "doc-3/edit")) for link in links
+        )
+
     def test_multiple_links_to_same_target_fetch_it_only_once(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:
