@@ -105,10 +105,11 @@ def test_two_separate_code_blocks_stay_separate() -> None:
 
 def test_language_marker_without_following_code_is_not_absorbed() -> None:
     # A literal paragraph that happens to start with ``` but isn't followed
-    # by a code run renders as plain text rather than crashing.
+    # by a code run renders as plain (backslash-escaped, so it round-trips
+    # instead of being misread as a fence) text rather than crashing.
     nodes = [_lang_marker("yaml"), _node(text="just prose")]
     md = render_nodes_to_markdown(nodes)
-    assert "```yaml" in md
+    assert r"\`\`\`yaml" in md
     assert "just prose" in md
 
 

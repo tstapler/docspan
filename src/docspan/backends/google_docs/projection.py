@@ -36,7 +36,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
 Node = Union[DocsParagraphNode, DocsTableNode]
 
 ResidueKind = Literal[
-    "empty_paragraph", "paragraph_style", "private_use_glyph", "ambiguous_code_prefix"
+    "empty_paragraph",
+    "paragraph_style",
+    "private_use_glyph",
+    "ambiguous_code_prefix",
+    "whitespace",
 ]
 
 # Named styles markdown has no syntax for, mapped to the nearest style it does.
@@ -136,14 +140,50 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     recorded as residue. Unlike rule 1 this is a *substitution*, not a removal,
     so ``kept`` keeps the same length.
 
+    Rule 3 — leading and trailing whitespace is stripped from the text.
+
+    Markdown has no way to keep it. Four or more leading spaces (or a tab) *is*
+    an indented code block, and trailing spaces are either dropped or mean a
+    hard line break — so the renderer cannot emit them and a backslash cannot
+    escape them, unlike every construct rule 3's sibling escaper handles
+    (whitespace is not ASCII punctuation, so CommonMark does not allow escaping
+    it at all).
+
+    Found by the property-based round-trip test, not by hand: after the block
+    markup escaper landed, all three round-trip laws shrank to exactly this case.
+    Unescaped it corrupts three different ways — ``'    indented'`` re-parses as
+    ``'indented'`` (4 requests), can re-parse to *no node at all* so push deletes
+    the paragraph, and drifts on re-render into ``` `indented` ``` — turning an
+    indented paragraph into inline code.
+
+    Stripping on both sides makes it invisible to the diff and therefore
+    preserved. A paragraph that is *only* whitespace strips to empty and is then
+    dropped by rule 1, which is right: markdown cannot distinguish it from a
+    blank paragraph.
+
     Idempotent by construction — ``project(project(x)[0])[0] == project(x)[0]``
-    — because both rules are properties of a single node, not of the sequence,
-    and ``HEADING_1``/``HEADING_2`` are not themselves keys of the map. A test
-    pins it anyway, since later rules will not have that for free.
+    — because all three rules are properties of a single node, not of the
+    sequence; ``HEADING_1``/``HEADING_2`` are not themselves keys of the style
+    map, and ``strip()`` is a fixpoint. A test pins it anyway, since later rules
+    will not have that for free.
     """
     kept: List[Node] = []
     residue: List[Residue] = []
     for index, node in enumerate(nodes):
+        # Rule 3 runs first: a whitespace-only paragraph strips to empty and is
+        # then handled by rule 1, which is the correct reading — markdown cannot
+        # tell it apart from a blank paragraph. Only reported as "whitespace" when
+        # the stripped text will actually be kept under that description — a
+        # paragraph that strips to empty, or to nothing but a private-use glyph, is
+        # about to be dropped for that more specific reason by rule 1/1b below, and
+        # reporting both would describe the same drop twice.
+        if isinstance(node, DocsParagraphNode) and node.text != node.text.strip():
+            stripped_text = node.text.strip()
+            if stripped_text and not _is_all_private_use(stripped_text):
+                residue.append(
+                    Residue(kind="whitespace", index=index, detail=_describe_space(node.text))
+                )
+            node = replace(node, text=stripped_text)
         if isinstance(node, DocsParagraphNode) and node.text == "":
             residue.append(
                 Residue(
@@ -191,6 +231,15 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
             node = replace(node, style=_UNWRITABLE_STYLES[node.style])
         kept.append(node)
     return kept, residue
+
+
+def _describe_space(text: str) -> str:
+    """Which side carried the unrepresentable whitespace."""
+    lead = len(text) - len(text.lstrip())
+    trail = len(text) - len(text.rstrip())
+    if lead and trail:
+        return "leading and trailing whitespace"
+    return "leading whitespace" if lead else "trailing whitespace"
 
 
 def _without_render_prefix(node: DocsParagraphNode) -> DocsParagraphNode:
@@ -288,6 +337,12 @@ def describe_residue(residue: List[Residue]) -> str:
             "was treated as code-block chrome and dropped, but the rest of the paragraph "
             "is not monospace, so it may instead be a character the author wrote. Check "
             "these in Google Docs if that glyph was intentional."
+        )
+    spaces = sum(1 for r in residue if r.kind == "whitespace")
+    if spaces:
+        parts.append(
+            f"{spaces} paragraph(s) have leading or trailing whitespace that markdown "
+            "cannot represent, so it was left as-is."
         )
     styles = sorted({r.detail for r in residue if r.kind == "paragraph_style"})
     if styles:

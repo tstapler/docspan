@@ -25,6 +25,7 @@ folded into or dropped from this fix.
 """
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -41,12 +42,6 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # the node-list representation, which has no field for it. Must stay in
 # sync with markdown_to_paragraph_parser.py's FENCE_MARKER.
 FENCE_MARKER = "```"
-
-# A rendered code fence can also open with tildes (see _fence_delimiter's
-# backtick-in-language fallback) — a bare paragraph starting with either
-# fence character must be escaped the same way.
-TILDE_FENCE_MARKER = "~~~"
-
 
 def _run_of_char(text: str, target: str) -> int:
     """The longest run of consecutive occurrences of `target` in text."""
@@ -100,12 +95,77 @@ def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
     return "`" * max(3, max_run + 1)
 
 
+# A paragraph's text is emitted at the start of a line, where markdown reads
+# leading punctuation as *block* syntax rather than as content. Left alone, a
+# document paragraph whose text happens to begin like markup is re-parsed as
+# that markup on the next pull, and the marker is stripped out of the text —
+# so pushing straight back rewrites the paragraph and permanently loses the
+# characters. Three of these are worse still: `---`, `***` and `[ref]: /x`
+# re-parse to *no node at all*, so push deletes the paragraph outright.
+#
+# Measured on cc6cd0b, before this escaping existed — 13 of 18 sampled prefixes
+# corrupted on a zero-edit round trip, and `* b` additionally drifted (rendered
+# `* b`, re-parsed as a bullet, re-rendered `- b`) so the file changed on every
+# sync.
+#
+# Everything here is ASCII punctuation, which is exactly what CommonMark lets a
+# backslash escape — verified round-tripping through mistune for all 13. Leading
+# *whitespace* is not escapable and is a separate, still-open gap (see the
+# module docstring).
+_BLOCK_PREFIXES = re.compile(
+    r"""^(?:
+          \#{1,6}\         # ATX heading
+        | [-*+]\           # bullet list
+        | \d{1,9}[.)]\     # ordered list
+        | (?:-{3,}|\*{3,}|_{3,})\s*$   # thematic break
+        | (?:`{3,}|~{3,})  # fenced code
+        | \[[^\]]*\]:\     # link reference definition
+        | >                # blockquote
+    )""",
+    re.VERBOSE,
+)
+
+# Characters CommonMark treats as *inline* syntax wherever they occur in a
+# line (as opposed to _BLOCK_PREFIXES, which only matters at line start).
+# Left unescaped, a literal occurrence in a document paragraph is read back
+# as real markdown on the next parse and the marker disappears on
+# push — e.g. a paragraph containing "50% * done" loses the `*`, and one
+# containing "a_b_c" comes back italicised. Verified round-tripping through
+# mistune for all of these, including adjacent-escape cases like `a\b` and
+# `100% \* literal` where a literal backslash sits next to another
+# escapable character.
+_INLINE_ESCAPE_CHARS = frozenset("\\`*_[]<&")
+
+
+def _escape_inline(text: str) -> str:
+    """Backslash-escape characters markdown would read as inline syntax."""
+    return "".join(f"\\{ch}" if ch in _INLINE_ESCAPE_CHARS else ch for ch in text)
+
+
+def _escape_block_start(text: str) -> str:
+    """Backslash-escape text that markdown would otherwise read as block syntax.
+
+    Only the first character needs escaping — a backslash there is enough to stop
+    the line being recognised as a block construct, and mistune returns the
+    original text. For an ordered list the digits must be kept, so the escape
+    goes before the delimiter instead.
+    """
+    if not _BLOCK_PREFIXES.match(text):
+        return text
+    ordered = re.match(r"^(\d{1,9})([.)]\ )", text)
+    if ordered:
+        return f"{ordered.group(1)}\\{text[ordered.end(1):]}"
+    return "\\" + text
+
+
 def _render_spans(spans: List[TextSpan]) -> str:
     parts = []
     for span in spans:
         text = span.text
         if span.monospace:
             text = _wrap_inline_code(text)
+        else:
+            text = _escape_inline(text)
         if span.bold:
             text = f"**{text}**"
         if span.italic:
@@ -388,24 +448,6 @@ def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]
     return lines
 
 
-def _escape_leading_fence(text: str) -> str:
-    """Escape a plain paragraph line that would otherwise open a live
-    CommonMark code fence when reparsed.
-
-    Only the bare-paragraph render path needs this: headings prefix "# ",
-    list items prefix "- ", and block quotes prefix "> ", all of which
-    already keep a fence-shaped line from starting the line. Without it, a
-    marker node left behind by `_group_code_runs` (because it wasn't
-    immediately followed by a matching code run) or ordinary user prose that
-    happens to start with ``` or ~~~ renders as literal fence-shaped text
-    that, on the next parse, opens an unterminated fence and swallows every
-    following line as code until EOF instead of staying inert.
-    """
-    if text.startswith(FENCE_MARKER) or text.startswith(TILDE_FENCE_MARKER):
-        return "\\" + text
-    return text
-
-
 def render_nodes_to_markdown(nodes: List[Node]) -> str:
     """Render a parsed node list (document order) back into Markdown text."""
     lines: List[str] = []
@@ -421,7 +463,7 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             lines.append("")
             continue
 
-        text = _render_spans(node.spans) if node.spans else node.text
+        text = _render_spans(node.spans) if node.spans else _escape_inline(node.text)
 
         if node.style.startswith("HEADING_"):
             try:
@@ -432,6 +474,12 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             lines.append(f"{'#' * level} {text}")
         elif node.is_list_item:
             indent = "  " * node.nesting_level
+            # A list item's content is itself parsed as a block (not inline,
+            # unlike a heading's text) — text like "# h" or "---" as the
+            # entire item content is read back as a nested heading or
+            # thematic break rather than literal text, so it needs the same
+            # block-start escaping a top-level paragraph gets.
+            text = _escape_block_start(text)
             if node.is_native_checkbox:
                 # This structural render (documents.get() -> DocsStructureParser
                 # -> here) is used for the tab-scoped pull path, where checked
@@ -448,7 +496,7 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             else:
                 lines.append(f"{indent}- {text}")
         else:
-            lines.append(_escape_leading_fence(text))
+            lines.append(_escape_block_start(text))
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"

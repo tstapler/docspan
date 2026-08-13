@@ -111,8 +111,8 @@ def test_interactive_oauth_flow_persists(monkeypatch, tmp_path):
     assert persisted.get("oauth_client_secret_path") == cs
 
 
-def test_non_interactive_prints_instructions(monkeypatch, capsys):
-    backend = be.GoogleDocsBackend(GoogleDocsConfig())
+def test_non_interactive_prints_instructions(monkeypatch, capsys, tmp_path):
+    backend = be.GoogleDocsBackend(GoogleDocsConfig(token_path=str(tmp_path / "no_token.json")))
     monkeypatch.setattr(be, "is_interactive", lambda: False)
     monkeypatch.delenv("ACCOUNT_A_CREDENTIALS", raising=False)
     monkeypatch.delenv("ACCOUNT_A_CREDENTIALS_PATH", raising=False)
