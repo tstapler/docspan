@@ -254,6 +254,7 @@ def link_payload(
     resolver: Optional[CrossDocLinkResolver],
     slug_to_id: Optional[Dict[str, str]] = None,
     known_ids: Optional[Set[str]] = None,
+    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> "tuple[Optional[dict], Optional[str]]":
     """Cross-doc-aware drop-in for `heading_anchors.link_payload`.
 
@@ -267,6 +268,8 @@ def link_payload(
     Falls through to `heading_anchors.link_payload` unchanged whenever
     `resolver`/`source_local_path` is absent or `href` isn't a cross-doc
     candidate — same-document anchor resolution (criterion 2) is unaffected.
+    `foreign_ids` is forwarded as-is; it only matters on that fallthrough,
+    since a cross-doc href is never also a same-document anchor.
     """
     if resolver is not None and source_local_path is not None and href:
         resolution = resolver.resolve(source_local_path, href)
@@ -280,4 +283,4 @@ def link_payload(
 
     if href is None:
         return None, None
-    return _same_doc_link_payload(href, slug_to_id, known_ids), None
+    return _same_doc_link_payload(href, slug_to_id, known_ids, foreign_ids), None

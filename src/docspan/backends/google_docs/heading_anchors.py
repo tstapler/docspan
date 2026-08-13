@@ -383,23 +383,33 @@ def link_payload(
     href: str,
     slug_to_id: Optional[Dict[str, str]] = None,
     known_ids: Optional[Iterable[str]] = None,
+    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     """The Docs `Link` union member for a markdown href.
 
     Returns ``{"url": ...}`` for a URL, ``{"headingId": ...}`` for a resolvable
-    anchor, and None for an anchor that resolves to nothing — never a `url` link
-    holding a `#fragment`, which is the dead link this module exists to stop
-    writing. A None return is a caller's cue to write no link at all and to report
-    the anchor, never to fall back to a `url`.
+    same-tab anchor, ``{"heading": {"id": ..., "tabId": ...}}`` for one that only
+    resolves in a sibling tab, and None for an anchor that resolves to nothing —
+    never a `url` link holding a `#fragment`, which is the dead link this module
+    exists to stop writing. A None return is a caller's cue to write no link at
+    all and to report the anchor, never to fall back to a `url`.
 
-    Only the flat `headingId` member is written. It resolves against the tab named
-    in the request, so it cannot express a link into a *different* tab of the same
-    document; such an anchor is reported unresolved. See the cross-tab follow-up.
+    `foreign_ids` is `tabs.heading_ids_by_tab()`'s map, already filtered by the
+    caller (`docs_request_builder.align()`) to drop any id this tab itself owns —
+    same-tab resolution always wins. It is consulted only when the same-tab
+    lookup above fails, so a name that exists in both places still emits the flat
+    `headingId` form pass 2 has always written.
     """
     if not is_anchor(href):
         return {"url": href}
     heading_id = resolve_anchor(href, slug_to_id or {}, known_ids)
-    return {"headingId": heading_id} if heading_id else None
+    if heading_id:
+        return {"headingId": heading_id}
+    target = anchor_target(href)
+    foreign_tab_id = (foreign_ids or {}).get(target)
+    if foreign_tab_id:
+        return {"heading": {"id": target, "tabId": foreign_tab_id}}
+    return None
 
 
 def anchors_in(nodes: Iterable[object]) -> List[str]:
@@ -416,13 +426,17 @@ def anchors_in(nodes: Iterable[object]) -> List[str]:
 def unresolved_anchors(
     target_nodes: Sequence[object],
     document_nodes: Sequence[object] = (),
+    foreign_ids: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Anchors in ``target_nodes`` that no heading can satisfy, in use order.
 
     Checked against the headings of the markdown being pushed *and* of the
     document as it stands, because both can supply a target: a heading this
     push is about to create is only in the markdown, while a `#h.abc123` id
-    emitted by an earlier pull is only in the document.
+    emitted by an earlier pull is only in the document. `foreign_ids` adds a
+    third source — a sibling tab's headings — so a cross-tab anchor `push()`
+    can resolve is never reported dead here; without it this dry-run view
+    would over-report, which its own contract forbids.
 
     This is the ``--dry-run`` view, computed before anything is written and
     therefore an approximation. The authoritative answer is
@@ -460,8 +474,9 @@ def unresolved_anchors(
     # it ever reached that function.
     resolvable = {slug: _UNWRITTEN_HEADING for slug in heading_slugs(target_nodes)}
     resolvable.update(document_slugs)
+    reachable_ids = known_ids | set(foreign_ids or ())
     return [
         href
         for href in anchors_in(target_nodes)
-        if resolve_anchor(href, resolvable, known_ids) is None
+        if resolve_anchor(href, resolvable, reachable_ids) is None
     ]

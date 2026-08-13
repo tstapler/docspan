@@ -269,6 +269,115 @@ class TestPushHighRiskGate:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# preview_push() cross-tab dry-run parity with push()
+#
+# unresolved_anchors' own contract is "never over-report" — a dry run must not
+# name an anchor as dead when push() would actually resolve it into a sibling
+# tab's heading via Link.heading={id,tabId}.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _multi_tab_doc_for_dry_run() -> dict:
+    return {
+        "revisionId": "rev-1",
+        "tabs": [
+            {
+                "tabProperties": {"tabId": "t.cur", "title": "Current"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 15,
+                                "paragraph": {
+                                    "paragraphStyle": {
+                                        "namedStyleType": "HEADING_2",
+                                        "headingId": "h.cur",
+                                    },
+                                    "elements": [{"textRun": {"content": "Current state\n"}}],
+                                },
+                            },
+                            {
+                                "startIndex": 15,
+                                "endIndex": 22,
+                                "paragraph": {
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                    "elements": [{"textRun": {"content": "see it\n"}}],
+                                },
+                            },
+                        ]
+                    },
+                    "lists": {},
+                },
+                "childTabs": [],
+            },
+            {
+                "tabProperties": {"tabId": "t.other", "title": "Other"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 14,
+                                "paragraph": {
+                                    "paragraphStyle": {
+                                        "namedStyleType": "HEADING_2",
+                                        "headingId": "h.other",
+                                    },
+                                    "elements": [{"textRun": {"content": "Other heading\n"}}],
+                                },
+                            }
+                        ]
+                    },
+                    "lists": {},
+                },
+                "childTabs": [],
+            },
+        ],
+    }
+
+
+class TestDryRunCrossTabParity:
+    def test_preview_push_does_not_over_report_an_anchor_push_would_resolve(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        doc = _multi_tab_doc_for_dry_run()
+        fake_client.get_document.return_value = doc
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("## Current state\n\nsee [it](#h.other)\n", encoding="utf-8")
+
+        preview = backend.preview_push(str(local), "doc-1")
+
+        assert preview.unresolved_anchors == [], preview.unresolved_anchors
+
+        backend.push(str(local), "doc-1")
+        links = [
+            request["updateTextStyle"]["textStyle"]["link"]
+            for call in fake_client.batch_update.call_args_list
+            for request in call.args[1]
+            if "updateTextStyle" in request
+            and "link" in request["updateTextStyle"].get("textStyle", {})
+        ]
+        assert {"heading": {"id": "h.other", "tabId": "t.other"}} in links, links
+
+    def test_preview_push_still_reports_a_genuinely_unresolvable_anchor(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc_for_dry_run()
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("## Current state\n\nsee [it](#h.nonexistent)\n", encoding="utf-8")
+
+        preview = backend.preview_push(str(local), "doc-1")
+
+        assert preview.unresolved_anchors == ["#h.nonexistent"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # push()'s temp-Drive-upload cleanup — blocked/skipped/success paths all
 # route through the same best-effort _cleanup_temp_uploads() helper (round-2
 # review finding: two of these previously called client.delete_temp_upload()

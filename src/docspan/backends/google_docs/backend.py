@@ -65,7 +65,11 @@ from docspan.backends.google_docs.push_preview import (
     render_available_anchors,
     render_high_risk,
 )
-from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
+from docspan.backends.google_docs.tabs import (
+    TabNotFoundError,
+    heading_ids_by_tab,
+    resolve_document_tab,
+)
 from docspan.core.paths import COMMENTS_SUFFIX
 
 if TYPE_CHECKING:
@@ -226,8 +230,8 @@ class GoogleDocsBackend(Backend):
             ]
 
         try:
-            doc = self._client.get_document(doc_id)
-            doc, resolved_tab_id, tab_warning = resolve_document_tab(doc, tab_id)
+            whole_doc = self._client.get_document(doc_id)
+            doc, resolved_tab_id, tab_warning = resolve_document_tab(whole_doc, tab_id)
             current_nodes = DocsStructureParser().parse(doc)
 
             # Both sides of the diff pass through the same projection, so the diff
@@ -289,6 +293,7 @@ class GoogleDocsBackend(Backend):
             tab_warning=tab_warning,
             resolved_tab_id=resolved_tab_id,
             residue=current_residue,
+            whole_doc=whole_doc,
             temp_drive_file_ids=temp_drive_file_ids,
             image_warnings=image_warnings,
         )
@@ -326,7 +331,12 @@ class GoogleDocsBackend(Backend):
             # then wrote correctly, which is the one direction this advisory must
             # never fail in.
             document_nodes = DocsStructureParser().parse(plan.doc)
-            unresolved = unresolved_anchors(plan.target_nodes, document_nodes)
+            # Same foreign-tab map push() gives align(), or the dry-run reports a
+            # cross-tab anchor the push then resolves — an over-report, which is
+            # the direction unresolved_anchors' own contract forbids.
+            unresolved = unresolved_anchors(
+                plan.target_nodes, document_nodes, heading_ids_by_tab(plan.whole_doc)
+            )
             target_residue_note = describe_target_residue(plan.target_residue)
             available = available_anchor_slugs(plan.target_nodes, document_nodes)
             # --dry-run never inserts anything, so any image just uploaded to
@@ -467,9 +477,10 @@ class GoogleDocsBackend(Backend):
                 # re-read. plan.doc is already narrowed to the resolved tab,
                 # which is why PushPlan carries resolved_tab_id.
                 if plan.requests:
-                    pass2_doc = self._client.get_document(doc_id)
-                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(pass2_doc, tab_id)
+                    whole_doc = self._client.get_document(doc_id)
+                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
                 else:
+                    whole_doc = plan.whole_doc
                     pass2_doc, pass2_tab_id = plan.doc, plan.resolved_tab_id
 
                 builder = DocsRequestBuilder()
@@ -481,7 +492,14 @@ class GoogleDocsBackend(Backend):
                 # batch_update below, where a concurrent edit costs a conflict on
                 # a document pass 1 has already changed. Measured at +43% on that
                 # window for a 5000-paragraph document.
-                alignment = builder.align(pass2_doc, plan.target_nodes)
+                # Heading ids from *every* tab, so an anchor into a sibling tab
+                # resolves instead of being reported dead on every push forever —
+                # on a file that is exactly what `pull` wrote, against a Doc whose
+                # link is fine. Needs the unresolved document, since
+                # resolve_document_tab narrows away the other tabs.
+                alignment = builder.align(
+                    pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
+                )
                 pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
                     pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment,

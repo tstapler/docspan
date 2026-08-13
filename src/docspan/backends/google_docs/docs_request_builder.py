@@ -4,7 +4,7 @@ from __future__ import annotations
 import difflib
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Literal, Optional, Set, Tuple, Union
 
 from docspan.backends.google_docs import cross_doc_links
@@ -128,6 +128,10 @@ class Pass2Alignment:
     slug_to_id: dict
     known_ids: set
     residue: List[Residue]
+    # headingId -> tabId for headings in *other* tabs (tabs.heading_ids_by_tab(),
+    # already stripped of any id this tab owns — see align()). Empty for a
+    # caller that doesn't pass foreign_ids, e.g. every pre-cross-tab test.
+    foreign_ids: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1447,7 +1451,7 @@ class DocsRequestBuilder:
                 start, limit = placed
                 requests.extend(self._span_requests_in(
                     cell.spans, start, limit, aligned.slug_to_id, aligned.known_ids,
-                    resolver, local_path,
+                    resolver, local_path, aligned.foreign_ids,
                 ))
         return requests
 
@@ -1612,7 +1616,12 @@ class DocsRequestBuilder:
         # end_index - 1 is the paragraph's newline; text lives strictly before it.
         return start_index + _utf16_len(text[:offset]), end_index - 1
 
-    def align(self, doc: dict, target: List[Node]) -> "Pass2Alignment":
+    def align(
+        self,
+        doc: dict,
+        target: List[Node],
+        foreign_ids: Optional[dict] = None,
+    ) -> "Pass2Alignment":
         """Parse ``doc``, pair it with ``target``, and resolve anchors — once.
 
         The three pass-2 consumers below each need the same alignment, and each
@@ -1627,11 +1636,23 @@ class DocsRequestBuilder:
         `push()` calls this once and hands the result to all three. Each still
         accepts ``alignment=None`` and computes its own, so a caller with only a
         document and a target — every existing test — keeps working.
+
+        ``foreign_ids`` is ``tabs.heading_ids_by_tab(whole_doc)`` — headingId ->
+        tabId across every tab, including this one. Same-tab resolution always
+        wins: an id this tab's own ``known_ids`` already covers is dropped here
+        rather than carried into `Pass2Alignment.foreign_ids`, so a name that
+        happens to exist in both places keeps writing the flat `headingId` form
+        pass 2 has always written, never the tabs-aware one.
         """
         current, pairs, unaligned, heading_pairs, residue, table_pairs = (
             self._align_for_styling(doc, target)
         )
         slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
+        foreign = {
+            heading_id: tab_id
+            for heading_id, tab_id in (foreign_ids or {}).items()
+            if heading_id not in known_ids
+        }
         return Pass2Alignment(
             current=current,
             pairs=pairs,
@@ -1640,6 +1661,7 @@ class DocsRequestBuilder:
             slug_to_id=slug_to_id,
             known_ids=known_ids,
             residue=residue,
+            foreign_ids=foreign,
         )
 
     def _aligned(
@@ -1670,7 +1692,7 @@ class DocsRequestBuilder:
         requests: List[dict] = []
         for cnode, tnode in pairs:
             requests.extend(self._span_style_requests(
-                tnode, cnode, slug_to_id, known_ids, resolver, local_path,
+                tnode, cnode, slug_to_id, known_ids, resolver, local_path, aligned.foreign_ids,
             ))
         return requests
 
@@ -1759,7 +1781,7 @@ class DocsRequestBuilder:
             for span in spans:
                 if not span.link or not is_anchor(span.link):
                     continue
-                if link_payload(span.link, slug_to_id, known_ids) is None:
+                if link_payload(span.link, slug_to_id, known_ids, aligned.foreign_ids) is None:
                     if span.link not in unresolved:
                         unresolved.append(span.link)
 
@@ -2494,6 +2516,7 @@ class DocsRequestBuilder:
         known_ids: Optional[set] = None,
         resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
         local_path: Optional[str] = None,
+        foreign_ids: Optional[dict] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -2526,6 +2549,7 @@ class DocsRequestBuilder:
             known_ids,
             resolver,
             local_path,
+            foreign_ids,
         )
 
     def _span_requests_in(
@@ -2537,6 +2561,7 @@ class DocsRequestBuilder:
         known_ids: Optional[set] = None,
         resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
         local_path: Optional[str] = None,
+        foreign_ids: Optional[dict] = None,
     ) -> List[dict]:
         """Place `spans` starting at `start`, never writing at or past `limit`.
 
@@ -2561,7 +2586,7 @@ class DocsRequestBuilder:
                 attrs["italic"] = True
             if span.link:
                 payload, _detail = cross_doc_links.link_payload(
-                    span.link, local_path, resolver, slug_to_id, known_ids,
+                    span.link, local_path, resolver, slug_to_id, known_ids, foreign_ids,
                 )
                 if payload is not None:
                     attrs["link"] = payload
