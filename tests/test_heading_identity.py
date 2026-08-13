@@ -801,6 +801,56 @@ class TestNoHeadingIsDemoted:
         )
 
 
+class TestMultipleSimultaneousRestylesDoNotCollide:
+    """AC5: two independent restyle groups in one push must not cross-contaminate.
+
+    `_prefer_structural_pairing` now pools every `_content_key` across the
+    *whole document* (PR #70), not just one `replace` run. Each distinct
+    `_content_key` is still its own dict entry (`candidates_by_key`/
+    `slots_by_key` are keyed by it), so two groups with different text can
+    never literally share a slot/candidate pool — but this exercises that two
+    such groups, each with their own duplicate-content stray, resolve
+    independently and correctly when diffed together in a single push,
+    rather than relying on each being tested in isolation.
+    """
+
+    def test_two_independent_duplicate_content_restyles_both_resolve_correctly(self) -> None:
+        # Two unrelated live headings ("Setup", "Config"), each shadowed by a
+        # same-text stray of different content-key-relevant shape, restyled
+        # simultaneously. If the global pool let one group's bookkeeping leak
+        # into the other's, either restyle could be resolved against the
+        # wrong group's candidate/slot or dropped outright.
+        current = [
+            DocsParagraphNode(text="Setup", style="HEADING_1", is_list_item=False),
+            DocsParagraphNode(text="Setup", style="BULLET", is_list_item=True),
+            DocsParagraphNode(text="Config", style="HEADING_2", is_list_item=False),
+            DocsParagraphNode(text="Config", style="NORMAL_TEXT", is_list_item=False),
+        ]
+        target = [
+            DocsParagraphNode(text="Setup", style="HEADING_2", is_list_item=False),
+            DocsParagraphNode(text="Config", style="HEADING_3", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        setup_op = next(op for op in opcodes if op[3] <= 0 < op[4])
+        config_op = next(op for op in opcodes if op[3] <= 1 < op[4])
+        assert setup_op[0] == "equal" and setup_op[1] == 0, (
+            f"the live 'Setup' heading (current index 0) was not restyled in "
+            f"place onto its own target slot: {opcodes}"
+        )
+        assert config_op[0] == "equal" and config_op[1] == 2, (
+            f"the live 'Config' heading (current index 2) was not restyled "
+            f"in place onto its own target slot: {opcodes}"
+        )
+        deleted_current = {ci1 for tag, ci1, ci2, *_ in opcodes if tag == "delete"
+                            for ci1 in range(ci1, ci2)}
+        assert deleted_current == {1, 3}, (
+            f"exactly the two strays (indices 1 and 3) should be deleted, "
+            f"got {sorted(deleted_current)}: {opcodes}"
+        )
+
+
 class TestUnrelatedDuplicateTextIsNotFalselyRestyled:
     """AC6: a coincidental `_content_key` match must not fabricate a restyle.
 
