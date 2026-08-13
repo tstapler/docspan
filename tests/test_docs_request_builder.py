@@ -836,6 +836,26 @@ def test_diff_summary_zero_edit_native_checkbox_round_trip_is_unchanged() -> Non
     assert unchanged_count == 2
 
 
+def test_repair_does_not_merge_a_checkbox_with_an_unrelated_literal_marker_paragraph() -> None:
+    """A native checkbox and an unrelated plain paragraph whose literal text
+    happens to start with `"[ ] "` must not collapse into the same key inside
+    a replace run: stripping the checkbox marker for `_target_key` comparison
+    must only ever apply to the target side, never to the current side, or
+    the two nodes falsely pair as `equal` and the plain paragraph's real edit
+    is silently dropped."""
+    current = [
+        _para_ncb("Buy milk", is_native_checkbox=True, is_list_item=True, start=1, end=10),
+        _para_ncb("[ ] Buy milk", is_native_checkbox=False, start=10, end=25),
+    ]
+    target = [
+        _para_ncb("[ ] Buy milk", is_list_item=True),
+        _para_ncb("[ ] Buy milk"),
+    ]
+    opcodes = [("replace", 0, len(current), 0, len(target))]
+    repaired = builder._repair(opcodes, current, target)
+    assert repaired == [("equal", 0, 1, 0, 1), ("replace", 1, 2, 1, 2)]
+
+
 def test_build_zero_edit_native_checkbox_round_trip_emits_no_requests() -> None:
     """Same scenario as the diff_summary test above, but at the request-build
     layer — an unedited native checkbox must not produce a delete+insert."""
