@@ -11,8 +11,29 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write  # to dispatch publish.yml below
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please-action creates the GitHub Release using the default
+      # GITHUB_TOKEN. GitHub doesn't let events produced by that token
+      # trigger other workflows (loop-prevention), so publish.yml's
+      # `on: release: published` trigger never fires for these releases —
+      # dispatch it explicitly instead. workflow_dispatch is exempted from
+      # that restriction even when invoked with GITHUB_TOKEN.
+      - name: Trigger PyPI publish
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run publish.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f ref="${{ steps.release.outputs.tag_name }}"
