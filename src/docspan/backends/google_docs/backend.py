@@ -285,13 +285,18 @@ class GoogleDocsBackend(Backend):
         self._ensure_client()
         assert self._client is not None
         mappings = kwargs.get("mappings")
+        cross_doc_cache = kwargs.get("cross_doc_cache")
         resolver: Optional[cross_doc_links.CrossDocLinkResolver] = None
         if mappings:
             assert isinstance(mappings, list), (
                 f"push() 'mappings' kwarg must be a list, got {type(mappings).__name__}"
             )
+            assert cross_doc_cache is None or isinstance(cross_doc_cache, dict), (
+                "push() 'cross_doc_cache' kwarg must be a dict, got "
+                f"{type(cross_doc_cache).__name__}"
+            )
             resolver = cross_doc_links.CrossDocLinkResolver(
-                mappings, self._fetch_target_headings
+                mappings, self._fetch_target_headings, cache=cross_doc_cache
             )
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)

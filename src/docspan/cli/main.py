@@ -234,6 +234,12 @@ def push(
     state = _load_state(state_path)
 
     had_error = False
+    # Shared across every mapping's push() call below (criterion 11): each
+    # mapping gets its own backend instance via _get_backend(), so without a
+    # cache threaded in from here a push --all run with N documents linking
+    # to the same target would fetch that target N times, once per pushing
+    # backend instance, instead of once for the whole run.
+    cross_doc_cache: dict = {}
     for mapping in mappings:
         if mapping.direction == "pull":
             console.print(f"[dim]Skipping {mapping.local} (pull-only)[/dim]")
@@ -325,6 +331,7 @@ def push(
 
         outcome = orchestrate_push(
             mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+            cross_doc_cache=cross_doc_cache,
         )
         result = outcome.result
 

@@ -161,13 +161,25 @@ class CrossDocLinkResolver:
     most once per resolver instance — a `push --all` run with many links to
     the same target document (criterion 6) or many mappings (criterion 10)
     still issues one fetch per distinct target, not one per link or mapping.
+
+    `cache`/`fetch_errors` may be supplied externally (and mutated in place)
+    so a whole `push --all` run — which constructs one resolver per pushed
+    document, since each mapping gets its own backend instance — still shares
+    a single fetch per distinct target across all of them, not one per
+    pushed document (criterion 11).
     """
 
-    def __init__(self, mappings: List["Mapping"], fetch_headings: FetchHeadings):
+    def __init__(
+        self,
+        mappings: List["Mapping"],
+        fetch_headings: FetchHeadings,
+        cache: Optional[Dict[tuple, Optional[TargetHeadings]]] = None,
+        fetch_errors: Optional[Dict[tuple, str]] = None,
+    ):
         self._mappings = mappings
         self._fetch_headings = fetch_headings
-        self._cache: Dict[tuple, Optional[TargetHeadings]] = {}
-        self._fetch_errors: Dict[tuple, str] = {}
+        self._cache: Dict[tuple, Optional[TargetHeadings]] = {} if cache is None else cache
+        self._fetch_errors: Dict[tuple, str] = {} if fetch_errors is None else fetch_errors
 
     def resolve(self, source_local_path: str, href: str) -> CrossDocResolution:
         parsed = parse_cross_doc_href(href)

@@ -157,16 +157,23 @@ def orchestrate_push(
     state_path: str,
     force: bool = False,
     mappings: Optional[list] = None,
+    cross_doc_cache: Optional[dict] = None,
 ) -> PushOutcome:
     """`mappings` is the full markgate.yaml mapping list (not just this one) —
     threaded through to backend.push() as a kwarg so a Google Docs push can
     resolve relative cross-document links to other mapped files' remote URLs.
     None (the default) preserves old behavior: no cross-doc resolution.
+
+    `cross_doc_cache`, when supplied by the caller and reused across multiple
+    orchestrate_push calls in one run, lets a heading fetch for one target
+    document be shared across every pushed document that links to it —
+    a `push --all` run doesn't refetch the same target once per pushing
+    document.
     """
     assert mapping.remote_id is not None, "orchestrate_push requires a mapping with a created remote doc/page"
     result = backend.push(
         mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
-        mappings=mappings,
+        mappings=mappings, cross_doc_cache=cross_doc_cache,
     )
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
