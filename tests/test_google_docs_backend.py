@@ -964,6 +964,76 @@ class TestBlankParagraphIsPreserved:
         assert any("Gamma" in t for t in texts)
 
 
+def _doc_with_blank_paragraph_adjacent_to_checkbox(revision_id: str = "rev-1") -> dict:
+    """Buy milk (native checkbox) / (blank) / Omega — root cause 2 from
+    issue #17: a blank paragraph immediately after a checkbox item."""
+    return {
+        "revisionId": revision_id,
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 11,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "Buy milk\n"}}],
+                        "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                    },
+                },
+                {
+                    "startIndex": 11,
+                    "endIndex": 12,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "\n"}}],
+                    },
+                },
+                {
+                    "startIndex": 12,
+                    "endIndex": 18,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "Omega\n"}}],
+                    },
+                },
+            ]
+        },
+        "lists": {
+            "kix.abc": {
+                "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+            }
+        },
+    }
+
+
+class TestBlankParagraphAdjacentToCheckboxRoundTrip:
+    """AC5 (issue #17, root cause 2): a blank paragraph next to a native
+    checkbox paragraph must not turn a zero-edit round trip into a
+    corrupting push. projection.py's Rule 1 already drops the blank
+    paragraph from *both* sides of the diff before it's compared (see its
+    docstring, which cites this exact issue), and that fix predates this
+    ticket (commit d8b1b5f). No new production code is added here — this
+    is a confirming regression test that root cause 2 is already closed.
+    """
+
+    def test_zero_edit_push_over_blank_paragraph_next_to_checkbox_is_a_noop(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        # Exactly what pull() would have rendered for this doc: project()
+        # drops the blank paragraph and nodes_to_markdown renders the
+        # checkbox with its synthetic "[ ] " prefix.
+        local.write_text("- [ ] Buy milk\n\nOmega\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_blank_paragraph_adjacent_to_checkbox()
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1", force=True)
+
+        assert result.status == "skipped"
+        client.batch_update.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # pull() renders TITLE as a heading, so pull → push is a fixpoint
 # ─────────────────────────────────────────────────────────────────────────────
