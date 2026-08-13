@@ -34,13 +34,74 @@ from unittest.mock import MagicMock
 
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    DocsStructureParser,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.projection import project
 
 markdown = MarkdownToParagraphParser()
 structure = DocsStructureParser()
 builder = DocsRequestBuilder()
+
+
+class TestCodeBlockLinesDoNotStealAHeadingOrBullet:
+    """Splitting fenced blocks per line (#40/#41) makes issue #42 easy to reach.
+
+    A code block contributes duplicate short lines in bulk (`}`, `);`, `EOF`,
+    `pass`), and any one matching a heading or list item's text elsewhere in
+    the document can share that node's anchor with the surrounding edit's
+    insert group. Criterion 6 of #42: this must not demote the heading or
+    steal the bullet.
+    """
+
+    def test_duplicate_short_code_lines_next_to_a_heading_edit_spare_the_heading(
+        self,
+    ) -> None:
+        """A doc-start insert (a new fenced-code line) shares its anchor with the
+        live heading's restyle group — the same collision as criterion 3/6 — while
+        several duplicate short code-flavored lines (`}`, `);`, `EOF`, `pass`)
+        sit unrelated and unchanged elsewhere in the document as decoys.
+
+        `is_heading("heading")` alone doesn't discriminate the bug: pre-fix, the
+        restyle request is still a *superset* of the heading's own range, so the
+        heading's paragraph id ends up in the covered set and gets the right style
+        regardless. What the corrupted (pre-insert) range actually does is bleed
+        the restyle onto the *newly inserted* paragraph too, and — because the
+        insert ran before the tied restyle — the live heading is left holding its
+        *old* style. Both of those are what the assertions below catch.
+        """
+        from .test_heading_identity import ParagraphReplay
+
+        replay = ParagraphReplay([
+            ("pass", "HEADING_2", "heading", False),
+            ("}", "NORMAL_TEXT", "decoyA", False),
+            (");", "NORMAL_TEXT", "decoyB", False),
+            ("EOF", "NORMAL_TEXT", "item", True),
+            ("pass", "NORMAL_TEXT", "decoyD", False),
+            ("tail", "NORMAL_TEXT", "tail", False),
+        ])
+        doc, end = replay.document()
+        md = "NewCode\n\n### pass\n\n}\n\n);\n\n- EOF\n\npass\n\ntail\n"
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+        replay.apply(builder.build(current, target, end))
+
+        assert replay.is_heading("heading"), (
+            f"the live heading was restyled to {replay.style['heading']}, "
+            "so its headingId is gone and every anchor to it is dead"
+        )
+        assert replay.style["heading"] == "HEADING_3"
+        assert not replay.is_heading("inserted-1"), (
+            f"the restyle range leaked onto the newly inserted code line "
+            f"(style={replay.style.get('inserted-1')}), which means it was "
+            "computed against coordinates the insert had already shifted"
+        )
+        assert replay.alive("item") and replay.bullet["item"], (
+            "the live list item must survive as the bullet, not be swapped out "
+            "for one of the duplicate decoy lines"
+        )
 
 
 def _doc_of_lines(*lines: str) -> tuple[dict, int]:
@@ -62,9 +123,13 @@ def _doc_of_lines(*lines: str) -> tuple[dict, int]:
 class TestGranularity:
     def test_each_line_of_a_fenced_block_is_its_own_node(self) -> None:
         nodes = markdown.parse("```yaml\nkey: value\n  indented: yes\n```\n")
-        assert [node.text for node in nodes] == ["key: value", "  indented: yes"]
-        # Every line stays monospace, so the styling survives the split.
-        assert all(node.spans[0].monospace for node in nodes)
+        # A literal, non-monospace marker line carries the fence language
+        # (issue #45 AC1) ahead of the monospace code lines.
+        assert [node.text for node in nodes] == ["```yaml", "key: value", "  indented: yes"]
+        code_nodes = nodes[1:]
+        # Every code line stays monospace, so the styling survives the split.
+        assert all(node.spans[0].monospace for node in code_nodes)
+        assert not nodes[0].spans
 
     def test_indentation_is_preserved(self) -> None:
         """`strip()` ate leading whitespace; in code that is meaning, not padding."""
@@ -74,27 +139,138 @@ class TestGranularity:
     def test_no_top_level_node_carries_an_embedded_newline(self) -> None:
         """The invariant the bug violated. A Doc paragraph cannot hold a newline.
 
-        Scoped to **top-level** blocks on purpose. `block_code` is parsed in three
-        places and only this one is fixed: a fence inside a list item still yields
-        one node with newlines (and concatenates onto the list text), and one
-        inside a blockquote is dropped entirely. Both are byte-identical before
-        this change, so neither is a regression — but an unqualified `all(...)`
-        over a document with no list in it reads as a guarantee that does not hold,
-        which is worse than no test.
+        `block_code` is parsed at three sites (top level, list items,
+        blockquotes) and all three now share `_nodes_from_code_block` — see
+        `TestFenceInAListItem` and `TestFenceInABlockQuote` below for the other
+        two.
         """
         nodes = markdown.parse(
             "before\n\n```sh\none\ntwo\nthree\n```\n\n```py\nfour\n```\n\nafter\n"
         )
         assert all("\n" not in node.text for node in nodes if hasattr(node, "text"))
 
-    def test_a_fence_in_a_list_item_is_still_unsplit(self) -> None:
-        """Pins the known gap so it cannot be mistaken for fixed.
 
-        Delete this test when the split moves into a helper shared by all three
-        parse sites; until then it is the honest statement of scope.
-        """
+class TestFenceInAListItem:
+    def test_a_fence_in_a_list_item_is_split_per_line(self) -> None:
         nodes = markdown.parse("- Steps:\n\n  ```sh\n  make build\n  make test\n  ```\n")
-        assert any("\n" in node.text for node in nodes if hasattr(node, "text"))
+
+        heading = next(n for n in nodes if n.text == "Steps:")
+        assert heading.is_list_item is True
+
+        code_lines = [n for n in nodes if n.text in ("make build", "make test")]
+        assert [n.text for n in code_lines] == ["make build", "make test"]
+        for line in code_lines:
+            assert line.is_list_item is True
+            assert line.nesting_level == 0
+            assert line.spans[0].monospace is True
+
+        assert all("\n" not in n.text for n in nodes)
+
+    def test_a_fence_at_the_start_of_a_list_item_emits_no_stray_node(self) -> None:
+        """No prose precedes the fence — nothing should flush an empty node."""
+        nodes = markdown.parse("- ```sh\n  make build\n  ```\n")
+        assert [n.text for n in nodes] == ["make build"]
+
+    def test_multiple_fences_in_one_list_item_stay_separate(self) -> None:
+        nodes = markdown.parse(
+            "- Steps:\n\n  ```sh\n  one\n  ```\n\n  ```sh\n  two\n  ```\n"
+        )
+        assert [n.text for n in nodes] == ["Steps:", "one", "two"]
+
+    def test_prose_after_a_fence_in_a_list_item_is_not_glued_or_dropped(self) -> None:
+        """The `spans = []` reset after emitting a fence's nodes must let a
+        trailing sibling line re-accumulate on its own, not vanish or merge
+        into the last code line."""
+        nodes = markdown.parse(
+            "- Steps:\n\n  ```sh\n  make build\n  ```\n\n  Done.\n"
+        )
+        assert [n.text for n in nodes] == ["Steps:", "make build", "Done."]
+        trailing = next(n for n in nodes if n.text == "Done.")
+        assert trailing.is_list_item is True
+        assert trailing.spans == []
+
+    def test_a_fence_nested_two_lists_deep_carries_its_nesting_level(self) -> None:
+        nodes = markdown.parse(
+            "- outer\n  - inner:\n\n    ```sh\n    cmd\n    ```\n"
+        )
+        code = next(n for n in nodes if n.text == "cmd")
+        assert code.is_list_item is True
+        assert code.nesting_level == 1
+
+    def test_pushing_an_unchanged_document_with_a_listed_fence_emits_no_requests(self) -> None:
+        """Mirrors #40's idempotence regression test, for the list-item site.
+
+        Before this fix the fence fell through `_walk_list_items` as raw
+        multi-line text glued onto the list item's own text, which pushed a
+        `deleteContentRange` + `insertText` pair on every sync of an untouched
+        document.
+        """
+        md = "- Steps:\n\n  ```sh\n  make build\n  make test\n  ```\n"
+        doc, end = _doc_of_lines("Steps:", "make build", "make test")
+        for element in doc["body"]["content"]:
+            element["paragraph"]["bullet"] = {"listId": "list-1"}
+
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+
+        assert builder.build(current, target, end) == []
+
+
+class TestFenceInABlockQuote:
+    def test_a_fence_in_a_block_quote_is_prefixed_per_line(self) -> None:
+        nodes = markdown.parse("> Note:\n>\n> ```sh\n> kubectl get pods\n> kubectl logs -f\n> ```\n")
+
+        note = next(n for n in nodes if n.text == "> Note:")
+        code_lines = [n for n in nodes if n.text.startswith("> kubectl")]
+        assert [n.text for n in code_lines] == ["> kubectl get pods", "> kubectl logs -f"]
+        for line in code_lines:
+            assert line.spans and line.spans[-1].monospace is True
+        assert note.text == "> Note:"
+
+    def test_a_fence_two_quote_levels_deep_gets_the_doubled_prefix(self) -> None:
+        nodes = markdown.parse("> > ```sh\n> > cmd\n> > ```\n")
+        assert [n.text for n in nodes] == ["> > cmd"]
+
+    def test_pushing_a_document_with_a_quoted_fence_does_not_delete_it(self) -> None:
+        """The item's core repro: a quoted fence already in the live doc must
+        survive an unchanged push, not be diffed away as a removal.
+        """
+        md = "intro\n\n> Note:\n>\n> ```sh\n> kubectl get pods\n> kubectl logs -f\n> ```\n\ntail\n"
+        doc, end = _doc_of_lines(
+            "intro", "> Note:", "> kubectl get pods", "> kubectl logs -f", "tail",
+        )
+
+        target, _ = project(markdown.parse(md))
+        current, _ = project(structure.parse(doc))
+
+        assert builder.build(current, target, end) == []
+
+    def test_a_list_item_inside_a_block_quote_containing_a_fence(self) -> None:
+        """Composition: fence -> list item -> blockquote, all three fixes at once."""
+        nodes = markdown.parse(
+            "> - Steps:\n>\n>   ```sh\n>   make build\n>   ```\n"
+        )
+        code = next(n for n in nodes if n.text == "> make build")
+        assert code.is_list_item is True
+        assert code.spans and code.spans[-1].monospace is True
+
+    def test_a_blank_line_in_a_quoted_fence_still_renders_as_a_bare_quote_marker(
+        self,
+    ) -> None:
+        """Deliberate choice, not an accident of `_prefix_node_text`.
+
+        The top-level fix drops a blank code line entirely (empty text, no
+        span — `projection.py` removes it from both sides on `text == ""`).
+        Prefixing that same blank line inside a quote turns it into `"> "`,
+        which is no longer empty, so it survives projection instead of being
+        dropped. That is intentional here: a vanishing line mid-quote would
+        break the blockquote's visual continuity, so a blank fenced line
+        renders as a bare quote marker instead.
+        """
+        nodes = markdown.parse("> ```sh\n> one\n>\n> two\n> ```\n")
+        assert [n.text for n in nodes] == ["> one", "> ", "> two"]
+        blank = nodes[1]
+        assert blank.spans == []
 
 
 class TestPushIsIdempotent:
@@ -105,7 +281,11 @@ class TestPushIsIdempotent:
         a document nobody had edited, and did so on every push forever.
         """
         md = "before\n\n```yaml\nkey: value\n  indented: yes\nafter\n```\n\ntail\n"
-        doc, end = _doc_of_lines("before", "key: value", "  indented: yes", "after", "tail")
+        # The literal, non-monospace "```yaml" marker line (issue #45 AC1) is
+        # itself a real paragraph in the live document, ahead of the code lines.
+        doc, end = _doc_of_lines(
+            "before", "```yaml", "key: value", "  indented: yes", "after", "tail"
+        )
 
         target, _ = project(markdown.parse(md))
         current, _ = project(structure.parse(doc))
@@ -140,7 +320,7 @@ class TestPushIsIdempotent:
             if "insertText" in request
         ]
         assert sorted(text.strip("\n") for text in texts) == [
-            "line one", "line three", "line two",
+            "```sh", "line one", "line three", "line two",
         ]
         for text in texts:
             assert text.count("\n") == 1, text
@@ -564,8 +744,8 @@ class TestRenderPrefixParticipatesInIdentity:
 
         A separate, harder collision — where `_node_key` alone still cannot
         resolve which current node should absorb a *single* target slot — is
-        pinned and out of scope for this fix; see
-        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        exercised and resolved by
+        `test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line`
         below.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg", code_first=True)
@@ -610,45 +790,209 @@ class TestRenderPrefixParticipatesInIdentity:
                 f"a request landed on or before the render_prefix glyph: {requests}"
             )
 
-    def test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence(self) -> None:
-        """A known residual gap, pinned rather than silently left undiscovered.
+    def test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line(
+        self,
+    ) -> None:
+        """The multi-candidate correspondence gap (issue #68), now resolved.
 
-        `_node_key` now keeps a prose paragraph and a code-rendered paragraph
+        `_node_key` keeps a prose paragraph and a code-rendered paragraph
         apart *when they are the only two candidates for their own slots* (see
         `test_node_key_distinguishes_prose_from_a_code_line_with_the_same_text`).
-        It cannot resolve the harder case where a plain current paragraph and a
-        real current code-rendered paragraph both read the same text, and only
-        one target slot (also that text) exists to match against: `_node_key`
-        never marks a *target* node as code (markdown never sets
-        `render_prefix`), so the plain current paragraph — whose key equals the
-        target's — wins the correspondence, and the actual code-rendered node
-        is left an unpaired `delete`, outside the `replace` run `_repair`
-        inspects and so beyond its content-key rescue.
+        The harder case is a plain current paragraph and a real current
+        code-rendered paragraph both reading the same text, with only one
+        target slot (also that text) to match against: `_node_key` never
+        marks a *target* node as code (markdown never sets `render_prefix`),
+        so the plain current paragraph — whose key equals the target's — used
+        to win the correspondence, leaving the actual code-rendered node an
+        unpaired `delete`, outside the `replace` run `_repair` inspects and so
+        beyond its content-key rescue.
 
-        This reproduces identically on unmodified `origin/main` (confirmed
-        before this fix), so it predates issue #54 and is not something a key
-        signal alone can fix — it needs `_prefer_structural_pairing`-style
-        disambiguation lifted to the top-level correspondence matcher, which is
-        outside this fix's scope. Tracked in issue #68. Pinned here as
-        documented, not silently reintroduced.
+        `_opcodes` now runs `_prefer_structural_pairing` a second time at the
+        top level (`prefer_code_line=True`), which prefers a
+        `render_prefix`-carrying candidate for a slot whose target node is
+        itself an all-monospace fenced-code line (`_target_wants_code_line`).
+        So the code-rendered node wins the slot, and the plain prose
+        paragraph is the one deleted — asserted below both by exclusion (the
+        code-rendered node's range is untouched) and by inclusion (the prose
+        paragraph's exact range is the one that gets deleted), mirroring
+        `test_replacing_a_code_lines_text_deletes_and_inserts_past_the_glyph`.
         """
         doc, end = self._doc_prose_and_code_sharing_text("cfg")
         current, _ = project(structure.parse(doc))
         target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
 
         code_node = next(n for n in current if n.render_prefix)
+        prose_node = next(n for n in current if n.text == "cfg" and not n.render_prefix)
         requests = builder.build(current, target, end)
 
         lands_inside_code_block = any(
-            code_node.start_index <= (
-                r.get("deleteContentRange", {}).get("range", {}).get("startIndex")
-                or r.get("insertText", {}).get("location", {}).get("index")
-                or -1
+            code_node.start_index <= next(
+                (
+                    v
+                    for v in (
+                        r.get("deleteContentRange", {}).get("range", {}).get("startIndex"),
+                        r.get("insertText", {}).get("location", {}).get("index"),
+                    )
+                    if v is not None
+                ),
+                -1,
             ) < code_node.end_index
             for r in requests
         )
-        assert lands_inside_code_block, (
-            "if this starts failing, the multi-candidate correspondence gap "
-            "described above has been fixed — replace this pin with a real "
-            "assertion that the code block is left alone"
+        assert not lands_inside_code_block, (
+            "the code-rendered node's range should be left alone now that the "
+            "top-level pass prefers it for the code slot"
+        )
+
+        deletes = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert deletes == [
+            {"startIndex": prose_node.start_index, "endIndex": prose_node.end_index}
+        ], (
+            "the plain prose paragraph — not the code-rendered one — should be "
+            f"the one deleted: {requests}"
+        )
+
+    def test_target_wanting_code_degrades_gracefully_with_no_code_rendered_candidate(
+        self,
+    ) -> None:
+        """`_target_wants_code_line` can be true with nothing to prefer.
+
+        Two plain (non-`render_prefix`) duplicate paragraphs both read "cfg",
+        and the target wants that slot to be a fenced-code line, but neither
+        current candidate is actually Docs-rendered. The whole-document pass
+        added for issue #68 must not invent a winner or misbehave when its
+        `code_slot_ids` gate finds no `render_prefix` candidate for the slot —
+        it should fall back to `_repair`'s ordinary positional pairing:
+        the first "cfg" survives as the match, the second is deleted as a
+        stale duplicate.
+        """
+        doc, end = _doc_of_lines("Intro", "cfg", "cfg", "Tail")
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
+
+        first, second = (n for n in current if n.text == "cfg")
+        requests = builder.build(current, target, end)
+
+        deletes = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert deletes == [
+            {"startIndex": second.start_index, "endIndex": second.end_index}
+        ], (
+            "with no code-rendered candidate to prefer, the first duplicate "
+            f"should be kept and the second deleted: {requests}"
+        )
+
+    def test_a_code_rendered_candidate_wins_the_slot_among_three_duplicates(self) -> None:
+        """The `code_slot_ids` preference holds with more than two candidates.
+
+        Two plain "cfg" paragraphs and one real Docs-rendered "cfg" paragraph
+        (glyph-prefixed, monospace) all share the same text, with a single
+        target slot wanting code. The code-rendered candidate must win the
+        slot regardless of how many plain duplicates compete for it, and both
+        plain duplicates are deleted.
+        """
+        mono = {"fontSize": {"magnitude": 9, "unit": "PT"},
+                "weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
+        paragraphs = [
+            [("Intro\n", {})],
+            [("cfg\n", {})],
+            [("cfg\n", {})],
+            [("", {}), ("cfg\n", mono)],
+            [("Tail\n", {})],
+        ]
+        content, index = [], 1
+        for runs in paragraphs:
+            raw = "".join(c for c, _ in runs)
+            end = index + len(raw.encode("utf-16-le")) // 2
+            content.append({"startIndex": index, "endIndex": end, "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": c, "textStyle": st}} for c, st in runs],
+            }})
+            index = end
+        doc = {"revisionId": "rev-1", "body": {"content": content}}
+
+        current, _ = project(structure.parse(doc))
+        target, _ = project(markdown.parse("Intro\n\n```\ncfg\n```\n\nTail\n"))
+
+        code_node = next(n for n in current if n.render_prefix)
+        plain_nodes = [n for n in current if n.text == "cfg" and not n.render_prefix]
+        assert len(plain_nodes) == 2
+        requests = builder.build(current, target, index)
+
+        lands_inside_code_block = any(
+            code_node.start_index <= next(
+                (
+                    v
+                    for v in (
+                        r.get("deleteContentRange", {}).get("range", {}).get("startIndex"),
+                        r.get("insertText", {}).get("location", {}).get("index"),
+                    )
+                    if v is not None
+                ),
+                -1,
+            ) < code_node.end_index
+            for r in requests
+        )
+        assert not lands_inside_code_block, (
+            f"the code-rendered node among three candidates should be left alone: {requests}"
+        )
+
+        deletes = {
+            (r["deleteContentRange"]["range"]["startIndex"], r["deleteContentRange"]["range"]["endIndex"])
+            for r in requests if "deleteContentRange" in r
+        }
+        assert deletes == {(n.start_index, n.end_index) for n in plain_nodes}, (
+            f"both plain duplicates — not the code-rendered node — should be deleted: {requests}"
+        )
+
+    def test_a_code_line_and_a_same_text_prose_node_in_different_runs_do_not_swap(
+        self,
+    ) -> None:
+        """PR #70's whole-document pooling (see `_content_key`'s docstring) puts
+        a code line and a same-text prose node from *unrelated* pre-repair runs
+        into the same `_prefer_structural_pairing` candidate/slot pool whenever
+        `_node_key` has already told them apart (issue #68) — unlike the
+        harder, still-open gap pinned by
+        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        above, where only one target slot exists at all.
+
+        Here each node has its *own* target slot, in a separate run (split by
+        an untouched "ANCHOR" paragraph), and the cross-run pairing is
+        deliberately the higher-scoring one on raw structural similarity
+        alone — so this only stays correct because `_prefer_structural_
+        pairing`'s same-origin tie-break keeps each node paired with its own
+        run's slot instead of reassigning the code line's target to the prose
+        node (or vice versa) purely because of the shared `_content_key`.
+        """
+        current = [
+            DocsParagraphNode(text="cfg", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="ANCHOR", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(
+                text="cfg", style="NORMAL_TEXT", is_list_item=True, render_prefix=""
+            ),
+        ]
+        target = [
+            DocsParagraphNode(text="cfg", style="HEADING_2", is_list_item=True),
+            DocsParagraphNode(text="ANCHOR", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="cfg", style="HEADING_4", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        def target_index_for(current_index: int) -> int:
+            for _tag, ci1, ci2, cj1, cj2 in opcodes:
+                if ci1 <= current_index < ci2 and cj2 - cj1 == ci2 - ci1:
+                    return cj1 + (current_index - ci1)
+            raise AssertionError(f"current index {current_index} not covered: {opcodes}")
+
+        assert target_index_for(0) == 0, (
+            f"the prose node's own target slot was handed to the code line "
+            f"from a different run: {opcodes}"
+        )
+        assert target_index_for(2) == 2, (
+            f"the code line's own target slot was handed to the prose node "
+            f"from a different run: {opcodes}"
         )

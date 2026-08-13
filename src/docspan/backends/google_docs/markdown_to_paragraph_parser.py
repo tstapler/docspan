@@ -1,6 +1,8 @@
 """Parse Markdown content into DocsParagraphNode/DocsTableNode list for Google Docs push."""
 from __future__ import annotations
 
+import html
+import re
 from typing import List, Optional, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -13,6 +15,88 @@ from docspan.backends.google_docs.docs_structure_parser import (
 from docspan.backends.google_docs.registry import MarkdownTokenConverter, MarkdownTokenRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode]
+
+_HTML_ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
+_HTML_CELL_RE = re.compile(r"<(th|td)>(.*?)</\1>", re.S)
+
+_inline_md = None
+
+_BLANK_PARAGRAPH_MARKER = "​"
+
+
+def _spans_from_markdown_text(text: str) -> List[TextSpan]:
+    """Inline-parse one paragraph fragment of a multi-paragraph HTML table cell.
+
+    A pipe-table cell already goes through mistune's inline tokenizer as part of
+    parsing the surrounding GFM table. A `<table>` block is opaque raw HTML to
+    mistune (see `_table_from_html_block`), so each paragraph's text is re-parsed
+    here the same way, independently, to recover bold/link/monospace spans.
+    """
+    if not text:
+        return []
+    global _inline_md
+    if _inline_md is None:
+        import mistune
+
+        _inline_md = mistune.create_markdown(renderer=None, plugins=["table"])
+    for token in _inline_md(text) or []:
+        # token is `str | dict[str, Any]` per mistune's stubs; the isinstance
+        # guard narrows it for mypy (matches the pattern used elsewhere in
+        # this file for the same union).
+        if isinstance(token, dict) and token.get("type") == "paragraph":
+            return _spans_from_inline(token.get("children", []))
+    # Not a paragraph (e.g. text that is itself a bare "<table>" or "<br>") —
+    # the whole fragment is opaque raw HTML to mistune's block parser, so keep it
+    # as literal text rather than dropping it or guessing at its structure.
+    return [TextSpan(text=text)]
+
+
+def _cell_from_html_text(raw_cell_html: str) -> TableCell:
+    """A `<td>`/`<th>` inner HTML string, decoded back into a `TableCell`.
+
+    The `\\n` between paragraphs is kept as a literal, unstyled `TextSpan` — it was
+    never HTML-encoded on render (see `_render_table_html`), so there is nothing to
+    decode there; only each paragraph fragment's own text needs unescaping. An
+    interior empty paragraph was rendered with `_BLANK_PARAGRAPH_MARKER` in place of
+    the blank line CommonMark would otherwise treat as ending the HTML block (see
+    `_guard_blank_paragraph_lines`); strip it back to empty here.
+
+    The marker check happens *before* `html.unescape` on each fragment, not on the
+    whole string upfront: a real cell containing a literal U+200B was entity-escaped
+    to `&#8203;` on render (`_escape_html`), so it never collides with the raw
+    marker byte here — only the guard's own insertion does.
+    """
+    if not raw_cell_html:
+        return TableCell(text="", spans=[])
+    spans: List[TextSpan] = []
+    for i, fragment in enumerate(raw_cell_html.split("\n")):
+        if i > 0:
+            spans.append(TextSpan(text="\n"))
+        paragraph = "" if fragment == _BLANK_PARAGRAPH_MARKER else html.unescape(fragment)
+        spans.extend(_spans_from_markdown_text(paragraph))
+    full_text = "".join(s.text for s in spans)
+    return TableCell(text=full_text, spans=spans if _has_styling(spans) else [])
+
+
+def _table_from_html_block(raw: str) -> DocsTableNode:
+    """Convert a raw HTML `<table>` block (see `_render_table_html`) into a DocsTableNode."""
+    rows: List[List[TableCell]] = []
+    for row_match in _HTML_ROW_RE.finditer(raw):
+        rows.append([
+            _cell_from_html_text(cell_match.group(2))
+            for cell_match in _HTML_CELL_RE.finditer(row_match.group(1))
+        ])
+    width = max((len(r) for r in rows), default=0)
+    rows = [r + [TableCell() for _ in range(width - len(r))] for r in rows]
+    return DocsTableNode(rows=rows, start_index=0, end_index=0)
+
+
+# Literal, non-monospace marker line written ahead of a fenced block's lines to
+# carry mistune's token.attrs.info (the fence language) through the node-list
+# representation, which otherwise has nowhere to put it. Must stay in sync
+# with nodes_to_markdown.py's FENCE_MARKER, which decodes it back into a real
+# ```lang fence on render.
+FENCE_MARKER = "```"
 
 
 def _extract_text_from_token(token: dict) -> str:
@@ -117,6 +201,19 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 spans = []
                 nodes.extend(_walk_list_items(child, nesting_level + 1))
                 continue
+            elif child.get("type") == "block_code":
+                text = _text_of(spans).strip()
+                if text:
+                    nodes.append(DocsParagraphNode(
+                        style="NORMAL_TEXT", text=text, is_list_item=True,
+                        nesting_level=nesting_level, start_index=0, end_index=0,
+                        spans=spans if _has_styling(spans) else [],
+                    ))
+                spans = []
+                nodes.extend(_nodes_from_code_block(
+                    child, is_list_item=True, nesting_level=nesting_level,
+                ))
+                continue
             else:
                 spans.extend(_spans_from_inline([child]))
         text = _text_of(spans).strip()
@@ -126,6 +223,69 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 nesting_level=nesting_level, start_index=0, end_index=0,
                 spans=spans if _has_styling(spans) else [],
             ))
+    return nodes
+
+
+def _nodes_from_code_block(
+    token: dict, *, is_list_item: bool = False, nesting_level: int = 0,
+    emit_language_marker: bool = False,
+) -> List[DocsParagraphNode]:
+    """One DocsParagraphNode per line of a fenced code block.
+
+    A Google Doc has no multi-line paragraph. Emitting the whole block as a
+    single node with embedded newlines meant `insertText` wrote "\\nline
+    one\\nline two", which Docs splits into N paragraphs — so every later diff
+    saw N document paragraphs against 1 markdown node and delete-and-reinserted
+    the whole block, on every push, forever. The text survived that; what did
+    not was idempotence, any comment anchored to a line of code, and the
+    monospace styling (pass 2 reported the block unaligned and emitted no span
+    requests at all). See issue #40 (top level) and #43 (list items and
+    blockquotes — the same token falls through to raw multi-line text at
+    those other two parse sites unless routed through this helper).
+
+    `strip("\n")` rather than `strip()`: the fence's own blank edges go,
+    indentation does not. Leading whitespace is meaning in code.
+
+    `emit_language_marker` carries mistune's `token.attrs.info` (the fence
+    language) through the node-list representation via a literal,
+    non-monospace `FENCE_MARKER + lang` line written ahead of the code lines
+    (see `FENCE_MARKER`'s docstring). Only the top-level call site
+    (`parse()`) passes True. `nodes_to_markdown.py`'s `_is_language_marker`
+    (like `_is_pure_code_line`) requires `not node.is_list_item`, so a marker
+    emitted for a list item would never decode back. A blockquote's
+    `_prefix_node_text` rewrites the marker's leading "```" into "> ```"
+    anyway, breaking the match on `FENCE_MARKER` the same way. Either way the
+    marker would just be a stray literal line, so list items and blockquotes
+    stay marker-less on purpose.
+    """
+    nodes: List[DocsParagraphNode] = []
+    if emit_language_marker:
+        # token is `str | dict[str, Any]` per mistune's stubs; the isinstance
+        # guard narrows it for mypy (this loop's other branches already
+        # tolerate the same union untyped).
+        attrs = token.get("attrs") if isinstance(token, dict) else None
+        info = (attrs or {}).get("info") or ""
+        lang = info.strip()
+        if lang:
+            nodes.append(DocsParagraphNode(
+                style="NORMAL_TEXT", text=f"{FENCE_MARKER}{lang}",
+                start_index=0, end_index=0, spans=[],
+            ))
+    raw = token.get("raw", "").strip("\n")
+    # An empty fenced block (` ```\n```\n `) has `raw == ""`, so
+    # `"".split("\n")` yields `[""]` — one blank-shaped node right after the
+    # marker (when present). That's deliberate: it's the signal
+    # `_group_code_runs` uses to render an explicit empty fence rather than
+    # losing the block or leaving an unterminated marker behind.
+    for line in raw.split("\n"):
+        nodes.append(DocsParagraphNode(
+            style="NORMAL_TEXT", text=line, is_list_item=is_list_item,
+            nesting_level=nesting_level, start_index=0, end_index=0,
+            # A blank line inside a block carries no span to style.
+            # projection.project() drops it from *both* sides, so the
+            # diff never sees it and never tries to delete it.
+            spans=[TextSpan(text=line, monospace=True)] if line else [],
+        ))
     return nodes
 
 
@@ -169,12 +329,22 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
             nodes.extend(
                 _prefix_node_text(n, prefix) for n in _walk_list_items(child, nesting_level=0)
             )
+        elif ctype == "block_code":
+            # A blank line inside the fence becomes a bare "> " line rather than
+            # being dropped: `_prefix_node_text` turns the empty text into a
+            # non-empty one, so it survives projection's blank-drop rule (which
+            # is keyed on text == "") — intentionally, so the quote's visual
+            # continuity isn't broken by a vanishing line mid-block. It carries
+            # no monospace span, matching every other blank code line.
+            nodes.extend(
+                _prefix_node_text(n, prefix) for n in _nodes_from_code_block(child)
+            )
         elif ctype == "block_quote":
             nodes.extend(_walk_block_quote(child, quote_depth + 1))
         elif ctype == "blank_line":
             continue
-        # nested tables/code inside a block quote are rare; fall back to
-        # skipping rather than mis-rendering them.
+        # nested tables inside a block quote are rare; fall back to skipping
+        # rather than mis-rendering them.
     return nodes
 
 
@@ -273,30 +443,17 @@ class CodeTokenConverter(MarkdownTokenConverter):
     token_type = "block_code"
 
     def convert(self, token: dict) -> List[Node]:
-        # One node per line, because a Google Doc has no multi-line
-        # paragraph. Emitting the whole block as a single node with
-        # embedded newlines meant `insertText` wrote "\nline one\nline
-        # two", which Docs splits into N paragraphs — so every later diff
-        # saw N document paragraphs against 1 markdown node and
-        # delete-and-reinserted the whole block, on every push, forever.
-        # The text survived that; what did not was idempotence, any comment
-        # anchored to a line of code, and the monospace styling (pass 2
-        # reported the block unaligned and emitted no span requests at
-        # all). See issue #40.
-        #
-        # `strip("\n")` rather than `strip()`: the fence's own blank edges
-        # go, indentation does not. Leading whitespace is meaning in code.
-        raw = token.get("raw", "").strip("\n")
-        nodes: List[Node] = []
-        for line in raw.split("\n"):
-            nodes.append(DocsParagraphNode(
-                style="NORMAL_TEXT", text=line, start_index=0, end_index=0,
-                # A blank line inside a block carries no span to style.
-                # projection.project() drops it from *both* sides, so the
-                # diff never sees it and never tries to delete it.
-                spans=[TextSpan(text=line, monospace=True)] if line else [],
-            ))
-        return nodes
+        # Top level is the only one of the three `_nodes_from_code_block`
+        # call sites (here, `_walk_list_items`, `_walk_block_quote`) that
+        # carries the fence's language through a marker line — see the
+        # helper's docstring for why list items and blockquotes stay
+        # marker-less. A *native* Google Docs code block (typed in the Docs
+        # UI, not pushed by this tool) never has a marker either, and
+        # matching push's target against that live structure depends on the
+        # two shapes being identical
+        # (`:test_an_unchanged_code_block_emits_nothing`), which is also why
+        # a lang-less fence here stays marker-less.
+        return _nodes_from_code_block(token, emit_language_marker=True)
 
 
 class TableTokenConverter(MarkdownTokenConverter):
@@ -320,6 +477,19 @@ class BlankLineTokenConverter(MarkdownTokenConverter):
         return []
 
 
+class BlockHtmlTokenConverter(MarkdownTokenConverter):
+    token_type = "block_html"
+
+    def convert(self, token: dict) -> List[Node]:
+        # A multi-paragraph table cell renders as a raw <table> block
+        # (_render_table_html) since pipe syntax has no cell-internal break.
+        # Any other raw HTML is unsupported and silently skipped, as before.
+        raw = token.get("raw", "").strip() if isinstance(token, dict) else ""
+        if raw.lower().startswith("<table"):
+            return [_table_from_html_block(raw)]
+        return []
+
+
 def _build_push_registry() -> MarkdownTokenRegistry:
     registry = MarkdownTokenRegistry()
     registry.register("heading", HeadingTokenConverter())
@@ -331,6 +501,7 @@ def _build_push_registry() -> MarkdownTokenRegistry:
     registry.register("table", TableTokenConverter())
     registry.register("block_quote", BlockQuoteTokenConverter())
     registry.register("blank_line", BlankLineTokenConverter())
+    registry.register("block_html", BlockHtmlTokenConverter())
     return registry
 
 

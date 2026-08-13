@@ -8,6 +8,7 @@ tests/conftest.py (also used by tests/test_push_preview.py).
 """
 from __future__ import annotations
 
+import json
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -239,6 +240,30 @@ class TestPushHighRiskGate:
         args, kwargs = fake_client.batch_update.call_args
         assert kwargs["required_revision_id"] == "rev-force"
 
+        # Assert on the actual request payload, not just that *a* call
+        # happened — a corrupting diff (e.g. a spurious delete of a
+        # neighboring paragraph, or the old "[ ] " marker surviving
+        # unflipped) would still satisfy assert_called_once() but must fail
+        # here.
+        doc_id, requests = args
+        assert doc_id == "doc-1"
+        insert_texts = [
+            r["insertText"]["text"] for r in requests if "insertText" in r
+        ]
+        # No trailing "\n": this paragraph is the last (only) one in the doc,
+        # so _make_insert_requests's bare_last mode reuses the deleted
+        # range's own clamp-spared terminal newline instead of writing a
+        # second one (see its docstring).
+        assert insert_texts == ["[x] Whatsapp group"]
+        delete_ranges = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert delete_ranges == [{"startIndex": 1, "endIndex": 20}]
+        # The original unchecked marker must not appear anywhere in the
+        # requests sent to Docs — proves the escape hatch actually replaced
+        # the literal text rather than layering on top of it.
+        assert not any("[ ] Whatsapp group" in json.dumps(r) for r in requests)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # preview_push() exception handling — mirrors push()'s try/except pattern
@@ -296,6 +321,61 @@ class TestPreviewPushExceptionHandling:
 
         assert rendered == "✗ dry-run failed: boom"
         assert "Traceback" not in rendered
+
+
+class TestDiffTooExpensiveSurfacesAsUserFacingError:
+    """AC6: DiffTooExpensive raised while building a push plan must be caught
+    by push() and reported through PushResult, never an uncaught traceback —
+    same shape as the HttpError/generic-exception handling above."""
+
+    def test_push_returns_error_status_instead_of_raising(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        monkeypatch.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "error"
+        assert result.message is not None
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_error_message_is_the_diff_too_expensive_message_not_a_traceback(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        monkeypatch.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.message == str(DiffTooExpensive("document", 6000, 3000))
+        assert "Traceback" not in (result.message or "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +562,203 @@ class TestPullTabId:
 
         assert result.status == "ok"
         assert result.message is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default (non-tab) path — checkbox round trip regression (AC4, issue #17).
+#
+# The tab-scoped path's zero-edit corruption came from DocsRequestBuilder's
+# diff key not accounting for the synthetic "[ ] " prefix that the
+# *structural* renderer (nodes_to_markdown.py) puts on a native checkbox
+# paragraph. The default path never goes through that renderer at all: it
+# exports via Drive's HTML API and DocumentConverter.html_to_markdown(),
+# which has no glyph/checkbox awareness whatsoever (verified: no "checkbox"
+# or bracket handling anywhere in converter.py) and renders any <li> — a
+# native checkbox item included — as a plain "- text" bullet with no
+# bracket marker. So the bug this ticket fixes cannot occur on this path;
+# this test locks that in as a regression guard.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _native_checkbox_doc(revision_id: str = "rev-default-checkbox") -> dict:
+    """A doc with one clean (uncorrupted) native BULLET_CHECKBOX paragraph —
+    text is just "Whatsapp group", with checkbox state carried only by the
+    bullet's glyph type, never as literal bracket text."""
+    return {
+        "revisionId": revision_id,
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 16,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "Whatsapp group\n"}}],
+                        "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                    },
+                }
+            ]
+        },
+        "lists": {
+            "kix.abc": {
+                "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+            }
+        },
+    }
+
+
+def _doc_with_native_checkboxes(*items: tuple, revision_id: str = "rev-checkboxes") -> dict:
+    """A doc whose body has one bullet paragraph per (text, nesting_level) in
+    `items`, each resolving as a native BULLET_CHECKBOX glyph (glyphType
+    GLYPH_TYPE_UNSPECIFIED — see docs_structure_parser._resolve_is_native_checkbox)."""
+    content = []
+    index = 1
+    for text, nesting_level in items:
+        end = index + len(text) + 1
+        content.append(
+            {
+                "startIndex": index,
+                "endIndex": end,
+                "paragraph": {
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "elements": [{"textRun": {"content": text + "\n"}}],
+                    "bullet": {"listId": "kix.cb", "nestingLevel": nesting_level},
+                },
+            }
+        )
+        index = end
+    return {
+        "revisionId": revision_id,
+        "body": {"content": content},
+        "lists": {
+            "kix.cb": {
+                "listProperties": {
+                    "nestingLevels": [
+                        {"glyphType": "GLYPH_TYPE_UNSPECIFIED"},
+                        {"glyphType": "GLYPH_TYPE_UNSPECIFIED"},
+                    ]
+                }
+            }
+        },
+    }
+
+
+class TestDefaultPathCheckboxRoundTrip:
+    def test_pull_then_push_zero_edit_round_trip_is_a_noop_for_native_checkbox(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _native_checkbox_doc()
+        fake_client.list_comments.return_value = []
+        # Drive's HTML export for a native checkbox list item — no bracket
+        # marker, no checkbox-specific class the converter interprets.
+        fake_client.get_doc_content.return_value = (
+            '<ul class="c1 lst-kix_abc-0 start">'
+            '<li class="c2 li-bullet-0"><span>Whatsapp group</span></li>'
+            "</ul>"
+        )
+        # The default path's checkbox-state recovery (#78) cross-references
+        # this against the structural checkbox paragraphs and patches the
+        # real `[ ]`/`[x]` marker in — a matching export here is what keeps
+        # this test's pull at status "ok" instead of the fail-closed warning.
+        fake_client.fetch_markdown_export.return_value = "- [ ] Whatsapp group\n"
+
+        local = tmp_path / "doc.md"
+        pull_result = backend.pull("doc-1", str(local))
+
+        assert pull_result.status == "ok"
+        pulled = local.read_text(encoding="utf-8")
+        assert pulled == "- [ ] Whatsapp group"
+
+        push_result = backend.push(str(local), "doc-1")
+
+        assert push_result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
+class TestPullCheckboxState:
+    def test_pull_recovers_checked_and_unchecked_state_from_markdown_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_native_checkboxes(
+            ("buy milk", 0), ("buy eggs", 0)
+        )
+        fake_client.get_doc_content.return_value = "<ul><li>buy milk</li><li>buy eggs</li></ul>"
+        fake_client.fetch_markdown_export.return_value = "- [ ] buy milk\n- [x] buy eggs\n"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok"
+        content = local.read_text(encoding="utf-8")
+        assert "- [ ] buy milk" in content
+        assert "- [x] buy eggs" in content
+
+    def test_pull_falls_back_to_unchecked_and_warns_on_checkbox_count_mismatch(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_native_checkboxes(
+            ("buy milk", 0), ("buy eggs", 0)
+        )
+        html = "<ul><li>buy milk</li><li>buy eggs</li></ul>"
+        fake_client.get_doc_content.return_value = html
+        # Only one checklist line comes back — count disagrees with the two
+        # native-checkbox paragraphs the structural parse found.
+        fake_client.fetch_markdown_export.return_value = "- [x] buy milk\n"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "warning"
+        assert "checkbox" in (result.message or "").lower()
+        content = local.read_text(encoding="utf-8")
+        assert "[x]" not in content
+        assert "[ ]" not in content
+
+    def test_pull_falls_back_to_unchecked_and_warns_on_markdown_export_failure(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _doc_with_native_checkboxes(("buy milk", 0))
+        fake_client.get_doc_content.return_value = "<ul><li>buy milk</li></ul>"
+        fake_client.fetch_markdown_export.side_effect = RuntimeError("transport failure")
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "warning"
+        assert "checkbox" in (result.message or "").lower()
+        content = local.read_text(encoding="utf-8")
+        assert local.exists()
+        assert "[x]" not in content
+
+    def test_pull_without_native_checkboxes_never_calls_markdown_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.get_doc_content.return_value = "<p>Hello</p>"
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok"
+        fake_client.fetch_markdown_export.assert_not_called()
+
+    def test_pull_with_tab_id_never_calls_markdown_export(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Tab-scoped pull stays on the structural path — files.export cannot
+        target a tab, so it must never even be attempted (criterion 1)."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _multi_tab_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local), tab_id="t.second")
+
+        assert result.status == "ok"
+        fake_client.fetch_markdown_export.assert_not_called()
 
 
 class TestPushTabId:
@@ -869,6 +1146,158 @@ class TestBlankParagraphIsPreserved:
         assert any("Gamma" in t for t in texts)
 
 
+def _doc_with_blank_paragraph_adjacent_to_checkbox(revision_id: str = "rev-1") -> dict:
+    """Buy milk (native checkbox) / (blank) / Omega — root cause 2 from
+    issue #17: a blank paragraph immediately after a checkbox item."""
+    return {
+        "revisionId": revision_id,
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 11,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "Buy milk\n"}}],
+                        "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                    },
+                },
+                {
+                    "startIndex": 11,
+                    "endIndex": 12,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "\n"}}],
+                    },
+                },
+                {
+                    "startIndex": 12,
+                    "endIndex": 18,
+                    "paragraph": {
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                        "elements": [{"textRun": {"content": "Omega\n"}}],
+                    },
+                },
+            ]
+        },
+        "lists": {
+            "kix.abc": {
+                "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+            }
+        },
+    }
+
+
+class TestBlankParagraphAdjacentToCheckboxRoundTrip:
+    """AC5 (issue #17, root cause 2): a blank paragraph next to a native
+    checkbox paragraph must not turn a zero-edit round trip into a
+    corrupting push. projection.py's Rule 1 already drops the blank
+    paragraph from *both* sides of the diff before it's compared (see its
+    docstring, which cites this exact issue), and that fix predates this
+    ticket (commit d8b1b5f). No new production code is added here — this
+    is a confirming regression test that root cause 2 is already closed.
+    """
+
+    def test_zero_edit_push_over_blank_paragraph_next_to_checkbox_is_a_noop(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        # Exactly what pull() would have rendered for this doc: project()
+        # drops the blank paragraph and nodes_to_markdown renders the
+        # checkbox with its synthetic "[ ] " prefix.
+        local.write_text("- [ ] Buy milk\n\nOmega\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.return_value = _doc_with_blank_paragraph_adjacent_to_checkbox()
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1", force=True)
+
+        assert result.status == "skipped"
+        client.batch_update.assert_not_called()
+
+
+def _tabbed_doc_with_prior_force_push_text(revision_id: str = "rev-force-2") -> dict:
+    """A native-checkbox paragraph whose text is already the literal
+    "[x] ..." left behind by a prior force-push escape-hatch edit (AC2/AC3)
+    — the bullet glyph is untouched, so is_native_checkbox is still True."""
+    return {
+        "revisionId": revision_id,
+        "tabs": [
+            {
+                "tabProperties": {"tabId": "t.0"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            {
+                                "startIndex": 1,
+                                "endIndex": 20,
+                                "paragraph": {
+                                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                                    "elements": [{"textRun": {"content": "[x] Whatsapp group\n"}}],
+                                    "bullet": {"listId": "kix.abc", "nestingLevel": 0},
+                                },
+                            },
+                        ]
+                    },
+                    "lists": {
+                        "kix.abc": {
+                            "listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}
+                        }
+                    },
+                },
+            }
+        ],
+    }
+
+
+class TestSecondRoundTripAfterForcePush:
+    """AC6 (issue #17): a doc that already carries literal bracket text
+    baked in by a prior force-push must not have that state compound on a
+    second pull→push cycle.
+
+    render_nodes_to_markdown() unconditionally prepends the synthetic
+    "- [ ] " marker to any is_native_checkbox paragraph regardless of what
+    its text already contains, so pulling this doc renders the cosmetically
+    doubled "- [ ] [x] Whatsapp group" rather than "- [x] Whatsapp group".
+    That's a separate, narrower defect from this ticket's push-corruption
+    bug: DocsRequestBuilder's _key() fix (commit 83cdb99) strips exactly one
+    literal "[ ] " prefix off a target and matches the remainder against the
+    real native-checkbox text, which folds this doubled text back to "no
+    change" — so the push side stays safe, and a second round trip doesn't
+    grow a third bracket.
+    """
+
+    def test_pull_push_pull_push_does_not_compound_prior_force_push_brackets(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        backend, client = make_backend()
+        client.get_document.return_value = _tabbed_doc_with_prior_force_push_text()
+        client.list_comments.return_value = []
+
+        first_pull = backend.pull("doc-1", str(local), tab_id="t.0")
+        assert first_pull.status == "ok", first_pull.message
+        first_content = local.read_text(encoding="utf-8")
+
+        first_push = backend.push(str(local), "doc-1", tab_id="t.0", force=True)
+        assert first_push.status == "skipped", first_push.message
+        client.batch_update.assert_not_called()
+
+        second_pull = backend.pull("doc-1", str(local), tab_id="t.0")
+        assert second_pull.status == "ok", second_pull.message
+        second_content = local.read_text(encoding="utf-8")
+
+        # No compounding: the second pull renders identically to the first
+        # (no extra brackets piled on), because push never sent a request
+        # that could have changed the live doc's text in between.
+        assert second_content == first_content
+        assert second_content.count("[") == 2  # exactly "[ ]" + "[x]", never a third
+
+        second_push = backend.push(str(local), "doc-1", tab_id="t.0", force=True)
+        assert second_push.status == "skipped", second_push.message
+        client.batch_update.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # pull() renders TITLE as a heading, so pull → push is a fixpoint
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1023,3 +1452,22 @@ class TestPullSurfacesResidue:
         result = backend.pull("doc-1", str(local), tab_id="t.0")
 
         assert result.status == "ok", result.message
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsBackend.create() — new-doc creation for `docspan map`
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCreate:
+    def test_create_calls_client_and_returns_doc_id_title_url(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.create_document.return_value = {"documentId": "new-doc-1", "title": "My Doc"}
+
+        result = backend.create("My Doc")
+
+        client.create_document.assert_called_once_with("My Doc")
+        assert result.doc_id == "new-doc-1"
+        assert result.title == "My Doc"
+        assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"

@@ -10,10 +10,23 @@ itself — never by a separately-fetched CLI-layer preview.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
 from docspan.backends.google_docs.projection import Residue
+
+
+@dataclass
+class AtRiskComment:
+    """One open Drive comment matched onto a HighRiskParagraph.
+
+    `id` is the Drive comment id — surfaced so a user can cross-reference the
+    `.comments.md` sidecar or the Drive UI directly, since a paragraph can
+    carry more than one open comment.
+    """
+    id: Optional[str]
+    quoted_text: Optional[str]
+    author: Optional[str]
 
 
 @dataclass
@@ -21,13 +34,13 @@ class HighRiskParagraph:
     """A `remove`/`change` DiffEntry that is high-risk for one or both reasons.
 
     A single paragraph can carry both reasons at once (e.g. a native-glyph
-    paragraph that also has an open comment). `comment_quoted_text`/
-    `comment_author` are only populated when "comment" is among `reasons`.
+    paragraph that also has an open comment). `comments` is only populated
+    when "comment" is among `reasons`, and holds every matching comment —
+    a paragraph can be the target of more than one open comment at once.
     """
     paragraph_text: str
     reasons: List[Literal["comment", "native_glyph"]]
-    comment_quoted_text: Optional[str] = None
-    comment_author: Optional[str] = None
+    comments: List[AtRiskComment] = field(default_factory=list)
 
 
 def find_high_risk_paragraphs(
@@ -55,8 +68,7 @@ def find_high_risk_paragraphs(
             continue
 
         reasons: List[Literal["comment", "native_glyph"]] = []
-        comment_quoted_text: Optional[str] = None
-        comment_author: Optional[str] = None
+        at_risk_comments: List[AtRiskComment] = []
 
         current_text = entry.current_text or ""
         for comment in comments:
@@ -64,10 +76,15 @@ def find_high_risk_paragraphs(
             if not quoted:
                 continue
             if quoted in current_text:
-                reasons.append("comment")
-                comment_quoted_text = quoted
-                comment_author = (comment.get("author") or {}).get("displayName")
-                break
+                at_risk_comments.append(
+                    AtRiskComment(
+                        id=comment.get("id"),
+                        quoted_text=quoted,
+                        author=(comment.get("author") or {}).get("displayName"),
+                    )
+                )
+        if at_risk_comments:
+            reasons.append("comment")
 
         if entry.current_is_native_checkbox:
             reasons.append("native_glyph")
@@ -77,8 +94,7 @@ def find_high_risk_paragraphs(
                 HighRiskParagraph(
                     paragraph_text=entry.current_text or "",
                     reasons=reasons,
-                    comment_quoted_text=comment_quoted_text,
-                    comment_author=comment_author,
+                    comments=at_risk_comments,
                 )
             )
 
@@ -116,22 +132,78 @@ def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
     blocks: List[str] = []
     for hr in high_risk:
         if "comment" in hr.reasons:
-            author = hr.comment_author or "unknown"
-            blocks.append(
-                f'⚠ COMMENT AT RISK: paragraph "{hr.paragraph_text}" has an open comment\n'
-                f'  from {author} ("{hr.comment_quoted_text}") and would be changed. '
-                "Resolve manually in Google\n"
-                "  Docs, or re-run with --force to proceed anyway."
+            n = len(hr.comments)
+            plural = "an open comment" if n == 1 else f"{n} open comments"
+            lines = [
+                f'⚠ COMMENT AT RISK: paragraph "{hr.paragraph_text}" has {plural}\n'
+                "  and would be changed:"
+            ]
+            for c in hr.comments:
+                author = c.author or "unknown"
+                comment_id = c.id or "unknown id"
+                lines.append(f'    • [{comment_id}] {author}: "{c.quoted_text}"')
+            lines.append(
+                "  Resolve manually in Google Docs, or re-run with --force to proceed anyway."
             )
+            blocks.append("\n".join(lines))
         if "native_glyph" in hr.reasons:
             blocks.append(
                 f'⚠ NATIVE CHECKBOX GLYPH: paragraph "{hr.paragraph_text}" is a native Google Docs\n'
                 "  checkbox (checked/unchecked state not readable via the API) — editing it here\n"
-                "  would layer literal [x]/[ ] text on top of the existing glyph. Toggle this\n"
-                "  line by hand in Google Docs UI instead, or re-run with --force to proceed\n"
-                "  anyway."
+                "  would delete the paragraph's existing text and reinsert literal [x]/[ ] text in\n"
+                "  its place; the checkbox glyph itself is untouched by that edit. Toggle this line\n"
+                "  by hand in Google Docs UI instead, or re-run with --force to proceed anyway."
             )
     return "\n".join(blocks)
+
+
+def find_churn_pairs(entries: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
+    """Pair up `remove`/`add` DiffEntry that are really one delete-and-reinsert
+    of byte-identical text (a destroyed-and-recreated paragraph, not a real
+    removal). Matched by `DiffEntry.edit_group`, not list adjacency — adjacent
+    entries can come from different opcodes (see
+    `test_find_churn_pairs_ignores_adjacent_entries_from_different_edit_groups`),
+    which is the same `_node_key` collision class as `docs_request_builder.py:112-150`.
+    Table rows (`style == "TABLE"`) are excluded as a weaker text signal.
+    """
+    groups: Dict[int, List[DiffEntry]] = {}
+    for entry in entries:
+        if entry.kind in ("remove", "add"):
+            groups.setdefault(entry.edit_group, []).append(entry)
+
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    for group in groups.values():
+        pairs.extend(_match_churn_run(group))
+    return pairs
+
+
+def _match_churn_run(run: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
+    removes = [e for e in run if e.kind == "remove" and e.style != "TABLE"]
+    adds = [e for e in run if e.kind == "add" and e.style != "TABLE"]
+
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    claimed: set = set()
+    for r in removes:
+        for i, a in enumerate(adds):
+            if i in claimed:
+                continue
+            if r.current_text is not None and r.current_text == a.target_text:
+                pairs.append((r, a))
+                claimed.add(i)
+                break
+    return pairs
+
+
+def render_churn_note(pairs: List[Tuple[DiffEntry, DiffEntry]]) -> str:
+    """Render the ⓘ note for churn pairs — text is unchanged, but the
+    paragraph itself (and anything anchored to it) was destroyed and recreated.
+    """
+    n = len(pairs)
+    return (
+        f"ⓘ {n} paragraph(s) are rewritten with no text change (delete-and-reinsert) — "
+        "the wording is identical, but the paragraph is destroyed and recreated, so "
+        "any comment anchored to it is still lost."
+    )
 
 
 def _is_checklist_marker(text: Optional[str]) -> bool:
@@ -216,29 +288,54 @@ class PushPreview:
         if self.error is not None:
             return f"✗ dry-run failed: {self.error}"
 
-        additions = sum(1 for e in self.entries if e.kind == "add")
-        removals = sum(1 for e in self.entries if e.kind == "remove")
+        churn_pairs = find_churn_pairs(self.entries)
+        churned_removes = {id(pair[0]) for pair in churn_pairs}
+        churned_adds = {id(pair[1]) for pair in churn_pairs}
+
+        additions = sum(
+            1 for e in self.entries if e.kind == "add" and id(e) not in churned_adds
+        )
+        removals = sum(
+            1 for e in self.entries if e.kind == "remove" and id(e) not in churned_removes
+        )
         changes = sum(1 for e in self.entries if e.kind == "change")
 
         lines = [
             f"Preview: {changes} change(s), {additions} addition(s), "
-            f"{removals} removal(s), {self.unchanged_count} unchanged"
+            f"{removals} removal(s), {len(churn_pairs)} rewritten (no text change), "
+            f"{self.unchanged_count} unchanged"
         ]
 
         for entry in self.entries:
             if entry.kind == "add":
+                if id(entry) in churned_adds:
+                    continue
                 lines.append(f"  + {entry.target_text}")
             elif entry.kind == "remove":
-                lines.append(f"  - {entry.current_text}")
+                if id(entry) in churned_removes:
+                    lines.append(f"  ~ rewritten (no text change): {entry.current_text}")
+                else:
+                    lines.append(f"  - {entry.current_text}")
             elif entry.kind == "change":
                 lines.append(f"  ~ {entry.current_text} → {entry.target_text}")
 
+        if churn_pairs:
+            lines.append(render_churn_note(churn_pairs))
+
+        non_churn_entries = [
+            e
+            for e in self.entries
+            if id(e) not in churned_adds and id(e) not in churned_removes
+        ]
         checklist_flags = [
             _is_checklist_marker(e.current_text) or _is_checklist_marker(e.target_text)
-            for e in self.entries
+            for e in non_churn_entries
+        ] + [
+            _is_checklist_marker(remove.current_text) or _is_checklist_marker(add.target_text)
+            for remove, add in churn_pairs
         ]
         n_checklist = sum(checklist_flags)
-        n_other = len(self.entries) - n_checklist
+        n_other = len(non_churn_entries) + len(churn_pairs) - n_checklist
         if n_checklist > 0 and n_other > 0:
             lines.append(
                 f"ⓘ This push mixes {n_checklist} checklist toggle(s) with {n_other} "

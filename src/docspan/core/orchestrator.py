@@ -138,6 +138,7 @@ def _record_state(
     content: str,
     remote_version: str,
 ) -> bool:
+    assert mapping.remote_id is not None
     return record_state(
         state, state_path, state_dir, local_path,
         mapping.remote_id, mapping.backend, content, remote_version,
@@ -155,8 +156,25 @@ def orchestrate_push(
     state_dir: str,
     state_path: str,
     force: bool = False,
+    mappings: Optional[list] = None,
+    cross_doc_cache: Optional[dict] = None,
 ) -> PushOutcome:
-    result = backend.push(mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id)
+    """`mappings` is the full markgate.yaml mapping list (not just this one) —
+    threaded through to backend.push() as a kwarg so a Google Docs push can
+    resolve relative cross-document links to other mapped files' remote URLs.
+    None (the default) preserves old behavior: no cross-doc resolution.
+
+    `cross_doc_cache`, when supplied by the caller and reused across multiple
+    orchestrate_push calls in one run, lets a heading fetch for one target
+    document be shared across every pushed document that links to it —
+    a `push --all` run doesn't refetch the same target once per pushing
+    document.
+    """
+    assert mapping.remote_id is not None, "orchestrate_push requires a mapping with a created remote doc/page"
+    result = backend.push(
+        mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
+        mappings=mappings, cross_doc_cache=cross_doc_cache,
+    )
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
@@ -190,6 +208,7 @@ def orchestrate_pull(
     state_dir: str,
     state_path: str,
 ) -> PullOutcome:
+    assert mapping.remote_id is not None, "orchestrate_pull requires a mapping with a created remote doc/page"
     entry = state.get(mapping.local)
 
     local_exists = os.path.exists(mapping.local)
@@ -247,6 +266,7 @@ def _first_sync_pull(
     state_path: str,
     remote_version: str,
 ) -> PullOutcome:
+    assert mapping.remote_id is not None
     result = backend.pull(mapping.remote_id, mapping.local, tab_id=mapping.tab_id)
     outcome = PullOutcome(local_path=mapping.local, action="first-sync", result=result)
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
@@ -267,6 +287,7 @@ def _fast_forward_pull(
     state_path: str,
     remote_version: str,
 ) -> PullOutcome:
+    assert mapping.remote_id is not None
     result = backend.pull(mapping.remote_id, mapping.local, tab_id=mapping.tab_id)
     outcome = PullOutcome(local_path=mapping.local, action="fast-forward", result=result)
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
@@ -289,6 +310,7 @@ def _merge_pull(
     remote_version: str,
     base_hash: str,
 ) -> PullOutcome:
+    assert mapping.remote_id is not None
     orig_path = mapping.local + ORIG_SUFFIX
     with open(orig_path, "w", encoding="utf-8") as fh:
         fh.write(local_content)

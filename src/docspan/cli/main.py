@@ -17,10 +17,14 @@ from rich.table import Table
 
 from docspan.backends import BACKENDS
 from docspan.config import (
+    ConfigConflictError,
+    Mapping,
     MarkgateConfig,
+    config_mtime,
     load_central_config,
     load_config,
     resolve_active_project,
+    save_config,
 )
 from docspan.core import (
     MappingState,
@@ -180,6 +184,21 @@ def _resolve(config_path: Optional[str], prefix: Optional[str]):
     return config, markgate_path, resolved_prefix
 
 
+def _resolve_with_mtime(
+    config_path: Optional[str], prefix: Optional[str]
+) -> tuple[MarkgateConfig, Optional[str], Optional[str], Optional[float]]:
+    """Like _resolve(), but also captures the config's mtime at load time.
+
+    The mtime must be sampled here — immediately after load_config() — not
+    later, right before save_config(). A caller that re-reads the mtime just
+    before writing (e.g. after a slow backend.create() network call) defeats
+    the whole point of the concurrency check: any edit that lands during that
+    window becomes the new "expected" baseline instead of being detected.
+    """
+    config, markgate_path, resolved_prefix = _resolve(config_path, prefix)
+    return config, markgate_path, resolved_prefix, config_mtime(markgate_path)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # push command
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,7 +216,7 @@ def push(
     ),
 ) -> None:
     """Push local markdown to remote docs."""
-    config, config_path, prefix = _resolve(config_path, prefix)
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
     mappings = config.mappings
 
     if files:
@@ -215,6 +234,12 @@ def push(
     state = _load_state(state_path)
 
     had_error = False
+    # Shared across every mapping's push() call below (criterion 11): each
+    # mapping gets its own backend instance via _get_backend(), so without a
+    # cache threaded in from here a push --all run with N documents linking
+    # to the same target would fetch that target N times, once per pushing
+    # backend instance, instead of once for the whole run.
+    cross_doc_cache: dict = {}
     for mapping in mappings:
         if mapping.direction == "pull":
             console.print(f"[dim]Skipping {mapping.local} (pull-only)[/dim]")
@@ -244,6 +269,47 @@ def push(
                 )
             continue
 
+        if mapping.remote_id is None:
+            if not _can_prompt():
+                err_console.print(
+                    f"'{mapping.local}' has no remote_id and this session cannot prompt "
+                    "(non-interactive/CI). Run 'docspan map' to create the remote doc first."
+                )
+                had_error = True
+                continue
+            if not typer.confirm(
+                f"'{mapping.local}' has no remote doc yet. Create one on [{mapping.backend}] now?",
+                default=True,
+            ):
+                console.print("Push cancelled.")
+                had_error = True
+                continue
+            try:
+                create_result = backend.create(os.path.splitext(os.path.basename(mapping.local))[0])
+            except ValueError as exc:
+                err_console.print(
+                    f"{exc}\n"
+                    f"Run 'docspan map {mapping.local} --backend {mapping.backend} --space <key>' "
+                    "to create the remote doc/page with the required options."
+                )
+                had_error = True
+                continue
+            mapping.remote_id = create_result.doc_id
+            try:
+                save_config(config, config_path, expected_mtime=loaded_mtime)
+            except ConfigConflictError as exc:
+                err_console.print(
+                    f"{exc}\n\n"
+                    f"⚠ A new {mapping.backend} doc/page was created but NOT recorded in markgate.yaml:\n"
+                    f"  remote_id: {create_result.doc_id}\n"
+                    f"  url: {create_result.url or '(none)'}\n"
+                    "Add it manually (or resolve the conflict and re-run)."
+                )
+                had_error = True
+                continue
+            loaded_mtime = config_mtime(config_path)
+            console.print(f"[green]✓[/green]  Created {mapping.backend} doc → {mapping.local}")
+
         # Story 1.2.5: ScratchVerificationMarker — a one-time confirmation
         # tripwire before the very first push against the live wedding doc
         # specifically. Never fires for --dry-run (handled above) or for any
@@ -263,7 +329,10 @@ def push(
                 with open(marker_path, "w", encoding="utf-8") as fh:
                     fh.write("verified\n")
 
-        outcome = orchestrate_push(mapping, backend, state, state_dir, state_path, force=force)
+        outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+            cross_doc_cache=cross_doc_cache,
+        )
         result = outcome.result
 
         icon, style = _status_display(result.status)
@@ -364,6 +433,100 @@ def pull(
 
     if had_error:
         raise typer.Exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# map command
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command("map")
+def map_(
+    file: str = typer.Argument(..., help="Local markdown file to map to a new remote doc/page"),
+    backend: str = typer.Option(
+        ..., "--backend", "-b", help="Backend to create the doc in: google_docs | confluence"
+    ),
+    space: Optional[str] = typer.Option(
+        None, "--space", help="Confluence space key (required for the confluence backend unless set in markgate.yaml)"
+    ),
+    title: Optional[str] = typer.Option(
+        None, "--title", help="Title for the new doc/page (default: the file's basename)"
+    ),
+    direction: str = typer.Option("both", "--direction", help="push | pull | both"),
+    tab_id: Optional[str] = typer.Option(None, "--tab-id", help="Google Docs tab id to target"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Create a new remote Google Doc / Confluence page and map it to a local file."""
+    if direction not in ("push", "pull", "both"):
+        err_console.print("--direction must be one of: push, pull, both")
+        raise typer.Exit(1)
+
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+
+    if any(m.local == file for m in config.mappings):
+        err_console.print(
+            f"'{file}' is already mapped in markgate.yaml. Remove the existing mapping before creating a new one."
+        )
+        raise typer.Exit(1)
+
+    if backend not in BACKENDS:
+        err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
+        raise typer.Exit(1)
+
+    doc_title = title or os.path.splitext(os.path.basename(file))[0]
+    backend_instance = _get_backend(backend, config, config_path)
+
+    create_kwargs: dict = {}
+    if space:
+        create_kwargs["space"] = space
+
+    try:
+        create_result = backend_instance.create(doc_title, **create_kwargs)
+    except ValueError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(1)
+
+    mapping = Mapping(
+        local=file,
+        backend=backend,
+        remote_id=create_result.doc_id,
+        direction=direction,  # type: ignore[arg-type]
+        tab_id=tab_id,
+    )
+    config.mappings.append(mapping)
+
+    try:
+        save_config(config, config_path, expected_mtime=loaded_mtime)
+    except ConfigConflictError as exc:
+        err_console.print(
+            f"{exc}\n\n"
+            f"⚠ A new {backend} doc/page was created but NOT recorded in markgate.yaml:\n"
+            f"  remote_id: {create_result.doc_id}\n"
+            f"  url: {create_result.url or '(none)'}\n"
+            "Add it manually (or resolve the conflict and re-run 'docspan map')."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green]  Created {backend} doc '{create_result.title}' → {file}")
+    if create_result.url:
+        console.print(f"   {create_result.url}")
+
+    # A freshly created remote doc/page is always empty. Push local content
+    # into it now regardless of `direction` — otherwise a "pull" mapping's
+    # very next pull has no prior sync state to compare against and will
+    # unconditionally overwrite the local file with that empty remote doc.
+    if os.path.exists(file):
+        state_path = get_state_path(config_path, prefix)
+        state_dir = get_state_dir(config_path, prefix)
+        state = _load_state(state_path)
+        outcome = orchestrate_push(
+            mapping, backend_instance, state, state_dir, state_path, mappings=config.mappings,
+        )
+        result = outcome.result
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

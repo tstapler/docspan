@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import difflib
+import logging
+from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Literal, Optional, Set, Tuple, Union
 
+from docspan.backends.google_docs import cross_doc_links
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
@@ -30,6 +33,85 @@ Node = Union[DocsParagraphNode, DocsTableNode]
 # inlined Literal in one signature and a bare `str` in the next do not unify.
 Opcode = Tuple[Literal["replace", "delete", "insert", "equal"], int, int, int, int]
 
+logger = logging.getLogger(__name__)
+
+# Thresholds for _bounded_opcodes. Tuned against this file's own test fixtures
+# (a 30-row table, the fenced-code-block fixtures in test_code_block_granularity.py)
+# so ordinary documents never trip the guard, while a document built from a
+# few thousand duplicate short lines/cells does.
+_MAX_COMPARISON_CELLS = 4_000_000
+_MAX_DUPLICATE_RUN = 60
+_MIN_SIZE_FOR_DUPLICATE_CHECK = 150
+
+# Must exceed `_structural_score`'s maximum possible value (currently 4: 2 for
+# matching style + 1 for matching heading-ness + 1 for matching list-item-ness)
+# so a code-rendered candidate always outranks a merely structurally-similar one.
+_CODE_LINE_PREFERENCE_BONUS = 100
+
+
+class DiffTooExpensive(Exception):
+    """Raised instead of running SequenceMatcher on pathological duplicate-heavy input.
+
+    `autojunk=False` is required for correctness (see `_opcodes`'s docstring
+    and issue #54/#68) but it also reintroduces difflib's cubic-ish worst case
+    once many short keys repeat — a document with a few thousand duplicate
+    lines or table cells can otherwise hang push/pull for minutes.
+
+    Refuses loudly rather than falling back to a positional/heuristic diff:
+    `_repair` and `_prefer_structural_pairing` both depend on
+    `get_opcodes()`'s exact partition guarantee, and a lookalike-popularity
+    heuristic is exactly what reopened the headingId-mispairing bug PR #50/#67
+    fixed. "Refuse, don't guess" matches this file's existing philosophy.
+    """
+
+    def __init__(self, context: str, size: int, max_duplicate_run: int):
+        self.context = context
+        self.size = size
+        self.max_duplicate_run = max_duplicate_run
+        super().__init__(
+            f"Diff for {context} is too expensive to compute safely: {size} "
+            f"nodes include a run of {max_duplicate_run} duplicate short "
+            "lines/cells. Split the table or code block into smaller pieces "
+            "and retry."
+        )
+
+
+def _bounded_opcodes(a_keys: List[Tuple], b_keys: List[Tuple], *, context: str) -> List[Opcode]:
+    """The sole place any `autojunk=False` `SequenceMatcher` gets constructed.
+
+    `_opcodes`, `_repair`'s inner per-run matcher and `_align_for_styling`'s
+    pass-2 matcher all route through this one function so the pathological-
+    input guard can never be applied at one call site and forgotten at
+    another — the same failure class `_opcodes`'s docstring already warns
+    about for build()/diff_summary() drifting apart.
+
+    Trips (raises `DiffTooExpensive`, logging a WARNING first) on either:
+    - a comparison matrix (`len(a_keys) * len(b_keys)`) large enough that
+      even difflib's average-case cost is unsafe, or
+    - a duplicate-key run dense enough to trigger the cubic-ish worst case,
+      gated by a size floor so a handful of legitimately-repeated short
+      values (a few blank paragraphs, a short status column) never trips it.
+
+    Otherwise behaves exactly as the removed inline `SequenceMatcher(None,
+    a_keys, b_keys, autojunk=False)` calls did — `autojunk` is never
+    re-enabled and no popularity heuristic is substituted.
+    """
+    combined_len = len(a_keys) + len(b_keys)
+    max_duplicate_run = max(Counter(a_keys + b_keys).values()) if combined_len else 0
+    if len(a_keys) * len(b_keys) > _MAX_COMPARISON_CELLS or (
+        combined_len >= _MIN_SIZE_FOR_DUPLICATE_CHECK and max_duplicate_run > _MAX_DUPLICATE_RUN
+    ):
+        logger.warning(
+            "Refusing expensive diff for %s: %d + %d nodes, largest duplicate run %d",
+            context,
+            len(a_keys),
+            len(b_keys),
+            max_duplicate_run,
+        )
+        raise DiffTooExpensive(context, combined_len, max_duplicate_run)
+    matcher = difflib.SequenceMatcher(None, a_keys, b_keys, autojunk=False)
+    return matcher.get_opcodes()
+
 
 @dataclass(frozen=True)
 class Pass2Alignment:
@@ -41,9 +123,27 @@ class Pass2Alignment:
     current: List[Node]
     pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]]
     unaligned: List[DocsParagraphNode]
+    table_pairs: List[Tuple[int, DocsTableNode]]
     slug_to_id: dict
     known_ids: set
     residue: List[Residue]
+
+
+@dataclass(frozen=True)
+class DeleteBounds:
+    """The range a node's deleteContentRange may actually cover, and why it was trimmed.
+
+    ``trimmed`` keeps its original meaning ("some trim happened"), covering
+    both the render_prefix/precedes_structural_element cases and the doc-end
+    clamp. ``doc_end_clamped`` narrows to the last of those specifically — the
+    body's terminal newline was what survived — so callers that need to tell
+    the doc-end case apart from the other two (see the "replace" branch of
+    build(), #62) don't have to re-derive it from node attributes.
+    """
+    start: int
+    end: int
+    trimmed: bool
+    doc_end_clamped: bool
 
 
 def _utf16_len(text: str) -> int:
@@ -104,6 +204,10 @@ class DiffEntry:
     target_text: Optional[str]
     style: str
     current_is_native_checkbox: bool = False
+    # Which `_opcodes()` iteration in diff_summary() produced this entry.
+    # push_preview.find_churn_pairs() scopes remove/add matching by this,
+    # not list adjacency — adjacent entries can come from different opcodes.
+    edit_group: int = -1
 
 
 class DocsRequestBuilder:
@@ -175,6 +279,18 @@ class DocsRequestBuilder:
         """
         return bool(node.render_prefix)
 
+    @staticmethod
+    def _target_wants_code_line(node: Node) -> bool:
+        """Whether a *target* paragraph is itself a fenced-code line.
+
+        Markdown targets never carry `render_prefix`, so `monospace=True` on
+        every span (`all()`, not `any()`, to exclude prose with just an
+        inline `` `code` `` span) is the only signal available.
+        """
+        if not isinstance(node, DocsParagraphNode):
+            return False
+        return bool(node.spans) and all(s.monospace for s in node.spans)
+
     def _cell_key(self, cell: TableCell) -> Tuple:
         """Hashable full identity for a table cell, including inline styling.
 
@@ -205,15 +321,20 @@ class DocsRequestBuilder:
         A stray `_content_key` collision between a prose and a code node with
         the same text is harmless *when they are the only two candidates for
         their own slots*: `_node_key` already keeps them apart there, so
-        `_repair` — which only inspects the two sides of a single
-        `_node_key`-identified `replace` run — never gets a run containing
-        both to conflate. It is not harmless in general: when a plain current
-        paragraph and a real code-rendered current paragraph both read the
-        same text and only one target slot exists for that text, the *outer*
-        `_node_key` matcher (not `_repair`) can still let the plain one win
-        the correspondence and leave the code-rendered one an unpaired
-        `delete` — a pre-existing gap this fix narrows but does not close; see
-        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        nothing conflates them. It is not harmless in general: since PR #70,
+        `_repair`'s `_prefer_structural_pairing` pools every `_content_key`
+        across the *whole document*, not just the two sides of a single
+        `_node_key`-identified `replace` run — so a code line and an
+        unrelated same-text prose node living in *different* pre-repair runs
+        now do share a candidate/slot pool, and `_structural_score`'s style
+        comparison is what is relied on to keep them from winning each
+        other's slot. Where only one target slot for that text exists and
+        the *outer* `_node_key` matcher (not `_repair`) has already let the
+        plain paragraph win the correspondence, the code-rendered one used
+        to end up an unpaired `delete` — that gap is now closed by
+        `_opcodes`'s top-level `_prefer_structural_pairing(prefer_code_line=True)`
+        pass, which re-scores that exact ambiguity across the whole document;
+        see `test_a_prose_line_repeating_a_code_lines_text_is_disambiguated_in_favor_of_the_code_line`
         in `tests/test_code_block_granularity.py` and issue #68.
         """
         if isinstance(node, DocsTableNode):
@@ -233,13 +354,47 @@ class DocsRequestBuilder:
         but they must see identical opcodes, since push()'s safety gate
         (high_risk, derived from diff_summary()'s classification) and the
         actual write (derived from build()'s classification) must never
-        drift apart. This is the one place current_keys/target_keys/
-        SequenceMatcher get constructed.
+        drift apart. This is the one place current_keys/target_keys get
+        constructed; the matcher itself is built by `_bounded_opcodes`, the
+        shared guard against difflib's duplicate-heavy worst case (see its
+        docstring) — a `DiffTooExpensive` raised here propagates to both
+        callers identically, so they can never diverge on whether a document
+        is pathological either.
+
+        `_repair` only disambiguates duplicate-content candidates *within* a
+        single `replace` run it already identified. It cannot rescue a
+        current node that `_node_key`'s top-level `SequenceMatcher` pass
+        already bound elsewhere in the document — e.g. a plain paragraph and
+        a real code-rendered paragraph reading the same text, competing for
+        one target slot the plain paragraph wins purely because its key
+        happens to match first (issue #68). `_prefer_structural_pairing`'s
+        candidate/slot/greedy-assignment machinery generalizes to that
+        top-level case unchanged (it already takes global indices and an
+        `i1`/`j1` offset; passing `0, 0` and the whole opcode list just
+        widens its view from "one run" to "the document"), so it is reused
+        here rather than duplicated — with `prefer_code_line=True` to prefer
+        a `render_prefix`-carrying candidate for a slot the target itself
+        marks as code (`_target_wants_code_line`). `_coalesce` runs again
+        afterward since the pass may re-tag opcodes that were previously
+        merged.
         """
         current_keys = [self._node_key(n) for n in current]
         target_keys = [self._node_key(n) for n in target]
-        matcher = difflib.SequenceMatcher(None, current_keys, target_keys, autojunk=False)
-        return self._repair(matcher.get_opcodes(), current, target)
+        opcodes = _bounded_opcodes(current_keys, target_keys, context="document")
+        repaired = self._repair(opcodes, current, target)
+        # The whole-document pass below only ever has work to do when some
+        # target slot is itself a fenced-code line (`_target_wants_code_line`)
+        # — see `_prefer_structural_pairing`'s `code_slot_ids` gate, which
+        # otherwise `continue`s past every content-key group unconditionally.
+        # Skipping the `by_key` grouping entirely for documents with no code
+        # blocks avoids that whole-document-sized bookkeeping on every single
+        # `_opcodes()`/`build()` call for the common case.
+        if not any(self._target_wants_code_line(n) for n in target):
+            return self._coalesce(repaired)
+        resolved = self._prefer_structural_pairing(
+            repaired, list(range(len(repaired))), current, target, prefer_code_line=True,
+        )
+        return self._coalesce(resolved)
 
     def _repair(
         self,
@@ -247,51 +402,103 @@ class DocsRequestBuilder:
         current: List[Node],
         target: List[Node],
     ) -> List[Opcode]:
-        """Re-classify text-identical pairs inside a `replace` run as `equal`.
+        """Re-classify text-identical pairs as `equal`, across the whole diff gap.
 
-        `_node_key` includes style and bullet, so a paragraph that was only
-        *restyled* now lands in a `replace` run — and `build()` answers a replace
-        with delete-then-insert, which retypes the paragraph and destroys any
-        comment anchored to it. That behaviour is what the old text-only key
-        avoided, at the cost of correspondence (see `_node_key`).
+        Two phases, as real diff tools do it (issue #52): phase 1 is the outer
+        `SequenceMatcher` (in `_opcodes`, before this runs), keyed on
+        `_node_key` — full identity, including style — which already
+        establishes every strong anchor: an `equal` opcode here means "this is
+        provably the same live paragraph, untouched," and is never revisited.
+        Everything else (every `replace`/`insert`/`delete` opcode) is the gap
+        phase 1 could not resolve.
 
-        So the two concerns are separated: the key decides *correspondence*, and
-        this decides *classification*. Where a replace run pairs nodes with equal
-        `_content_key`, the edit is an in-place restyle and the opcode becomes
-        `equal`, which `_make_style_update_requests` turns into the two or three
-        in-place requests it actually needs.
+        Phase 2 (this method, plus `_prefer_structural_pairing`) refines that
+        whole gap on `_content_key` — text-only identity — globally, not run by
+        run. `_node_key` includes style and bullet, so a paragraph that was
+        only *restyled* lands in a non-`equal` opcode, and naively answering a
+        `replace` with delete-then-insert (or an `insert`+`delete` pair with
+        an unrelated `equal` opcode between them, which is exactly the shape a
+        duplicate current-side text produces) retypes the paragraph and
+        destroys any comment or heading-anchor pinned to it. That is what the
+        old text-only key avoided, at the cost of correspondence — see
+        `_node_key`.
 
-        Leftovers on either side stay a `replace`/`insert`/`delete` for the part
-        that genuinely differs, so nothing is silently dropped.
+        So content-identity within a `replace` run is still resolved with a
+        second SequenceMatcher (keyed on `_content_key`) exactly as before —
+        positional pairing within a run is not a correspondence relation, see
+        below — but the resulting candidates (including whole standalone
+        `insert`/`delete` opcodes, not just `replace` interiors) are pooled and
+        matched by `_prefer_structural_pairing` across the *entire* gap at
+        once, so a restyle whose two halves ended up in unrelated opcodes still
+        gets recognized as one in-place edit.
 
-        Pairing nodes by their position within the run (same offset from the
+        Pairing nodes by their position within a run (same offset from the
         run's start on both sides) is not a correspondence relation — it just
         assumes the run has no internal insert/delete of its own. Where it
         does (e.g. a restyle sitting next to an unrelated deletion in the same
         run), a positional walk mispairs nodes: a live heading can end up
         "paired" with an unrelated line, so the heading looks like a rewrite
-        and gets deleted-and-reinserted, destroying its headingId. So instead
-        of walking positionally, a second SequenceMatcher (keyed on
-        `_content_key`) finds the actual content correspondence within the
-        run's own sub-ranges. `get_opcodes()` returns a partition of both
-        inputs, so this can't assign two current nodes to the same target
-        node.
+        and gets deleted-and-reinserted, destroying its headingId.
+
+        A native checkbox's checked state can't be read back from the API
+        (ADR-001), so pull always round-trips it as `- [ ] text`;
+        `_target_key` strips that synthetic `"[ ] "` marker before keying the
+        target side only, so an unedited checkbox doesn't look changed and
+        get retyped on every push.
         """
-        repaired: List[Opcode] = []
-        for tag, i1, i2, j1, j2 in opcodes:
+        passthrough: List[Opcode] = []
+        pending: List[Opcode] = []
+        # Which top-level (pre-repair) opcode each `pending` entry came from.
+        # `_prefer_structural_pairing` uses this to prefer a candidate that
+        # shares its slot's original opcode over an equally- or
+        # better-scored one from elsewhere in the document — see that
+        # method's docstring for why raw structural score alone is not
+        # enough once the pool is global.
+        origin: List[int] = []
+        for run_id, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+            if tag == "equal":
+                # A strong phase-1 anchor: full identity already matched, so
+                # this pair is never a candidate for reassignment elsewhere —
+                # doing so would perturb a paragraph nothing actually touched.
+                passthrough.append((tag, i1, i2, j1, j2))
+                continue
             if tag != "replace":
-                repaired.append((tag, i1, i2, j1, j2))
+                # insert / delete: one side is empty, so there is no interior
+                # content pairing to resolve here — but this opcode's whole
+                # range is still a first-class candidate/slot for the global
+                # pooling in _prefer_structural_pairing below.
+                pending.append((tag, i1, i2, j1, j2))
+                origin.append(run_id)
                 continue
             cur_slice = current[i1:i2]
             tgt_slice = target[j1:j2]
-            inner = difflib.SequenceMatcher(
-                None,
+            checkbox_texts = {
+                n.text for n in cur_slice
+                if isinstance(n, DocsParagraphNode) and n.is_native_checkbox
+            }
+
+            def _target_key(node: Node, _checkbox_texts: Set[str] = checkbox_texts) -> Tuple:
+                # Only the target (markdown) side ever carries pull's synthetic
+                # "[ ] " marker for an unedited checkbox — stripping it on the
+                # current (live-doc) side too would let an unrelated plain
+                # paragraph that merely *starts with* literal "[ ] " text
+                # collide with a real checkbox's key and steal its pairing.
+                if (
+                    isinstance(node, DocsParagraphNode)
+                    and not node.is_native_checkbox
+                    and node.text.startswith("[ ] ")
+                ):
+                    stripped = node.text[len("[ ] "):]
+                    if stripped in _checkbox_texts:
+                        return ("__para__", stripped)
+                return self._content_key(node)
+
+            inner_opcodes = _bounded_opcodes(
                 [self._content_key(n) for n in cur_slice],
-                [self._content_key(n) for n in tgt_slice],
-                autojunk=False,
+                [_target_key(n) for n in tgt_slice],
+                context="replace-run",
             )
-            pending: List[Opcode] = []
-            for itag, ci1, ci2, tj1, tj2 in inner.get_opcodes():
+            for itag, ci1, ci2, tj1, tj2 in inner_opcodes:
                 aci1, aci2 = i1 + ci1, i1 + ci2
                 atj1, atj2 = j1 + tj1, j1 + tj2
                 if itag == "equal":
@@ -300,171 +507,444 @@ class DocsRequestBuilder:
                         pending.append(
                             ("equal", aci1 + off, aci1 + off + 1, atj1 + off, atj1 + off + 1)
                         )
+                        origin.append(run_id)
                 else:
                     # Genuinely different content in this sub-window -> real rewrite.
                     pending.append((itag, aci1, aci2, atj1, atj2))
-            pending = self._prefer_structural_pairing(pending, cur_slice, tgt_slice, i1, j1)
-            repaired.extend(self._coalesce(pending))
-        return repaired
+                    origin.append(run_id)
+        pending = self._prefer_structural_pairing(pending, origin, current, target)
+        # `build()`/`diff_summary()` only need each opcode's own absolute
+        # indices (see `build()`'s per-tag anchor computation) — not overall
+        # list order — so passthrough and pending can simply be concatenated
+        # before the final coalesce.
+        return self._coalesce(sorted(passthrough + pending, key=lambda op: (op[1], op[3])))
+
+    @staticmethod
+    def _covered_target_indices(opcodes: List[Opcode]) -> set:
+        """The set of target indices these opcodes account for.
+
+        Used only as an invariant check in `_prefer_structural_pairing`: a
+        "delete" opcode carries no target range (`cj1 == cj2`) by
+        convention, everything else does.
+        """
+        covered: set = set()
+        for tag, _ci1, _ci2, cj1, cj2 in opcodes:
+            if tag != "delete":
+                covered.update(range(cj1, cj2))
+        return covered
 
     def _prefer_structural_pairing(
         self,
         pending: List[Opcode],
-        cur_slice: List[Node],
-        tgt_slice: List[Node],
-        i1: int,
-        j1: int,
+        origin: List[int],
+        current: List[Node],
+        target: List[Node],
+        prefer_code_line: bool = False,
     ) -> List[Opcode]:
-        """Reassign ambiguous equal/delete pairings toward their structurally closest node.
+        """Reassign ambiguous equal/delete/insert pairings to their structurally closest node.
 
-        The inner `SequenceMatcher` in `_repair` treats every current node sharing
-        a `_content_key` as interchangeable and pairs whichever ones it meets first
-        with the target — typically by position. When several current nodes share
-        text (a stale body paragraph and a live heading both reading "Setup"),
-        that can restyle-in-place the wrong one and delete the live heading
-        instead, destroying its `headingId`. Same thing happens, worse, when the
-        *target* side also repeats the text (e.g. restyling one duplicate up to a
-        heading and another down to a bullet): each ambiguous target then needs
-        its own best-matching current node, not just the first one considered.
+        Phase 2 of `_repair` (see its docstring): `pending` is every opcode
+        `_repair` produced from a non-`equal` phase-1 opcode — content-matched
+        `equal`/`replace` pieces from inside a `replace` run, plus whole
+        standalone `insert`/`delete` opcodes passed straight through — pooled
+        across the *entire* diff, not scoped to one run. This treats duplicate
+        `_content_key`s as an assignment problem the same way regardless of
+        which original opcode a candidate or slot came from.
 
-        So for every `_content_key` shared by more than one current node in this
-        run, this treats it as a small assignment problem: each target position
-        that currently has an "equal" pairing is a slot, every current node
-        sharing the key (whether currently paired or currently "delete") is a
-        candidate, and slots claim candidates greedily by structural similarity
-        (style, heading-ness, list-item-ness), highest score first, ties going to
-        a candidate's own existing slot so an already-fine pairing is not
-        needlessly perturbed. Whichever candidates no slot claims become deletes.
+        This generalizes what used to be a `replace`-run-local fixup. Two
+        gaps that scoping closed:
 
-        This only ever reassigns which current index a given target range maps
-        to — the target ranges themselves, and every other opcode's indices, are
-        untouched — so it cannot double-book or drop a target index. There is no
-        list-order requirement to preserve: `build()` and `diff_summary()` both
-        consume each opcode by its own absolute (i1, i2, j1, j2), and `_coalesce`
-        only merges entries whose indices are exactly contiguous, so reordering
-        which candidate owns which target range cannot corrupt either consumer.
+        1. A restyle-only pair can end up as a standalone `insert` and a
+           standalone `delete` with an unrelated `equal` opcode between them
+           (issue #52) — duplicate current-side text lets the *outer*,
+           `_node_key`-keyed matcher anchor on the wrong occurrence, pushing
+           the real edit's two halves out of any shared `replace` run
+           entirely. A whole `insert` opcode was never a slot before (only
+           `replace`-interior and singleton `equal`/`delete` entries were),
+           so this shape was invisible to the old, run-scoped repair.
+        2. A `replace` run's duplicate `_content_key` correspondence to a
+           node living in a *different* run (or in a standalone `insert`/
+           `delete`) was invisible for the same reason.
 
-        Generalization: a duplicate-content current node does not stop being a
-        candidate just because the inner matcher happened to fold it into a
-        multi-node "replace" block alongside other, genuinely different content
-        in the same run (e.g. a live heading sitting next to an edited sentence,
-        with the actual duplicate target slot won by a stray paragraph
-        elsewhere in the run). Every current index inside a "replace" opcode is
-        registered as a candidate the same way a singleton "delete" is; if one
-        wins a slot, its parent "replace" opcode is structurally split
+        Mechanics (unchanged from the run-scoped version, just over a wider
+        pool): for every `_content_key` shared by more than one node, this is
+        a small assignment problem. A "slot" is a target position that could
+        receive an in-place restyle — an existing "equal" pairing (which
+        already has a current node assigned, itself a candidate, so ties can
+        prefer leaving it alone) or a standalone "insert" singleton (which
+        has no current node yet — the #52 gap). A "candidate" is any current
+        node that could fill a slot — a singleton "equal"/"delete" entry, or
+        an index still trapped inside a "replace" opcode's current range.
+        Slots claim candidates greedily by structural similarity (style,
+        heading-ness, list-item-ness), highest score first, ties going to a
+        slot's own existing candidate so an already-fine pairing is not
+        needlessly perturbed. An "equal" slot whose own candidate is claimed
+        by someone else has its target range re-exposed as a fresh standalone
+        "insert" (its own current node becomes a "delete" only if that node
+        itself went unclaimed — the two are independent, see the two-part
+        fixup below); an "insert" slot left unclaimed stays an "insert"
+        (nothing regresses over the old behavior — it is simply not fixed,
+        same as before this function ran at all).
+
+        This only ever reassigns which current index a given target range
+        maps to — the target ranges themselves, and every other opcode's
+        indices, are untouched — so it cannot double-book or drop a target
+        index. There is no list-order requirement to preserve: `build()` and
+        `diff_summary()` both consume each opcode by its own absolute
+        (i1, i2, j1, j2), and `_coalesce` only merges entries whose indices
+        are exactly contiguous, so reordering which candidate owns which
+        target range cannot corrupt either consumer.
+
+        Generalization retained from the run-scoped version: a duplicate-
+        content current node does not stop being a candidate just because it
+        sits inside a multi-node "replace" block alongside genuinely
+        different content. Every current index inside a "replace" opcode is
+        registered as a candidate the same way a singleton "delete" is; if
+        one wins a slot, its parent "replace" opcode is structurally split
         afterward — the winning index is carved out as its own "equal", and
         whatever current indices remain keep the original, untouched target
         range (attached to the first surviving contiguous run; any other
         surviving run becomes a plain "delete", since the target content is
         already spoken for). If every current index in the block is claimed,
-        the target range becomes a fresh "insert" anchored where the block used
-        to be. This never touches a target index more than once and never
-        drops one, so it cannot corrupt `build()`/`diff_summary()` the same way
-        the singleton case cannot (see above).
+        the target range becomes a fresh "insert" anchored where the block
+        used to be.
 
         Scope note: only the *current* side of "replace"/"insert" opcodes is
-        considered here. A duplicate *target* slot trapped inside a multi-node
-        block (the symmetric case) is not decomposed — there is no existing
-        "equal" opcode to use as the slot in that case, only a range with no
-        established per-index correspondence to split by. That gap is open.
+        considered as candidates. A duplicate *target* slot trapped inside a
+        multi-node "replace" block (the symmetric case) is not decomposed —
+        there is no existing "equal" opcode to use as the slot in that case,
+        only a range with no established per-index correspondence to split
+        by. That gap is open, same as before.
+
+        `prefer_code_line=True` (issue #68) is used only by `_opcodes`'s
+        single whole-document call: it restricts the slots up for grabs to
+        those whose target itself wants a code line
+        (`_target_wants_code_line`), and adds a scoring bonus for a
+        candidate that is itself a code line (`_is_code_line`), so that a
+        prose line and a real code-rendered line sharing text don't let the
+        prose line win the code slot by structural score alone.
         """
         expanded: List[Opcode] = []
-        for tag, ci1, ci2, cj1, cj2 in pending:
+        expanded_origin: List[int] = []
+        for (tag, ci1, ci2, cj1, cj2), run_id in zip(pending, origin):
             if tag == "delete" and ci2 - ci1 > 1:
                 for idx in range(ci1, ci2):
                     expanded.append(("delete", idx, idx + 1, cj1, cj1))
+                    expanded_origin.append(run_id)
+            elif tag == "equal" and ci2 - ci1 > 1:
+                # "equal" guarantees ci2-ci1 == cj2-cj1, so the stride below is
+                # always > 1 (never falsy) here. `_repair` itself only ever
+                # emits singleton "equal" entries into `pending`, but
+                # `_opcodes`'s whole-document call passes already-`_coalesce`d
+                # opcodes, which can merge adjacent singletons back into a
+                # multi-node "equal" run — split it back out here so each
+                # target index is its own slot for that call.
+                for offset in range(ci2 - ci1):
+                    idx = ci1 + offset
+                    jdx = cj1 + offset
+                    expanded.append(("equal", idx, idx + 1, jdx, jdx + 1))
+                    expanded_origin.append(run_id)
+            elif tag == "insert" and cj2 - cj1 > 1:
+                for idx in range(cj1, cj2):
+                    expanded.append(("insert", ci1, ci1, idx, idx + 1))
+                    expanded_origin.append(run_id)
             else:
                 expanded.append((tag, ci1, ci2, cj1, cj2))
+                expanded_origin.append(run_id)
 
-        # A candidate id is either ("pos", position) — a singleton "equal"/
-        # "delete" entry in `expanded`, matching the prior behavior — or
-        # ("interior", position, idx) — a current index still trapped inside
-        # the "replace" opcode at `position`. Only "pos" candidates that are
-        # currently "equal" can be slots; "interior" candidates can only win.
-        by_key: Dict[Tuple, List[Tuple]] = {}
+        # Snapshot for the invariant check at the bottom of this function:
+        # the set of target indices this whole pool is responsible for must
+        # come out the same on the other end, however it gets reshuffled.
+        original_targets = self._covered_target_indices(expanded)
+
+        # Candidates: every current-side node available for reassignment —
+        # singleton "equal"/"delete" entries, and every index still trapped
+        # inside a "replace" opcode's current range.
+        #
+        # This pool (and the matching `slots_by_key` below) is now scoped to
+        # the *whole document* rather than one `replace` run (PR #70,
+        # generalizing issue #52's fix) — the per-`_content_key` assignment
+        # below is still worst-case O(n^2) in the size of the largest
+        # duplicate-content group, and that cost is no longer bounded by a
+        # single run. No size guard exists yet; flagged here as a pointer
+        # for a future perf pass rather than blocking this fix on it.
+        candidates_by_key: Dict[Tuple, List[Tuple]] = {}
         for pos, (tag, ci1, ci2, _cj1, _cj2) in enumerate(expanded):
             if tag in ("equal", "delete") and ci2 - ci1 == 1:
-                by_key.setdefault(self._content_key(cur_slice[ci1 - i1]), []).append(("pos", pos))
+                candidates_by_key.setdefault(self._content_key(current[ci1]), []).append(
+                    ("pos", pos)
+                )
             elif tag == "replace":
                 for idx in range(ci1, ci2):
-                    key = self._content_key(cur_slice[idx - i1])
-                    by_key.setdefault(key, []).append(("interior", pos, idx))
+                    key = self._content_key(current[idx])
+                    candidates_by_key.setdefault(key, []).append(("interior", pos, idx))
+
+        def _candidate_origin(cid: Tuple) -> int:
+            # Both "pos" and "interior" candidate ids carry the owning
+            # expanded-list position as their second element.
+            return expanded_origin[int(cid[1])]
 
         def _current_index(cid: Tuple) -> int:
             if cid[0] == "pos":
                 return int(expanded[cid[1]][1])
             return int(cid[2])
 
+        # Slots: singleton "equal" entries (self_cid is their own existing
+        # candidate id, preferred on ties) and singleton "insert" entries
+        # (self_cid is None — no current node is assigned yet, the #52 gap).
+        slots_by_key: Dict[Tuple, List[Tuple[int, Optional[Tuple]]]] = {}
+        for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
+            if tag == "equal" and cj2 - cj1 == 1:
+                key = self._content_key(current[ci1])
+                slots_by_key.setdefault(key, []).append((pos, ("pos", pos)))
+            elif tag == "insert" and cj2 - cj1 == 1:
+                key = self._content_key(target[cj1])
+                slots_by_key.setdefault(key, []).append((pos, None))
+
         # position -> {idx: (target j1, target j2)} claimed out of a "replace" opcode
         extractions: Dict[int, Dict[int, Tuple[int, int]]] = {}
+        # Standalone "insert" slot positions fully satisfied by a relocated
+        # candidate — their meaning transferred to that candidate's new
+        # "equal" opcode, so the original "insert" entry is now redundant.
+        satisfied_inserts: set = set()
+        # (anchor, target j1, target j2) for an "equal" slot's own target
+        # range when nothing won it *and* `expanded[spos]` was reused by a
+        # different slot to record its own reassignment — see the second
+        # per-slot loop below.
+        new_inserts: List[Tuple[int, int, int]] = []
 
-        for positions in by_key.values():
-            slot_ids = [cid for cid in positions if cid[0] == "pos" and expanded[cid[1]][0] == "equal"]
-            if not slot_ids or len(positions) < 2:
+        for key, slot_entries in slots_by_key.items():
+            candidates = candidates_by_key.get(key, [])
+            if not candidates:
                 continue
-            slot_targets = {sid: (expanded[sid[1]][3], expanded[sid[1]][4]) for sid in slot_ids}
+
+            if prefer_code_line:
+                # The top-level call runs this over the *whole document*, not one
+                # `_repair`-scoped run — so a content-key group here can span
+                # slots `_repair` already resolved correctly and independently
+                # (e.g. a live heading and a live bullet that both happen to read
+                # "Setup"). Without this gate, re-scoring every slot in the group
+                # lets an unrelated candidate's raw `_structural_score` outrank an
+                # already-fine self-pair on a slot that was never in question
+                # (see `test_duplicate_text_on_both_sides_still_saves_every_live_node`).
+                # So only a slot whose target actually wants a code line is up for
+                # grabs; every other slot's own candidate is pulled out of the
+                # pool entirely rather than left in to compete for the code slot.
+                code_slot_entries = [
+                    (spos, self_cid) for spos, self_cid in slot_entries
+                    if self._target_wants_code_line(target[expanded[spos][3]])
+                ]
+                if not code_slot_entries:
+                    continue
+                excluded_cids = {self_cid for _spos, self_cid in slot_entries} - {
+                    self_cid for _spos, self_cid in code_slot_entries
+                }
+                excluded_cids.discard(None)
+                candidates = [cid for cid in candidates if cid not in excluded_cids]
+                slot_entries = code_slot_entries
 
             pair_scores = []
-            for si, sid in enumerate(slot_ids):
-                scj1, _scj2 = slot_targets[sid]
-                target_node = tgt_slice[scj1 - j1]
-                for ci, cid in enumerate(positions):
-                    score = self._structural_score(cur_slice[_current_index(cid) - i1], target_node)
-                    pair_scores.append((score, sid == cid, si, ci, sid, cid))
-            pair_scores.sort(key=lambda t: (-t[0], 0 if t[1] else 1, t[2], t[3]))
+            for si, (spos, self_cid) in enumerate(slot_entries):
+                _, _sci1, _sci2, scj1, _scj2 = expanded[spos]
+                target_node = target[scj1]
+                slot_origin = expanded_origin[spos]
+                wants_code = prefer_code_line and self._target_wants_code_line(target_node)
+                for ci, cid in enumerate(candidates):
+                    candidate_node = current[_current_index(cid)]
+                    score = self._structural_score(candidate_node, target_node)
+                    if (
+                        wants_code
+                        and isinstance(candidate_node, DocsParagraphNode)
+                        and self._is_code_line(candidate_node)
+                    ):
+                        score += _CODE_LINE_PREFERENCE_BONUS
+                    if score == 0 and cid != self_cid:
+                        # AC6 (issue #52 backlog): a candidate that shares
+                        # nothing structurally with this slot's target — not
+                        # even coincidentally, since `_structural_score` is 0
+                        # only when style, heading-ness, and list-item-ness
+                        # *all* differ — is excluded from competing for this
+                        # slot. Without this, a `_content_key` group with
+                        # exactly one slot and one candidate coalesces them
+                        # unconditionally (no rejection floor previously
+                        # existed), so a genuinely deleted node and an
+                        # unrelated inserted node sharing text (e.g. "TODO")
+                        # get merged into a false in-place restyle purely by
+                        # coincidence, with the widened whole-document pool
+                        # giving them a chance to meet at all. A slot's own
+                        # pre-existing candidate (`cid == self_cid`) is never
+                        # excluded here — that pairing already exists
+                        # upstream (a real content-matched restyle can
+                        # legitimately change style, heading-ness, and
+                        # list-item-ness all at once, scoring 0 despite being
+                        # correct) and losing it here would falsely turn it
+                        # into a spurious delete+insert.
+                        continue
+                    same_origin = _candidate_origin(cid) == slot_origin
+                    pair_scores.append(
+                        (same_origin, score, cid == self_cid, si, ci, spos, self_cid, cid)
+                    )
+            # A candidate from the *same* original (pre-repair) opcode as the
+            # slot is preferred outright over one from elsewhere, even if the
+            # elsewhere one scores higher on style/heading/list-item alone —
+            # see the docstring's "closer" note. Without this, pooling
+            # globally lets an unrelated node from a totally different edit
+            # win a slot away from the correct same-run candidate whenever
+            # `_structural_score`'s crude heuristic happens to favor it (e.g.
+            # a coincidental raw-style match beating a real is_list_item
+            # match). Only when nothing in the slot's own run shares the
+            # content key does this fall through to the global pool.
+            #
+            # `prefer_code_line`'s single whole-document call passes a
+            # distinct origin per entry (it has no pre-repair-run concept),
+            # so `same_origin` there only ever means "is this the slot's own
+            # existing candidate" — always true for a self-pair. Ranking
+            # that ahead of score would make the `_CODE_LINE_PREFERENCE_BONUS`
+            # above pointless, since the prose node's self-pair would always
+            # outrank the real code-rendered candidate. So this call skips
+            # the same_origin tier and ranks by score alone.
+            if prefer_code_line:
+                pair_scores.sort(key=lambda t: (-t[1], 0 if t[2] else 1, t[3], t[4]))
+            else:
+                pair_scores.sort(
+                    key=lambda t: (0 if t[0] else 1, -t[1], 0 if t[2] else 1, t[3], t[4])
+                )
 
-            assigned_candidate_for: Dict[Tuple, Tuple] = {}
+            assigned_candidate_for: Dict[int, Tuple] = {}
             chosen_candidates = set()
-            for _score, _self_pair, _si, _ci, sid, cid in pair_scores:
-                if sid in assigned_candidate_for or cid in chosen_candidates:
+            for _same_origin, _score, _self_pair, _si, _ci, spos, _self_cid, cid in pair_scores:
+                if spos in assigned_candidate_for or cid in chosen_candidates:
                     continue
-                assigned_candidate_for[sid] = cid
+                assigned_candidate_for[spos] = cid
                 chosen_candidates.add(cid)
 
-            for sid, cid in assigned_candidate_for.items():
-                if cid == sid:
+            # Snapshot each slot's target range before mutating `expanded`.
+            # A slot position can *also* be another slot's winning "pos"
+            # candidate (every singleton "equal" entry is registered as both
+            # a slot and a candidate) — e.g. a genuine two-way swap where
+            # slot A's winner is slot B's own node and vice versa. Re-reading
+            # `expanded[spos]` inside this loop, after an earlier iteration
+            # may have already overwritten it via the `expanded[cid[1]] = `
+            # assignment below, silently swapped in the wrong target range
+            # and dropped one target index while duplicating another —
+            # verified by direct repro before this snapshot was added.
+            slot_target_range = {spos: (expanded[spos][3], expanded[spos][4]) for spos, _ in slot_entries}
+
+            for spos, self_cid in slot_entries:
+                winning_cid = assigned_candidate_for.get(spos)
+                if winning_cid is None or winning_cid == self_cid:
                     continue
-                scj1, scj2 = slot_targets[sid]
-                if cid[0] == "pos":
-                    _, cci1, cci2, _, _ = expanded[cid[1]]
-                    expanded[cid[1]] = ("equal", cci1, cci2, scj1, scj2)
+                scj1, scj2 = slot_target_range[spos]
+                if winning_cid[0] == "pos":
+                    _, cci1, cci2, _, _ = expanded[winning_cid[1]]
+                    expanded[winning_cid[1]] = ("equal", cci1, cci2, scj1, scj2)
                 else:
-                    _, rpos, idx = cid
+                    _, rpos, idx = winning_cid
                     extractions.setdefault(rpos, {})[idx] = (scj1, scj2)
+                if self_cid is None:
+                    satisfied_inserts.add(spos)
 
-            for sid in slot_ids:
-                if sid not in chosen_candidates:
-                    _, sci1, sci2, scj1, _scj2 = expanded[sid[1]]
-                    expanded[sid[1]] = ("delete", sci1, sci2, scj1, scj1)
+            # Two independent things can go wrong for a slot that did not
+            # keep its own self-candidate (cid != self_cid above), and they
+            # must be handled separately rather than conflated into one
+            # "becomes a delete" fallback:
+            #
+            #  1. The slot's own *target* range (`spos`) may have won no
+            #     candidate at all (`assigned_candidate_for.get(spos) is
+            #     None`). That target still needs a home. Usually it's
+            #     still sitting untouched in `expanded[spos]` — but `spos`
+            #     doubles as a *candidate id* too (every singleton "equal"
+            #     slot is also its own self-candidate), so a *different*
+            #     slot can have already overwritten `expanded[spos]` via
+            #     the `expanded[cid[1]] = ...` mutation above, when this
+            #     slot's own current node won that other slot's target
+            #     instead. In that case the target range computed here
+            #     would silently vanish unless re-exposed as a fresh
+            #     standalone "insert" — this is the second instance of the
+            #     "shared mutable state across a greedy per-key assignment"
+            #     bug class (the first was the stale-read fixed by the
+            #     snapshot above, in 511bd0d/bdb311c), so use the same
+            #     pre-mutation snapshot rather than re-reading `expanded`.
+            #  2. The slot's own *current node* (`self_cid`) may not have
+            #     been claimed by anyone (`self_cid not in
+            #     chosen_candidates`) — genuinely surplus, so it becomes a
+            #     delete. Standalone "insert" slots (`self_cid is None`)
+            #     have no current node to dispose of.
+            #
+            # These two facts are independent: a slot can need both (its
+            # current node deleted *and* its target range re-inserted), or
+            # just one (its current node reassigned to fill someone else's
+            # slot, but its own target range still needs (1)).
+            for spos, self_cid in slot_entries:
+                winning_cid = assigned_candidate_for.get(spos)
+                if winning_cid == self_cid:
+                    continue
+                if self_cid is None:
+                    # Standalone "insert" slot, left unclaimed: stays
+                    # "insert" (nothing regresses over the old behavior).
+                    continue
+                scj1, scj2 = slot_target_range[spos]
+                if winning_cid is None:
+                    new_inserts.append((expanded[spos][1], scj1, scj2))
+                if self_cid not in chosen_candidates:
+                    _, sci1, sci2, _, _ = expanded[spos]
+                    expanded[spos] = ("delete", sci1, sci2, scj1, scj1)
 
-        if not extractions:
-            return expanded
+        expanded.extend(
+            ("insert", anchor, anchor, scj1, scj2) for anchor, scj1, scj2 in new_inserts
+        )
 
-        rebuilt: List[Opcode] = []
-        new_equals: List[Opcode] = []
-        for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
-            claimed = extractions.get(pos)
-            if not claimed:
-                rebuilt.append((tag, ci1, ci2, cj1, cj2))
-                continue
-            for idx, (scj1, scj2) in claimed.items():
-                new_equals.append(("equal", idx, idx + 1, scj1, scj2))
-            remaining = []
-            start = ci1
-            for idx in sorted(claimed):
-                if idx > start:
-                    remaining.append((start, idx))
-                start = idx + 1
-            if start < ci2:
-                remaining.append((start, ci2))
-            if not remaining:
-                rebuilt.append(("insert", ci1, ci1, cj1, cj2))
-            else:
-                (first_start, first_end), *rest = remaining
-                rebuilt.append(("replace", first_start, first_end, cj1, cj2))
-                for start, end in rest:
-                    rebuilt.append(("delete", start, end, cj1, cj1))
-        rebuilt.extend(new_equals)
+        if extractions or satisfied_inserts:
+            rebuilt: List[Opcode] = []
+            new_equals: List[Opcode] = []
+            for pos, (tag, ci1, ci2, cj1, cj2) in enumerate(expanded):
+                if pos in satisfied_inserts:
+                    continue
+                claimed = extractions.get(pos)
+                if not claimed:
+                    rebuilt.append((tag, ci1, ci2, cj1, cj2))
+                    continue
+                for idx, (scj1, scj2) in claimed.items():
+                    new_equals.append(("equal", idx, idx + 1, scj1, scj2))
+                remaining = []
+                start = ci1
+                for idx in sorted(claimed):
+                    if idx > start:
+                        remaining.append((start, idx))
+                    start = idx + 1
+                if start < ci2:
+                    remaining.append((start, ci2))
+                if not remaining:
+                    rebuilt.append(("insert", ci1, ci1, cj1, cj2))
+                else:
+                    (first_start, first_end), *rest = remaining
+                    rebuilt.append(("replace", first_start, first_end, cj1, cj2))
+                    for start, end in rest:
+                        rebuilt.append(("delete", start, end, cj1, cj1))
+            rebuilt.extend(new_equals)
+        else:
+            rebuilt = expanded
+
+        # Invariant: this function only ever reassigns which current index
+        # a given target range maps to (see docstring) — it must never drop
+        # or duplicate a target index. Cheap to check unconditionally, and
+        # this exact bug class (a slot's target silently swallowed by
+        # another slot's mutation) has now recurred once already, so make a
+        # future regression fail loudly here instead of surfacing as a
+        # missing paragraph downstream. Checked against the actual return
+        # value (post `extractions`/`satisfied_inserts` rebuild) rather than
+        # the intermediate `expanded` list — a target range that a
+        # `replace`-interior candidate won is legitimately absent from
+        # `expanded` at that point (it lives in `extractions` until the
+        # rebuild below re-homes it as a fresh "equal"), so asserting on
+        # `expanded` mid-rebuild produced false-positive failures.
+        final_targets = self._covered_target_indices(rebuilt)
+        assert final_targets == original_targets, (
+            "_prefer_structural_pairing dropped or duplicated target "
+            f"indices: missing={sorted(original_targets - final_targets)} "
+            f"extra={sorted(final_targets - original_targets)}"
+        )
+
         return rebuilt
 
     @staticmethod
@@ -527,7 +1007,7 @@ class DocsRequestBuilder:
         entries: List[DiffEntry] = []
         unchanged_count = 0
 
-        for tag, i1, i2, j1, j2 in self._opcodes(current, target):
+        for edit_group, (tag, i1, i2, j1, j2) in enumerate(self._opcodes(current, target)):
             if tag == "equal":
                 # "equal" means equal *text*: `_node_key` includes style and
                 # bullet, so a restyle lands in a `replace` run, and `_repair`
@@ -548,6 +1028,7 @@ class DocsRequestBuilder:
                                 current_is_native_checkbox=_node_is_native_checkbox(
                                     current[ci]
                                 ),
+                                edit_group=edit_group,
                             )
                         )
                     else:
@@ -562,6 +1043,7 @@ class DocsRequestBuilder:
                             target_text=None,
                             style=_node_style(node),
                             current_is_native_checkbox=_node_is_native_checkbox(node),
+                            edit_group=edit_group,
                         )
                     )
 
@@ -573,6 +1055,7 @@ class DocsRequestBuilder:
                             current_text=None,
                             target_text=_node_text(node),
                             style=_node_style(node),
+                            edit_group=edit_group,
                         )
                     )
 
@@ -588,6 +1071,7 @@ class DocsRequestBuilder:
                             target_text=_node_text(tgt_node),
                             style=_node_style(cur_node),
                             current_is_native_checkbox=_node_is_native_checkbox(cur_node),
+                            edit_group=edit_group,
                         )
                     )
                 # Length mismatch (e.g. one checklist line split into two) —
@@ -601,6 +1085,7 @@ class DocsRequestBuilder:
                             target_text=None,
                             style=_node_style(extra_cur),
                             current_is_native_checkbox=_node_is_native_checkbox(extra_cur),
+                            edit_group=edit_group,
                         )
                     )
                 for extra_tgt in tgt_slice[common:]:
@@ -610,6 +1095,7 @@ class DocsRequestBuilder:
                             current_text=None,
                             target_text=_node_text(extra_tgt),
                             style=_node_style(extra_tgt),
+                            edit_group=edit_group,
                         )
                     )
 
@@ -643,13 +1129,25 @@ class DocsRequestBuilder:
         """
         opcodes = self._opcodes(current, target)
 
-        # (anchor_index, requests) — the requests for one node or one insert
-        # group, and the document index they are all written against.
+        # (anchor_index, is_insert, requests) — the requests for one node or
+        # one insert group, the document index they are all written against,
+        # and whether this group is an insert (vs. a restyle/delete against
+        # pre-existing content).
         #
         # Ordering rule, stated once here because getting it wrong is silent:
         # groups are applied highest-anchor-first (so every edit runs against
-        # coordinates nothing has shifted yet), and within a group in emission
-        # order (so an insert precedes the styling of what it inserted).
+        # coordinates nothing has shifted yet). Within a *tied* anchor,
+        # non-insert groups (equal-restyle, delete) go first and insert
+        # groups go last: every non-insert group's range was computed from
+        # `current[...].start_index`, a pre-insert coordinate, so an insert
+        # sharing that anchor must not run first — it would shift the range
+        # out from under the paragraph it was meant for, corrupting whichever
+        # node happens to land in the old range instead (e.g. #42: a live
+        # heading demoted and the new paragraph promoted in its place, or a
+        # bullet request landing on the wrong paragraph). The `replace`
+        # opcode's delete-then-insert pair already got this right by
+        # emission order alone; `is_insert` makes that same rule explicit
+        # and general instead of accidental.
         #
         # This used to be one flat sort over every request's own startIndex,
         # which is only equivalent while every request in a group shares the
@@ -658,20 +1156,20 @@ class DocsRequestBuilder:
         # carried a higher startIndex than the insertText it depends on and
         # sorted ahead of it — a style request against a range that did not
         # exist yet. The anchor is now carried explicitly instead of inferred.
-        groups: List[Tuple[int, List[dict]]] = []
+        groups: List[Tuple[int, int, List[dict]]] = []
 
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == "equal":
                 for ci, ti in zip(range(i1, i2), range(j1, j2)):
                     requests = self._make_style_update_requests(current[ci], target[ti])
                     if requests:
-                        groups.append((current[ci].start_index, requests))
+                        groups.append((current[ci].start_index, 0, requests))
 
             elif tag == "delete":
                 for node in current[i1:i2]:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
-                        groups.append((node.start_index, requests))
+                        groups.append((node.start_index, 0, requests))
 
             elif tag == "insert":
                 previous = current[i1 - 1] if i1 > 0 else None
@@ -713,14 +1211,14 @@ class DocsRequestBuilder:
                     before_newline=at_body_end or before_boundary,
                 )
                 if requests:
-                    groups.append((insert_at, requests))
+                    groups.append((insert_at, 1, requests))
 
             elif tag == "replace":
                 delete_start = current[i1].start_index
                 for node in current[i1:i2]:
                     requests = self._make_delete_requests([node], doc_end_index)
                     if requests:
-                        groups.append((node.start_index, requests))
+                        groups.append((node.start_index, 0, requests))
                 # render_prefix and precedes_structural_element both stop the
                 # last deleted node's delete range short of a newline that
                 # belongs to something else — chrome shared with a following
@@ -737,39 +1235,59 @@ class DocsRequestBuilder:
                 # of the one just protected, splitting the paragraph and
                 # leaving a stray empty one behind on every such edit (#56).
                 #
-                # KNOWN LIMITATION (pre-existing, not introduced here): the
-                # doc_end_index clamp in _delete_bounds also spares a
+                # The doc_end_index clamp in _delete_bounds also spares a
                 # newline — the paragraph's own terminator — when the
-                # deleted range ends at the document's last paragraph, but
-                # that case isn't checked here. A normal `text + "\n"`
-                # insert does NOT recreate the original state in that case;
-                # it duplicates the clamp-spared newline and leaves a stray
-                # blank paragraph behind. `before_newline=True` isn't a fix
-                # either — it would prepend a blank paragraph in front of
-                # that newline instead. Properly handling this needs a
-                # third insert-text mode (bare text, no newline) that this
-                # branch doesn't have yet. See #62.
+                # deleted range ends at the document's last paragraph.
+                # Unlike the render_prefix/structural cases above, there is
+                # no following paragraph to open: the spared newline is the
+                # last node's own terminator, so the replacement text goes
+                # in bare, with no newline on either side (#62). This is
+                # checked only when `spares_structural_newline` above is
+                # False — a node can in principle satisfy both (a
+                # render-glyph paragraph that also happens to be the doc's
+                # last paragraph), and the leading-newline mode already has
+                # passing coverage for that case.
+                #
+                # `last_bounds.start < last_bounds.end` excludes the #21
+                # masking case: when `last` is already the doc's empty
+                # terminal placeholder paragraph (nothing left to delete —
+                # start == end after the clamp), the spared "newline" is
+                # that placeholder's *entire* content. Bare mode there would
+                # glue the new text onto that untouched terminator instead
+                # of opening a fresh paragraph in front of it, collapsing
+                # the trailing blank paragraph every doc must keep.
                 last = current[i2 - 1]
-                spares_newline = isinstance(last, DocsParagraphNode) and (
+                spares_structural_newline = isinstance(last, DocsParagraphNode) and (
                     bool(last.render_prefix) or last.precedes_structural_element
                 )
+                last_bounds = self._delete_bounds(last, doc_end_index)
+                doc_end_clamped = (
+                    not spares_structural_newline
+                    and last_bounds.doc_end_clamped
+                    and last_bounds.start < last_bounds.end
+                )
                 requests = self._make_insert_requests(
-                    target[j1:j2], delete_start, before_newline=spares_newline
+                    target[j1:j2],
+                    delete_start,
+                    before_newline=spares_structural_newline,
+                    bare_last=doc_end_clamped,
                 )
                 if requests:
-                    # Same anchor as the first deleted node's group, and emitted
-                    # after it, so the delete runs before the insert that
-                    # replaces it.
-                    groups.append((delete_start, requests))
+                    # Same anchor as the first deleted node's group. is_insert=1
+                    # places it after that delete group in the sort below, so
+                    # the delete still runs before the insert that replaces it.
+                    groups.append((delete_start, 1, requests))
 
-        # Stable, so groups sharing an anchor keep the order above.
-        groups.sort(key=lambda group: group[0], reverse=True)
-        all_requests = [request for _anchor, requests in groups for request in requests]
+        # Descending by anchor so later edits never shift an earlier one's
+        # coordinates; at a tied anchor, non-insert groups (is_insert=0)
+        # before insert groups (is_insert=1) — see the comment above.
+        groups.sort(key=lambda group: (-group[0], group[1]))
+        all_requests = [request for _anchor, _is_insert, requests in groups for request in requests]
         self._inject_tab_id(all_requests, tab_id)
         return all_requests
 
     @staticmethod
-    def _delete_bounds(node: Node, doc_end_index: int) -> Tuple[int, int, bool]:
+    def _delete_bounds(node: Node, doc_end_index: int) -> DeleteBounds:
         """The range a node's deleteContentRange may actually cover, and whether it was trimmed.
 
         Single source of truth for the two undeletable-newline rules described
@@ -815,39 +1333,44 @@ class DocsRequestBuilder:
         elif isinstance(node, DocsParagraphNode) and node.precedes_structural_element:
             end -= 1
             trimmed = True
+        doc_end_clamped = False
         if end >= doc_end_index:
             end = doc_end_index - 1
             trimmed = True
-        return start, end, trimmed
+            doc_end_clamped = True
+        return DeleteBounds(start, end, trimmed, doc_end_clamped)
 
     # ──────────────────────────────────────────────
     # Pass 2 — fill table cells from a re-fetched doc
     # ──────────────────────────────────────────────
 
-    def build_table_fill_requests(self, doc: dict, target: List[Node]) -> List[dict]:
+    def build_table_fill_requests(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
         """
         Emit insertText requests to fill empty tables created by a prior push (pass 1).
 
-        Matches the empty tables in the re-fetched document (in document order) to the
-        DocsTableNodes in ``target`` (in order), reading real cell indices from ``doc`` so
-        no index prediction is required.
+        Pairs live tables with ``target`` DocsTableNodes via `_paired_tables` — the
+        same content-aligned, document-order pairing `build_table_cell_span_requests`
+        uses — then reads real cell indices from ``doc`` so no index prediction is
+        required. A live table that pairs but is not empty (already populated by an
+        earlier push) is skipped for insertion, but still consumes its pairing slot,
+        so a mix of populated and empty tables cannot shift a later table onto the
+        wrong target.
         """
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
 
+        aligned = self._aligned(doc, target, alignment)
         inserts: List[Tuple[int, str]] = []
-        ti = 0
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is None:
-                continue
+        for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             if not self._table_is_empty(table):
                 continue  # already populated (or a pre-existing content table)
-            if ti >= len(target_tables):
-                break
-            inserts.extend(self._cell_inserts(table, target_tables[ti]))
-            ti += 1
+            inserts.extend(self._cell_inserts(table, tnode))
 
         # Insert highest index first so earlier inserts don't shift later cell indices.
         inserts.sort(key=lambda pair: pair[0], reverse=True)
@@ -862,6 +1385,8 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for inline styling inside table cells.
 
@@ -887,7 +1412,7 @@ class DocsRequestBuilder:
 
         aligned = self._aligned(doc, target, alignment)
         requests: List[dict] = []
-        for table, tnode in self._paired_tables(doc, target_tables):
+        for table, tnode in self._paired_tables(doc, aligned.table_pairs):
             for live, cell in self._paired_cells(table, tnode):
                 if not cell.styled:
                     continue
@@ -897,6 +1422,7 @@ class DocsRequestBuilder:
                 start, limit = placed
                 requests.extend(self._span_requests_in(
                     cell.spans, start, limit, aligned.slug_to_id, aligned.known_ids,
+                    resolver, local_path,
                 ))
         return requests
 
@@ -936,10 +1462,11 @@ class DocsRequestBuilder:
         target_tables = [n for n in target if isinstance(n, DocsTableNode)]
         if not target_tables:
             return []
-        live_tables = self._live_tables(doc, len(target_tables))
+        aligned = self._aligned(doc, target, alignment)
         missed: List[str] = []
-        for position, tnode in enumerate(target_tables):
-            table = live_tables[position] if position < len(live_tables) else None
+        paired = {id(tnode): table for table, tnode in self._paired_tables(doc, aligned.table_pairs)}
+        for tnode in target_tables:
+            table = paired.get(id(tnode))
             rows = table.get("tableRows", []) if table else []
             for r, row in enumerate(tnode.rows):
                 live_cells = rows[r].get("tableCells", []) if r < len(rows) else []
@@ -966,50 +1493,37 @@ class DocsRequestBuilder:
         return missed
 
     @staticmethod
-    def _live_tables(doc: dict, limit: int) -> List[dict]:
-        """The first `limit` tables in body order — the pairing both cell passes use."""
-        tables: List[dict] = []
-        if limit <= 0:
-            return tables
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is not None:
-                tables.append(table)
-                if len(tables) >= limit:
-                    break
-        return tables
-
-    @staticmethod
     def _paired_tables(
-        doc: dict, target_tables: List[DocsTableNode]
+        doc: dict, table_pairs: List[Tuple[int, DocsTableNode]]
     ) -> Iterator[Tuple[dict, DocsTableNode]]:
-        """Live tables paired with target tables, in document order.
+        """Live tables paired with target tables via `_align_for_styling`'s content alignment.
 
-        Order is the only correspondence available: a table has no id, and
-        `_align_for_styling` keys a table on its whole cell grid, so a table whose
-        cells changed does not align at all.
+        The single pairing shared by `build_table_fill_requests` and
+        `build_table_cell_span_requests` — both used to compute their own
+        (one advancing only past *empty* live tables, the other advancing
+        unconditionally), which meant a live table's fill and its styling
+        could disagree about which target table it corresponded to. `doc` is
+        walked here, rather than in `_align_for_styling`, because
+        `table_pairs`' ordinals are positions among tables in the *parsed*
+        `current` list, and only the raw API dicts in `_body_content(doc)`
+        carry the real cell indices `_cell_inserts`/`_table_is_empty`/
+        `_cell_placement` need.
 
-        This is **not** the same pairing `build_table_fill_requests` uses — that one
-        advances only past *empty* live tables, so it pairs the Nth empty table with
-        the Nth target table. This pairs the Nth table outright, because by the time
-        styling runs pass 1 has filled them and "empty" no longer identifies them.
-
-        Raw body position is weaker than the content alignment
-        `build_span_style_requests` uses for paragraphs, and the gap is real: if a
-        concurrent edit adds a table between pass 1 and pass 2 the counts shift and a
-        stale table can be styled. `_cell_placement`'s text search catches that only
-        when the two tables' cell texts differ, and headers like "Status" or "Owner"
-        repeat constantly. Narrow, but the same window `_cell_placement` bails on.
+        A table has no id, and `_align_for_styling` keys every table on one
+        sentinel (`_alignment_key`), so within a content-aligned "equal" run
+        tables still pair by relative order — but that order now tracks
+        paragraphs difflib finds inserted or removed around a table, unlike
+        raw body position, which the previous version of this method used and
+        which drifts whenever a concurrent edit shifts table counts between
+        pass 1 and pass 2.
         """
-        index = 0
-        for element in _body_content(doc):
-            table = element.get("table")
-            if table is None:
+        live_tables = [
+            element["table"] for element in _body_content(doc) if element.get("table") is not None
+        ]
+        for ordinal, tnode in table_pairs:
+            if ordinal >= len(live_tables):
                 continue
-            if index >= len(target_tables):
-                return
-            yield table, target_tables[index]
-            index += 1
+            yield live_tables[ordinal], tnode
 
     @staticmethod
     def _paired_cells(
@@ -1089,12 +1603,15 @@ class DocsRequestBuilder:
         accepts ``alignment=None`` and computes its own, so a caller with only a
         document and a target — every existing test — keeps working.
         """
-        current, pairs, unaligned, heading_pairs, residue = self._align_for_styling(doc, target)
+        current, pairs, unaligned, heading_pairs, residue, table_pairs = (
+            self._align_for_styling(doc, target)
+        )
         slug_to_id, known_ids = self._anchor_resolution(current, target, heading_pairs)
         return Pass2Alignment(
             current=current,
             pairs=pairs,
             unaligned=unaligned,
+            table_pairs=table_pairs,
             slug_to_id=slug_to_id,
             known_ids=known_ids,
             residue=residue,
@@ -1110,6 +1627,8 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """
         Emit updateTextStyle requests for inline styling (links/bold/italic/monospace).
@@ -1125,7 +1644,9 @@ class DocsRequestBuilder:
         pairs, slug_to_id, known_ids = aligned.pairs, aligned.slug_to_id, aligned.known_ids
         requests: List[dict] = []
         for cnode, tnode in pairs:
-            requests.extend(self._span_style_requests(tnode, cnode, slug_to_id, known_ids))
+            requests.extend(self._span_style_requests(
+                tnode, cnode, slug_to_id, known_ids, resolver, local_path,
+            ))
         return requests
 
     def unaligned_span_targets(
@@ -1226,6 +1747,51 @@ class DocsRequestBuilder:
                         collect(cell.spans)
         return unresolved
 
+    def cross_doc_link_issues(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
+    ) -> List[str]:
+        """Cross-document links pass 2 could not resolve, as human-readable detail strings.
+
+        Parallel to unresolved_anchor_links() for same-document `#fragment`
+        anchors, but a cross-doc failure's cause (ambiguous mapping,
+        unsupported target, fetch failure, missing heading) differs by kind
+        and `cross_doc_links.CrossDocResolution` already carries that detail,
+        so this returns the detail strings directly rather than bare hrefs.
+        """
+        if resolver is None or local_path is None:
+            return []
+        styled_paragraph = any(isinstance(n, DocsParagraphNode) and n.spans for n in target)
+        styled_cell = any(cell.styled for n in target if isinstance(n, DocsTableNode)
+                          for row in n.rows for cell in row)
+        if not styled_paragraph and not styled_cell:
+            return []
+        aligned = self._aligned(doc, target, alignment)
+        issues: List[str] = []
+
+        def collect(spans: List[TextSpan]) -> None:
+            for span in spans:
+                if not span.link:
+                    continue
+                _payload, detail = cross_doc_links.link_payload(
+                    span.link, local_path, resolver, aligned.slug_to_id, aligned.known_ids,
+                )
+                if detail is not None and detail not in issues:
+                    issues.append(detail)
+
+        for _cnode, tnode in aligned.pairs:
+            collect(tnode.spans)
+        for node in target:
+            if isinstance(node, DocsTableNode):
+                for row in node.rows:
+                    for cell in row:
+                        collect(cell.spans)
+        return issues
+
     @staticmethod
     def _spans_overflow(node: DocsParagraphNode, placement: DocsParagraphNode) -> bool:
         """True when ``node``'s spans cannot all fit inside ``placement``'s text.
@@ -1276,14 +1842,31 @@ class DocsRequestBuilder:
         List[DocsParagraphNode],
         List[Tuple[DocsParagraphNode, DocsParagraphNode]],
         List[Residue],
+        List[Tuple[int, DocsTableNode]],
     ]:
         """Pair re-fetched document nodes with ``target`` nodes for pass-2 styling.
 
-        Returns ``(current, pairs, unaligned, heading_pairs, residue)`` — the
-        parsed document, pairs of (document node, target node) that are safe to
-        style, the target paragraphs with spans that could not be paired, the
-        same pairing restricted to target paragraphs that are headings, and any
-        residue from projecting this second, post-pass-1 parse of the document.
+        Returns ``(current, pairs, unaligned, heading_pairs, residue,
+        table_pairs)`` — the parsed document, pairs of (document node, target
+        node) that are safe to style, the target paragraphs with spans that
+        could not be paired, the same pairing restricted to target paragraphs
+        that are headings, any residue from projecting this second, post-pass-1
+        parse of the document, and the table pairing described below.
+
+        ``table_pairs`` pairs a *live table ordinal* (its position among only
+        the tables in ``current``, 0-based) with a target ``DocsTableNode``.
+        An ordinal rather than the parsed ``DocsTableNode`` itself, because
+        every table consumer (`_table_is_empty`, `_cell_inserts`,
+        `_cell_placement`) needs the raw API dict from the re-fetched ``doc``,
+        which `current` does not carry — the ordinal is what lets a caller find
+        that dict back in `_body_content(doc)`. `_alignment_key` collapses
+        every table to one sentinel key (see its docstring), so within a
+        difflib "equal" run tables pair by position exactly like duplicate
+        paragraph text does: order-preserving, but blind to which table's
+        *cells* actually match. That is still strictly better than raw body
+        position for this purpose, because it tracks paragraphs inserted or
+        removed around a table rather than assuming the table's index in the
+        body is stable.
 
         ``current`` is returned rather than re-parsed by callers because parsing
         a large document twice per push to learn the same thing is pure cost.
@@ -1356,24 +1939,37 @@ class DocsRequestBuilder:
         # docstring) — it must reach the caller the same way the identical
         # residue kind on the original doc parse reaches plan.residue.
         current, current_residue = project(DocsStructureParser().parse(doc))
-        matcher = difflib.SequenceMatcher(
-            None,
+        opcodes = _bounded_opcodes(
             [self._alignment_key(n) for n in current],
             [self._alignment_key(n) for n in target],
-            autojunk=False,
+            context="pass-2 styling",
         )
+
+        # Ordinal of each table's position in `current`, among tables only —
+        # what `table_pairs` reports instead of the parsed DocsTableNode, since
+        # downstream table consumers need the raw dict at that ordinal in
+        # `_body_content(doc)`, not the parsed node.
+        table_ordinals: Dict[int, int] = {}
+        table_count = 0
+        for ci, node in enumerate(current):
+            if isinstance(node, DocsTableNode):
+                table_ordinals[ci] = table_count
+                table_count += 1
 
         pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
         heading_pairs: List[Tuple[DocsParagraphNode, DocsParagraphNode]] = []
+        table_pairs: List[Tuple[int, DocsTableNode]] = []
         aligned_target_indices = set()
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for tag, i1, i2, j1, j2 in opcodes:
             if tag != "equal":
                 continue
             for ci, ti in zip(range(i1, i2), range(j1, j2)):
                 cnode, tnode = current[ci], target[ti]
-                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
-                    continue
                 aligned_target_indices.add(ti)
+                if isinstance(cnode, DocsTableNode) or isinstance(tnode, DocsTableNode):
+                    if isinstance(cnode, DocsTableNode) and isinstance(tnode, DocsTableNode):
+                        table_pairs.append((table_ordinals[ci], tnode))
+                    continue
                 if tnode.spans:
                     pairs.append((cnode, tnode))
                 if is_heading_style(tnode.style):
@@ -1386,7 +1982,7 @@ class DocsRequestBuilder:
             and node.spans
             and index not in aligned_target_indices
         ]
-        return current, pairs, unaligned, heading_pairs, current_residue
+        return current, pairs, unaligned, heading_pairs, current_residue, table_pairs
 
     def _anchor_resolution(
         self, current: List[Node], target: List[Node],
@@ -1535,6 +2131,8 @@ class DocsRequestBuilder:
         target: List[Node],
         tab_id: Optional[str] = None,
         alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """
         Combined pass-2 requests: table cell fills + inline text styling.
@@ -1550,8 +2148,8 @@ class DocsRequestBuilder:
                 the right tab's content; this parameter only affects which
                 tab the *requests* are addressed to.
         """
-        requests = self.build_table_fill_requests(doc, target)
-        requests += self.build_span_style_requests(doc, target, alignment)
+        requests = self.build_table_fill_requests(doc, target, alignment)
+        requests += self.build_span_style_requests(doc, target, alignment, resolver, local_path)
         # Cell styling reads indices from `doc`, i.e. from *before* the fills above
         # are applied. A table that already holds its text — every table on a
         # second or later push — is placed correctly. A table this push is
@@ -1561,7 +2159,7 @@ class DocsRequestBuilder:
         # brand-new table's cells needs the post-fill index, which is predictable
         # but is index arithmetic that has to be verified by replay, not reasoned
         # about — left for its own change.
-        requests += self.build_table_cell_span_requests(doc, target, alignment)
+        requests += self.build_table_cell_span_requests(doc, target, alignment, resolver, local_path)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
         return requests
@@ -1639,18 +2237,18 @@ class DocsRequestBuilder:
         """
         requests = []
         for node in nodes:
-            start, end, trimmed = self._delete_bounds(node, doc_end_index)
-            if start >= end:
+            bounds = self._delete_bounds(node, doc_end_index)
+            if bounds.start >= bounds.end:
                 # Nothing left to delete — an already-empty paragraph pinned by
                 # a boundary or by the body's terminal newline. Emitting the
                 # normalisation alone would make every push rewrite a paragraph
                 # it can never remove, so push would never be idempotent.
                 continue
-            if trimmed and isinstance(node, DocsParagraphNode):
+            if bounds.trimmed and isinstance(node, DocsParagraphNode):
                 requests.extend(self._residue_normalize_requests(node))
             requests.append({
                 "deleteContentRange": {
-                    "range": {"startIndex": start, "endIndex": end}
+                    "range": {"startIndex": bounds.start, "endIndex": bounds.end}
                 }
             })
         return requests
@@ -1689,7 +2287,11 @@ class DocsRequestBuilder:
         return requests
 
     def _make_insert_requests(
-        self, nodes: List[Node], insert_at_index: int, before_newline: bool = False
+        self,
+        nodes: List[Node],
+        insert_at_index: int,
+        before_newline: bool = False,
+        bare_last: bool = False,
     ) -> List[dict]:
         """
         Emit insert requests per node.
@@ -1726,7 +2328,22 @@ class DocsRequestBuilder:
         which is what the ``+ 1`` below accounts for. Without it the
         updateParagraphStyle range begins on the preceding paragraph's newline
         and Docs applies namedStyleType to both paragraphs.
+
+        ``bare_last`` is the mirror case: ``insert_at_index`` sits on a newline
+        that terminates the *inserted* text rather than the preceding one — the
+        deleted range's own terminal newline, spared by the doc_end_index clamp
+        in ``_delete_bounds`` because it is undeletable. Writing either
+        ``"text\\n"`` or ``"\\ntext"`` there would duplicate that newline; the
+        text must go in bare, with no newline on either side, so the
+        clamp-spared newline is reused as the new text's own terminator. It
+        only ever applies to the last of ``nodes`` (the one bordering that
+        clamp-spared newline once all nodes have been inserted) — earlier
+        nodes in a multi-node replace are still followed by more inserted
+        text, not by the spared newline, so they keep their own trailing
+        ``"\\n"``. Mutually exclusive with ``before_newline``: both describe
+        the same insert point, and only one boundary condition can hold.
         """
+        assert not (before_newline and bare_last)
         requests: List[dict] = []
         for node in reversed(nodes):
             if isinstance(node, DocsTableNode):
@@ -1739,14 +2356,21 @@ class DocsRequestBuilder:
                 })
                 continue
 
-            # The paragraph's own text always ends up as node.text + "\n"; only
-            # which side of it carries the newline in the insert differs.
-            text = "\n" + node.text if before_newline else node.text + "\n"
+            is_bare = bare_last and node is nodes[-1]
+            # The paragraph's own text always ends up as node.text + "\n",
+            # except in bare mode, where the trailing "\n" already exists at
+            # the insert point and must not be duplicated.
+            if is_bare:
+                text = node.text
+            elif before_newline:
+                text = "\n" + node.text
+            else:
+                text = node.text + "\n"
             requests.append({
                 "insertText": {"location": {"index": insert_at_index}, "text": text}
             })
             paragraph_start = insert_at_index + 1 if before_newline else insert_at_index
-            text_len = _utf16_len(node.text + "\n")
+            text_len = _utf16_len(node.text) if is_bare else _utf16_len(node.text + "\n")
             paragraph_range = {
                 "startIndex": paragraph_start,
                 "endIndex": paragraph_start + text_len,
@@ -1795,6 +2419,8 @@ class DocsRequestBuilder:
         placement: DocsParagraphNode,
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """Emit updateTextStyle for each styled span of ``node``, placed inside ``placement``.
 
@@ -1825,6 +2451,8 @@ class DocsRequestBuilder:
             placement.end_index - 1 if placement.end_index else None,
             slug_to_id,
             known_ids,
+            resolver,
+            local_path,
         )
 
     def _span_requests_in(
@@ -1834,6 +2462,8 @@ class DocsRequestBuilder:
         limit: Optional[int],
         slug_to_id: Optional[dict] = None,
         known_ids: Optional[set] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> List[dict]:
         """Place `spans` starting at `start`, never writing at or past `limit`.
 
@@ -1857,7 +2487,9 @@ class DocsRequestBuilder:
             if span.italic:
                 attrs["italic"] = True
             if span.link:
-                payload = link_payload(span.link, slug_to_id, known_ids)
+                payload, _detail = cross_doc_links.link_payload(
+                    span.link, local_path, resolver, slug_to_id, known_ids,
+                )
                 if payload is not None:
                     attrs["link"] = payload
                 # else: the anchor names no heading in the written document, so
