@@ -315,6 +315,33 @@ def _nodes_from_code_block(
     return nodes
 
 
+def _fence_lang(token: dict) -> str:
+    """Return a fenced code block's mistune `attrs.info` (the fence language), stripped."""
+    attrs = token.get("attrs") if isinstance(token, dict) else None
+    return ((attrs or {}).get("info") or "").strip()
+
+
+def _mermaid_image_node(token: dict) -> DocsImageNode:
+    """Build a DocsImageNode carrying a ```mermaid fence's raw diagram text.
+
+    `alt` is synthesized from a content hash rather than left blank: image
+    identity in docs_request_builder.py's diffing is keyed on
+    `(alt, width_pt, height_pt)`, not `src` (which holds a volatile Drive
+    URI) -- so an unchanging hash means an unchanged diagram is recognized
+    as the same image across pushes, and a changed diagram gets a new alt
+    and is correctly treated as a changed image.
+    """
+    import hashlib
+
+    diagram = token.get("raw", "").strip("\n")
+    digest = hashlib.sha256(diagram.encode("utf-8")).hexdigest()[:12]
+    return DocsImageNode(
+        alt=f"mermaid diagram {digest}",
+        start_index=0, end_index=0,
+        mermaid_source=diagram,
+    )
+
+
 def _prefix_node_text(node: DocsParagraphNode, prefix: str) -> DocsParagraphNode:
     """Return a copy of node with prefix prepended to its text and first span.
 
@@ -486,6 +513,8 @@ class CodeTokenConverter(MarkdownTokenConverter):
         # two shapes being identical
         # (`:test_an_unchanged_code_block_emits_nothing`), which is also why
         # a lang-less fence here stays marker-less.
+        if _fence_lang(token) == "mermaid":
+            return [_mermaid_image_node(token)]
         return _nodes_from_code_block(token, emit_language_marker=True)
 
 

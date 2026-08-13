@@ -259,6 +259,11 @@ class DocsImageNode:
     the embeddedObject. `object_id` is the Docs `inlineObjectId`, present only
     when parsed from a live document (pull) — never set on a node built from
     markdown (push), since Docs assigns it on insert.
+
+    `mermaid_source` carries the raw diagram text of a ```mermaid fenced code
+    block through to resolve time (see image_source.py's MermaidSource); it
+    is never set on a node parsed from a live document (pull has no notion of
+    "this image came from a mermaid fence").
     """
     src: str = ""
     alt: str = ""
@@ -267,6 +272,7 @@ class DocsImageNode:
     object_id: Optional[str] = None
     width_pt: Optional[float] = None
     height_pt: Optional[float] = None
+    mermaid_source: Optional[str] = None
 
 
 class DocsStructureParser:

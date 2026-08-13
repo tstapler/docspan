@@ -1,9 +1,10 @@
 """Resolve markdown image references to fetchable URIs for insertInlineImage.
 
 `ImageSource` is a closed union (`LocalPathSource | InMemorySource |
-UrlSource`) so the future mermaid-diagram follow-on can reuse
-`resolve_images()` via `InMemorySource` (rendered bytes, no backing file)
-without any changes here.
+UrlSource | MermaidSource`). `MermaidSource` carries raw diagram text
+rather than pre-rendered bytes so rendering happens lazily in
+`_resolve_one`, behind the same try/except that turns every other
+resolution failure into a push warning instead of a crash.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
+from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError, render_mermaid_png
 
 # Practical ceiling before a raw Drive/Docs API 400 -- see validation.md's
 # "oversized image" edge case.
@@ -52,9 +54,18 @@ class UrlSource:
     url: str
 
 
-ImageSource = Union[LocalPathSource, InMemorySource, UrlSource]
+@dataclass(frozen=True)
+class MermaidSource:
+    """Raw mermaid diagram text, rendered to PNG bytes at resolve time."""
+
+    diagram: str
+
+
+ImageSource = Union[LocalPathSource, InMemorySource, UrlSource, MermaidSource]
 
 Uploader = Callable[[bytes, str, str], Dict[str, str]]
+
+Renderer = Callable[[str], bytes]
 
 
 @dataclass
@@ -99,14 +110,16 @@ def build_source(markdown_path: str, image_ref: str) -> ImageSource:
 
 
 def resolve_images(
-    sources: Dict[str, ImageSource], uploader: Uploader
+    sources: Dict[str, ImageSource], uploader: Uploader, renderer: Optional[Renderer] = None
 ) -> Tuple[Dict[str, ResolvedImage], List[ImageResolutionError]]:
     """Resolve each image source to a URI usable in an insertInlineImage request.
 
     `uploader` matches `GoogleDocsClient.upload_temp_image`'s call shape
     (`(data, filename, mime_type) -> {"file_id", "uri"}`) -- injected rather
     than constructing a client here, so this module is testable without
-    mocking Drive API client construction.
+    mocking Drive API client construction. `renderer` (diagram text -> PNG
+    bytes) defaults to `render_mermaid_png`; tests inject a stub to avoid
+    shelling out to mermaid-cli.
 
     Returns `(resolved, errors)`: resolved sources feed the request builder;
     errors become push residue warnings (never an exception), keyed the same
@@ -116,7 +129,7 @@ def resolve_images(
     errors: List[ImageResolutionError] = []
     for key, source in sources.items():
         try:
-            resolved[key] = _resolve_one(source, uploader)
+            resolved[key] = _resolve_one(source, uploader, renderer or render_mermaid_png)
         except _ResolutionFailure as exc:
             errors.append(ImageResolutionError(key=key, reason=str(exc)))
         except Exception as exc:
@@ -128,7 +141,15 @@ def resolve_images(
     return resolved, errors
 
 
-def _resolve_one(source: ImageSource, uploader: Uploader) -> ResolvedImage:
+def _render_mermaid(source: MermaidSource, renderer: Renderer) -> Tuple[bytes, str]:
+    try:
+        data = renderer(source.diagram)
+    except MermaidRenderError as exc:
+        raise _ResolutionFailure(f"mermaid render failed: {exc}") from exc
+    return data, "diagram.png"
+
+
+def _resolve_one(source: ImageSource, uploader: Uploader, renderer: Renderer) -> ResolvedImage:
     if isinstance(source, UrlSource):
         return ResolvedImage(uri=source.url)
 
@@ -138,6 +159,9 @@ def _resolve_one(source: ImageSource, uploader: Uploader) -> ResolvedImage:
     elif isinstance(source, InMemorySource):
         data, filename = source.data, source.filename
         mime_type = source.mime_type or _sniff_mime_type(data)
+    elif isinstance(source, MermaidSource):
+        data, filename = _render_mermaid(source, renderer)
+        mime_type = _sniff_mime_type(data)
     else:
         raise _ResolutionFailure(f"unsupported image source type: {type(source).__name__}")
 
@@ -192,14 +216,18 @@ def _sniff_mime_type(data: bytes) -> Optional[str]:
 
 
 def resolve_document_images(
-    nodes: List[DocsImageNode], markdown_path: str, uploader: Uploader
+    nodes: List[DocsImageNode],
+    markdown_path: str,
+    uploader: Uploader,
+    renderer: Optional[Renderer] = None,
 ) -> Tuple[List[Optional[DocsImageNode]], List[str], List[str]]:
     """Resolve every `DocsImageNode.src` in `nodes` to a fetchable URI, in place-equivalent form.
 
     Convenience wrapper over `resolve_images()` for the `backend.py` push
-    pre-pass: builds an `ImageSource` per node from its raw markdown `src`
-    (via `build_source`), resolves them all, and returns `(nodes, warnings,
-    temp_drive_file_ids)`.
+    pre-pass: builds an `ImageSource` per node -- a `MermaidSource` when
+    `node.mermaid_source` is set (a ```mermaid fence), otherwise from its raw
+    markdown `src` via `build_source` -- resolves them all, and returns
+    `(nodes, warnings, temp_drive_file_ids)`.
 
     The returned `nodes` list is positional -- same length and order as the
     input, one slot per input node -- so a caller splicing these back into a
@@ -212,8 +240,13 @@ def resolve_document_images(
     `temp_drive_file_ids` lets the caller delete on success or retry on
     failure (criterion 5/7/8).
     """
-    sources = {str(i): build_source(markdown_path, node.src) for i, node in enumerate(nodes)}
-    resolved, errors = resolve_images(sources, uploader)
+    sources: Dict[str, ImageSource] = {
+        str(i): MermaidSource(diagram=node.mermaid_source)
+        if node.mermaid_source
+        else build_source(markdown_path, node.src)
+        for i, node in enumerate(nodes)
+    }
+    resolved, errors = resolve_images(sources, uploader, renderer)
 
     warnings = [f"image {sources[e.key]!r}: {e.reason}" for e in errors]
     temp_drive_file_ids = [
