@@ -13,15 +13,14 @@ MarkdownToParagraphParser — round-tripping through Markdown is inherently
 lossy (e.g. Docs' native nested-list structure vs. flat nesting_level here).
 
 The default (no-tab_id) pull path through converter.py's
-_GoogleDocsMarkdownConverter has the same per-line-inline-code symptom via a
-completely separate CSS-font-family-based mechanism and is NOT touched here
-— see issue #45's "Scope gap found late": that HTML-export pipeline has no
-render_prefix/span-shape equivalent to key fence detection off, would need
-its own detection heuristic, and was out of scope for this fix. This was
-confirmed rather than silently assumed: a live scope-confirmation request
-went unanswered, so the gap was filed as a separate, explicit follow-up
-(docspan backlog item a500ef94-2e02-499e-a628-5f843198c49e) instead of being
-folded into or dropped from this fix.
+_GoogleDocsMarkdownConverter detects monospace via a completely separate
+CSS-font-family-based mechanism (that HTML-export pipeline has no
+render_prefix/span-shape equivalent to key fence detection off) — see issue
+#45's "Scope gap found late". Once detected, though, both paths need the
+identical CommonMark backtick-fence-escaping rule, so that piece
+(wrap_inline_code / run_of_backticks) now lives in the shared
+markdown_escaping.py module and is imported by both, rather than
+duplicated or reached into privately across module boundaries.
 """
 from __future__ import annotations
 
@@ -33,6 +32,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsTableNode,
     TableCell,
     TextSpan,
+)
+from docspan.backends.google_docs.markdown_escaping import (
+    run_of_backticks,
+    run_of_char,
+    wrap_inline_code,
 )
 from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
 
@@ -50,47 +54,6 @@ FENCE_MARKER = "```"
 TILDE_FENCE_MARKER = "~~~"
 
 
-def _run_of_char(text: str, target: str) -> int:
-    """The longest run of consecutive occurrences of `target` in text."""
-    max_run = run = 0
-    for ch in text:
-        if ch == target:
-            run += 1
-            max_run = max(max_run, run)
-        else:
-            run = 0
-    return max_run
-
-
-def _run_of_backticks(text: str) -> int:
-    """The longest run of consecutive backticks in text."""
-    return _run_of_char(text, "`")
-
-
-def _wrap_inline_code(text: str) -> str:
-    """Wrap text as a CommonMark code span, escaping any backticks inside it.
-
-    CommonMark's rule: the delimiter must be a run of backticks longer than
-    the longest run inside the content, and if the content starts or ends
-    with a backtick (or starts and ends with a space around non-space
-    content), a single space is added inside the delimiters so the content
-    doesn't fuse with them.
-
-    Empty text is left unwrapped: a 1-backtick fence around no content is
-    two adjacent backticks, which CommonMark parses as literal text, not an
-    empty code span — wrapping would silently produce that ambiguous output.
-    """
-    if not text:
-        return text
-    delim = "`" * (_run_of_backticks(text) + 1)
-    needs_pad = text.startswith("`") or text.endswith("`")
-    if not needs_pad and text[:1] == " " and text[-1:] == " " and text.strip():
-        needs_pad = True
-    if needs_pad:
-        return f"{delim} {text} {delim}"
-    return f"{delim}{text}{delim}"
-
-
 def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
     """The shortest fence (at least 3) longer than any run of its own
     character appearing in the content, so the fence can never be confused
@@ -102,9 +65,9 @@ def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
     tilde fence instead, which has no such restriction on its info string.
     """
     if lang and "`" in lang:
-        max_run = max((_run_of_char(line, "~") for line in code_lines), default=0)
+        max_run = max((run_of_char(line, "~") for line in code_lines), default=0)
         return "~" * max(3, max_run + 1)
-    max_run = max((_run_of_backticks(line) for line in [lang or "", *code_lines]), default=0)
+    max_run = max((run_of_backticks(line) for line in [lang or "", *code_lines]), default=0)
     return "`" * max(3, max_run + 1)
 
 
@@ -113,7 +76,7 @@ def _render_spans(spans: List[TextSpan]) -> str:
     for span in spans:
         text = span.text
         if span.monospace:
-            text = _wrap_inline_code(text)
+            text = wrap_inline_code(text)
         if span.bold:
             text = f"**{text}**"
         if span.italic:

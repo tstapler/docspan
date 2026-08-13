@@ -11,7 +11,7 @@ import urllib.parse
 
 from markdownify import MarkdownConverter, chomp
 
-from docspan.backends.google_docs.nodes_to_markdown import _wrap_inline_code
+from docspan.backends.google_docs.markdown_escaping import wrap_inline_code
 
 logger = logging.getLogger(__name__)
 
