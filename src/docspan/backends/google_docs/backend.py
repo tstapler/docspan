@@ -395,6 +395,19 @@ class GoogleDocsBackend(Backend):
                 # way as dead_anchors and for the same reason — this is the only
                 # thing standing between such a link and a written `url` holding
                 # the original (broken) relative path.
+                #
+                # This is also why an already-broken link never gets reported as
+                # "fixed": the message-assembly path below only ever surfaces
+                # failures (dead_anchors, cross_doc_issues, unstyled/unplaced
+                # content, residue) — there is no success/fix-claim branch to
+                # begin with. `grep -rn '"fixed"\|auto-fixed' src/docspan/`
+                # (excluding tests/) returns nothing. See
+                # tests/test_cross_doc_links_backend.py::
+                # test_untouched_broken_link_is_never_claimed_as_fixed for the
+                # pinned scenario: a paragraph pass 1 finds no diff for still
+                # goes through pass 2 (because *some* paragraph in the document
+                # needs it), and the pre-existing broken link in it is reported
+                # as still-unresolved, never as fixed.
                 cross_doc_issues = builder.cross_doc_link_issues(
                     pass2_doc, plan.target_nodes, alignment,
                     resolver=resolver, local_path=local_path,
