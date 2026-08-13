@@ -823,10 +823,16 @@ class TestRenderPrefixParticipatesInIdentity:
         requests = builder.build(current, target, end)
 
         lands_inside_code_block = any(
-            code_node.start_index <= (
-                r.get("deleteContentRange", {}).get("range", {}).get("startIndex")
-                or r.get("insertText", {}).get("location", {}).get("index")
-                or -1
+            code_node.start_index <= next(
+                (
+                    v
+                    for v in (
+                        r.get("deleteContentRange", {}).get("range", {}).get("startIndex"),
+                        r.get("insertText", {}).get("location", {}).get("index"),
+                    )
+                    if v is not None
+                ),
+                -1,
             ) < code_node.end_index
             for r in requests
         )
@@ -914,10 +920,16 @@ class TestRenderPrefixParticipatesInIdentity:
         requests = builder.build(current, target, index)
 
         lands_inside_code_block = any(
-            code_node.start_index <= (
-                r.get("deleteContentRange", {}).get("range", {}).get("startIndex")
-                or r.get("insertText", {}).get("location", {}).get("index")
-                or -1
+            code_node.start_index <= next(
+                (
+                    v
+                    for v in (
+                        r.get("deleteContentRange", {}).get("range", {}).get("startIndex"),
+                        r.get("insertText", {}).get("location", {}).get("index"),
+                    )
+                    if v is not None
+                ),
+                -1,
             ) < code_node.end_index
             for r in requests
         )
