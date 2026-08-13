@@ -294,3 +294,115 @@ def test_nested_checkbox_preserves_indent() -> None:
     nodes = [_node(text="nested", is_list_item=True, nesting_level=1, is_native_checkbox=True)]
     md = render_nodes_to_markdown(nodes)
     assert "  - [ ] nested" in md
+
+
+# --- issue #44: stray-backtick injection when a monospace span itself
+# contains a backtick (single-span, non-fenced-block shape) ---
+
+
+def _isolated_span(text: str) -> DocsParagraphNode:
+    """A monospace span surrounded by prose, so pass 2 leaves it inline
+    rather than grouping it into a fenced code block (AC0's rule for the
+    exact pure-code-line shape does not apply here)."""
+    return _node(text=f"see {text} here",
+                 spans=[TextSpan(text="see "), TextSpan(text=text, monospace=True), TextSpan(text=" here")])
+
+
+def _round_trip(md: str) -> str:
+    """Parse md back into nodes and return the recovered monospace span text."""
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    reparsed = MarkdownToParagraphParser().parse(md)
+    spans = [span for node in reparsed for span in node.spans if span.monospace]
+    assert len(spans) == 1, f"expected exactly one monospace span, got {spans!r}"
+    return spans[0].text
+
+
+def test_backtick_free_monospace_span_unchanged() -> None:
+    # AC0: no regression for the common case.
+    md = render_nodes_to_markdown([_isolated_span("date")])
+    assert "`date`" in md
+
+
+def test_monospace_span_with_single_backtick_round_trips() -> None:
+    # AC1/AC7: 'A=`date`' must survive a full render -> re-parse cycle
+    # unchanged, with no stray backticks injected or dropped.
+    original = "A=`date`"
+    md = render_nodes_to_markdown([_isolated_span(original)])
+    assert _round_trip(md) == original
+
+
+def test_monospace_span_entirely_backticks_round_trips() -> None:
+    # AC2: fence length must be (longest run + 1) with padding on both sides.
+    original = "```"
+    md = render_nodes_to_markdown([_isolated_span(original)])
+    assert "```` ``` ````" in md
+    assert _round_trip(md) == original
+
+
+def test_monospace_span_leading_backtick_round_trips() -> None:
+    # AC3: a single padding space on the side that touches the backtick.
+    original = "`x"
+    md = render_nodes_to_markdown([_isolated_span(original)])
+    assert "`` `x ``" in md
+    assert _round_trip(md) == original
+
+
+def test_monospace_span_trailing_backtick_round_trips() -> None:
+    original = "x`"
+    md = render_nodes_to_markdown([_isolated_span(original)])
+    assert "`` x` ``" in md
+    assert _round_trip(md) == original
+
+
+def test_monospace_span_leading_and_trailing_backtick_round_trips() -> None:
+    original = "`x`"
+    md = render_nodes_to_markdown([_isolated_span(original)])
+    assert "`` `x` ``" in md
+    assert _round_trip(md) == original
+
+
+def test_empty_monospace_span_does_not_produce_malformed_fence() -> None:
+    # AC4: an empty monospace span must not render as two bare backticks,
+    # which CommonMark parses as literal text, not an empty code span.
+    md = render_nodes_to_markdown([_isolated_span("")])
+    assert "``" not in md
+
+
+def test_monospace_mixed_backtick_runs_uses_longest_run() -> None:
+    # Longest-run detection, not merely "contains a backtick": a single-tick
+    # run and a double-tick run in the same span must force a 3-tick fence.
+    original = "a``b`c"
+    md = render_nodes_to_markdown([_isolated_span(original)])
+    assert "```a``b`c```" in md
+    assert _round_trip(md) == original
+
+
+def test_adjacent_monospace_spans_with_backticks_documented() -> None:
+    # Two back-to-back monospace spans with no separating text: documents
+    # current (unfixed) adjacency behavior rather than asserting round-trip
+    # correctness, which is a separate, out-of-scope issue.
+    from docspan.backends.google_docs.nodes_to_markdown import _render_spans
+
+    spans = [TextSpan(text="a`", monospace=True), TextSpan(text="`b", monospace=True)]
+    assert _render_spans(spans) == "`` a` ```` `b ``"
+
+
+def test_bold_monospace_span_with_backtick_renders_and_round_trips() -> None:
+    # Bold/italic wrap outside the (now variable-length) fence.
+    original = "a`b"
+    nodes = [_node(text="x", spans=[TextSpan(text=original, monospace=True, bold=True)])]
+    md = render_nodes_to_markdown(nodes)
+    assert "**``a`b``**" in md
+
+    from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+        MarkdownToParagraphParser,
+    )
+
+    reparsed = MarkdownToParagraphParser().parse(md)
+    spans = [span for node in reparsed for span in node.spans if span.monospace]
+    assert len(spans) == 1
+    assert spans[0].text == original
+    assert spans[0].bold is True
