@@ -114,7 +114,7 @@ def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
 # module docstring).
 _BLOCK_PREFIXES = re.compile(
     r"""^(?:
-          \#{1,6}\         # ATX heading
+          \#{1,6}(?:\ |$)  # ATX heading (space, or end of line — no space needed)
         | [-*+]\           # bullet list
         | \d{1,9}[.)]\     # ordered list
         | (?:-{3,}|\*{3,}|_{3,})\s*$   # thematic break
@@ -140,6 +140,25 @@ _INLINE_ESCAPE_CHARS = frozenset("\\`*_[]<&")
 def _escape_inline(text: str) -> str:
     """Backslash-escape characters markdown would read as inline syntax."""
     return "".join(f"\\{ch}" if ch in _INLINE_ESCAPE_CHARS else ch for ch in text)
+
+
+# A heading's content is parsed as *inline* text, so `_escape_inline` alone
+# covers most cases — but CommonMark also lets an ATX heading end in an
+# optional "closing sequence" of #s preceded by whitespace (`# foo #` reads
+# as content "foo", not "foo #"). A heading whose text is itself "#", or
+# ends in "<space>#", is silently stripped back to less content on the next
+# pull — e.g. text "#" renders as "# #" and reparses with empty content.
+# Escaping the first # of that trailing run defeats the closing-sequence
+# rule while leaving every other # in the text untouched.
+_HEADING_CLOSING_HASHES = re.compile(r"\s(#+)\s*$")
+
+
+def _escape_heading_text(text: str) -> str:
+    match = _HEADING_CLOSING_HASHES.search(" " + text)
+    if not match:
+        return text
+    start = match.start(1) - 1
+    return text[:start] + "\\" + text[start:]
 
 
 def _escape_block_start(text: str) -> str:
@@ -471,7 +490,7 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             except ValueError:
                 level = 1
             level = max(1, min(level, 6))
-            lines.append(f"{'#' * level} {text}")
+            lines.append(f"{'#' * level} {_escape_heading_text(text)}")
         elif node.is_list_item:
             indent = "  " * node.nesting_level
             # A list item's content is itself parsed as a block (not inline,
