@@ -33,6 +33,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TableCell,
     TextSpan,
 )
+from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -249,12 +250,27 @@ def _render_table(node: DocsTableNode) -> str:
     return "\n".join(lines)
 
 
+def _node_text(node: DocsParagraphNode) -> str:
+    return _render_spans(node.spans) if node.spans else node.text
+
+
+def _dispatch_key(node: Node) -> str:
+    """Synthesize a dispatch key — DocsParagraphNode/DocsTableNode carry no `.type` field."""
+    if isinstance(node, DocsTableNode):
+        return "table"
+    if node.style.startswith("HEADING_"):
+        return "heading"
+    if node.is_list_item:
+        return "list_item"
+    return "paragraph"
+
+
 def _is_pure_code_line(node: Node) -> bool:
-    """Exactly the shape MarkdownToParagraphParser writes for a code line
-    (`:294`): one span, monospace, and no other mark. Deliberately narrower
-    than "contains some monospace" — a mixed-mark span (e.g. monospace+bold)
-    or an isolated inline-code span inside an otherwise normal paragraph must
-    never be swept into a fence.
+    """Exactly the shape MarkdownToParagraphParser's `_nodes_from_code_block`
+    writes for a code line: one span, monospace, and no other mark.
+    Deliberately narrower than "contains some monospace" — a mixed-mark span
+    (e.g. monospace+bold) or an isolated inline-code span inside an otherwise
+    normal paragraph must never be swept into a fence.
     """
     if not isinstance(node, DocsParagraphNode):
         return False
@@ -271,7 +287,8 @@ def _is_pure_code_line(node: Node) -> bool:
 
 
 def _is_blank_code_line(node: Node) -> bool:
-    """A blank line inside a fenced block (`:294`'s `spans=[]` branch).
+    """A blank line inside a fenced block (`_nodes_from_code_block`'s
+    `spans=[]` branch).
 
     Only ever absorbed into an already-open code run by `_group_code_runs`
     (it looks ahead for another code line before treating one of these as
@@ -314,7 +331,15 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
     """Partition nodes into ("node", node) passthroughs and
     ("code", lang, code_nodes) runs of consecutive pure code lines
     (optionally preceded by a language marker, and allowing interior blank
-    lines that are followed by more code before the run ends)."""
+    lines that are followed by more code before the run ends).
+
+    Only ever recovers a *top-level* fence: `_is_pure_code_line` and its
+    siblings all require `not node.is_list_item`, since that's the only call
+    site `_nodes_from_code_block` marks with a language marker
+    (`emit_language_marker=True`) — a list item's or blockquote's own code
+    lines render one at a time via the normal per-node dispatch below instead
+    of being regrouped into a fence.
+    """
     groups: List[Tuple] = []
     i, n = 0, len(nodes)
     while i < n:
@@ -334,7 +359,8 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
                 # A marker immediately followed by exactly one blank-shaped
                 # line, with no code line beyond it, is
                 # MarkdownToParagraphParser's shape for an explicitly empty
-                # fenced block (`:294`) — not an orphaned marker.
+                # fenced block (see `_nodes_from_code_block`) — not an
+                # orphaned marker.
                 groups.append(("code", node.text[len(FENCE_MARKER):], []))
                 i += 2
                 continue
@@ -406,6 +432,75 @@ def _escape_leading_fence(text: str) -> str:
     return text
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pull-direction renderers — one class per synthesized dispatch key,
+# registered in _build_pull_registry(). To add a new node kind, register a
+# renderer there; render_nodes_to_markdown()'s dispatch loop needs no changes.
+# Code lines are handled separately, before dispatch even runs — see
+# _group_code_runs/_render_code_group above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TableNodeRenderer(MarkdownNodeRenderer):
+    node_key = "table"
+
+    def render(self, node: DocsTableNode) -> str:
+        return _render_table(node)
+
+
+class HeadingNodeRenderer(MarkdownNodeRenderer):
+    node_key = "heading"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        try:
+            level = int(node.style.split("_", 1)[1])
+        except ValueError:
+            level = 1
+        level = max(1, min(level, 6))
+        return f"{'#' * level} {_node_text(node)}"
+
+
+class ListItemNodeRenderer(MarkdownNodeRenderer):
+    node_key = "list_item"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        indent = "  " * node.nesting_level
+        text = _node_text(node)
+        if node.is_native_checkbox:
+            # The Docs API does not expose a native checkbox's
+            # checked/unchecked bit anywhere DocsStructureParser can read
+            # it (see push_preview.py's NATIVE CHECKBOX GLYPH warning) —
+            # DocsParagraphNode carries no checked-state field at all.
+            # Rendering unchecked is the only honest option here; this is
+            # a one-way, lossy render (never fed back through
+            # MarkdownToParagraphParser as this exact text), not a claim
+            # about the glyph's real state.
+            return f"{indent}- [ ] {text}"
+        return f"{indent}- {text}"
+
+
+class ParagraphNodeRenderer(MarkdownNodeRenderer):
+    node_key = "paragraph"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        # Escaping here (rather than in _node_text) keeps the escape scoped
+        # to the bare-paragraph path — headings/list items/block quotes all
+        # already prefix the line with something that keeps a fence-shaped
+        # line from opening a live fence on reparse.
+        return _escape_leading_fence(_node_text(node))
+
+
+def _build_pull_registry() -> MarkdownRenderRegistry:
+    registry = MarkdownRenderRegistry()
+    registry.register("table", TableNodeRenderer())
+    registry.register("heading", HeadingNodeRenderer())
+    registry.register("list_item", ListItemNodeRenderer())
+    registry.register("paragraph", ParagraphNodeRenderer())
+    return registry
+
+
+_PULL_REGISTRY = _build_pull_registry()
+
+
 def render_nodes_to_markdown(nodes: List[Node]) -> str:
     """Render a parsed node list (document order) back into Markdown text."""
     lines: List[str] = []
@@ -416,39 +511,11 @@ def render_nodes_to_markdown(nodes: List[Node]) -> str:
             continue
 
         node = group[1]
-        if isinstance(node, DocsTableNode):
-            lines.append(_render_table(node))
-            lines.append("")
-            continue
-
-        text = _render_spans(node.spans) if node.spans else node.text
-
-        if node.style.startswith("HEADING_"):
-            try:
-                level = int(node.style.split("_", 1)[1])
-            except ValueError:
-                level = 1
-            level = max(1, min(level, 6))
-            lines.append(f"{'#' * level} {text}")
-        elif node.is_list_item:
-            indent = "  " * node.nesting_level
-            if node.is_native_checkbox:
-                # This structural render (documents.get() -> DocsStructureParser
-                # -> here) is used for the tab-scoped pull path, where checked
-                # state genuinely can't be recovered: Drive's files.export
-                # can't target a single tab, and that's the only read path
-                # that exposes a native checkbox's checked bit (see
-                # checkbox_state.py, used by the default/non-tab-scoped pull
-                # path instead). DocsParagraphNode itself still carries no
-                # checked-state field. Rendering unchecked is the only honest
-                # option on this path; this is a one-way, lossy render (never
-                # fed back through MarkdownToParagraphParser as this exact
-                # text), not a claim about the glyph's real state.
-                lines.append(f"{indent}- [ ] {text}")
-            else:
-                lines.append(f"{indent}- {text}")
-        else:
-            lines.append(_escape_leading_fence(text))
+        key = _dispatch_key(node)
+        renderer = _PULL_REGISTRY.get(key)
+        if renderer is None:
+            raise ValueError(f"no renderer registered for dispatch key {key!r}")
+        lines.append(renderer.render(node))
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"

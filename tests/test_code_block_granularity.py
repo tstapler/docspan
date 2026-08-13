@@ -34,7 +34,10 @@ from unittest.mock import MagicMock
 
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    DocsStructureParser,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.projection import project
 
@@ -943,4 +946,53 @@ class TestRenderPrefixParticipatesInIdentity:
         }
         assert deletes == {(n.start_index, n.end_index) for n in plain_nodes}, (
             f"both plain duplicates — not the code-rendered node — should be deleted: {requests}"
+        )
+
+    def test_a_code_line_and_a_same_text_prose_node_in_different_runs_do_not_swap(
+        self,
+    ) -> None:
+        """PR #70's whole-document pooling (see `_content_key`'s docstring) puts
+        a code line and a same-text prose node from *unrelated* pre-repair runs
+        into the same `_prefer_structural_pairing` candidate/slot pool whenever
+        `_node_key` has already told them apart (issue #68) — unlike the
+        harder, still-open gap pinned by
+        `test_a_prose_line_repeating_a_code_lines_text_still_confuses_correspondence`
+        above, where only one target slot exists at all.
+
+        Here each node has its *own* target slot, in a separate run (split by
+        an untouched "ANCHOR" paragraph), and the cross-run pairing is
+        deliberately the higher-scoring one on raw structural similarity
+        alone — so this only stays correct because `_prefer_structural_
+        pairing`'s same-origin tie-break keeps each node paired with its own
+        run's slot instead of reassigning the code line's target to the prose
+        node (or vice versa) purely because of the shared `_content_key`.
+        """
+        current = [
+            DocsParagraphNode(text="cfg", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="ANCHOR", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(
+                text="cfg", style="NORMAL_TEXT", is_list_item=True, render_prefix=""
+            ),
+        ]
+        target = [
+            DocsParagraphNode(text="cfg", style="HEADING_2", is_list_item=True),
+            DocsParagraphNode(text="ANCHOR", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="cfg", style="HEADING_4", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        def target_index_for(current_index: int) -> int:
+            for _tag, ci1, ci2, cj1, cj2 in opcodes:
+                if ci1 <= current_index < ci2 and cj2 - cj1 == ci2 - ci1:
+                    return cj1 + (current_index - ci1)
+            raise AssertionError(f"current index {current_index} not covered: {opcodes}")
+
+        assert target_index_for(0) == 0, (
+            f"the prose node's own target slot was handed to the code line "
+            f"from a different run: {opcodes}"
+        )
+        assert target_index_for(2) == 2, (
+            f"the code line's own target slot was handed to the prose node "
+            f"from a different run: {opcodes}"
         )

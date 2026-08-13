@@ -12,6 +12,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TextSpan,
     _trim_spans_to_cell_text,
 )
+from docspan.backends.google_docs.registry import MarkdownTokenConverter, MarkdownTokenRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode]
 
@@ -397,6 +398,116 @@ def _table_from_token(token: dict) -> DocsTableNode:
     return DocsTableNode(rows=rows, start_index=0, end_index=0)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Push-direction converters — one class per mistune token_type, registered in
+# _build_push_registry(). To add a new node type (e.g. a mermaid fence),
+# register a converter there; parse()'s dispatch loop needs no changes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HeadingTokenConverter(MarkdownTokenConverter):
+    token_type = "heading"
+
+    def convert(self, token: dict) -> List[Node]:
+        level = token.get("attrs", {}).get("level", token.get("level", 1))
+        spans = _spans_from_inline(token.get("children", []))
+        return [DocsParagraphNode(
+            style=f"HEADING_{level}", text=_text_of(spans).strip(),
+            start_index=0, end_index=0,
+            spans=spans if _has_styling(spans) else [],
+        )]
+
+
+class ParagraphTokenConverter(MarkdownTokenConverter):
+    token_type = "paragraph"
+
+    def convert(self, token: dict) -> List[Node]:
+        spans = _spans_from_inline(token.get("children", []))
+        return [DocsParagraphNode(
+            style="NORMAL_TEXT", text=_text_of(spans).strip(),
+            start_index=0, end_index=0,
+            spans=spans if _has_styling(spans) else [],
+        )]
+
+
+class ListTokenConverter(MarkdownTokenConverter):
+    token_type = "list"
+
+    def convert(self, token: dict) -> List[Node]:
+        return _walk_list_items(token, nesting_level=0)
+
+
+class CodeTokenConverter(MarkdownTokenConverter):
+    # mistune has referred to this token as both "block_code" and "code"
+    # across versions; _build_push_registry() registers this one converter
+    # instance under both keys so neither aliasing silently drops the block.
+    token_type = "block_code"
+
+    def convert(self, token: dict) -> List[Node]:
+        # Top level is the only one of the three `_nodes_from_code_block`
+        # call sites (here, `_walk_list_items`, `_walk_block_quote`) that
+        # carries the fence's language through a marker line — see the
+        # helper's docstring for why list items and blockquotes stay
+        # marker-less. A *native* Google Docs code block (typed in the Docs
+        # UI, not pushed by this tool) never has a marker either, and
+        # matching push's target against that live structure depends on the
+        # two shapes being identical
+        # (`:test_an_unchanged_code_block_emits_nothing`), which is also why
+        # a lang-less fence here stays marker-less.
+        return _nodes_from_code_block(token, emit_language_marker=True)
+
+
+class TableTokenConverter(MarkdownTokenConverter):
+    token_type = "table"
+
+    def convert(self, token: dict) -> List[Node]:
+        return [_table_from_token(token)]
+
+
+class BlockQuoteTokenConverter(MarkdownTokenConverter):
+    token_type = "block_quote"
+
+    def convert(self, token: dict) -> List[Node]:
+        return _walk_block_quote(token)
+
+
+class BlankLineTokenConverter(MarkdownTokenConverter):
+    token_type = "blank_line"
+
+    def convert(self, token: dict) -> List[Node]:
+        return []
+
+
+class BlockHtmlTokenConverter(MarkdownTokenConverter):
+    token_type = "block_html"
+
+    def convert(self, token: dict) -> List[Node]:
+        # A multi-paragraph table cell renders as a raw <table> block
+        # (_render_table_html) since pipe syntax has no cell-internal break.
+        # Any other raw HTML is unsupported and silently skipped, as before.
+        raw = token.get("raw", "").strip() if isinstance(token, dict) else ""
+        if raw.lower().startswith("<table"):
+            return [_table_from_html_block(raw)]
+        return []
+
+
+def _build_push_registry() -> MarkdownTokenRegistry:
+    registry = MarkdownTokenRegistry()
+    registry.register("heading", HeadingTokenConverter())
+    registry.register("paragraph", ParagraphTokenConverter())
+    registry.register("list", ListTokenConverter())
+    code_converter = CodeTokenConverter()
+    registry.register("block_code", code_converter)
+    registry.register("code", code_converter)
+    registry.register("table", TableTokenConverter())
+    registry.register("block_quote", BlockQuoteTokenConverter())
+    registry.register("blank_line", BlankLineTokenConverter())
+    registry.register("block_html", BlockHtmlTokenConverter())
+    return registry
+
+
+_PUSH_REGISTRY = _build_push_registry()
+
+
 class MarkdownToParagraphParser:
     """
     Parse Markdown content into a list of DocsParagraphNode / DocsTableNode.
@@ -418,59 +529,10 @@ class MarkdownToParagraphParser:
 
         nodes: List[Node] = []
         for token in tokens:
-            token_type = token.get("type")
-
-            if token_type == "heading":
-                level = token.get("attrs", {}).get("level", token.get("level", 1))
-                spans = _spans_from_inline(token.get("children", []))
-                nodes.append(DocsParagraphNode(
-                    style=f"HEADING_{level}", text=_text_of(spans).strip(),
-                    start_index=0, end_index=0,
-                    spans=spans if _has_styling(spans) else [],
-                ))
-
-            elif token_type == "paragraph":
-                spans = _spans_from_inline(token.get("children", []))
-                nodes.append(DocsParagraphNode(
-                    style="NORMAL_TEXT", text=_text_of(spans).strip(),
-                    start_index=0, end_index=0,
-                    spans=spans if _has_styling(spans) else [],
-                ))
-
-            elif token_type == "list":
-                nodes.extend(_walk_list_items(token, nesting_level=0))
-
-            elif token_type in ("block_code", "code"):
-                # Top level is the only one of the three `_nodes_from_code_block`
-                # call sites (here, `_walk_list_items`, `_walk_block_quote`)
-                # that carries the fence's language through a marker line —
-                # see the helper's docstring for why list items and
-                # blockquotes stay marker-less. A *native* Google Docs code
-                # block (typed in the Docs UI, not pushed by this tool) never
-                # has a marker either, and matching push's target against
-                # that live structure depends on the two shapes being
-                # identical (`:test_an_unchanged_code_block_emits_nothing`),
-                # which is also why a lang-less fence here stays marker-less.
-                nodes.extend(_nodes_from_code_block(token, emit_language_marker=True))
-
-            elif token_type == "table":
-                nodes.append(_table_from_token(token))
-
-            elif token_type == "block_quote":
-                nodes.extend(_walk_block_quote(token))
-
-            elif token_type == "blank_line":
-                pass
-
-            elif token_type == "block_html":
-                # A multi-paragraph table cell renders as a raw <table> block
-                # (_render_table_html) since pipe syntax has no cell-internal
-                # break. Any other raw HTML is unsupported and silently
-                # skipped, as before.
-                raw = token.get("raw", "").strip() if isinstance(token, dict) else ""
-                if raw.lower().startswith("<table"):
-                    nodes.append(_table_from_html_block(raw))
-
-            # thematic_break, etc. are silently skipped
+            converter = _PUSH_REGISTRY.get(token.get("type"))
+            if converter is None:
+                # thematic_break, html, etc. are silently skipped
+                continue
+            nodes.extend(converter.convert(token))
 
         return nodes
