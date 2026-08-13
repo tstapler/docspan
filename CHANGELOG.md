@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/tstapler/docspan/compare/docspan-v0.3.0...docspan-v0.4.0) (2026-08-13)
+
+
+### Features
+
+* **docspan:** add docspan map command and push auto-create for unmapped files ([#80](https://github.com/tstapler/docspan/issues/80)) ([aa4258b](https://github.com/tstapler/docspan/commit/aa4258b3ff381c3e6afc389ad55c426abb5850ba))
+* **google-docs:** add inline image push/pull support ([#101](https://github.com/tstapler/docspan/issues/101)) ([e5256af](https://github.com/tstapler/docspan/commit/e5256afa18076051b891f44511786e4f2750a489))
+* **google-docs:** render mermaid diagrams as inline PNGs on push ([9298d1b](https://github.com/tstapler/docspan/commit/9298d1b0c645231056571a2c5afaa296e14d751b))
+
+
+### Bug Fixes
+
+* **config:** round-trip YAML comments on save_config writes ([780ddcc](https://github.com/tstapler/docspan/commit/780ddcc18b760f184627eb9c9a2b870249c6ed51))
+* **confluence:** confirm mermaid render pipeline is a stub, not a rasterizer ([#94](https://github.com/tstapler/docspan/issues/94)) ([fb5ca80](https://github.com/tstapler/docspan/commit/fb5ca8002e91e050447766d7e498ff30eadae9dc))
+* **google-docs:** bound difflib's cubic-ish blowup on duplicate-heavy documents ([#84](https://github.com/tstapler/docspan/issues/84)) ([834df71](https://github.com/tstapler/docspan/commit/834df71d2737b09ee68b14dd1f509bc3928249da))
+* **google-docs:** distinguish delete-and-reinsert churn from real removal in push preview ([#86](https://github.com/tstapler/docspan/issues/86)) ([052b64d](https://github.com/tstapler/docspan/commit/052b64d591bc88ab6962e5173c2494b2fedab1c3))
+* **google-docs:** escape backticks in monospace spans on both pull paths ([#103](https://github.com/tstapler/docspan/issues/103)) ([74d007d](https://github.com/tstapler/docspan/commit/74d007d162d511641650d2afb8b9f8b482c3e48e))
+* **google-docs:** land PR [#70](https://github.com/tstapler/docspan/issues/70) restyle repair, verify AC0-8 (issue [#52](https://github.com/tstapler/docspan/issues/52)) ([#99](https://github.com/tstapler/docspan/issues/99)) ([8203c93](https://github.com/tstapler/docspan/commit/8203c93567a3d962bb3bb5754338298260f610aa))
+* **google-docs:** order same-anchor insert groups after restyle/delete groups ([#83](https://github.com/tstapler/docspan/issues/83)) ([b8eace0](https://github.com/tstapler/docspan/commit/b8eace0505f7196eeb5bfe659f2d284a4b8c07ad))
+* **google-docs:** render multi-paragraph table cells as HTML tables ([#79](https://github.com/tstapler/docspan/issues/79)) ([45e072d](https://github.com/tstapler/docspan/commit/45e072de2ae845443d6b5862a6c70234a55fb501))
+* **google-docs:** resolve cross-tab heading anchors on push ([#102](https://github.com/tstapler/docspan/issues/102)) ([c1be541](https://github.com/tstapler/docspan/commit/c1be541d7e8d227369367ac8d99700405ac31195))
+* **google-docs:** resolve relative cross-document markdown links to target Google Doc URLs ([#98](https://github.com/tstapler/docspan/issues/98)) ([27e7f15](https://github.com/tstapler/docspan/commit/27e7f1551549d7bff9d64b5e43abfd09f4f19e36))
+* **google-docs:** richer at-risk-comment warning, no anchor migration ([#92](https://github.com/tstapler/docspan/issues/92)) ([#95](https://github.com/tstapler/docspan/issues/95)) ([be854db](https://github.com/tstapler/docspan/commit/be854db8cc4dd5a8252685847455e51d444decee))
+* **google-docs:** split/preserve fenced code blocks in list items and blockquotes ([#87](https://github.com/tstapler/docspan/issues/87)) ([0a01f9f](https://github.com/tstapler/docspan/commit/0a01f9f6c927489c9234049aed56b4fe8c895b58))
+* **google-docs:** stop force-push from corrupting tab-scoped checkbox docs ([#97](https://github.com/tstapler/docspan/issues/97)) ([63ab43b](https://github.com/tstapler/docspan/commit/63ab43bc755dad67ce22d516b6ea4f1eaeba9c3e))
+* **google-docs:** stop replace branch from duplicating the doc-end-clamped newline ([#85](https://github.com/tstapler/docspan/issues/85)) ([68f0de9](https://github.com/tstapler/docspan/commit/68f0de985be5b13df0d4e1b3c4b0177a2e0eced8))
+
 ## [0.3.0](https://github.com/tstapler/docspan/compare/docspan-v0.2.0...docspan-v0.3.0) (2026-08-11)
 
 
