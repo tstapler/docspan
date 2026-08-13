@@ -26,7 +26,10 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    DocsStructureParser,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.projection import project
 
@@ -384,6 +387,273 @@ class TestTheLiveHeadingSurvives:
         )
         assert replay.style["heading"] == "HEADING_3"
         assert not replay.alive("body")
+
+    def test_a_standalone_insert_slot_claims_a_replace_trapped_candidate(self) -> None:
+        """Gap #2 from `_prefer_structural_pairing`'s docstring, the other half.
+
+        `test_duplicate_trapped_inside_a_replace_block_still_saves_the_heading`
+        above covers gap #2 for an existing "equal" slot claiming a
+        replace-interior candidate. This is the standalone-"insert"-slot
+        variant (gap #1's shape, but pointed at gap #2's source): "Dup" sits
+        trapped inside an unrelated `replace` block ("Dup"/"Junk" ->
+        "Zeta") in one run, while a separate run elsewhere in the document
+        is a pure standalone `insert` for "Dup" at a new style. Before whole-
+        document pooling, `_repair` never looked past its own run, so the
+        `replace` block was deleted wholesale and the insert stayed an
+        unclaimed, freshly-created paragraph instead of the same live one
+        restyled in place.
+        """
+        current = [
+            DocsParagraphNode(text="Alpha", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Dup", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Junk", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Beta", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Gamma", style="NORMAL_TEXT", is_list_item=False),
+        ]
+        target = [
+            DocsParagraphNode(text="Alpha", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Zeta", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Beta", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Dup", style="HEADING_3", is_list_item=False),
+            DocsParagraphNode(text="Gamma", style="NORMAL_TEXT", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        dup_opcode = next(op for op in opcodes if op[1] <= 1 < op[2])
+        assert dup_opcode[0] == "equal", (
+            f"the live 'Dup' paragraph was not restyled in place: {opcodes}"
+        )
+        assert (dup_opcode[3], dup_opcode[4]) == (3, 4), (
+            f"'Dup' was not matched to its own standalone insert slot: {opcodes}"
+        )
+        assert not any(op[0] == "insert" and op[3] == 3 for op in opcodes), (
+            f"a fresh paragraph was still inserted instead of reusing 'Dup': {opcodes}"
+        )
+
+    def _assert_no_destruction(self, replay: ParagraphReplay, pids, expected_styles) -> None:
+        """Both original paragraphs must still exist and carry the target styles.
+
+        Both `pids` share the same text ("A"), so which original paragraph
+        maps to which target index is inherently ambiguous when their current
+        styles also coincide — that ambiguity is not the bug. The bug is a
+        paragraph getting deleted and reinserted (losing its `headingId`)
+        instead of restyled in place. So this checks the property the issue
+        actually cares about: nothing was deleted/reinserted (no `inserted-*`
+        id appears, both original pids are still alive) and the resulting
+        styles match the target's multiset.
+        """
+        for pid in pids:
+            assert replay.alive(pid), f"{pid!r} was deleted and not preserved"
+        assert not any(pid.startswith("inserted-") for pid in replay.owner if pid), (
+            "a new paragraph was inserted -> the original was deleted and "
+            "reinserted rather than restyled in place"
+        )
+        assert sorted(replay.style[pid] for pid in pids) == sorted(expected_styles)
+
+    def test_a_duplicated_heading_survives_restyle_of_the_first_copy(self) -> None:
+        """Issue #52's exact shape: two identical-content, identical-style headings.
+
+        Both current paragraphs read "A" as `HEADING_2`. The markdown restyles
+        one copy to `###`, keeping the other at `##`. `_node_key` (style-
+        inclusive) can't anchor either copy to a specific target index, since
+        both current nodes are identical to each other — so the phase-1
+        matcher can express this as a standalone `insert` (the new
+        `HEADING_3` "A") and a standalone `delete` (one of the `HEADING_2`
+        "A"s) with an unrelated `equal` opcode for the *other* "A" sitting
+        between them. `_repair` must still recognize the leftover
+        insert+delete pair as one in-place restyle rather than
+        delete-and-reinsert, for whichever original copy the outer matcher
+        happened to anchor.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_2", "first", False),
+            ("A", "HEADING_2", "second", False),
+        ])
+        _push(replay, "### A\n\n## A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_2", "HEADING_3"])
+
+    def test_restyle_only_shape_a_survives(self) -> None:
+        """Minimal L=2 destructive shape from the issue #52 measurement.
+
+        `AA`/(H1,H1) -> `AA`/(H2,H1): one paragraph is restyled, the other
+        untouched — neither is deleted and reinserted.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_1", "second", False),
+        ])
+        _push(replay, "## A\n\n# A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "HEADING_2"])
+
+    def test_restyle_only_shape_b_survives(self) -> None:
+        """Minimal L=2 destructive shape from the issue #52 measurement.
+
+        `AA`/(H1,H1) -> `AA`/(NORMAL_TEXT,H1): one paragraph is demoted to
+        body text in place, not deleted and reinserted.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_1", "second", False),
+        ])
+        _push(replay, "A\n\n# A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "NORMAL_TEXT"])
+
+    def test_restyle_only_shape_c_survives(self) -> None:
+        """Minimal L=2 destructive shape from the issue #52 measurement.
+
+        `AA`/(H1,H2) -> `AA`/(H2,H1): both paragraphs' styles change (or the
+        pairing flips, needing no edit at all) — either way, in place.
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_2", "second", False),
+        ])
+        _push(replay, "## A\n\n# A\n")
+
+        self._assert_no_destruction(replay, ["first", "second"], ["HEADING_1", "HEADING_2"])
+
+    def test_a_two_way_content_swap_does_not_drop_a_target(self) -> None:
+        """Regression: pooling can pick each slot's winner to be the *other*
+        slot's own current node — a genuine two-way swap. `_prefer_structural_
+        pairing` used to look up a slot's target range by re-reading
+        `expanded[spos]` from inside the loop that reassigns winners, so once
+        one swap side had already overwritten the other's `expanded` entry, the
+        second side's lookup returned the first side's (already-consumed)
+        target range instead of its own. That silently duplicated one target
+        opcode and dropped the other, so `_opcodes()` no longer returned a
+        full partition of `target` — the paragraph mapped to the dropped range
+        never got any request at all.
+
+        Exercised directly at the `_opcodes()` level, not through markdown
+        parsing, because reproducing the exact opcode shape end-to-end depends
+        on `SequenceMatcher` internals that are otherwise fiddly to steer.
+        """
+        current = [
+            DocsParagraphNode(text="A", style="HEADING_1", is_list_item=False),
+            DocsParagraphNode(text="A", style="HEADING_1", is_list_item=True),
+        ]
+        target = [
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=True),
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        covered = set()
+        for _tag, _i1, _i2, j1, j2 in opcodes:
+            for j in range(j1, j2):
+                assert j not in covered, f"target index {j} produced twice: {opcodes}"
+                covered.add(j)
+        assert covered == set(range(len(target))), f"target coverage incomplete: {opcodes}"
+
+    def test_a_stranded_equal_slot_is_not_silently_dropped(self) -> None:
+        """Regression: an "equal" slot's own target range can be lost when a
+        *different* slot wins that slot's own self-candidate.
+
+        A position in `expanded` doubles as both a slot (something needing a
+        target) and, for "equal"/singleton "delete" entries, its own
+        self-candidate. When some other slot's greedy assignment beats that
+        self-pairing and wins the candidate, `_prefer_structural_pairing`
+        used to overwrite `expanded[spos]` in place with the *winner's*
+        target range — permanently discarding the original slot's own
+        demand once nothing else claimed it. Fixed by re-exposing an
+        unfulfilled slot's own target range as a standalone `insert` using a
+        pre-mutation snapshot, verified by the target-coverage invariant at
+        the bottom of `_prefer_structural_pairing`.
+        """
+        current = [
+            DocsParagraphNode(text="Overview", style="NORMAL_TEXT", is_list_item=True),
+            DocsParagraphNode(text="Overview", style="HEADING_3", is_list_item=False),
+            DocsParagraphNode(text="Config", style="HEADING_2", is_list_item=False),
+            DocsParagraphNode(text="Config", style="HEADING_2", is_list_item=False),
+        ]
+        target = [
+            DocsParagraphNode(text="Overview", style="HEADING_1", is_list_item=False),
+            DocsParagraphNode(text="U10", style="BULLET", is_list_item=True),
+            DocsParagraphNode(text="Overview", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Overview", style="HEADING_3", is_list_item=False),
+            DocsParagraphNode(text="Overview", style="HEADING_1", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        covered = set()
+        for _tag, _i1, _i2, j1, j2 in opcodes:
+            for j in range(j1, j2):
+                assert j not in covered, f"target index {j} produced twice: {opcodes}"
+                covered.add(j)
+        assert covered == set(range(len(target))), f"target coverage incomplete: {opcodes}"
+
+    def test_same_origin_tie_break_beats_a_higher_scoring_cross_run_pair(self) -> None:
+        """The `same_origin` tier in `_prefer_structural_pairing`'s sort key is
+        load-bearing, not a redundant nicety.
+
+        Two duplicate-`_content_key` ("A") restyles land in two *separate*
+        pre-repair runs (split by an untouched "ANCHOR" paragraph between
+        them), and each slot's own same-run candidate is deliberately the
+        *lower*-scoring structural match — the other run's candidate scores
+        higher on raw style/list-item similarity alone. Without the
+        same-origin tier sorted ahead of raw score, the greedy assignment
+        would swap the two runs' nodes across each other purely because the
+        cross-run pairing scores better, which is exactly the kind of
+        unrelated-edit-steals-a-slot regression pooling globally risks (see
+        this method's docstring). Asserted directly on which target index
+        each current index ends up mapped to, rather than the coalesced
+        opcode shape, since that is the one thing a wrong tie-break changes.
+        """
+        current = [
+            DocsParagraphNode(text="A", style="HEADING_1", is_list_item=False),
+            DocsParagraphNode(text="ANCHOR", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="A", style="HEADING_3", is_list_item=True),
+        ]
+        target = [
+            DocsParagraphNode(text="A", style="HEADING_2", is_list_item=True),
+            DocsParagraphNode(text="ANCHOR", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="A", style="HEADING_4", is_list_item=False),
+        ]
+
+        opcodes = builder._opcodes(current, target)
+
+        def target_index_for(current_index: int) -> int:
+            for _tag, ci1, ci2, cj1, cj2 in opcodes:
+                if ci1 <= current_index < ci2 and cj2 - cj1 == ci2 - ci1:
+                    return cj1 + (current_index - ci1)
+            raise AssertionError(f"current index {current_index} not covered: {opcodes}")
+
+        assert target_index_for(0) == 0, (
+            f"current index 0 (same-run candidate for slot 0) lost its own slot "
+            f"to the higher-scoring cross-run candidate: {opcodes}"
+        )
+        assert target_index_for(2) == 2, (
+            f"current index 2 (same-run candidate for slot 2) lost its own slot "
+            f"to the higher-scoring cross-run candidate: {opcodes}"
+        )
+
+    def test_three_duplicate_headings_cyclically_restyled_all_survive(self) -> None:
+        """Three (not just two) duplicate-content nodes, cyclically restyled.
+
+        `_prefer_structural_pairing`'s pooling and same-origin tie-break are
+        exercised more heavily as the number of same-`_content_key` copies
+        grows past two — this checks the assignment logic still resolves a
+        3-way cycle to three in-place restyles rather than falling back to
+        any delete+insert. Before this PR's fix, this exact shape lost one
+        of the three paragraphs (`insert`+`equal`+`delete` instead of three
+        `equal`s).
+        """
+        replay = ParagraphReplay([
+            ("A", "HEADING_1", "first", False),
+            ("A", "HEADING_2", "second", False),
+            ("A", "HEADING_3", "third", False),
+        ])
+        _push(replay, "### A\n\n# A\n\n## A\n")
+
+        self._assert_no_destruction(
+            replay, ["first", "second", "third"], ["HEADING_1", "HEADING_2", "HEADING_3"]
+        )
 
 
 class TestNoHeadingIsDemoted:
