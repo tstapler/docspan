@@ -8,6 +8,7 @@ tests/conftest.py (also used by tests/test_push_preview.py).
 """
 from __future__ import annotations
 
+import json
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -238,6 +239,26 @@ class TestPushHighRiskGate:
         fake_client.batch_update.assert_called_once()
         args, kwargs = fake_client.batch_update.call_args
         assert kwargs["required_revision_id"] == "rev-force"
+
+        # Assert on the actual request payload, not just that *a* call
+        # happened — a corrupting diff (e.g. a spurious delete of a
+        # neighboring paragraph, or the old "[ ] " marker surviving
+        # unflipped) would still satisfy assert_called_once() but must fail
+        # here.
+        doc_id, requests = args
+        assert doc_id == "doc-1"
+        insert_texts = [
+            r["insertText"]["text"] for r in requests if "insertText" in r
+        ]
+        assert insert_texts == ["[x] Whatsapp group\n"]
+        delete_ranges = [
+            r["deleteContentRange"]["range"] for r in requests if "deleteContentRange" in r
+        ]
+        assert delete_ranges == [{"startIndex": 1, "endIndex": 20}]
+        # The original unchecked marker must not appear anywhere in the
+        # requests sent to Docs — proves the escape hatch actually replaced
+        # the literal text rather than layering on top of it.
+        assert not any("[ ] Whatsapp group" in json.dumps(r) for r in requests)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
