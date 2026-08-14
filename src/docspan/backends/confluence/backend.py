@@ -12,6 +12,10 @@ import markdownify as md_lib
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.confluence.adf.converter import AdfConverter
+from docspan.backends.confluence.anchors import (
+    internal_anchors_in_markdown,
+    render_dead_anchors,
+)
 from docspan.backends.confluence.config.models import ConfluenceConfig as InternalConfluenceConfig
 from docspan.backends.confluence.markdown.parser import MarkdownParser
 from docspan.backends.confluence.models.page import ConfluencePage
@@ -138,7 +142,13 @@ class ConfluenceBackend(Backend):
             )
             self._client.update_page(confluence_page)
             base_url = self.config.base_url or ""
-            return PushResult(status="ok", doc_id=doc_id, url=f"{base_url}/pages/{doc_id}")
+            url = f"{base_url}/pages/{doc_id}"
+            anchors = internal_anchors_in_markdown(content)
+            if anchors:
+                return PushResult(
+                    status="warning", doc_id=doc_id, url=url, message=render_dead_anchors(anchors)
+                )
+            return PushResult(status="ok", doc_id=doc_id, url=url)
         except Exception as exc:
             return PushResult(status="error", doc_id=doc_id, message=str(exc))
 
