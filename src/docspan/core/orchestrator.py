@@ -253,15 +253,15 @@ class PullOutcome:
     # changed) — each entry is (old_filename, new_filename), so a user isn't
     # misled into thinking an untouched section's heading/content changed
     # when only its position did.
-    renumbered_only: list = field(default_factory=list)
-    content_renamed: list = field(default_factory=list)
+    renumbered_only: list[tuple[str, str]] = field(default_factory=list)
+    content_renamed: list[tuple[str, str]] = field(default_factory=list)
     # Sectioned pulls only: filenames of sections the prior manifest knew
     # about that vanished from this pull's fresh manifest (see
     # `_detect_orphaned_sections`). Each is converted into an explicit
     # conflict in its own section file (never silently dropped, never
     # silently auto-deleted) — this list is purely for observability/
     # reporting on top of that.
-    orphaned_sections: list = field(default_factory=list)
+    orphaned_sections: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
