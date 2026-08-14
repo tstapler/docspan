@@ -131,7 +131,9 @@ Each of these is tracked as a follow-up rather than half-addressed here.
 - A pull cannot express a `bookmark`/`bookmarkId` link, a link to a tab, or any link inside
   a table cell, so those are dropped from the pulled file without a report.
 - Confluence writes an internal anchor as a literal `#fragment` href, which it does not
-  resolve.
+  resolve. `push` now reports this as a warning naming the anchor(s) instead of shipping it
+  silently; the href itself is unchanged, since no live instance was available to establish
+  what Confluence actually generates for a heading.
 - An anchor that resolves to nothing is written as plain text, so a later pull replaces the
   author's `[text](#anchor)` with `text`. The push reports it; nothing does afterwards.
 - Such a push exits non-zero on every run, with no flag to suppress it.
