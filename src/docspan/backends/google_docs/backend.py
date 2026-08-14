@@ -8,7 +8,7 @@ import os
 import pathlib
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from googleapiclient.errors import HttpError
 
@@ -27,6 +27,7 @@ from docspan.backends.google_docs.checkbox_state import (
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.comments import (
     RespondResult,
+    bucket_comments_by_section,
     format_comments_markdown,
     parse_reply_directives,
 )
@@ -1273,10 +1274,12 @@ class GoogleDocsBackend(Backend):
             )
             try:
                 entries: List[SectionManifestEntry] = []
+                section_texts: List[Tuple[str, str]] = []
                 for index, section in enumerate(sections):
                     filename = f"{str(index).zfill(width)}-{section.slug}.md"
                     content = render_nodes_to_markdown(section.nodes) if section.nodes else ""
                     (tmp_dir / filename).write_text(content)
+                    section_texts.append((filename, content))
                     entries.append(
                         SectionManifestEntry(
                             heading_id=section.heading_id,
@@ -1286,6 +1289,7 @@ class GoogleDocsBackend(Backend):
                         )
                     )
                 ManifestStore.save(str(tmp_dir / MANIFEST_FILENAME), entries)
+                self._write_sectioned_comment_sidecars(doc_id, tmp_dir, section_texts)
                 self._atomic_replace_dir(tmp_dir, target_dir)
             except Exception:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1396,6 +1400,52 @@ class GoogleDocsBackend(Backend):
                 "rather than risk a wrong match.",
             )
         return patched, None
+
+    def _write_sectioned_comment_sidecars(
+        self, doc_id: str, tmp_dir: pathlib.Path, section_texts: List[Tuple[str, str]]
+    ) -> None:
+        """Bucket the doc's comments into one `{file}.comments.md` sidecar per
+        section, written into `tmp_dir` alongside that section's `.md` file so
+        they land inside the same atomic temp-dir-then-swap `pull_sectioned`
+        already uses (Epic 6).
+
+        Best-effort, matching `_write_comment_sidecar`'s single-file
+        semantics: any failure fetching comments or doc metadata is logged
+        and swallowed rather than failing the whole sectioned pull. Only
+        sections with at least one bucketed comment get a sidecar file — no
+        empty `{file}.comments.md` files are written (plan.md Story 4.1).
+        Comments whose quoted text matches no section are logged as residue
+        by `bucket_comments_by_section` and otherwise dropped, consistent
+        with the Observability Plan's warning-only residue treatment.
+        """
+        if not self.config.pull_comments:
+            return
+        assert self._client is not None
+        try:
+            comments = self._client.get_comments(doc_id)
+        except Exception:
+            logger.warning("Could not fetch comments for %s — skipping comment sidecars.", doc_id)
+            return
+        if not comments:
+            return
+        try:
+            title = self._client.get_doc_info(doc_id).get("name", doc_id)
+        except Exception:
+            title = doc_id
+
+        try:
+            bucketed = bucket_comments_by_section(list(comments), section_texts)
+        except Exception:
+            logger.warning(
+                "Failed to bucket comments for %s by section — skipping comment sidecars.", doc_id
+            )
+            return
+
+        for filename, section_comments in bucketed.by_section.items():
+            if not section_comments:
+                continue
+            sidecar = tmp_dir / (filename + COMMENTS_SUFFIX)
+            sidecar.write_text(format_comments_markdown(title, section_comments))
 
     def _write_comment_sidecar(self, doc_id: str, local_path: str) -> None:
         """Write a {file}.comments.md sidecar of the doc's comments (best-effort)."""

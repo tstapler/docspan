@@ -3,7 +3,11 @@
 import copy
 
 from docspan.backends.google_docs.backend import GoogleDocsBackend
-from docspan.backends.google_docs.comments import format_comments_markdown, parse_reply_directives
+from docspan.backends.google_docs.comments import (
+    bucket_comments_by_section,
+    format_comments_markdown,
+    parse_reply_directives,
+)
 from docspan.config import GoogleDocsConfig
 
 SAMPLE = [
@@ -251,3 +255,105 @@ def test_respond_to_comments_missing_sidecar_is_noop(tmp_path) -> None:
     assert result.posted == 0
     assert result.resolved == 0
     assert client.replies == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# bucket_comments_by_section — gdocs-sectioned-sync Epic 4, Story 4.1
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _comment(comment_id: str, quoted: str) -> dict:
+    return {
+        "id": comment_id,
+        "author": {"displayName": "Reviewer"},
+        "resolved": False,
+        "quotedFileContent": {"value": quoted},
+        "content": f"About: {quoted}",
+    }
+
+
+def test_bucket_comments_by_section_should_assign_comment_to_matching_section_text() -> None:
+    sections = [
+        ("00-preamble.md", "Preamble content."),
+        ("01-section-1.md", "# Section 1\n\nBody of section 1."),
+        ("02-section-2.md", "# Section 2\n\nBody of section 2."),
+        ("03-section-3.md", "# Section 3\n\nBody of section 3."),
+    ]
+    comments = [_comment("c1", "Body of section 3.")]
+
+    result = bucket_comments_by_section(comments, sections)
+
+    assert list(result.by_section.keys()) == ["03-section-3.md"]
+    assert result.by_section["03-section-3.md"] == comments
+    assert result.residue == []
+
+
+def test_bucket_comments_by_section_should_bucket_multiple_sections_independently() -> None:
+    sections = [
+        ("00-preamble.md", "Preamble content."),
+        ("01-section-1.md", "# Section 1\n\nBody of section 1."),
+        ("02-section-2.md", "# Section 2\n\nBody of section 2."),
+    ]
+    comments = [
+        _comment("c1", "Body of section 1."),
+        _comment("c2", "Body of section 2."),
+        _comment("c3", "Body of section 1."),
+    ]
+
+    result = bucket_comments_by_section(comments, sections)
+
+    assert [c["id"] for c in result.by_section["01-section-1.md"]] == ["c1", "c3"]
+    assert [c["id"] for c in result.by_section["02-section-2.md"]] == ["c2"]
+    assert "00-preamble.md" not in result.by_section
+    assert result.residue == []
+
+
+def test_bucket_comments_by_section_should_surface_unmatched_comment_as_residue_warning(
+    caplog,
+) -> None:
+    sections = [("01-section-1.md", "# Section 1\n\nBody of section 1.")]
+    comments = [_comment("c-orphan", "text found nowhere in the doc")]
+
+    with caplog.at_level("WARNING"):
+        result = bucket_comments_by_section(comments, sections)
+
+    assert result.by_section == {}
+    assert result.residue == comments
+    assert "c-orphan" in caplog.text
+
+
+def test_bucket_comments_by_section_should_treat_no_quoted_text_as_residue() -> None:
+    sections = [("01-section-1.md", "# Section 1\n\nBody of section 1.")]
+    comments = [{"id": "c-no-quote", "content": "general comment, no anchor"}]
+
+    result = bucket_comments_by_section(comments, sections)
+
+    assert result.by_section == {}
+    assert result.residue == comments
+
+
+def test_bucket_comments_by_section_ambiguous_match_assigns_first_and_warns(caplog) -> None:
+    sections = [
+        ("01-section-1.md", "shared duplicated line"),
+        ("02-section-2.md", "shared duplicated line"),
+    ]
+    comments = [_comment("c-dupe", "shared duplicated line")]
+
+    with caplog.at_level("WARNING"):
+        result = bucket_comments_by_section(comments, sections)
+
+    assert [c["id"] for c in result.by_section["01-section-1.md"]] == ["c-dupe"]
+    assert "02-section-2.md" not in result.by_section
+    assert result.residue == []
+    assert "c-dupe" in caplog.text
+
+
+def test_bucket_comments_by_section_zero_comment_section_absent_from_result() -> None:
+    sections = [
+        ("01-section-1.md", "Body of section 1."),
+        ("02-section-2.md", "Body of section 2."),
+    ]
+    comments = [_comment("c1", "Body of section 1.")]
+
+    result = bucket_comments_by_section(comments, sections)
+
+    assert "02-section-2.md" not in result.by_section

@@ -2,9 +2,12 @@
 and parse Reply:/Resolve: directives written back into that sidecar."""
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def _author(node: dict) -> str:
@@ -122,3 +125,80 @@ def parse_reply_directives(markdown_text: str) -> List[ReplyDirective]:
             directives.append(ReplyDirective(comment_id=comment_id, reply=reply, resolve=resolve))
 
     return directives
+
+
+@dataclass
+class CommentBucketResult:
+    """Result of bucketing a doc's comments into per-section groups.
+
+    `by_section` maps a section key (e.g. `SectionManifestEntry.filename`)
+    to the comments assigned to it, in manifest order, only for sections
+    that ended up with at least one comment. `residue` holds comments whose
+    `quotedFileContent.value` matched no section's rendered text at all —
+    surfaced as a warning, never silently dropped (plan.md Task 4.1.3).
+    """
+
+    by_section: Dict[str, List[dict]] = field(default_factory=dict)
+    residue: List[dict] = field(default_factory=list)
+
+
+def _quoted_text(comment: dict) -> str:
+    return (comment.get("quotedFileContent") or {}).get("value", "").strip()
+
+
+def bucket_comments_by_section(
+    comments: List[dict], sections: List[Tuple[str, str]]
+) -> CommentBucketResult:
+    """Bucket `comments` into the section whose rendered text they quote.
+
+    Chain-of-Responsibility-flavored matching (plan.md Pattern Decisions:
+    "Comment bucketing"): for each comment, walk `sections` — a list of
+    `(section_key, rendered_markdown_text)` pairs in manifest order — and
+    substring-match the comment's `quotedFileContent.value` against each
+    section's rendered text in turn. The first matching section wins.
+
+    If a comment's quoted text matches more than one section, that's an
+    ambiguous match, not a silent first-wins pick: it's still assigned to
+    the first (manifest-order) match for determinism, but a warning is
+    logged naming the comment id/snippet and every matching section, so the
+    ambiguity is surfaced rather than invisible.
+
+    A comment with no quoted text, or whose quoted text matches no
+    section's rendered text at all, is unassigned and lands in
+    `CommentBucketResult.residue` — never silently dropped and never
+    silently attached to the wrong section.
+    """
+    result = CommentBucketResult()
+    for comment in comments:
+        quoted = _quoted_text(comment)
+        if not quoted:
+            result.residue.append(comment)
+            logger.warning(
+                "Comment %s has no quoted text to bucket by section — treating as residue.",
+                comment.get("id", "<unknown>"),
+            )
+            continue
+
+        matches = [key for key, text in sections if quoted in text]
+        if not matches:
+            result.residue.append(comment)
+            logger.warning(
+                "Comment %s (%r) matched no section's text — unassigned, surfaced as residue.",
+                comment.get("id", "<unknown>"),
+                quoted[:80],
+            )
+            continue
+
+        if len(matches) > 1:
+            logger.warning(
+                "Comment %s (%r) matched multiple sections (%s) — assigned to "
+                "the first match (%s) in manifest order.",
+                comment.get("id", "<unknown>"),
+                quoted[:80],
+                ", ".join(matches),
+                matches[0],
+            )
+
+        result.by_section.setdefault(matches[0], []).append(comment)
+
+    return result

@@ -2205,6 +2205,59 @@ class TestPullSectioned:
         siblings = [p.name for p in tmp_path.iterdir()]
         assert siblings == ["doc"]
 
+    def test_pull_sectioned_should_write_one_comments_sidecar_per_section(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        fake_client.get_doc_info.return_value = {"name": "Sectioned Doc"}
+        fake_client.get_comments.return_value = [
+            {
+                "id": "c-sec3",
+                "author": {"displayName": "Reviewer"},
+                "resolved": False,
+                "quotedFileContent": {"value": "Body of section 3."},
+                "content": "Question about section 3.",
+            },
+            {
+                "id": "c-sec5",
+                "author": {"displayName": "Reviewer"},
+                "resolved": False,
+                "quotedFileContent": {"value": "Body of section 5."},
+                "content": "Question about section 5.",
+            },
+            {
+                "id": "c-unmatched",
+                "author": {"displayName": "Reviewer"},
+                "resolved": False,
+                "quotedFileContent": {"value": "text that appears nowhere in the doc"},
+                "content": "Orphaned comment.",
+            },
+        ]
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "ok", result.message
+        comment_sidecars = sorted(p.name for p in local_dir.glob("*.comments.md"))
+        assert comment_sidecars == ["03-section-3.md.comments.md", "05-section-5.md.comments.md"]
+
+        section_3_comments = (local_dir / "03-section-3.md.comments.md").read_text()
+        assert "Question about section 3." in section_3_comments
+        assert "Question about section 5." not in section_3_comments
+
+        section_5_comments = (local_dir / "05-section-5.md.comments.md").read_text()
+        assert "Question about section 5." in section_5_comments
+        assert "Question about section 3." not in section_5_comments
+
+        # The unmatched comment is surfaced as residue, not silently attached
+        # to any section, and doesn't get its own sidecar either.
+        assert "text that appears nowhere" not in section_3_comments
+        assert "text that appears nowhere" not in section_5_comments
+        for entry in local_dir.iterdir():
+            if entry.name.endswith(".comments.md"):
+                assert "c-unmatched" not in entry.read_text()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # push_sectioned() — gdocs-sectioned-sync Epic 3: reassemble a sectioned
