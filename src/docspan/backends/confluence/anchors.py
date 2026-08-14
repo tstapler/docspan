@@ -34,22 +34,60 @@ from typing import List
 # negative in the one job this module has. The two patterns must not drift.
 _ANCHOR_LINK = re.compile(r"(?<!!)\[[^\]]+\]\(#(?P<target>[^)\s]+)(?:\s+\"[^\"]+\")?\)")
 
-# Fenced blocks and inline code, which the block parser never runs the inline
-# parser over — so a link inside one is documentation, not a link.
-_FENCED = re.compile(r"^[ \t]*(?P<fence>```+|~~~+).*?^[ \t]*(?P=fence)[ \t]*$", re.S | re.M)
+# Inline code, which the block parser never runs the inline parser over — so a
+# link inside one is documentation, not a link.
 _INLINE_CODE = re.compile(r"`[^`\n]+`")
+
+
+def _strip_fenced_code(content: str) -> str:
+    """Replace fenced code blocks with blank lines, in linear time.
+
+    A regex equivalent of this (matching an opening fence, then lazily
+    scanning for its close) is quadratic-or-worse on input containing many
+    lines that look like fence-opens but never close: each candidate open
+    forces a fresh scan to the end of the input looking for a match that
+    isn't there. A single left-to-right pass over lines, tracking fence
+    state, does the same job in O(n).
+
+    An opening fence that is never closed extends to end-of-document (the
+    CommonMark rule) rather than matching nothing: everything after it is
+    still code, not prose, so a link inside it must not be reported.
+    """
+    out: List[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for line in content.split("\n"):
+        stripped = line.lstrip(" \t")
+        if not in_fence:
+            marker = stripped[:1]
+            if marker in ("`", "~"):
+                run = len(stripped) - len(stripped.lstrip(marker))
+                if run >= 3:
+                    in_fence = True
+                    fence_char = marker
+                    fence_len = run
+                    out.append("")
+                    continue
+            out.append(line)
+        else:
+            closing = stripped.rstrip(" \t")
+            if closing and closing == fence_char * len(closing) and len(closing) == fence_len:
+                in_fence = False
+            out.append("")
+    return "\n".join(out)
 
 
 def internal_anchors_in_markdown(content: str) -> List[str]:
     """Every distinct `#fragment` link destination in ``content``, in use order.
 
-    Code is removed first. The regex is not block-aware, and a page documenting
+    Code is removed first. The scan is not block-aware, and a page documenting
     anchor syntax inside a ```` ```markdown ```` fence had its own example
     reported — a warning, and a non-zero exit, on a page containing no link at
     all. `![alt](#f)` is excluded too: it becomes a `media` node, so "a reader
     clicking one lands nowhere" would be the wrong thing to say about it.
     """
-    prose = _INLINE_CODE.sub(" ", _FENCED.sub("\n", content))
+    prose = _INLINE_CODE.sub(" ", _strip_fenced_code(content))
     seen: List[str] = []
     for match in _ANCHOR_LINK.finditer(prose):
         anchor = "#" + match.group("target")

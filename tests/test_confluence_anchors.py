@@ -7,12 +7,16 @@ the same dead link the Google Docs backend was fixed for.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from docspan.backends.confluence.anchors import (
+    _ANCHOR_LINK,
     internal_anchors_in_markdown,
     render_dead_anchors,
 )
+from docspan.backends.confluence.markdown.inline_parser import InlineParser
 
 
 class TestFindingInternalAnchors:
@@ -51,6 +55,17 @@ class TestRendering:
         message = render_dead_anchors([f"#a{n}" for n in range(8)])
         assert "… and 3 more" in message
 
+    def test_exactly_five_are_not_truncated(self) -> None:
+        message = render_dead_anchors([f"#a{n}" for n in range(5)])
+        assert "more" not in message
+        for n in range(5):
+            assert f"#a{n}" in message
+
+    def test_exactly_six_are_truncated_by_one_singular(self) -> None:
+        message = render_dead_anchors([f"#a{n}" for n in range(6)])
+        assert "… and 1 more" in message
+        assert "2 more" not in message
+
 
 class TestCodeIsNotProse:
     """A link inside code is documentation, not a link.
@@ -86,6 +101,13 @@ class TestCodeIsNotProse:
         content = "````\nhere is ``` inline-looking text and [a](#in-fence)\n````\n\nsee [b](#real)\n"
         assert internal_anchors_in_markdown(content) == ["#real"]
 
+    def test_an_unclosed_fence_swallows_everything_after_it(self) -> None:
+        """Per CommonMark, an unclosed fence extends to end-of-document, so a
+        "link" after the opening marker never renders as a link in real
+        Confluence content either — it must not be reported as dead."""
+        content = "```\nsee [a](#never-closed)\n"
+        assert internal_anchors_in_markdown(content) == []
+
 
 class TestMatchingTheParsersOwnPattern:
     def test_a_link_with_a_title_is_reported(self) -> None:
@@ -102,3 +124,52 @@ class TestMatchingTheParsersOwnPattern:
         """`![alt](#f)` becomes a media node, so "a reader clicking one lands
         nowhere" would be the wrong thing to say about it."""
         assert internal_anchors_in_markdown("![alt](#f)\n") == []
+
+
+class TestAnchorLinkDriftGuard:
+    """`_ANCHOR_LINK` is a hand-narrowed copy of ``InlineParser.PATTERNS["link"]``,
+    kept in sync only by a code comment — this already caused one false-negative
+    regression (see the module docstring). This runs the real, live pattern
+    against a shared corpus so a future edit to ``PATTERNS["link"]`` that isn't
+    mirrored here fails loudly instead of silently.
+    """
+
+    _LINK_PATTERN = re.compile(InlineParser.PATTERNS["link"])
+
+    _CORPUS = [
+        "[a](#one)",
+        '[a](#one "Some Title")',
+        "[a](https://example.com)",
+        '[a](https://example.com "Some Title")',
+        "![alt](#f)",
+        '![alt](#f "Some Title")',
+        "no link here at all",
+        "[a](#one) and [b](#two)",
+        "[a](#one-two_three.four)",
+        "text [A1](#a1 \"Some Title\") more text",
+        "![alt](https://example.com/img.png)",
+    ]
+
+    @staticmethod
+    def _expected_hash_destinations(content: str, link_pattern: "re.Pattern[str]") -> set:
+        """What `PATTERNS["link"]` matches as `#`-destinations, minus the ones
+        that are actually images — the real parser lets an image match (which
+        starts one character earlier, at the `!`) win the overlap and drops
+        the underlying link match entirely."""
+        expected = set()
+        for match in link_pattern.finditer(content):
+            dest = match.group(2)
+            if not dest.startswith("#"):
+                continue
+            if match.start() > 0 and content[match.start() - 1] == "!":
+                continue
+            expected.add(dest)
+        return expected
+
+    @pytest.mark.parametrize("content", _CORPUS)
+    def test_anchor_link_agrees_with_the_parsers_pattern_on_hash_destinations(
+        self, content: str
+    ) -> None:
+        expected = self._expected_hash_destinations(content, self._LINK_PATTERN)
+        actual = {"#" + match.group("target") for match in _ANCHOR_LINK.finditer(content)}
+        assert actual == expected
