@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/tstapler/docspan/compare/docspan-v0.4.0...docspan-v0.5.0) (2026-08-14)
+
+
+### Features
+
+* **google-docs:** sectioned sync for large document mappings ([#106](https://github.com/tstapler/docspan/issues/106)) ([fe12122](https://github.com/tstapler/docspan/commit/fe121229c8b6b957254020fd2c06241f7506aa80))
+
+
+### Bug Fixes
+
+* **ci:** dispatch PyPI publish from release-please via workflow_dispatch ([e76ffb8](https://github.com/tstapler/docspan/commit/e76ffb8547bfd7d2d2b453a64a5fb3899445fc5f))
+* **confluence:** report internal anchors instead of writing a link to nowhere ([#105](https://github.com/tstapler/docspan/issues/105)) ([cd38f24](https://github.com/tstapler/docspan/commit/cd38f2415e37814e071a180182454d761cfcbfa9))
+* **google-docs:** reset table cell paragraph style to NORMAL_TEXT on fill ([e6db797](https://github.com/tstapler/docspan/commit/e6db797d51746c738586c3cab171367e23bd5be0))
+
 ## [0.4.0](https://github.com/tstapler/docspan/compare/docspan-v0.3.0...docspan-v0.4.0) (2026-08-13)
 
 
