@@ -72,6 +72,17 @@ def save_base_content(state_dir: str, content: str) -> str:
     return sha
 
 
+def _section_files(directory: str) -> list[str]:
+    """List a sectioned mapping's section content files, sorted.
+
+    Only `*.md` files are per-section content subject to the state/merge
+    loop; `_manifest.yaml` and any other sidecar is not.
+    """
+    if not os.path.isdir(directory):
+        return []
+    return sorted(f for f in os.listdir(directory) if f.endswith(".md"))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Outcome types
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,10 +182,17 @@ def orchestrate_push(
     document.
     """
     assert mapping.remote_id is not None, "orchestrate_push requires a mapping with a created remote doc/page"
-    result = backend.push(
-        mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
-        mappings=mappings, cross_doc_cache=cross_doc_cache,
-    )
+
+    if mapping.sectioned:
+        result = backend.push_sectioned(
+            mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
+            mappings=mappings, cross_doc_cache=cross_doc_cache,
+        )
+    else:
+        result = backend.push(
+            mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
+            mappings=mappings, cross_doc_cache=cross_doc_cache,
+        )
     outcome = PushOutcome(local_path=mapping.local, result=result)
 
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
@@ -188,11 +206,26 @@ def orchestrate_push(
                 exc_info=True,
             )
             remote_version = ""
-        with open(mapping.local, encoding="utf-8") as fh:
-            content = fh.read()
-        outcome.state_saved = _record_state(
-            state, state_path, state_dir, mapping.local, mapping, content, remote_version
-        )
+
+        if mapping.sectioned:
+            # One state entry per section file, keyed by that file's own
+            # path — reuses the existing (already generically-keyed) state
+            # store without needing any change to SyncState itself.
+            saved = True
+            for filename in _section_files(mapping.local):
+                section_path = os.path.join(mapping.local, filename)
+                with open(section_path, encoding="utf-8") as fh:
+                    content = fh.read()
+                saved = _record_state(
+                    state, state_path, state_dir, section_path, mapping, content, remote_version
+                ) and saved
+            outcome.state_saved = saved
+        else:
+            with open(mapping.local, encoding="utf-8") as fh:
+                content = fh.read()
+            outcome.state_saved = _record_state(
+                state, state_path, state_dir, mapping.local, mapping, content, remote_version
+            )
 
     return outcome
 
@@ -209,6 +242,10 @@ def orchestrate_pull(
     state_path: str,
 ) -> PullOutcome:
     assert mapping.remote_id is not None, "orchestrate_pull requires a mapping with a created remote doc/page"
+
+    if mapping.sectioned:
+        return _orchestrate_pull_sectioned(mapping, backend, state, state_dir, state_path)
+
     entry = state.get(mapping.local)
 
     local_exists = os.path.exists(mapping.local)
@@ -358,3 +395,125 @@ def _merge_pull(
         has_conflicts=merge_result.has_conflicts,
         conflict_count=merge_result.conflict_count,
     )
+
+
+def _orchestrate_pull_sectioned(
+    mapping: "Mapping",
+    backend: Backend,
+    state: SyncState,
+    state_dir: str,
+    state_path: str,
+) -> PullOutcome:
+    """Pull dispatch for `mapping.sectioned` mappings.
+
+    A Google Doc has one remote_version for the whole document, so unlike
+    the single-file path that alone can't tell us which *section* changed.
+    Instead this always fetches a fresh split into a throwaway temp
+    directory, then runs the same first-sync/fast-forward/local-only/
+    three-way-merge decision independently per section file — each keyed by
+    that section file's own path in `state`, so a conflict in one section
+    never touches another section's merge base.
+    """
+    assert mapping.remote_id is not None
+
+    try:
+        remote_version = backend.get_remote_version(mapping.remote_id)
+    except Exception as exc:
+        return PullOutcome(
+            local_path=mapping.local,
+            action="error",
+            result=PullResult(
+                status="error", doc_id=mapping.remote_id, local_path=mapping.local, message=str(exc),
+            ),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        pull_result = backend.pull_sectioned(tmp_dir, mapping.remote_id, tab_id=mapping.tab_id)
+        if pull_result.status not in ("ok", "warning"):
+            return PullOutcome(local_path=mapping.local, action="error", result=pull_result)
+
+        os.makedirs(mapping.local, exist_ok=True)
+
+        any_merge = False
+        any_conflicts = False
+        conflict_total = 0
+        written_files = 0
+        first_sync_files = 0
+
+        for filename in _section_files(tmp_dir):
+            theirs_path = os.path.join(tmp_dir, filename)
+            local_section_path = os.path.join(mapping.local, filename)
+            with open(theirs_path, encoding="utf-8") as fh:
+                theirs_content = fh.read()
+
+            entry = state.get(local_section_path)
+
+            if entry is None:
+                with open(local_section_path, "w", encoding="utf-8") as fh:
+                    fh.write(theirs_content)
+                _record_state(
+                    state, state_path, state_dir, local_section_path, mapping,
+                    theirs_content, remote_version,
+                )
+                written_files += 1
+                first_sync_files += 1
+                continue
+
+            local_exists = os.path.exists(local_section_path)
+            local_content = ""
+            if local_exists:
+                with open(local_section_path, encoding="utf-8") as fh:
+                    local_content = fh.read()
+
+            current_local_hash = sha256_of_content(local_content) if local_exists else ""
+            local_changed = local_exists and current_local_hash != entry.local_hash
+            remote_changed = sha256_of_content(theirs_content) != entry.base_hash
+
+            if not remote_changed and not local_changed:
+                continue
+
+            if remote_changed and not local_changed:
+                with open(local_section_path, "w", encoding="utf-8") as fh:
+                    fh.write(theirs_content)
+                _record_state(
+                    state, state_path, state_dir, local_section_path, mapping,
+                    theirs_content, remote_version,
+                )
+                written_files += 1
+                continue
+
+            if local_changed and not remote_changed:
+                # Local-only edit to this section — leave it for the user to push.
+                continue
+
+            # Both sides changed this section — three-way merge, scoped to it alone.
+            any_merge = True
+            written_files += 1
+            base_content = get_base_content(state_dir, entry.base_hash)
+            merge_result = three_way_merge(base_content, theirs_content, local_content)
+            with open(local_section_path, "w", encoding="utf-8") as fh:
+                fh.write(merge_result.merged)
+            _record_state(
+                state, state_path, state_dir, local_section_path, mapping,
+                merge_result.merged, remote_version,
+            )
+            if merge_result.has_conflicts:
+                any_conflicts = True
+                conflict_total += merge_result.conflict_count
+
+        if any_merge:
+            action = "merged"
+        elif written_files > 0 and written_files == first_sync_files:
+            action = "first-sync"
+        elif written_files > 0:
+            action = "fast-forward"
+        else:
+            action = "up-to-date"
+
+        return PullOutcome(
+            local_path=mapping.local,
+            action=action,
+            result=pull_result,
+            has_conflicts=any_conflicts,
+            conflict_count=conflict_total,
+        )

@@ -113,3 +113,30 @@ def test_state_file_is_valid_json(tmp_path) -> None:  # type: ignore[no-untyped-
         data = json.load(fh)
     assert "mappings" in data
     assert "doc.md" in data["mappings"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sectioned mappings (gdocs-sectioned-sync Epic 5): one entry per section file
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_mapping_state_should_key_one_entry_per_section_file_path(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """SyncState is already a generic str-keyed dict — a sectioned mapping's
+    orchestrator dispatch keys per-section-file state by that file's own path
+    (e.g. `docs/big-doc/02-body.md`) instead of by `mapping.local` (the
+    directory), and each section's entry updates independently."""
+    path = str(tmp_path / "state.json")
+    state = SyncState()
+
+    state.update("docs/big-doc/01-intro.md", _make_entry(doc_id="doc-123", remote_version="1"))
+    state.update("docs/big-doc/02-body.md", _make_entry(doc_id="doc-123", remote_version="1"))
+    state.save(path)
+
+    # Updating one section's entry leaves the other untouched.
+    state.update("docs/big-doc/02-body.md", _make_entry(doc_id="doc-123", remote_version="2"))
+    state.save(path)
+
+    loaded = SyncState.load(path)
+    assert loaded.get("docs/big-doc/01-intro.md").remote_version == "1"  # type: ignore[union-attr]
+    assert loaded.get("docs/big-doc/02-body.md").remote_version == "2"  # type: ignore[union-attr]
+    # No entry is keyed by the mapping's directory itself.
+    assert loaded.get("docs/big-doc") is None

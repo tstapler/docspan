@@ -14,7 +14,7 @@ import yaml
 from typer.testing import CliRunner
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
-from docspan.cli.main import LIVE_WEDDING_DOC_ID, SCRATCH_VERIFIED_MARKER, app
+from docspan.cli.main import LIVE_WEDDING_DOC_ID, SCRATCH_VERIFIED_MARKER, app, resolve_mapping_for_path
 from docspan.config import ConfigConflictError, Mapping, MarkgateConfig
 from docspan.core.orchestrator import PullOutcome, PushOutcome
 from docspan.core.state import MappingState, SyncState, sha256_of_content
@@ -1004,3 +1004,35 @@ class TestGroupLevelOptions:
         assert "--prefix" in output
         # The group help text must survive adding a callback.
         assert "Push and pull markdown" in output
+
+
+class TestResolveMappingForPath:
+    """resolve_mapping_for_path (Specification pattern) replaces the old
+    exact `m.local == file` checks at the map/comments-respond/conflicts-resolve
+    call sites so a path inside a sectioned mapping's directory resolves to
+    that mapping too, not just an exact single-file match."""
+
+    def test_resolve_mapping_for_path_should_match_sectioned_mapping_when_path_is_a_file_inside_its_directory(self) -> None:  # type: ignore[no-untyped-def]
+        sectioned = Mapping(
+            local="docs/big-doc", backend="google_docs", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        other = Mapping(local="docs/other.md", backend="google_docs", remote_id="doc-2")
+
+        result = resolve_mapping_for_path([other, sectioned], "docs/big-doc/02-intro.md")
+
+        assert result is sectioned
+
+    def test_resolve_mapping_for_path_should_return_none_when_path_is_outside_any_mapping_directory(self) -> None:  # type: ignore[no-untyped-def]
+        sectioned = Mapping(
+            local="docs/big-doc", backend="google_docs", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        single_file = Mapping(local="docs/other.md", backend="google_docs", remote_id="doc-2")
+
+        # "docs/big-doc-appendix.md" shares a string prefix with "docs/big-doc"
+        # but is not a path *inside* that directory — a naive prefix check
+        # (without the os.sep boundary) would wrongly match it.
+        result = resolve_mapping_for_path([sectioned, single_file], "docs/big-doc-appendix.md")
+
+        assert result is None

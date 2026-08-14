@@ -435,6 +435,27 @@ def pull(
         raise typer.Exit(1)
 
 
+def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Mapping]:
+    """Find the mapping that owns `file` (Specification pattern).
+
+    A non-sectioned mapping owns exactly the file at `mapping.local` (the old
+    exact-match check). A sectioned mapping's `local` is a *directory* of
+    section files (`NN-slug.md` + `_manifest.yaml`), so it owns every path
+    underneath that directory — e.g. `docs/big-doc/02-intro.md` resolves to
+    the `docs/big-doc` mapping even though no mapping's `local` ever equals
+    that section path exactly.
+    """
+    norm_file = os.path.normpath(file)
+    for m in mappings:
+        norm_local = os.path.normpath(m.local)
+        if not m.sectioned:
+            if norm_local == norm_file:
+                return m
+        elif norm_file == norm_local or norm_file.startswith(norm_local + os.sep):
+            return m
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # map command
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,7 +484,7 @@ def map_(
 
     config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
 
-    if any(m.local == file for m in config.mappings):
+    if resolve_mapping_for_path(config.mappings, file) is not None:
         err_console.print(
             f"'{file}' is already mapped in markgate.yaml. Remove the existing mapping before creating a new one."
         )
@@ -575,7 +596,7 @@ def comments_respond(
     """
     config, config_path, prefix = _resolve(config_path, prefix)
 
-    mapping = next((m for m in config.mappings if m.local == file), None)
+    mapping = resolve_mapping_for_path(config.mappings, file)
     if mapping is None:
         err_console.print(f"No mapping found for: {file}")
         raise typer.Exit(1)
@@ -786,7 +807,7 @@ def conflicts_resolve(
     # mapping up in markgate.yaml by local path so a re-fetch of a tab-scoped
     # mapping targets the right tab instead of silently falling back to the
     # doc's first tab.
-    mapping = next((m for m in config.mappings if m.local == file), None)
+    mapping = resolve_mapping_for_path(config.mappings, file)
     tab_id = mapping.tab_id if mapping is not None else None
 
     if accept == "remote":
