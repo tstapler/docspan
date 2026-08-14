@@ -9,7 +9,7 @@ import pathlib
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from googleapiclient.errors import HttpError
 
@@ -791,6 +791,68 @@ class GoogleDocsBackend(Backend):
                 retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
             )
 
+    def _resolve_sectioned_push_order(
+        self, local_dir: str, doc_id: str, manifest_path: str
+    ) -> Union[PushResult, Tuple[List[str], List[SectionManifestEntry], Optional[str]]]:
+        """Load a sectioned mapping's manifest and compute push ordering.
+
+        Extracted out of `push_sectioned` (pure extraction, no behavior
+        change) — everything up to reading section file *content*.
+
+        On any validation failure, returns the `PushResult(status="error",
+        ...)` `push_sectioned` should return as-is. On success, returns
+        `(ordered_filenames, present_entries, reorder_warning)`: manifest
+        order followed by any filesystem-only additions, the manifest
+        entries whose files still exist (for reorder classification), and
+        the reorder warning string (or `None`).
+        """
+        try:
+            entries = ManifestStore.load(manifest_path)
+        except ManifestError as exc:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: {exc}",
+            )
+
+        if not entries:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: manifest {manifest_path!r} has no sections",
+            )
+
+        # A manifest entry whose file no longer exists is a *deleted* section
+        # (drop it — the reused diff tail sees its content missing from the
+        # target and emits the delete itself), not an error: only a wholesale
+        # missing/unreadable manifest is an error condition here.
+        present_files = (
+            {f for f in os.listdir(local_dir) if f.endswith(".md")}
+            if os.path.isdir(local_dir)
+            else set()
+        )
+        known_filenames = {e.filename for e in entries}
+        present_entries = [e for e in entries if e.filename in present_files]
+        # New local .md files with no manifest entry are *added* sections —
+        # appended after every known section, in filename order. Their
+        # position within the reassembled document is therefore always "at
+        # the end" rather than wherever their NN- prefix might suggest; a
+        # section meant to land elsewhere needs a subsequent pull to
+        # re-derive its manifest position. Documented simplification, not an
+        # attempt to infer mid-document placement from filename ordinals.
+        added_filenames = sorted(present_files - known_filenames)
+
+        ordered_filenames = [e.filename for e in present_entries] + added_filenames
+        if not ordered_filenames:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: no section files present in {local_dir!r}",
+            )
+
+        reorder_warning = self._classify_section_reorder(present_entries)
+        return ordered_filenames, present_entries, reorder_warning
+
     def push_sectioned(
         self,
         local_dir: str,
@@ -868,51 +930,10 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         manifest_path = os.path.join(local_dir, MANIFEST_FILENAME)
-        try:
-            entries = ManifestStore.load(manifest_path)
-        except ManifestError as exc:
-            return PushResult(
-                status="error",
-                doc_id=doc_id,
-                message=f"cannot push sectioned mapping: {exc}",
-            )
-
-        if not entries:
-            return PushResult(
-                status="error",
-                doc_id=doc_id,
-                message=f"cannot push sectioned mapping: manifest {manifest_path!r} has no sections",
-            )
-
-        # A manifest entry whose file no longer exists is a *deleted* section
-        # (drop it — the reused diff tail sees its content missing from the
-        # target and emits the delete itself), not an error: only a wholesale
-        # missing/unreadable manifest is an error condition here.
-        present_files = (
-            {f for f in os.listdir(local_dir) if f.endswith(".md")}
-            if os.path.isdir(local_dir)
-            else set()
-        )
-        known_filenames = {e.filename for e in entries}
-        present_entries = [e for e in entries if e.filename in present_files]
-        # New local .md files with no manifest entry are *added* sections —
-        # appended after every known section, in filename order. Their
-        # position within the reassembled document is therefore always "at
-        # the end" rather than wherever their NN- prefix might suggest; a
-        # section meant to land elsewhere needs a subsequent pull to
-        # re-derive its manifest position. Documented simplification, not an
-        # attempt to infer mid-document placement from filename ordinals.
-        added_filenames = sorted(present_files - known_filenames)
-
-        ordered_filenames = [e.filename for e in present_entries] + added_filenames
-        if not ordered_filenames:
-            return PushResult(
-                status="error",
-                doc_id=doc_id,
-                message=f"cannot push sectioned mapping: no section files present in {local_dir!r}",
-            )
-
-        reorder_warning = self._classify_section_reorder(present_entries)
+        prepared = self._resolve_sectioned_push_order(local_dir, doc_id, manifest_path)
+        if isinstance(prepared, PushResult):
+            return prepared
+        ordered_filenames, present_entries, reorder_warning = prepared
 
         section_paths = [os.path.join(local_dir, name) for name in ordered_filenames]
         try:
