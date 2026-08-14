@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import pathlib
@@ -179,7 +180,11 @@ class GoogleDocsBackend(Backend):
         return self._cleanup_temp_uploads_logged(plan.temp_drive_file_ids if plan else [])
 
     def _build_push_plan(
-        self, local_path: str, doc_id: str, tab_id: Optional[str] = None
+        self,
+        local_path: str,
+        doc_id: str,
+        tab_id: Optional[str] = None,
+        content: Optional[str] = None,
     ) -> PushPlan:
         """Fetch the doc + open comments exactly once and compute the diff/risk plan.
 
@@ -199,9 +204,20 @@ class GoogleDocsBackend(Backend):
         one tab, plan.tab_warning is set so callers can surface that the
         choice was implicit. Raises TabNotFoundError if tab_id doesn't match
         any tab.
+
+        `content`: when given, this markdown string is parsed directly and
+        `local_path` is never read from disk — used by push_sectioned(),
+        which has already reassembled the section files into one markdown
+        string and only needs `local_path` as the anchor file path for
+        image resolution (resolve_document_images/build_source only ever
+        take `Path(markdown_path).resolve().parent`, so `local_path` must
+        stay a real file path, never the sectioned directory itself).
+        push() and preview_push() never pass this — they keep reading
+        `local_path` themselves, unchanged.
         """
         assert self._client is not None
-        content = pathlib.Path(local_path).read_text()
+        if content is None:
+            content = pathlib.Path(local_path).read_text()
 
         target_nodes = MarkdownToParagraphParser().parse(content)
 
@@ -409,24 +425,63 @@ class GoogleDocsBackend(Backend):
         to whichever tab happens to be first.
         """
         self._ensure_client()
-        assert self._client is not None
-        plan: Optional[PushPlan] = None
+        resolver = self._build_cross_doc_resolver(kwargs, caller="push")
+        return self._execute_push(
+            local_path, doc_id, force=force, tab_id=tab_id, resolver=resolver
+        )
+
+    def _build_cross_doc_resolver(
+        self, kwargs: dict, *, caller: str
+    ) -> Optional["cross_doc_links.CrossDocLinkResolver"]:
+        """Shared `mappings`/`cross_doc_cache` kwarg validation for push()/push_sectioned()."""
         mappings = kwargs.get("mappings")
         cross_doc_cache = kwargs.get("cross_doc_cache")
-        resolver: Optional[cross_doc_links.CrossDocLinkResolver] = None
-        if mappings:
-            assert isinstance(mappings, list), (
-                f"push() 'mappings' kwarg must be a list, got {type(mappings).__name__}"
-            )
-            assert cross_doc_cache is None or isinstance(cross_doc_cache, dict), (
-                "push() 'cross_doc_cache' kwarg must be a dict, got "
-                f"{type(cross_doc_cache).__name__}"
-            )
-            resolver = cross_doc_links.CrossDocLinkResolver(
-                mappings, self._fetch_target_headings, cache=cross_doc_cache
-            )
+        if not mappings:
+            return None
+        assert isinstance(mappings, list), (
+            f"{caller}() 'mappings' kwarg must be a list, got {type(mappings).__name__}"
+        )
+        assert cross_doc_cache is None or isinstance(cross_doc_cache, dict), (
+            f"{caller}() 'cross_doc_cache' kwarg must be a dict, got "
+            f"{type(cross_doc_cache).__name__}"
+        )
+        return cross_doc_links.CrossDocLinkResolver(
+            mappings, self._fetch_target_headings, cache=cross_doc_cache
+        )
+
+    def _execute_push(
+        self,
+        local_path: str,
+        doc_id: str,
+        *,
+        force: bool,
+        tab_id: Optional[str],
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"],
+        content: Optional[str] = None,
+        diff_too_expensive_status: str = "error",
+    ) -> PushResult:
+        """Shared diff/request-emission tail for push() and push_sectioned().
+
+        Everything from `_build_push_plan` through the pass-1/pass-2
+        batch_update calls and PushResult assembly lives here, unchanged
+        from push()'s own former body — push() calls this with
+        `content=None` (read `local_path` itself, exactly as before);
+        push_sectioned() calls it with the reassembled section markdown as
+        `content` and a section file's own path as `local_path` (the
+        anchor path `_build_push_plan`/resolve_document_images need).
+
+        `diff_too_expensive_status` lets push_sectioned() report the guard
+        trip as "blocked" (refused to write, no partial batch_update ever
+        sent) instead of push()'s historical "error", without touching the
+        guard itself (_MAX_COMPARISON_CELLS/_MAX_DUPLICATE_RUN in
+        docs_request_builder.py) or adding any bypass/fallback around it —
+        the guard fires identically either way, only the reported status
+        string differs.
+        """
+        assert self._client is not None
+        plan: Optional[PushPlan] = None
         try:
-            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
+            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id, content=content)
 
             if plan.requests and plan.high_risk and not force:
                 # A blocked push is not going to be auto-retried, so cleanup
@@ -715,9 +770,12 @@ class GoogleDocsBackend(Backend):
             )
         except DiffTooExpensive as exc:
             # A clear, actionable error rather than a multi-minute hang or an
-            # uncaught traceback — see DiffTooExpensive's docstring.
+            # uncaught traceback — see DiffTooExpensive's docstring. The guard
+            # itself already raised before any batch_update was ever issued,
+            # so there is no partial-write state to clean up here beyond the
+            # usual temp-upload cleanup.
             return PushResult(
-                status="error",
+                status=diff_too_expensive_status,
                 doc_id=doc_id,
                 message=str(exc),
                 retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
@@ -729,6 +787,202 @@ class GoogleDocsBackend(Backend):
                 message=str(exc),
                 retryable_temp_drive_file_ids=self._cleanup_plan_temp_uploads(plan),
             )
+
+    def push_sectioned(
+        self,
+        local_dir: str,
+        doc_id: str,
+        force: bool = False,
+        tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> PushResult:
+        """Reassemble a sectioned mapping's section files and push() the result.
+
+        Reads `_manifest.yaml` (ManifestStore.load) for the ordered list of
+        (heading_id, filename) entries, reads each section file's markdown
+        in **manifest order** (not filesystem/glob order — a user can
+        reorder sections by editing the manifest without renaming files)
+        and concatenates them into one markdown string, then hands off to
+        `_execute_push` exactly as push() does — the diff/request-emission
+        tail (SequenceMatcher-based node diff -> DocsRequestBuilder.build()
+        -> pass 1/pass 2 batch_update) is entirely unchanged and untouched
+        by this method; only content acquisition differs.
+
+        `local_path` passed into `_execute_push`/`_build_push_plan` is the
+        *anchor* section file's own path (the manifest's first entry) —
+        never `local_dir` itself. resolve_document_images/build_source only
+        ever take `Path(markdown_path).resolve().parent`, so passing the
+        bare directory would resolve relative image paths one level too
+        high (plan.md Task 3.1.3).
+
+        Section-level add/delete/reorder is classified (via
+        difflib.SequenceMatcher keyed on heading_id, comparing the
+        manifest's on-disk entry order against the section files actually
+        present, sorted the way pull_sectioned names them) purely for the
+        warning surfaced in a PushResult — it does not steer request
+        emission. Google Docs' batchUpdate API has no "move paragraph"
+        primitive (confirmed in docs_request_builder.py's `build()`: only
+        equal/delete/insert/replace opcodes exist), so in general a section
+        reorder can only be written as an ordinary delete-old-range +
+        insert-at-new-range pair by the reused diff tail, exactly like any
+        other content reorder — which would mean the reordered heading's
+        `heading_id` does NOT survive the round trip (fallback rung 3 of
+        plan.md's in-place-move ladder: accept heading_id churn as a
+        documented limitation, by necessity since there is no rung-1 API
+        primitive and rung-2 copy-then-delete would mean new request-shape
+        code beyond what's demonstrated necessary here).
+        In practice, for a *pure* reorder (manifest order changed, section
+        content itself untouched), `docs_request_builder.py`'s `_repair`
+        step recognizes the swapped run's content pairs as literally
+        unchanged and folds them back to `equal` opcodes rather than
+        delete+insert — so heading_ids are in fact preserved and zero
+        batch_update requests are emitted; the live document's paragraph
+        order is left as-is (Docs has no notion of order independent of
+        content identity here). Rung-3 heading_id churn only actually
+        occurs when the reordered run also carries a genuine content edit
+        that the differ cannot fold back to `equal` — the next
+        `pull_sectioned` re-derives the manifest fresh in that case.
+
+        The reorder warning is only ever attached to a push that already
+        writes something (`ok`/`warning`), never to a true `skipped`
+        no-op: `_classify_section_reorder` compares manifest order against
+        *filename* order, a static property of how the mapping is laid
+        out, not evidence that anything changed since the last push — a
+        mapping deliberately kept in a manifest order that differs from
+        its filenames (as in the byte-for-content-identical case) would
+        otherwise warn on every single push forever, which is churn, not
+        signal.
+
+        DiffTooExpensive still fires from the same single guard point
+        (`_bounded_opcodes` in docs_request_builder.py) with the same
+        thresholds — this method adds no per-sectioned override or
+        fallback around it. It is reported as `status="blocked"` (a
+        refused write, no partial batch_update ever sent) rather than
+        push()'s historical `status="error"` for the same exception,
+        because a sectioned push failing the guard is a decision not to
+        write, not an unexpected fault — the guard itself is bit-for-bit
+        identical to the non-sectioned path either way.
+        """
+        self._ensure_client()
+        manifest_path = os.path.join(local_dir, MANIFEST_FILENAME)
+        try:
+            entries = ManifestStore.load(manifest_path)
+        except ManifestError as exc:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: {exc}",
+            )
+
+        if not entries:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: manifest {manifest_path!r} has no sections",
+            )
+
+        # A manifest entry whose file no longer exists is a *deleted* section
+        # (drop it — the reused diff tail sees its content missing from the
+        # target and emits the delete itself), not an error: only a wholesale
+        # missing/unreadable manifest is an error condition here.
+        present_files = (
+            {f for f in os.listdir(local_dir) if f.endswith(".md")}
+            if os.path.isdir(local_dir)
+            else set()
+        )
+        known_filenames = {e.filename for e in entries}
+        present_entries = [e for e in entries if e.filename in present_files]
+        # New local .md files with no manifest entry are *added* sections —
+        # appended after every known section, in filename order. Their
+        # position within the reassembled document is therefore always "at
+        # the end" rather than wherever their NN- prefix might suggest; a
+        # section meant to land elsewhere needs a subsequent pull to
+        # re-derive its manifest position. Documented simplification, not an
+        # attempt to infer mid-document placement from filename ordinals.
+        added_filenames = sorted(present_files - known_filenames)
+
+        ordered_filenames = [e.filename for e in present_entries] + added_filenames
+        if not ordered_filenames:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: no section files present in {local_dir!r}",
+            )
+
+        reorder_warning = self._classify_section_reorder(present_entries)
+
+        section_paths = [os.path.join(local_dir, name) for name in ordered_filenames]
+        contents = [pathlib.Path(p).read_text() for p in section_paths]
+        combined_content = "".join(
+            c if c.endswith("\n") or c == "" else c + "\n" for c in contents
+        )
+        anchor_path = section_paths[0]
+
+        resolver = self._build_cross_doc_resolver(kwargs, caller="push_sectioned")
+        result = self._execute_push(
+            anchor_path,
+            doc_id,
+            force=force,
+            tab_id=tab_id,
+            resolver=resolver,
+            content=combined_content,
+            diff_too_expensive_status="blocked",
+        )
+        if reorder_warning and result.status in ("ok", "warning"):
+            result.status = "warning"
+            result.message = (
+                f"{result.message}\n{reorder_warning}" if result.message else reorder_warning
+            )
+        return result
+
+    @staticmethod
+    def _classify_section_reorder(
+        entries: List[SectionManifestEntry],
+    ) -> Optional[str]:
+        """Detect a manifest-order reorder relative to filesystem (filename) order.
+
+        `entries` is already filtered to manifest entries whose section file
+        is still present (added/deleted sections are handled separately by
+        the caller and never reach here — they have no prior manifest
+        position to compare against).
+
+        `pull_sectioned` names section files `NN-slug.md` so filesystem order
+        and manifest order agree immediately after a pull. A push where they
+        differ means the manifest itself was hand-edited to reorder sections
+        since the last pull. Uses difflib.SequenceMatcher keyed on
+        heading_id (never on slug/filename/title, which can be renamed
+        without the section moving) to report *which* sections moved,
+        matching the identity key `manifest.py`'s own docstring calls the
+        stable one across pulls. Returns None when order matches (the
+        common case — no warning needed).
+        """
+        manifest_order = [e.heading_id for e in entries]
+        filesystem_order = [
+            e.heading_id for e in sorted(entries, key=lambda e: e.filename)
+        ]
+        if manifest_order == filesystem_order:
+            return None
+
+        matcher = difflib.SequenceMatcher(a=filesystem_order, b=manifest_order, autojunk=False)
+        moved_ids: List[str] = []
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "equal":
+                moved_ids.extend(filesystem_order[i1:i2])
+                moved_ids.extend(
+                    hid for hid in manifest_order[j1:j2] if hid not in moved_ids
+                )
+        if not moved_ids:
+            return None
+        return (
+            "Section order in _manifest.yaml differs from the section files' own "
+            f"names ({len(moved_ids)} section(s) reordered: {', '.join(sorted(set(moved_ids)))}). "
+            "Google Docs has no move primitive: if the reordered section(s) also "
+            "carry a content edit, they are written as delete+insert and their "
+            "heading_id will change (the manifest is regenerated fresh on the "
+            "next pull); if the reorder is the only change, the differ folds the "
+            "swapped content back to a no-op and nothing is written — the live "
+            "document's order is left as-is."
+        )
 
     @staticmethod
     def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:
