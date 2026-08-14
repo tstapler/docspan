@@ -43,10 +43,12 @@ Deliberate simplifications, so nothing here is read as more than it is:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock
 
 import pytest
 
+from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
     UNDELETABLE_BOUNDARY_KEYS,
@@ -1378,3 +1380,243 @@ def test_a_text_change_still_goes_through_delete_and_insert() -> None:
     _entries, _unchanged, requests, kinds = _restyle(live, "## new\n", 5)
 
     assert "insertText" in kinds and "deleteContentRange" in kinds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# gdocs-sectioned-sync Epic 7, Story 7.1 / REQ-5: the fixpoint gate.
+#
+# Everything above this point exercises the parser/builder/model chain
+# directly. These two tests instead drive the real `GoogleDocsBackend`
+# entry points (`pull_sectioned` / `push_sectioned`) against a mocked
+# `docs_service`, the same `make_backend`-fixture convention used throughout
+# tests/test_google_docs_backend.py and tests/test_tabs.py — this is the
+# "Integration" row validation.md's requirement -> test mapping calls for at
+# this file+name, not a restyled unit test.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _heading_paragraph(text: str, heading_id: str, style: str = "HEADING_1") -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": style, "headingId": heading_id},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _body_paragraph(text: str) -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _fixpoint_fixture_doc() -> dict:
+    """Preamble + three `HEADING_1` sections -- plain text, an inline image,
+    and a table -- matching Story 7.1 Task 7.1.1's literal fixture
+    description ("multiple HEADING_1 sections, tables, images, and a
+    preamble").
+
+    The image is built with no `size` on its `embeddedObject`, so its parsed
+    `width_pt`/`height_pt` are `None` on both sides of the pull/push round
+    trip: `render_nodes_to_markdown` only emits `![alt](src)` (no dimension
+    syntax), and `DocsRequestBuilder` treats width/height, not `src`, as an
+    image's change-identity (test_gdocs_images.py's
+    test_unchanged_image_with_rotated_src_is_not_reinserted /
+    test_changing_alt_text_still_reinserts_the_image). A `size`-bearing
+    fixture would desync (live width_pt=100.0 vs. markdown-round-tripped
+    None) and spuriously fail the zero-diff assertion below on an image that
+    never actually changed.
+    """
+    content: List[dict] = []
+    offset = 1
+
+    def _add_paragraph(p: dict) -> None:
+        nonlocal offset
+        text = p["paragraph"]["elements"][0]["textRun"]["content"]
+        length = len(text)
+        content.append({**p, "startIndex": offset, "endIndex": offset + length})
+        offset += length
+
+    _add_paragraph(_body_paragraph("Preamble content."))
+
+    _add_paragraph(_heading_paragraph("Section One", heading_id="h.section1"))
+    _add_paragraph(_body_paragraph("Body of section one."))
+
+    _add_paragraph(_heading_paragraph("Section Two With Image", heading_id="h.section2"))
+    # Inline image: an object-element paragraph (1 unit) followed by its own
+    # trailing-newline paragraph (1 unit) -- the same shape
+    # test_gdocs_images.py's _doc_with_inline_image() uses.
+    content.append(
+        {
+            "startIndex": offset,
+            "endIndex": offset + 1,
+            "paragraph": {"elements": [{"inlineObjectElement": {"inlineObjectId": "kix.obj1"}}]},
+        }
+    )
+    offset += 1
+    content.append(
+        {
+            "startIndex": offset,
+            "endIndex": offset + 1,
+            "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+        }
+    )
+    offset += 1
+
+    _add_paragraph(_heading_paragraph("Section Three With Table", heading_id="h.section3"))
+
+    # A 2x2 table (header row + one data row), the same shape
+    # test_gdocs_tables_and_styles.py's _populated_table_doc() uses --
+    # already proven idempotent under an unchanged push/pull round trip
+    # there (test_unchanged_table_is_idempotent).
+    def _cell(idx: int, text: str) -> dict:
+        return {
+            "content": [
+                {
+                    "startIndex": idx,
+                    "endIndex": idx + len(text) + 1,
+                    "paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]},
+                }
+            ]
+        }
+
+    table_start = offset
+    cell_a = table_start + 3
+    cell_b = cell_a + 4
+    cell_1 = cell_b + 4
+    cell_2 = cell_1 + 4
+    table_end = cell_2 + 4
+    content.append(
+        {
+            "startIndex": table_start,
+            "endIndex": table_end,
+            "table": {
+                "rows": 2,
+                "columns": 2,
+                "tableRows": [
+                    {"tableCells": [_cell(cell_a, "A"), _cell(cell_b, "B")]},
+                    {"tableCells": [_cell(cell_1, "1"), _cell(cell_2, "2")]},
+                ],
+            },
+        }
+    )
+    offset = table_end
+    content.append(
+        {
+            "startIndex": offset,
+            "endIndex": offset + 1,
+            "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+        }
+    )
+
+    return {
+        "revisionId": "rev-fixpoint",
+        "body": {"content": content},
+        "inlineObjects": {
+            "kix.obj1": {
+                "inlineObjectProperties": {
+                    "embeddedObject": {
+                        "contentUri": "https://docs.google.com/image-content-uri",
+                        "description": "a diagram",
+                    }
+                }
+            }
+        },
+    }
+
+
+def test_sectioned_pull_then_push_with_no_edits_should_produce_zero_diff(
+    tmp_path, make_backend: Callable[[], Tuple[GoogleDocsBackend, MagicMock]]
+) -> None:  # type: ignore[no-untyped-def]
+    """Story 7.1 / requirements.md's fixpoint success metric: `pull_sectioned`
+    then `push_sectioned` with no edits in between must write nothing back.
+
+    This drives the full chain end to end -- splitter -> manifest ->
+    `render_nodes_to_markdown` -> filesystem -> re-parse ->
+    `DocsRequestBuilder.build()` -- through the real `pull_sectioned`/
+    `push_sectioned` backend methods against a single shared mocked
+    `get_document` fixture, not a hand-assembled manifest+files pair.
+    """
+    backend, fake_client = make_backend()
+    doc = _fixpoint_fixture_doc()
+    fake_client.get_document.return_value = doc
+
+    local_dir = tmp_path / "doc"
+    pull_result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+    assert pull_result.status == "ok", pull_result.message
+
+    written = sorted(p.name for p in local_dir.iterdir())
+    assert written == [
+        "00-preamble.md",
+        "01-section-one.md",
+        "02-section-two-with-image.md",
+        "03-section-three-with-table.md",
+        "_manifest.yaml",
+    ]
+
+    push_result = backend.push_sectioned(str(local_dir), "doc-1")
+
+    assert push_result.status == "skipped", push_result.message
+    fake_client.batch_update.assert_not_called()
+
+
+def test_push_sectioned_should_produce_batch_update_matching_manifest_heading_order(
+    tmp_path, make_backend: Callable[[], Tuple[GoogleDocsBackend, MagicMock]]
+) -> None:  # type: ignore[no-untyped-def]
+    """REQ-5: the reassembled `batchUpdate` request body's resulting content
+    order matches manifest order end to end through
+    `DocsRequestBuilder().build()`, not filesystem/glob order.
+
+    A *pure* reorder (content otherwise identical) folds back to `equal`
+    opcodes and writes nothing at all (ADR-002 / the `_repair` step in
+    docs_request_builder.py) -- proven separately by
+    test_push_sectioned_should_reassemble_sections_in_manifest_order_not_filesystem_order
+    in test_google_docs_backend.py. So both section bodies are rewritten
+    here to text that shares no matching run with the live document at all,
+    forcing a genuine wholesale insert whose *content order* can be checked
+    against manifest order rather than filename (01-/02-) order or the live
+    document's own (still section-1-first) order.
+    """
+    backend, fake_client = make_backend()
+    local_dir = tmp_path / "doc"
+    local_dir.mkdir()
+    (local_dir / "01-section-1.md").write_text(
+        "# Section 1\n\nCompletely rewritten alpha content.\n"
+    )
+    (local_dir / "02-section-2.md").write_text(
+        "# Section 2\n\nCompletely rewritten beta content.\n"
+    )
+    (local_dir / "_manifest.yaml").write_text(
+        "entries:\n"
+        "- heading_id: h.section2\n  slug: section-2\n  filename: 02-section-2.md\n"
+        "- heading_id: h.section1\n  slug: section-1\n  filename: 01-section-1.md\n"
+    )
+    fake_client.get_document.return_value = {
+        "revisionId": "rev-order-live",
+        "body": {
+            "content": [
+                _heading_paragraph("Section 1", heading_id="h.section1"),
+                _body_paragraph("Body of section 1."),
+                _heading_paragraph("Section 2", heading_id="h.section2"),
+                _body_paragraph("Body of section 2."),
+            ]
+        },
+    }
+
+    result = backend.push_sectioned(str(local_dir), "doc-1")
+
+    assert result.status in ("ok", "warning"), result.message
+    assert fake_client.batch_update.call_count >= 1
+    args, _kwargs = fake_client.batch_update.call_args_list[0]
+    requests = args[1]
+    insert_texts = [r["insertText"]["text"] for r in requests if "insertText" in r]
+    assert insert_texts, "expected the content edit to require at least one insert"
+    joined = "".join(insert_texts)
+    # Section 2's rewritten body must appear before section 1's in the
+    # emitted insert sequence -- manifest order, not filename (01-/02-)
+    # order or the live document's own (still section-1-first) order.
+    assert "beta content" in joined and "alpha content" in joined
+    assert joined.find("beta content") < joined.find("alpha content")

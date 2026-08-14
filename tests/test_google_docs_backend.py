@@ -2444,6 +2444,57 @@ class TestPushSectioned:
         assert result.message == str(DiffTooExpensive("document", 6000, 3000))
         fake_client.batch_update.assert_not_called()
 
+    def test_diff_too_expensive_status_diverges_between_push_and_push_sectioned_by_design(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Locks in the intentional status divergence documented in
+        push_sectioned's own docstring: the same DiffTooExpensive exception,
+        raised from the same single guard point in docs_request_builder.py
+        with no sectioned-specific override, is surfaced as `status="error"`
+        by push() (TestDiffTooExpensiveSurfacesAsUserFacingError, historical
+        behavior) but `status="blocked"` by push_sectioned() (a refused
+        write, not an unexpected fault). Both code paths are exercised here
+        side-by-side against the identical exception instance so a future
+        change that accidentally unifies or flips either status fails loudly
+        rather than only breaking whichever of the two pre-existing tests
+        happens to run first.
+        """
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        # Non-sectioned push(): historical status="error".
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+            legacy_result = backend.push(str(local), "doc-1")
+        assert legacy_result.status == "error"
+        assert legacy_result.message == str(DiffTooExpensive("document", 6000, 3000))
+        fake_client.batch_update.assert_not_called()
+
+        # Sectioned push_sectioned(): status="blocked" for the identical guard.
+        sectioned_backend, sectioned_client = make_backend()
+        sectioned_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        sectioned_backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+            sectioned_result = sectioned_backend.push_sectioned(str(local_dir), "doc-1")
+        assert sectioned_result.status == "blocked"
+        assert sectioned_result.message == str(DiffTooExpensive("document", 6000, 3000))
+        sectioned_client.batch_update.assert_not_called()
+
+        # Same exception, deliberately different reported status — this is
+        # the divergence being locked in, not an oversight.
+        assert legacy_result.status != sectioned_result.status
+
     def test_push_sectioned_should_report_error_without_partial_state_when_batch_update_fails(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]
