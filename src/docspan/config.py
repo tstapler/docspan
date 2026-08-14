@@ -8,7 +8,7 @@ import tempfile
 from typing import Literal, Optional
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
@@ -75,6 +75,9 @@ class BackendsConfig(BaseModel):
     confluence: Optional[ConfluenceConfig] = None
 
 
+_VALID_SPLIT_LEVELS = {f"HEADING_{i}" for i in range(1, 7)}
+
+
 class Mapping(BaseModel):
     local: str       # relative path to local markdown file
     backend: str     # "google_docs" or "confluence"
@@ -86,6 +89,39 @@ class Mapping(BaseModel):
     # None (default) targets the doc's first/default tab — preserves pre-tabs
     # behavior. Ignored by backends that don't support tabs (e.g. Confluence).
     tab_id: Optional[str] = None
+    # Sectioned sync (gdocs-sectioned-sync): when True, `local` names a
+    # directory of `NN-slug.md` section files + `_manifest.yaml` instead of a
+    # single markdown file. Requires `split_level` to be set (see validator
+    # below). Default False/absent preserves today's single-file behavior
+    # completely unchanged.
+    sectioned: bool = False
+    # Heading style at which a sectioned pull partitions the document into
+    # sections (e.g. "HEADING_1"). Only meaningful when `sectioned` is True.
+    split_level: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_sectioned_split_level(self) -> "Mapping":
+        """Enforce sectioned <-> split_level coupling at load time.
+
+        A silently-ignored `split_level` (set but `sectioned` false/absent) is
+        indistinguishable from a typo (e.g. `sectioned` misspelled) to the
+        user, so both directions of the mismatch are rejected here rather
+        than surfacing confusingly deep inside pull_sectioned/split_nodes.
+        """
+        if self.split_level is not None and self.split_level not in _VALID_SPLIT_LEVELS:
+            raise ValueError(
+                f"mapping {self.local!r}: split_level {self.split_level!r} is invalid; "
+                f"must be one of HEADING_1..HEADING_6"
+            )
+        if self.sectioned and self.split_level is None:
+            raise ValueError(
+                f"mapping {self.local!r}: sectioned mappings require split_level"
+            )
+        if not self.sectioned and self.split_level is not None:
+            raise ValueError(
+                f"mapping {self.local!r}: split_level requires sectioned: true"
+            )
+        return self
 
 
 class MarkgateConfig(BaseModel):
