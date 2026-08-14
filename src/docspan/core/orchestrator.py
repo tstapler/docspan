@@ -585,8 +585,14 @@ def _orchestrate_pull_sectioned(
                 continue
 
             # Both sides changed this section — three-way merge, scoped to it alone.
+            # Mirror _merge_pull's .orig backup so `conflicts resolve --accept
+            # local` has the pre-merge section content to restore instead of
+            # silently falling back to the merge base.
             any_merge = True
             written_files += 1
+            orig_path = local_section_path + ORIG_SUFFIX
+            with open(orig_path, "w", encoding="utf-8") as fh:
+                fh.write(local_content)
             base_content = get_base_content(state_dir, entry.base_hash)
             merge_result = three_way_merge(base_content, theirs_content, local_content)
             with open(local_section_path, "w", encoding="utf-8") as fh:

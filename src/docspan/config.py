@@ -77,6 +77,18 @@ class BackendsConfig(BaseModel):
 
 _VALID_SPLIT_LEVELS = {f"HEADING_{i}" for i in range(1, 7)}
 
+# Registered backend names that do NOT support sectioned sync (no
+# push_sectioned/pull_sectioned implementation) — currently only
+# "confluence"; "google_docs" is the sole sectioned-capable backend.
+# Deliberately a blocklist of *known* backend names, not an allowlist:
+# test doubles construct Mapping with arbitrary backend names (e.g. "fake")
+# that are never registered in docspan.backends.BACKENDS, and those must
+# stay unaffected. Kept as a plain set here rather than sourced from
+# docspan.backends.BACKENDS: confluence/backend.py already imports from
+# this module at load time, so importing the backend registry back into
+# config.py would be circular.
+_SECTIONED_UNSUPPORTED_BACKENDS = {"confluence"}
+
 
 class Mapping(BaseModel):
     local: str       # relative path to local markdown file
@@ -120,6 +132,12 @@ class Mapping(BaseModel):
         if not self.sectioned and self.split_level is not None:
             raise ValueError(
                 f"mapping {self.local!r}: split_level requires sectioned: true"
+            )
+        if self.sectioned and self.backend in _SECTIONED_UNSUPPORTED_BACKENDS:
+            raise ValueError(
+                f"mapping {self.local!r}: backend {self.backend!r} does not support "
+                "sectioned sync; either set sectioned: false or switch to a backend "
+                "that supports it (e.g. google_docs)"
             )
         return self
 

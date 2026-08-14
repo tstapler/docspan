@@ -2420,6 +2420,50 @@ class TestPushSectioned:
         assert result.status == "skipped", result.message
         assert fake_client.batch_update.call_count == 0
 
+    def test_push_sectioned_reorder_with_content_edit_should_accept_heading_id_churn_and_warn(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """plan.md's Story 7.3 second Given/When/Then: a section that is both
+        reordered *and* content-edited in the same push. ADR-002's Consequences
+        (rung 3 of the fallback ladder, formally recorded after Task 3.2.2's
+        spike found no Docs API move primitive) documents that this combination
+        cannot be folded back to a no-op the way a pure reorder can — the
+        differ sees genuine content change, emits an ordinary delete+insert,
+        heading_id does not survive, and push_sectioned must surface a warning
+        naming the reordered section(s) rather than silently losing that
+        identity. This is the one acceptance case
+        test_push_sectioned_reorder_should_preserve_heading_ids_via_in_place_move
+        does not cover (it only exercises reorder with content untouched)."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        import yaml
+
+        manifest_path = local_dir / "_manifest.yaml"
+        raw = yaml.safe_load(manifest_path.read_text())
+        entries = raw["entries"]
+        # Swap section 1 and section 2's manifest entries, same as the
+        # pure-reorder test — but this time also edit one of the swapped
+        # sections' actual content, so the differ can't fold the pair back
+        # to `equal`.
+        entries[1], entries[2] = entries[2], entries[1]
+        manifest_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+        section_1_file = local_dir / "01-section-1.md"
+        section_1_file.write_text(
+            section_1_file.read_text() + "\nAn extra edited line.\n"
+        )
+
+        fake_client.batch_update.return_value = {}
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "warning", result.message
+        assert "reordered" in (result.message or "")
+        # Unlike the pure-reorder no-op, the content edit forces an actual
+        # write — this is the documented heading_id-churn path, not a skip.
+        assert fake_client.batch_update.call_count > 0
+
     def test_push_sectioned_should_return_blocked_status_without_partial_batch_update_when_diff_too_expensive(
         self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]

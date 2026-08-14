@@ -101,3 +101,32 @@ class Backend(ABC):
     @abstractmethod
     def validate_config(self) -> None:
         """Raise ValueError with a clear message if config is missing required keys."""
+
+    # Sectioned sync (push_sectioned/pull_sectioned) is only implemented by
+    # backends that opt in (currently google_docs). These are concrete, not
+    # @abstractmethod, so existing single-file-only backends (e.g.
+    # Confluence) aren't forced to implement them. The primary guard against
+    # calling these on an unsupported backend is
+    # docspan.config.Mapping's cross-field validator, which rejects
+    # `sectioned: true` for a backend not in its capability list at
+    # config-load time; these defaults are defense in depth for callers that
+    # construct a Backend directly, bypassing config validation.
+    def push_sectioned(
+        self,
+        local_dir: str,
+        doc_id: str,
+        force: bool = False,
+        tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> PushResult:
+        raise NotImplementedError(f"{self.name} does not support sectioned sync")
+
+    def pull_sectioned(
+        self,
+        doc_id: str,
+        local_dir: str,
+        split_level: Optional[str] = None,
+        tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> PullResult:
+        raise NotImplementedError(f"{self.name} does not support sectioned sync")

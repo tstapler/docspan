@@ -495,6 +495,40 @@ class TestOrchestrateSectioned:
         assert "local edit" in content_b
         assert "remote addition" in content_b
 
+    def test_orchestrate_pull_sectioned_should_write_orig_backup_before_merge(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Mirrors TestOrchestratePull's test_orig_file_created_before_merge
+        but for the sectioned per-file merge branch: without an .orig
+        sidecar, `docspan conflicts resolve --accept local` has nothing but
+        the merge base to restore, silently discarding the user's actual
+        pre-merge edit (see _merge_pull's existing single-file behavior)."""
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        base_content = "line1\nline2\nline3\n"
+        local_content = "line1\nlocal edit\nline3\n"
+        remote_content = "line1\nline2\nline3\nremote addition\n"
+        local_section_path = str(directory / "01-body.md")
+        (directory / "01-body.md").write_text(local_content, encoding="utf-8")
+        base_hash = save_base_content(state_dir, base_content)
+        state.update(local_section_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=base_hash, remote_version="v1",
+            local_hash=sha256_of_content(base_content),
+        ))
+
+        backend = FakeBackend(section_files={"01-body.md": remote_content})
+
+        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        assert outcome.action == "merged"
+        orig = directory / "01-body.md.orig"
+        assert orig.exists()
+        assert orig.read_text(encoding="utf-8") == local_content
+
     def test_orchestrate_pull_should_rekey_state_and_report_renumbering_only_rename(
         self, tmp_path
     ) -> None:  # type: ignore[no-untyped-def]

@@ -157,6 +157,42 @@ def test_load_config_rejects_split_level_without_sectioned() -> None:
         Mapping(local="docs/big-doc", backend="google_docs", split_level="HEADING_1")
 
 
+def test_mapping_rejects_sectioned_true_with_unsupported_backend() -> None:
+    """A backend that doesn't implement push_sectioned/pull_sectioned (e.g.
+    confluence) must be rejected at config-load time — not left to crash
+    with an AttributeError mid-sync when the orchestrator calls
+    backend.push_sectioned()/pull_sectioned()."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="does not support sectioned sync"):
+        Mapping(
+            local="docs/big-doc", backend="confluence", remote_id="999",
+            sectioned=True, split_level="HEADING_1",
+        )
+
+
+def test_load_config_rejects_sectioned_confluence_mapping_at_load_time(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Same rejection, exercised through load_config() end-to-end — a config
+    with an unsupported backend + sectioned: true must fail fast at load,
+    not at sync time."""
+    config_file = tmp_path / "markgate.yaml"
+    config_file.write_text(
+        yaml.dump({
+            "mappings": [
+                {
+                    "local": "docs/big-doc",
+                    "backend": "confluence",
+                    "remote_id": "999",
+                    "sectioned": True,
+                    "split_level": "HEADING_1",
+                },
+            ]
+        })
+    )
+    with pytest.raises(Exception, match="does not support sectioned sync"):
+        load_config(str(config_file))
+
+
 def test_existing_mapping_unaffected_by_sectioned_fields(tmp_path) -> None:  # type: ignore[no-untyped-def]
     config_file = tmp_path / "markgate.yaml"
     config_file.write_text(
