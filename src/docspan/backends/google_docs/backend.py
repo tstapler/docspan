@@ -6,6 +6,7 @@ import difflib
 import logging
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -45,7 +46,7 @@ from docspan.backends.google_docs.heading_anchors import (
     unresolved_anchors,
     upgrade_heading_id_anchors,
 )
-from docspan.backends.google_docs.image_source import resolve_document_images
+from docspan.backends.google_docs.image_source import UrlSource, build_source, resolve_document_images
 from docspan.backends.google_docs.manifest import (
     MANIFEST_FILENAME,
     ManifestError,
@@ -913,11 +914,22 @@ class GoogleDocsBackend(Backend):
         reorder_warning = self._classify_section_reorder(present_entries)
 
         section_paths = [os.path.join(local_dir, name) for name in ordered_filenames]
-        contents = [pathlib.Path(p).read_text() for p in section_paths]
+        try:
+            contents = [pathlib.Path(p).read_text() for p in section_paths]
+        except OSError as exc:
+            return PushResult(
+                status="error",
+                doc_id=doc_id,
+                message=f"cannot push sectioned mapping: {exc}",
+            )
         combined_content = "".join(
             c if c.endswith("\n") or c == "" else c + "\n" for c in contents
         )
         anchor_path = section_paths[0]
+
+        duplicate_image_warning = self._classify_duplicate_images(
+            ordered_filenames, section_paths, contents
+        )
 
         resolver = self._build_cross_doc_resolver(kwargs, caller="push_sectioned")
         result = self._execute_push(
@@ -929,10 +941,11 @@ class GoogleDocsBackend(Backend):
             content=combined_content,
             diff_too_expensive_status="blocked",
         )
-        if reorder_warning and result.status in ("ok", "warning"):
+        warnings = [w for w in (reorder_warning, duplicate_image_warning) if w]
+        if warnings and result.status in ("ok", "warning"):
             result.status = "warning"
             result.message = (
-                f"{result.message}\n{reorder_warning}" if result.message else reorder_warning
+                "\n".join([result.message, *warnings]) if result.message else "\n".join(warnings)
             )
         return result
 
@@ -984,6 +997,61 @@ class GoogleDocsBackend(Backend):
             "swapped content back to a no-op and nothing is written — the live "
             "document's order is left as-is."
         )
+
+    # Matches markdown image syntax `![alt](ref "optional title")`. Deliberately
+    # does not attempt to parse mermaid fences (```mermaid blocks) — those are
+    # rendered fresh per section on every push (image_source.py's
+    # `MermaidSource`) rather than referencing a shared on-disk/URL asset, so
+    # they can never collide the way a reused filename can.
+    _IMAGE_REF_RE = re.compile(r'!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
+
+    @classmethod
+    def _classify_duplicate_images(
+        cls,
+        filenames: List[str],
+        section_paths: List[str],
+        contents: List[str],
+    ) -> Optional[str]:
+        """Detect two sections referencing an image with the same filename but a different source.
+
+        A sectioned push reassembles every section's markdown into one
+        document, but each section's relative image references are still
+        resolved independently (`build_source`, keyed off that section's own
+        path). If two different sections happen to reference an image with
+        the same final filename — e.g. both a `diagram.png` — but the refs
+        actually resolve to different content (different local paths, or a
+        local path in one section and a URL in another), only whichever one
+        `resolve_document_images` happens to process second effectively
+        "wins" any place the filename alone is used to key an upload. This is
+        surfaced as a push warning rather than silently letting one section's
+        image shadow the other's, naming both originating sections and the
+        shared filename so the ambiguity is visible instead of guessed at.
+        """
+        # basename -> list of (section_filename, identity)
+        seen: dict = {}
+        for section_filename, section_path, content in zip(filenames, section_paths, contents):
+            for ref in cls._IMAGE_REF_RE.findall(content):
+                basename = os.path.basename(ref.split("?", 1)[0].split("#", 1)[0])
+                if not basename:
+                    continue
+                source = build_source(section_path, ref)
+                identity = source.url if isinstance(source, UrlSource) else source.path
+                seen.setdefault(basename, []).append((section_filename, identity))
+
+        warnings = []
+        for basename, occurrences in seen.items():
+            distinct_identities = {identity for _, identity in occurrences}
+            if len(distinct_identities) <= 1:
+                continue
+            origins = sorted({section_filename for section_filename, _ in occurrences})
+            warnings.append(
+                f"Image {basename!r} is referenced by {len(origins)} sections "
+                f"({', '.join(origins)}) with different underlying sources — "
+                "only one will be used; rename one of the images to disambiguate."
+            )
+        if not warnings:
+            return None
+        return "\n".join(warnings)
 
     @staticmethod
     def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:

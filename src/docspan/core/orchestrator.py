@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -139,7 +140,10 @@ def _detect_section_renames(
 
 
 def _rekey_renamed_sections(
-    local_dir: str, state: SyncState, renames: list[tuple[str, str]]
+    canonical_dir: str,
+    physical_dir: str,
+    state: SyncState,
+    renames: list[tuple[str, str]],
 ) -> None:
     """Move (not duplicate) each renamed section's state entry and local file.
 
@@ -147,16 +151,75 @@ def _rekey_renamed_sections(
     (leaving stale, never-cleaned-up state) while the new path is treated as
     a first-sync — discarding the section's actual merge history/local_hash
     even though its heading_id/content identity survived the rename.
+
+    `canonical_dir` and `physical_dir` are split because
+    `_orchestrate_pull_sectioned` stages every write for a pull in a scratch
+    directory before atomically swapping it into place (Epic 6 Story 6.1):
+    `state.mappings` must always be keyed by the real `mapping.local` path
+    (`canonical_dir`) since that's what every other lookup in this module
+    keys against and what survives the eventual swap, but the actual file
+    being renamed on disk right now still lives in the scratch directory
+    (`physical_dir`) until the swap happens.
     """
     for old_filename, new_filename in renames:
-        old_path = os.path.join(local_dir, old_filename)
-        new_path = os.path.join(local_dir, new_filename)
+        old_canonical = os.path.join(canonical_dir, old_filename)
+        new_canonical = os.path.join(canonical_dir, new_filename)
+        if old_canonical in state.mappings:
+            state.mappings[new_canonical] = state.mappings.pop(old_canonical)
 
-        if old_path in state.mappings:
-            state.mappings[new_path] = state.mappings.pop(old_path)
+        old_physical = os.path.join(physical_dir, old_filename)
+        new_physical = os.path.join(physical_dir, new_filename)
+        if os.path.exists(old_physical) and not os.path.exists(new_physical):
+            os.rename(old_physical, new_physical)
 
-        if os.path.exists(old_path) and not os.path.exists(new_path):
-            os.rename(old_path, new_path)
+
+def _detect_orphaned_sections(
+    old_dir: str, new_dir: str
+) -> list[SectionManifestEntry]:
+    """Sections the prior manifest knew about that vanished from a fresh pull.
+
+    heading_id-keyed so a rename (already handled by `_detect_section_renames`)
+    is never mistaken for a deletion — an entry only lands here when its
+    heading_id is genuinely absent from the freshly-pulled manifest, not
+    just renamed/renumbered. Per plan.md's Domain Glossary ("Orphan
+    section"), this must be surfaced as a conflict, never silently dropped
+    or silently kept as if nothing happened.
+    """
+    old_entries = _load_manifest_entries(old_dir)
+    new_ids = {e.heading_id for e in _load_manifest_entries(new_dir)}
+    return [e for e in old_entries if e.heading_id not in new_ids]
+
+
+def _atomic_replace_dir(tmp_dir: str, target_dir: str) -> None:
+    """Atomically replace `target_dir`'s contents with `tmp_dir`'s.
+
+    String-path analog of `backends/google_docs/backend.py`'s
+    `GoogleDocsBackend._atomic_replace_dir` (the pattern `pull_sectioned`
+    already uses for its own directory swap): move any existing target
+    aside to a sibling `.old.` directory via `os.replace` (same filesystem,
+    so this step alone can't partially fail), then `os.replace` the staged
+    directory into the target's place; on any failure, restore the
+    original target from the `.old.` sibling before re-raising, so a crash
+    at any point leaves `target_dir` either fully absent (first sync only)
+    or fully intact — never half-written.
+    """
+    old_dir: Optional[str] = None
+    if os.path.exists(target_dir):
+        old_dir = tempfile.mkdtemp(
+            dir=os.path.dirname(os.path.abspath(target_dir)),
+            prefix=f".{os.path.basename(target_dir)}.old.",
+            suffix=".tmp",
+        )
+        os.replace(target_dir, old_dir)
+    try:
+        os.replace(tmp_dir, target_dir)
+    except Exception:
+        if old_dir is not None:
+            os.replace(old_dir, target_dir)
+        raise
+    else:
+        if old_dir is not None:
+            shutil.rmtree(old_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +251,13 @@ class PullOutcome:
     # when only its position did.
     renumbered_only: list = field(default_factory=list)
     content_renamed: list = field(default_factory=list)
+    # Sectioned pulls only: filenames of sections the prior manifest knew
+    # about that vanished from this pull's fresh manifest (see
+    # `_detect_orphaned_sections`). Each is converted into an explicit
+    # conflict in its own section file (never silently dropped, never
+    # silently auto-deleted) — this list is purely for observability/
+    # reporting on top of that.
+    orphaned_sections: list = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,8 +273,20 @@ def record_state(
     backend_name: str,
     content: str,
     remote_version: str,
+    save: bool = True,
 ) -> bool:
-    """Persist sync state after a successful operation. Returns True on success."""
+    """Persist sync state after a successful operation. Returns True on success.
+
+    `save=False` updates `state` in memory (and writes the content-addressed
+    base blob, which is idempotent and has no ordering dependency on the
+    caller's own atomicity) but skips the `state.save(state_path)` disk
+    write — used by `_orchestrate_pull_sectioned`'s per-section loop so the
+    on-disk state file is only ever flushed once, after that function's
+    directory-level atomic swap has actually succeeded. Flushing state to
+    disk before the swap would let `.markgate-state.json` describe section
+    content that a crash between the two writes never actually delivered
+    into the real target directory.
+    """
     try:
         local_hash = sha256_of_content(content)
         base_hash = save_base_content(state_dir, content)
@@ -219,7 +301,8 @@ def record_state(
                 local_hash=local_hash,
             ),
         )
-        state.save(state_path)
+        if save:
+            state.save(state_path)
         return True
     except Exception:
         logger.warning("Failed to save sync state for %s", local_path, exc_info=True)
@@ -234,11 +317,12 @@ def _record_state(
     mapping: "Mapping",
     content: str,
     remote_version: str,
+    save: bool = True,
 ) -> bool:
     assert mapping.remote_id is not None
     return record_state(
         state, state_path, state_dir, local_path,
-        mapping.remote_id, mapping.backend, content, remote_version,
+        mapping.remote_id, mapping.backend, content, remote_version, save=save,
     )
 
 
@@ -513,6 +597,8 @@ def _orchestrate_pull_sectioned(
             ),
         )
 
+    canonical_dir = mapping.local
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         pull_result = backend.pull_sectioned(
             mapping.remote_id, tmp_dir, split_level=mapping.split_level, tab_id=mapping.tab_id,
@@ -520,92 +606,181 @@ def _orchestrate_pull_sectioned(
         if pull_result.status not in ("ok", "warning"):
             return PullOutcome(local_path=mapping.local, action="error", result=pull_result)
 
-        os.makedirs(mapping.local, exist_ok=True)
-
         # Story 2.2 / Task 2.2.2: detect section renames via heading_id-match
         # (section_splitter.split_nodes already applied this when producing
         # the fresh split in `tmp_dir`) before the per-file merge loop below,
         # so a renamed section's prior state entry is found under its *new*
-        # path rather than looking like a fresh first-sync.
-        renumbered_only, content_renamed = _detect_section_renames(mapping.local, tmp_dir)
-        if renumbered_only or content_renamed:
-            _rekey_renamed_sections(mapping.local, state, renumbered_only + content_renamed)
-            state.save(state_path)
+        # path rather than looking like a fresh first-sync. Also detect
+        # orphaned sections (Domain Glossary: "surfaced as conflict, never
+        # silently dropped") the same way, before anything is written.
+        renumbered_only, content_renamed = _detect_section_renames(canonical_dir, tmp_dir)
+        orphaned_entries = _detect_orphaned_sections(canonical_dir, tmp_dir)
 
-        any_merge = False
-        any_conflicts = False
-        conflict_total = 0
-        written_files = 0
-        first_sync_files = 0
+        # Epic 6 Story 6.1: stage every write for this pull — renames,
+        # per-section merges, and the fresh manifest — in a scratch
+        # directory seeded from the current live directory, then swap it
+        # into place with a single `_atomic_replace_dir` call at the end.
+        # Before this, each `open(local_section_path, "w")` in the merge
+        # loop below wrote straight into the live `mapping.local` directory,
+        # so a crash partway through left a mix of old and new section
+        # files; only the throwaway fetch into `tmp_dir` above was ever
+        # atomic. Persisting `state` is deferred the same way (`save=False`
+        # below, single `state.save(state_path)` after the swap succeeds)
+        # so the state file never describes section content that a crash
+        # before the swap kept the real directory from ever receiving.
+        staging_parent = os.path.dirname(os.path.abspath(canonical_dir))
+        os.makedirs(staging_parent, exist_ok=True)
+        staging_dir = tempfile.mkdtemp(
+            dir=staging_parent,
+            prefix=f".{os.path.basename(canonical_dir)}.staging.",
+            suffix=".tmp",
+        )
+        try:
+            if os.path.isdir(canonical_dir):
+                shutil.copytree(canonical_dir, staging_dir, dirs_exist_ok=True)
 
-        for filename in _section_files(tmp_dir):
-            theirs_path = os.path.join(tmp_dir, filename)
-            local_section_path = os.path.join(mapping.local, filename)
-            with open(theirs_path, encoding="utf-8") as fh:
-                theirs_content = fh.read()
+            if renumbered_only or content_renamed:
+                _rekey_renamed_sections(
+                    canonical_dir, staging_dir, state, renumbered_only + content_renamed
+                )
 
-            entry = state.get(local_section_path)
+            fresh_manifest_path = os.path.join(tmp_dir, MANIFEST_FILENAME)
+            if os.path.exists(fresh_manifest_path):
+                shutil.copyfile(
+                    fresh_manifest_path, os.path.join(staging_dir, MANIFEST_FILENAME)
+                )
 
-            if entry is None:
-                with open(local_section_path, "w", encoding="utf-8") as fh:
-                    fh.write(theirs_content)
+            any_merge = False
+            any_conflicts = False
+            conflict_total = 0
+            written_files = 0
+            first_sync_files = 0
+
+            for filename in _section_files(tmp_dir):
+                theirs_path = os.path.join(tmp_dir, filename)
+                # `local_section_path` is the canonical (real, post-swap)
+                # path — used only as the `state` key, since that key must
+                # survive the eventual swap unchanged. `staged_section_path`
+                # is both where this loop writes *and* where it reads the
+                # section's current local content from: `staging_dir` was
+                # seeded from `canonical_dir` and already has any rename
+                # from `_rekey_renamed_sections` applied, so it (not
+                # `canonical_dir`, which for a renamed section is still
+                # sitting under the *old* filename) is the accurate source
+                # for "what does this section look like right now."
+                local_section_path = os.path.join(canonical_dir, filename)
+                staged_section_path = os.path.join(staging_dir, filename)
+                with open(theirs_path, encoding="utf-8") as fh:
+                    theirs_content = fh.read()
+
+                entry = state.get(local_section_path)
+
+                if entry is None:
+                    with open(staged_section_path, "w", encoding="utf-8") as fh:
+                        fh.write(theirs_content)
+                    _record_state(
+                        state, state_path, state_dir, local_section_path, mapping,
+                        theirs_content, remote_version, save=False,
+                    )
+                    written_files += 1
+                    first_sync_files += 1
+                    continue
+
+                local_exists = os.path.exists(staged_section_path)
+                local_content = ""
+                if local_exists:
+                    with open(staged_section_path, encoding="utf-8") as fh:
+                        local_content = fh.read()
+
+                current_local_hash = sha256_of_content(local_content) if local_exists else ""
+                local_changed = local_exists and current_local_hash != entry.local_hash
+                remote_changed = sha256_of_content(theirs_content) != entry.base_hash
+
+                if not remote_changed and not local_changed:
+                    continue
+
+                if remote_changed and not local_changed:
+                    with open(staged_section_path, "w", encoding="utf-8") as fh:
+                        fh.write(theirs_content)
+                    _record_state(
+                        state, state_path, state_dir, local_section_path, mapping,
+                        theirs_content, remote_version, save=False,
+                    )
+                    written_files += 1
+                    continue
+
+                if local_changed and not remote_changed:
+                    # Local-only edit to this section — leave it for the user to push.
+                    continue
+
+                # Both sides changed this section — three-way merge, scoped to it alone.
+                # Mirror _merge_pull's .orig backup so `conflicts resolve --accept
+                # local` has the pre-merge section content to restore instead of
+                # silently falling back to the merge base.
+                any_merge = True
+                written_files += 1
+                orig_path = staged_section_path + ORIG_SUFFIX
+                with open(orig_path, "w", encoding="utf-8") as fh:
+                    fh.write(local_content)
+                base_content = get_base_content(state_dir, entry.base_hash)
+                merge_result = three_way_merge(base_content, theirs_content, local_content)
+                with open(staged_section_path, "w", encoding="utf-8") as fh:
+                    fh.write(merge_result.merged)
                 _record_state(
                     state, state_path, state_dir, local_section_path, mapping,
-                    theirs_content, remote_version,
+                    merge_result.merged, remote_version, save=False,
                 )
-                written_files += 1
-                first_sync_files += 1
-                continue
+                if merge_result.has_conflicts:
+                    any_conflicts = True
+                    conflict_total += merge_result.conflict_count
 
-            local_exists = os.path.exists(local_section_path)
-            local_content = ""
-            if local_exists:
-                with open(local_section_path, encoding="utf-8") as fh:
+            # Orphaned sections: present in the prior manifest but absent
+            # from this pull's fresh manifest. Per plan.md's Domain
+            # Glossary this must be "surfaced as conflict, never silently
+            # dropped" — so rather than leaving the staged copy (inherited
+            # unchanged from `canonical_dir` via the copytree above) as if
+            # nothing happened, or deleting it, convert it into an explicit
+            # conflict in its own file, exactly like a genuine two-sided
+            # merge conflict above, so `docspan conflicts list/resolve`
+            # finds it.
+            for orphan_entry in orphaned_entries:
+                local_section_path = os.path.join(canonical_dir, orphan_entry.filename)
+                staged_section_path = os.path.join(staging_dir, orphan_entry.filename)
+                if not os.path.exists(staged_section_path):
+                    continue  # nothing local survives to protect
+                with open(staged_section_path, encoding="utf-8") as fh:
                     local_content = fh.read()
 
-            current_local_hash = sha256_of_content(local_content) if local_exists else ""
-            local_changed = local_exists and current_local_hash != entry.local_hash
-            remote_changed = sha256_of_content(theirs_content) != entry.base_hash
+                orig_path = staged_section_path + ORIG_SUFFIX
+                with open(orig_path, "w", encoding="utf-8") as fh:
+                    fh.write(local_content)
 
-            if not remote_changed and not local_changed:
-                continue
-
-            if remote_changed and not local_changed:
-                with open(local_section_path, "w", encoding="utf-8") as fh:
-                    fh.write(theirs_content)
+                conflict_content = (
+                    "<<<<<<< ours\n"
+                    f"{local_content}"
+                    "=======\n"
+                    ">>>>>>> theirs (section removed upstream)\n"
+                )
+                with open(staged_section_path, "w", encoding="utf-8") as fh:
+                    fh.write(conflict_content)
                 _record_state(
                     state, state_path, state_dir, local_section_path, mapping,
-                    theirs_content, remote_version,
+                    conflict_content, remote_version, save=False,
                 )
-                written_files += 1
-                continue
-
-            if local_changed and not remote_changed:
-                # Local-only edit to this section — leave it for the user to push.
-                continue
-
-            # Both sides changed this section — three-way merge, scoped to it alone.
-            # Mirror _merge_pull's .orig backup so `conflicts resolve --accept
-            # local` has the pre-merge section content to restore instead of
-            # silently falling back to the merge base.
-            any_merge = True
-            written_files += 1
-            orig_path = local_section_path + ORIG_SUFFIX
-            with open(orig_path, "w", encoding="utf-8") as fh:
-                fh.write(local_content)
-            base_content = get_base_content(state_dir, entry.base_hash)
-            merge_result = three_way_merge(base_content, theirs_content, local_content)
-            with open(local_section_path, "w", encoding="utf-8") as fh:
-                fh.write(merge_result.merged)
-            _record_state(
-                state, state_path, state_dir, local_section_path, mapping,
-                merge_result.merged, remote_version,
-            )
-            if merge_result.has_conflicts:
                 any_conflicts = True
-                conflict_total += merge_result.conflict_count
+                conflict_total += 1
+                written_files += 1
 
-        if any_merge:
+            _atomic_replace_dir(staging_dir, canonical_dir)
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+        # Only reached once the atomic swap above has actually succeeded —
+        # see the `save=False` calls throughout the loop.
+        state.save(state_path)
+
+        if any_merge or any_conflicts:
             action = "merged"
         elif written_files > 0 and written_files == first_sync_files:
             action = "first-sync"
@@ -622,4 +797,5 @@ def _orchestrate_pull_sectioned(
             conflict_count=conflict_total,
             renumbered_only=renumbered_only,
             content_renamed=content_renamed,
+            orphaned_sections=[e.filename for e in orphaned_entries],
         )

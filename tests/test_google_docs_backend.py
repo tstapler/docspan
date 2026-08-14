@@ -2588,3 +2588,60 @@ class TestPushSectioned:
 
         assert result.status == "skipped", result.message
         fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_should_return_error_when_section_file_unreadable(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """A section file present in the manifest but unreadable at push
+        time (e.g. a permissions problem) must surface as
+        `PushResult(status="error", ...)`, matching the `ManifestStore.load`
+        failure a few lines above — not an unhandled OSError bubbling out of
+        push_sectioned."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        section_3 = local_dir / "03-section-3.md"
+        section_3.chmod(0o000)
+        try:
+            result = backend.push_sectioned(str(local_dir), "doc-1")
+        finally:
+            # Restore permissions so pytest's tmp_path cleanup can remove it.
+            section_3.chmod(0o644)
+
+        assert result.status == "error"
+        assert "03-section-3.md" in (result.message or "") or "cannot push sectioned mapping" in (
+            result.message or ""
+        )
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_should_warn_when_two_sections_reference_same_image_filename_with_different_sources(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Two sections referencing an image with the same filename but a
+        different underlying source must be surfaced as a push warning
+        naming both originating sections and the shared filename, per
+        plan.md's Observability Plan ("Two sections reference
+        identically-named-but-different images at push time")."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        (local_dir / "assets").mkdir()
+        (local_dir / "other").mkdir()
+        (local_dir / "assets" / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+        (local_dir / "other" / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\nsecond")
+
+        section_1 = local_dir / "01-section-1.md"
+        section_2 = local_dir / "02-section-2.md"
+        section_1.write_text(section_1.read_text() + "\n![one](assets/diagram.png)\n")
+        section_2.write_text(section_2.read_text() + "\n![two](other/diagram.png)\n")
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "warning", result.message
+        assert "diagram.png" in (result.message or "")
+        assert "01-section-1.md" in (result.message or "")
+        assert "02-section-2.md" in (result.message or "")

@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+import pytest
+
+import docspan.core.orchestrator as orchestrator_module
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.google_docs.manifest import MANIFEST_FILENAME, ManifestStore, SectionManifestEntry
 from docspan.config import Mapping
@@ -637,6 +640,140 @@ class TestOrchestrateSectioned:
         # The migrated section's content itself was also updated remotely --
         # rekey does not prevent the normal fast-forward from applying.
         assert (directory / "01-body-updated.md").read_text(encoding="utf-8") == updated_content
+
+    def test_orchestrate_pull_sectioned_should_leave_target_directory_untouched_on_partial_failure(
+        self, tmp_path, monkeypatch
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Item 1 (pull atomicity): a crash partway through the per-section
+        merge loop must not leave a mix of old/new section files in the real
+        `mapping.local` directory. All per-section writes land in a staging
+        copy first; only a fully successful loop gets atomically swapped in.
+        """
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        # Both sections require an actual three-way merge (local AND remote
+        # changed), so section B's failure is only reached after section A
+        # has already been written into the staging copy -- the scenario
+        # that would leak a half-updated directory without atomic staging.
+        base_a = "a1\na2\n"
+        local_a = "a1\nlocal-a\n"
+        remote_a = "a1\na2\nremote-a\n"
+        a_path = str(directory / "01-a.md")
+        (directory / "01-a.md").write_text(local_a, encoding="utf-8")
+        a_base_hash = save_base_content(state_dir, base_a)
+        state.update(a_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=a_base_hash, remote_version="v1", local_hash=sha256_of_content(base_a),
+        ))
+
+        base_b = "b1\nb2\n"
+        local_b = "b1\nlocal-b\n"
+        remote_b = "b1\nb2\nremote-b\n"
+        b_path = str(directory / "02-b.md")
+        (directory / "02-b.md").write_text(local_b, encoding="utf-8")
+        b_base_hash = save_base_content(state_dir, base_b)
+        state.update(b_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=b_base_hash, remote_version="v1", local_hash=sha256_of_content(base_b),
+        ))
+
+        backend = FakeBackend(section_files={"01-a.md": remote_a, "02-b.md": remote_b})
+
+        real_three_way_merge = orchestrator_module.three_way_merge
+
+        def flaky_three_way_merge(base, theirs, ours):  # type: ignore[no-untyped-def]
+            if "remote-b" in theirs:
+                raise RuntimeError("boom mid-loop")
+            return real_three_way_merge(base, theirs, ours)
+
+        monkeypatch.setattr(orchestrator_module, "three_way_merge", flaky_three_way_merge)
+
+        with pytest.raises(RuntimeError, match="boom mid-loop"):
+            orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        # The real target directory is left completely unchanged: original
+        # local content for BOTH sections, including the one merged first.
+        assert (directory / "01-a.md").read_text(encoding="utf-8") == local_a
+        assert (directory / "02-b.md").read_text(encoding="utf-8") == local_b
+        assert not (directory / "01-a.md.orig").exists()
+        assert not (directory / "02-b.md.orig").exists()
+
+        # No leftover staging directory next to the target.
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".big-doc.")]
+        assert leftovers == []
+
+        # State was never persisted mid-loop (save is deferred until after
+        # the atomic swap succeeds).
+        assert not os.path.exists(state_path)
+
+    def test_orchestrate_pull_should_report_orphaned_section_as_conflict(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Item 4 (orphan section): a section known locally (manifest +
+        state entry) whose counterpart is absent from the freshly-pulled
+        manifest must be surfaced as a conflict, never silently dropped."""
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        intro_content = "intro\n"
+        body_content = "body content\n"
+        (directory / "01-intro.md").write_text(intro_content, encoding="utf-8")
+        (directory / "02-body.md").write_text(body_content, encoding="utf-8")
+        intro_base_hash = save_base_content(state_dir, intro_content)
+        body_base_hash = save_base_content(state_dir, body_content)
+        state.update(str(directory / "01-intro.md"), MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=intro_base_hash, remote_version="v1",
+            local_hash=sha256_of_content(intro_content),
+        ))
+        state.update(str(directory / "02-body.md"), MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=body_base_hash, remote_version="v1",
+            local_hash=sha256_of_content(body_content),
+        ))
+        ManifestStore.save(
+            str(directory / MANIFEST_FILENAME),
+            [
+                SectionManifestEntry(heading_id="h.1", slug="intro", filename="01-intro.md", title="Intro"),
+                SectionManifestEntry(heading_id="h.2", slug="body", filename="02-body.md", title="Body"),
+            ],
+        )
+        # Freshly-pulled manifest no longer has "h.2" -- deleted upstream.
+        new_manifest_text = tmp_path / "new_manifest_scratch.yaml"
+        ManifestStore.save(
+            str(new_manifest_text),
+            [SectionManifestEntry(heading_id="h.1", slug="intro", filename="01-intro.md", title="Intro")],
+        )
+
+        backend = FakeBackend(section_files={
+            "01-intro.md": intro_content,
+            MANIFEST_FILENAME: new_manifest_text.read_text(),
+        })
+
+        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        assert outcome.has_conflicts
+        assert outcome.conflict_count >= 1
+        assert outcome.action == "merged"
+        assert outcome.orphaned_sections == ["02-body.md"]
+
+        body_after = (directory / "02-body.md").read_text(encoding="utf-8")
+        assert "<<<<<<< ours" in body_after
+        assert body_content in body_after
+        assert ">>>>>>> theirs (section removed upstream)" in body_after
+
+        orig = directory / "02-body.md.orig"
+        assert orig.exists()
+        assert orig.read_text(encoding="utf-8") == body_content
 
     def test_orchestrate_push_should_call_push_sectioned_when_mapping_sectioned_is_true(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         directory = tmp_path / "big-doc"
