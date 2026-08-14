@@ -143,17 +143,33 @@ def split_nodes(
     _preamble_heading_id, preamble_title, preamble_nodes = raw_groups[0]
     section_groups = raw_groups[1:]
 
-    # `existing_entries` is accepted (Story 2.2) so a section's identity is
-    # always exposed via `Section.heading_id` exactly as parsed off the live
-    # doc — a caller (pull_sectioned) matches that against
-    # `existing_entries` by equality to detect a heading-text-only rename
-    # (Task 2.2.1). A heading missing an id entirely (never persisted) gets
-    # `""`, which never equals a real Docs-assigned id, so it is always
-    # "genuinely new" rather than accidentally matched by position.
-    del existing_entries
+    # `existing_entries` (Story 2.2 / Task 2.2.1): match each section to a
+    # prior manifest entry by `heading_id` first. When a match is found *and*
+    # the heading text is unchanged (per the entry's stored `title`), reuse
+    # the entry's existing slug verbatim rather than re-deriving+
+    # re-disambiguating it — this is what prevents an unrelated edit
+    # elsewhere in the doc (e.g. a duplicate-titled heading inserted before
+    # this one) from spuriously shifting this section's slug even though its
+    # own heading_id/content never changed. A match whose heading text *has*
+    # changed is re-slugified below (git-mv semantics: same identity, new
+    # name) — this is the committed rename behavior (plan.md Story 2.2). A
+    # heading_id with no match (or missing entirely — `""` never equals a
+    # real Docs-assigned id) is always "genuinely new", so it always gets a
+    # freshly derived slug.
+    existing_by_id = {
+        e.heading_id: e for e in (existing_entries or []) if e.heading_id != PREAMBLE_HEADING_ID
+    }
 
     titles = [title for _, title, _ in section_groups]
-    slugs = slugify_all(titles)
+    fresh_slugs = slugify_all(titles)
+
+    slugs: List[str] = []
+    for (heading_id, title, _), fresh_slug in zip(section_groups, fresh_slugs):
+        entry = existing_by_id.get(heading_id) if heading_id else None
+        if entry is not None and entry.title == title:
+            slugs.append(entry.slug)
+        else:
+            slugs.append(fresh_slug)
 
     sections: List[Section] = [
         Section(

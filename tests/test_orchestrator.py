@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
+from docspan.backends.google_docs.manifest import MANIFEST_FILENAME, ManifestStore, SectionManifestEntry
 from docspan.config import Mapping
 from docspan.core.orchestrator import (
     get_base_content,
@@ -50,13 +51,24 @@ class FakeBackend(Backend):
                 fh.write(self.remote_content)
         return PullResult(status=self.pull_status, doc_id=doc_id, local_path=local_path)  # type: ignore[arg-type]
 
-    def pull_sectioned(self, directory: str, doc_id: str, **kwargs: object) -> PullResult:
-        self.pull_sectioned_calls.append((directory, doc_id))
+    def pull_sectioned(
+        self,
+        doc_id: str,
+        local_dir: str,
+        split_level: str,
+        tab_id: "str | None" = None,
+    ) -> PullResult:
+        # Exact signature match to backend.py's real
+        # `pull_sectioned(self, doc_id, local_dir, split_level, tab_id=None)`
+        # (Gap 4 regression guard) — a `**kwargs`-tolerant fake would let a
+        # future signature drift between backend.py and orchestrator.py's
+        # call site pass tests silently instead of failing loudly.
+        self.pull_sectioned_calls.append((doc_id, local_dir, split_level, tab_id))
         if self.pull_status in ("ok", "warning"):
             for filename, content in self.section_files.items():
-                with open(os.path.join(directory, filename), "w", encoding="utf-8") as fh:
+                with open(os.path.join(local_dir, filename), "w", encoding="utf-8") as fh:
                     fh.write(content)
-        return PullResult(status=self.pull_status, doc_id=doc_id, local_path=directory)  # type: ignore[arg-type]
+        return PullResult(status=self.pull_status, doc_id=doc_id, local_path=local_dir)  # type: ignore[arg-type]
 
     def get_remote_version(self, doc_id: str) -> str:
         return self.remote_version
@@ -377,11 +389,44 @@ class TestOrchestrateSectioned:
         outcome = orchestrate_pull(mapping, backend, state, str(tmp_path), state_path)
 
         assert len(backend.pull_sectioned_calls) == 1
-        assert backend.pull_sectioned_calls[0][1] == "doc-123"
+        doc_id, local_dir, split_level, tab_id = backend.pull_sectioned_calls[0]
+        assert doc_id == "doc-123"
+        assert split_level == "HEADING_1"
         assert not backend.pull_calls
         assert outcome.action == "first-sync"
         assert (directory / "01-intro.md").read_text(encoding="utf-8") == "intro\n"
         assert state.get(str(directory / "01-intro.md")) is not None
+
+    def test_orchestrate_pull_should_call_pull_sectioned_with_correct_argument_order(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # Gap 4 regression guard: the real `backend.pull_sectioned` signature
+        # is `(self, doc_id, local_dir, split_level, tab_id=None)`. The
+        # orchestrator once called it as
+        # `backend.pull_sectioned(tmp_dir, mapping.remote_id, tab_id=...)`
+        # — doc_id and local_dir swapped, and split_level never passed at
+        # all. A Mock-based spy (unlike the tolerant `**kwargs` fake this
+        # test used to rely on) fails loudly the moment the call-site
+        # argument order or arity drifts again.
+        from unittest.mock import MagicMock
+
+        directory = tmp_path / "big-doc"
+        mapping = _sectioned_mapping(str(directory), remote_id="doc-xyz")
+        mapping.tab_id = "tab-1"
+        backend = MagicMock(spec=FakeBackend)
+        backend.pull_sectioned.return_value = PullResult(
+            status="ok", doc_id="doc-xyz", local_path=str(directory)
+        )
+        backend.get_remote_version.return_value = "v1"
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+
+        orchestrate_pull(mapping, backend, state, str(tmp_path), state_path)
+
+        backend.pull_sectioned.assert_called_once()
+        _, call_args, call_kwargs = backend.pull_sectioned.mock_calls[0]
+        assert call_args[0] == "doc-xyz"  # doc_id
+        assert call_args[1] != "doc-xyz"  # local_dir (a temp directory path)
+        assert call_kwargs["split_level"] == "HEADING_1"
+        assert call_kwargs["tab_id"] == "tab-1"
 
     def test_orchestrate_pull_should_call_legacy_pull_when_mapping_sectioned_is_false(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
@@ -449,6 +494,115 @@ class TestOrchestrateSectioned:
         content_b = (directory / "02-body.md").read_text(encoding="utf-8")
         assert "local edit" in content_b
         assert "remote addition" in content_b
+
+    def test_orchestrate_pull_should_rekey_state_and_report_renumbering_only_rename(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        # Gap 2 + Gap 3: section "h.2" (slug "body") is unchanged content, but
+        # shifts from 02-body.md to 01-body.md purely because a sibling
+        # section (h.1) was deleted upstream, not because "h.2" itself
+        # changed. Its prior state entry must migrate to the new path (not
+        # be orphaned, not be treated as a fresh first-sync), and the
+        # renumbering must be reported separately from a content rename.
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        body_content = "same body content\n"
+        old_local_path = str(directory / "02-body.md")
+        (directory / "02-body.md").write_text(body_content, encoding="utf-8")
+        base_hash = save_base_content(state_dir, body_content)
+        state.update(old_local_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=base_hash, remote_version="v1",
+            local_hash=sha256_of_content(body_content),
+        ))
+        ManifestStore.save(
+            str(directory / MANIFEST_FILENAME),
+            [
+                SectionManifestEntry(heading_id="h.1", slug="intro", filename="01-intro.md", title="Intro"),
+                SectionManifestEntry(heading_id="h.2", slug="body", filename="02-body.md", title="Body"),
+            ],
+        )
+        new_manifest_text = (tmp_path / "new_manifest_scratch.yaml")
+        ManifestStore.save(
+            str(new_manifest_text),
+            [SectionManifestEntry(heading_id="h.2", slug="body", filename="01-body.md", title="Body")],
+        )
+
+        backend = FakeBackend(section_files={
+            "01-body.md": body_content,
+            MANIFEST_FILENAME: new_manifest_text.read_text(),
+        })
+
+        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        # Old path's state entry is gone -- not orphaned.
+        assert state.get(old_local_path) is None
+        # New path's entry migrated with the *original* content's hash, not
+        # a blank/fresh one.
+        new_entry = state.get(str(directory / "01-body.md"))
+        assert new_entry is not None
+        assert new_entry.local_hash == sha256_of_content(body_content)
+        # Section content/heading_id never changed -- recognized as
+        # up-to-date, not rewritten as if it were a brand new file.
+        assert outcome.action == "up-to-date"
+        assert outcome.renumbered_only == [("02-body.md", "01-body.md")]
+        assert outcome.content_renamed == []
+
+    def test_orchestrate_pull_should_rekey_state_and_report_content_driven_rename(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        # Gap 2 + Gap 3: same heading_id, but the heading text (and slug)
+        # actually changed -- a content-driven rename, reported distinctly
+        # from renumbering-only, per plan.md's Observability Plan.
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        original_content = "original content\n"
+        old_local_path = str(directory / "01-body.md")
+        (directory / "01-body.md").write_text(original_content, encoding="utf-8")
+        base_hash = save_base_content(state_dir, original_content)
+        state.update(old_local_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=base_hash, remote_version="v1",
+            local_hash=sha256_of_content(original_content),
+        ))
+        ManifestStore.save(
+            str(directory / MANIFEST_FILENAME),
+            [SectionManifestEntry(heading_id="h.1", slug="body", filename="01-body.md", title="Body")],
+        )
+        new_manifest_text = (tmp_path / "new_manifest_scratch.yaml")
+        ManifestStore.save(
+            str(new_manifest_text),
+            [SectionManifestEntry(
+                heading_id="h.1", slug="body-updated", filename="01-body-updated.md", title="Body Updated",
+            )],
+        )
+        updated_content = "updated content\n"
+
+        backend = FakeBackend(section_files={
+            "01-body-updated.md": updated_content,
+            MANIFEST_FILENAME: new_manifest_text.read_text(),
+        })
+
+        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        assert state.get(old_local_path) is None
+        new_entry = state.get(str(directory / "01-body-updated.md"))
+        assert new_entry is not None
+        assert outcome.renumbered_only == []
+        assert outcome.content_renamed == [("01-body.md", "01-body-updated.md")]
+        # The migrated section's content itself was also updated remotely --
+        # rekey does not prevent the normal fast-forward from applying.
+        assert (directory / "01-body-updated.md").read_text(encoding="utf-8") == updated_content
 
     def test_orchestrate_push_should_call_push_sectioned_when_mapping_sectioned_is_true(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         directory = tmp_path / "big-doc"

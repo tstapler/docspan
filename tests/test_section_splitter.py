@@ -124,14 +124,23 @@ class TestSplitNodesDuplicateTitles:
 
 
 class TestSplitNodesRenameMatching:
-    def test_split_nodes_should_match_existing_manifest_entries_by_heading_id_when_renamed(
+    def test_split_nodes_should_reuse_existing_slug_on_heading_id_match_with_unchanged_text(
         self,
     ) -> None:
+        # Old slugs deliberately differ from what fresh slugify_all(title)
+        # would produce, so a passing assertion actually proves reuse
+        # happened rather than coincidentally matching a freshly derived
+        # slug (the bug this test used to hide: existing_entries was a
+        # no-op, so this only ever exercised fresh derivation).
         existing = [
-            SectionManifestEntry(heading_id="h.1", slug="one", filename="01-one.md"),
-            SectionManifestEntry(heading_id="h.2", slug="two", filename="02-two.md"),
             SectionManifestEntry(
-                heading_id="h.3", slug="three", filename="03-three.md"
+                heading_id="h.1", slug="one-legacy", filename="01-one-legacy.md", title="One"
+            ),
+            SectionManifestEntry(
+                heading_id="h.2", slug="two-legacy", filename="02-two-legacy.md", title="Two"
+            ),
+            SectionManifestEntry(
+                heading_id="h.3", slug="three", filename="03-three.md", title="Three"
             ),
         ]
         nodes = [
@@ -144,11 +153,14 @@ class TestSplitNodesRenameMatching:
         sections = split_nodes(nodes, "HEADING_1", existing_entries=existing)
 
         by_id = {s.heading_id: s for s in sections if s.heading_id != PREAMBLE_HEADING_ID}
-        assert by_id["h.1"].slug == "one"
-        assert by_id["h.2"].slug == "two"
-        # heading_id still matches the existing manifest entry, so the
-        # caller can detect this as a rename (old filename 03-three.md ->
-        # new slug three-renamed) rather than a delete+insert.
+        # Unchanged heading text -> reuse the prior slug verbatim, not a
+        # freshly derived "one"/"two".
+        assert by_id["h.1"].slug == "one-legacy"
+        assert by_id["h.2"].slug == "two-legacy"
+        # heading_id still matches the existing manifest entry, but the
+        # heading text changed, so the caller can detect this as a
+        # content-driven rename (old filename 03-three.md -> new slug
+        # three-renamed) rather than a delete+insert.
         assert by_id["h.3"].title == "Three Renamed"
         assert by_id["h.3"].slug == "three-renamed"
         existing_ids = {e.heading_id for e in existing}

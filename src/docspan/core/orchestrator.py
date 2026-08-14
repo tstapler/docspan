@@ -9,13 +9,19 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 logger = logging.getLogger(__name__)
 
 from docspan.backends.base import Backend, PullResult, PushResult
+from docspan.backends.google_docs.manifest import (
+    MANIFEST_FILENAME,
+    ManifestError,
+    ManifestStore,
+    SectionManifestEntry,
+)
 from docspan.core.merge import three_way_merge
 from docspan.core.paths import BASE_FILE_SUFFIX, BASE_STORE_DIR, ORIG_SUFFIX, STATE_FILENAME
 from docspan.core.state import MappingState, SyncState, sha256_of_content
@@ -83,6 +89,76 @@ def _section_files(directory: str) -> list[str]:
     return sorted(f for f in os.listdir(directory) if f.endswith(".md"))
 
 
+def _load_manifest_entries(directory: str) -> list[SectionManifestEntry]:
+    """Load `_manifest.yaml` from `directory`, or `[]` if absent/unreadable.
+
+    A missing manifest is expected on a mapping's very first sectioned pull
+    (nothing has ever been written there yet); a malformed one is treated
+    the same way rather than failing the whole pull, since manifest.py's own
+    `ManifestStore.load` is only a rename-detection aid here, not the
+    source of truth for section content.
+    """
+    manifest_path = os.path.join(directory, MANIFEST_FILENAME)
+    try:
+        return ManifestStore.load(manifest_path)
+    except ManifestError:
+        return []
+
+
+def _detect_section_renames(
+    old_dir: str, new_dir: str
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Diff old vs. new `_manifest.yaml` by `heading_id` to find renamed sections.
+
+    Returns `(renumbered_only, content_renamed)`, each a list of
+    `(old_filename, new_filename)` pairs. A `heading_id` present in both
+    manifests whose `filename` changed is a rename; it is "renumbering-only"
+    when the `slug` is unchanged (only the `NN` ordinal prefix shifted,
+    e.g. because a sibling section was inserted/deleted elsewhere) and
+    "content-driven" otherwise (the heading text itself changed, so
+    `section_splitter.split_nodes` derived a new slug — see Gap 1's
+    heading_id-match logic in `section_splitter.py`).
+    """
+    old_entries = _load_manifest_entries(old_dir)
+    new_entries = _load_manifest_entries(new_dir)
+    old_by_id = {e.heading_id: e for e in old_entries}
+    new_by_id = {e.heading_id: e for e in new_entries}
+
+    renumbered_only: list[tuple[str, str]] = []
+    content_renamed: list[tuple[str, str]] = []
+    for heading_id, old_entry in old_by_id.items():
+        new_entry = new_by_id.get(heading_id)
+        if new_entry is None or new_entry.filename == old_entry.filename:
+            continue
+        pair = (old_entry.filename, new_entry.filename)
+        if new_entry.slug == old_entry.slug:
+            renumbered_only.append(pair)
+        else:
+            content_renamed.append(pair)
+    return renumbered_only, content_renamed
+
+
+def _rekey_renamed_sections(
+    local_dir: str, state: SyncState, renames: list[tuple[str, str]]
+) -> None:
+    """Move (not duplicate) each renamed section's state entry and local file.
+
+    Without this, a rename would orphan the old path's `MappingState` entry
+    (leaving stale, never-cleaned-up state) while the new path is treated as
+    a first-sync — discarding the section's actual merge history/local_hash
+    even though its heading_id/content identity survived the rename.
+    """
+    for old_filename, new_filename in renames:
+        old_path = os.path.join(local_dir, old_filename)
+        new_path = os.path.join(local_dir, new_filename)
+
+        if old_path in state.mappings:
+            state.mappings[new_path] = state.mappings.pop(old_path)
+
+        if os.path.exists(old_path) and not os.path.exists(new_path):
+            os.rename(old_path, new_path)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Outcome types
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,6 +178,16 @@ class PullOutcome:
     result: Optional[PullResult] = None
     has_conflicts: bool = False
     conflict_count: int = 0
+    # Sectioned pulls only (plan.md Task 2.2.2 / Observability Plan): section
+    # renames detected via heading_id-match against the prior manifest,
+    # split into renumbering-only (same heading_id/slug, only the `NN`
+    # ordinal prefix shifted because a sibling section was added/removed)
+    # versus content-driven (heading_id matched but the slug/content itself
+    # changed) — each entry is (old_filename, new_filename), so a user isn't
+    # misled into thinking an untouched section's heading/content changed
+    # when only its position did.
+    renumbered_only: list = field(default_factory=list)
+    content_renamed: list = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,11 +514,23 @@ def _orchestrate_pull_sectioned(
         )
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        pull_result = backend.pull_sectioned(tmp_dir, mapping.remote_id, tab_id=mapping.tab_id)
+        pull_result = backend.pull_sectioned(
+            mapping.remote_id, tmp_dir, split_level=mapping.split_level, tab_id=mapping.tab_id,
+        )
         if pull_result.status not in ("ok", "warning"):
             return PullOutcome(local_path=mapping.local, action="error", result=pull_result)
 
         os.makedirs(mapping.local, exist_ok=True)
+
+        # Story 2.2 / Task 2.2.2: detect section renames via heading_id-match
+        # (section_splitter.split_nodes already applied this when producing
+        # the fresh split in `tmp_dir`) before the per-file merge loop below,
+        # so a renamed section's prior state entry is found under its *new*
+        # path rather than looking like a fresh first-sync.
+        renumbered_only, content_renamed = _detect_section_renames(mapping.local, tmp_dir)
+        if renumbered_only or content_renamed:
+            _rekey_renamed_sections(mapping.local, state, renumbered_only + content_renamed)
+            state.save(state_path)
 
         any_merge = False
         any_conflicts = False
@@ -516,4 +614,6 @@ def _orchestrate_pull_sectioned(
             result=pull_result,
             has_conflicts=any_conflicts,
             conflict_count=conflict_total,
+            renumbered_only=renumbered_only,
+            content_renamed=content_renamed,
         )
