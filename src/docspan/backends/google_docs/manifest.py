@@ -65,6 +65,34 @@ class SectionManifestEntry:
     title: Optional[str] = None
 
 
+def _validate_filename(filename: object, manifest_path: str, index: int) -> str:
+    """Reject a manifest entry `filename` that could escape the mapping's directory.
+
+    A `_manifest.yaml` is a committed file, not gitignored, so a crafted
+    entry (e.g. `filename: "../../../../.ssh/authorized_keys"`) must never
+    be allowed to flow into the `os.path.join`/`open`/`os.rename` calls in
+    `core/orchestrator.py` that trust this field as a plain relative
+    filename within the mapping's section directory.
+    """
+    if not isinstance(filename, str) or not filename:
+        raise ManifestError(
+            f"manifest {manifest_path!r} entry {index} has an invalid filename: {filename!r}"
+        )
+    if os.path.isabs(filename):
+        raise ManifestError(
+            f"manifest {manifest_path!r} entry {index} has an absolute filename: {filename!r}"
+        )
+
+    section_dir = os.path.abspath(os.path.dirname(manifest_path))
+    resolved = os.path.abspath(os.path.join(section_dir, filename))
+    if os.path.commonpath([section_dir, resolved]) != section_dir:
+        raise ManifestError(
+            f"manifest {manifest_path!r} entry {index} has a filename that "
+            f"escapes the mapping directory: {filename!r}"
+        )
+    return filename
+
+
 class ManifestStore:
     """Repository for reading/writing a sectioned mapping's `_manifest.yaml`."""
 
@@ -106,11 +134,12 @@ class ManifestStore:
                     f"got {type(item).__name__}"
                 )
             try:
+                filename = _validate_filename(item["filename"], path, i)
                 entries.append(
                     SectionManifestEntry(
                         heading_id=item["heading_id"],
                         slug=item["slug"],
-                        filename=item["filename"],
+                        filename=filename,
                         title=item.get("title"),
                     )
                 )

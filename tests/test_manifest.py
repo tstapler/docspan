@@ -46,6 +46,32 @@ def test_manifest_store_load_raises_on_malformed_yaml(tmp_path) -> None:  # type
         ManifestStore.load(str(manifest_path))
 
 
+def test_manifest_store_load_raises_on_path_traversal_filename(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    manifest_path = tmp_path / "_manifest.yaml"
+    manifest_path.write_text(
+        "entries:\n"
+        "  - heading_id: h.aaa\n"
+        "    slug: apple\n"
+        "    filename: ../../../../.ssh/authorized_keys\n"
+    )
+
+    with pytest.raises(ManifestError):
+        ManifestStore.load(str(manifest_path))
+
+
+def test_manifest_store_load_raises_on_absolute_path_filename(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    manifest_path = tmp_path / "_manifest.yaml"
+    manifest_path.write_text(
+        "entries:\n"
+        "  - heading_id: h.aaa\n"
+        "    slug: apple\n"
+        "    filename: /etc/passwd\n"
+    )
+
+    with pytest.raises(ManifestError):
+        ManifestStore.load(str(manifest_path))
+
+
 def test_manifest_store_load_raises_clear_error_on_missing_required_field(tmp_path) -> None:  # type: ignore[no-untyped-def]
     manifest_path = tmp_path / "_manifest.yaml"
     manifest_path.write_text(
