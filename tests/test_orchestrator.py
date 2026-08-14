@@ -901,3 +901,40 @@ class TestRekeyRenamedSectionsCollision:
             "01-old.md" in record.getMessage() and "02-new.md" in record.getMessage()
             for record in caplog.records
         )
+
+
+class TestAtomicReplaceDirDoubleFailure:
+    """A failed swap-in whose restore-on-failure also fails must not go silent."""
+
+    def test_logs_both_failures_and_raises_restore_exception(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:  # type: ignore[no-untyped-def]
+        target_dir = tmp_path / "target"
+        target_dir.mkdir()
+        (target_dir / "existing.md").write_text("existing\n", encoding="utf-8")
+        tmp_dir = tmp_path / "staging"
+        tmp_dir.mkdir()
+        (tmp_dir / "fresh.md").write_text("fresh\n", encoding="utf-8")
+
+        real_replace = os.replace
+        call_count = {"n": 0}
+
+        def _flaky_replace(src, dst):  # type: ignore[no-untyped-def]
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First call: real move of target_dir aside to old_dir --
+                # let it succeed so the function reaches the swap-in.
+                return real_replace(src, dst)
+            # All subsequent os.replace calls fail: the swap-in of tmp_dir
+            # into target_dir, and then the restore-on-failure attempt.
+            raise OSError("simulated failure")
+
+        monkeypatch.setattr(orchestrator_module.os, "replace", _flaky_replace)
+
+        with caplog.at_level("ERROR", logger=orchestrator_module.logger.name):
+            with pytest.raises(OSError):
+                orchestrator_module._atomic_replace_dir(str(tmp_dir), str(target_dir))
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("Failed to swap" in m for m in messages)
+        assert any("also failed" in m for m in messages)

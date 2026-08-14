@@ -239,9 +239,27 @@ def _atomic_replace_dir(tmp_dir: str, target_dir: str) -> None:
         os.replace(target_dir, old_dir)
     try:
         os.replace(tmp_dir, target_dir)
-    except Exception:
+    except Exception as swap_exc:
         if old_dir is not None:
-            os.replace(old_dir, target_dir)
+            try:
+                os.replace(old_dir, target_dir)
+            except Exception as restore_exc:
+                # Double failure: the swap-in failed *and* restoring the
+                # prior contents from the `.old.` sibling also failed.
+                # Letting `restore_exc` propagate unguarded would silently
+                # mask `swap_exc` with no record of either -- log both
+                # before raising the restore failure (the more urgent of
+                # the two: `target_dir` may now be missing entirely),
+                # chained to the original for full context.
+                logger.error(
+                    "Failed to swap %r into %r: %r", tmp_dir, target_dir, swap_exc,
+                    exc_info=swap_exc,
+                )
+                logger.error(
+                    "Restoring %r from %r after the failed swap also failed: %r",
+                    target_dir, old_dir, restore_exc, exc_info=restore_exc,
+                )
+                raise restore_exc from swap_exc
         raise
     else:
         if old_dir is not None:
