@@ -1072,6 +1072,38 @@ def test_ordinary_table_and_code_block_never_trip_guard() -> None:
     builder.diff_summary([table_current] + code_current, [table_target] + code_target)
 
 
+def test_diff_too_expensive_should_trip_on_realistic_multi_section_fixture() -> None:
+    """Story 7.4 (plan.md Task 7.4.1): a reassembled multi-section document —
+    the shape `push_sectioned` hands to `DocsRequestBuilder.build()` after
+    concatenating N section files — re-validated against the *production*
+    thresholds (`_MAX_COMPARISON_CELLS`/`_MAX_DUPLICATE_RUN`, not monkeypatched),
+    proving the guard was checked at sectioned scale rather than only ever
+    exercised via small hand-picked fixtures.
+
+    Models a ~180-paragraph document assembled from several sections, one of
+    which is a long boilerplate checklist (a realistic duplicate-heavy
+    pattern — e.g. repeated "Status: Draft" rows) that alone exceeds
+    `_MAX_DUPLICATE_RUN`. Combined length clears `_MIN_SIZE_FOR_DUPLICATE_CHECK`
+    (150) via the surrounding unique section content, so this exercises the
+    same combined-length gate a real reassembled doc would hit.
+    """
+    max_duplicate_run = docs_request_builder_module._MAX_DUPLICATE_RUN
+    min_size = docs_request_builder_module._MIN_SIZE_FOR_DUPLICATE_CHECK
+
+    unique_prefix = [
+        _para(f"Section {i} unique paragraph text.", start=1 + i * 40, end=1 + i * 40 + 35)
+        for i in range(40)
+    ]
+    offset = 1 + 40 * 40
+    boilerplate = _duplicate_paragraphs("Status: Draft", max_duplicate_run + 5, start=offset)
+    current = unique_prefix + boilerplate
+    target = unique_prefix + boilerplate
+    assert len(current) + len(target) >= min_size
+
+    with pytest.raises(DiffTooExpensive):
+        builder.build(current, target, DOC_END + offset + 2000)
+
+
 def test_build_and_diff_summary_raise_identically_on_pathological_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

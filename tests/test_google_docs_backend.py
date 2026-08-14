@@ -9,7 +9,8 @@ tests/conftest.py (also used by tests/test_push_preview.py).
 from __future__ import annotations
 
 import json
-from typing import Callable
+import pathlib
+from typing import Callable, List
 from unittest.mock import MagicMock
 
 import pytest
@@ -2007,3 +2008,654 @@ class TestCreate:
         assert result.doc_id == "new-doc-1"
         assert result.title == "My Doc"
         assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pull_sectioned() — gdocs-sectioned-sync Epic 2: split a doc into one
+# NN-slug.md file per split_level heading plus _manifest.yaml, always via the
+# structural path, written atomically (temp dir + os.replace).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _heading_paragraph(text: str, heading_id: str, style: str = "HEADING_1") -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": style, "headingId": heading_id},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _body_paragraph(text: str) -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _with_real_indices(paragraphs: List[dict]) -> List[dict]:
+    """Assign sequential startIndex/endIndex to a paragraph-dict list.
+
+    `DocsStructureParser` defaults a paragraph's start/end index to 0 when
+    the source dict omits `startIndex`/`endIndex` (real Docs API responses
+    always include them). Every node in a doc built without this ends up
+    with identical (0, 0) positions, which collapses `DocsRequestBuilder`'s
+    deletion/reorder detection (position-based) into an empty request list
+    even though the node *content* differs — a test-fixture gap, not a
+    production bug (confirmed by reproducing the same "no changes detected"
+    symptom via plain, unmodified `push()`). Real Docs paragraphs are
+    contiguous, so a simple running offset over each paragraph's text
+    length reproduces realistic positions.
+    """
+    indexed: List[dict] = []
+    offset = 1
+    for p in paragraphs:
+        text = p["paragraph"]["elements"][0]["textRun"]["content"]
+        length = len(text)
+        p = {**p, "startIndex": offset, "endIndex": offset + length}
+        indexed.append(p)
+        offset += length
+    return indexed
+
+
+def _sectioned_doc(revision_id: str = "rev-sectioned") -> dict:
+    """5 HEADING_1 sections plus preamble content — Story 2.1's own example."""
+    content = [_body_paragraph("Preamble content.")]
+    for i in range(1, 6):
+        content.append(_heading_paragraph(f"Section {i}", heading_id=f"h.section{i}"))
+        content.append(_body_paragraph(f"Body of section {i}."))
+    content = _with_real_indices(content)
+    return {"revisionId": revision_id, "body": {"content": content}}
+
+
+class TestPullSectioned:
+    def test_pull_sectioned_should_write_section_files_and_manifest_using_structural_path(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "ok", result.message
+        # Never falls back to Drive's HTML export — it can't be scoped to a
+        # heading range.
+        fake_client.get_doc_content.assert_not_called()
+
+        written = sorted(p.name for p in local_dir.iterdir())
+        assert written == [
+            "00-preamble.md",
+            "01-section-1.md",
+            "02-section-2.md",
+            "03-section-3.md",
+            "04-section-4.md",
+            "05-section-5.md",
+            "_manifest.yaml",
+        ]
+        assert "Preamble content." in (local_dir / "00-preamble.md").read_text()
+        section_3 = (local_dir / "03-section-3.md").read_text()
+        assert "# Section 3" in section_3
+        assert "Body of section 3." in section_3
+
+        import yaml
+
+        manifest = yaml.safe_load((local_dir / "_manifest.yaml").read_text())
+        assert len(manifest["entries"]) == 6
+        assert manifest["entries"][0]["heading_id"] == "__preamble__"
+        assert manifest["entries"][3]["heading_id"] == "h.section3"
+        assert manifest["entries"][3]["filename"] == "03-section-3.md"
+
+    def test_pull_sectioned_should_return_error_for_unknown_tab_id(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned(
+            "doc-1", str(local_dir), split_level="HEADING_1", tab_id="t.nonexistent"
+        )
+
+        assert result.status == "error"
+        assert "t.nonexistent" in (result.message or "")
+
+    def test_pull_sectioned_should_return_error_when_split_level_absent_from_doc(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_2")
+
+        assert result.status == "error"
+        assert "HEADING_2" in (result.message or "")
+
+    def test_pull_sectioned_should_leave_prior_directory_intact_when_write_fails_partway(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+        (local_dir / "00-preamble.md").write_text("prior preamble\n")
+        (local_dir / "_manifest.yaml").write_text(
+            "entries:\n- heading_id: __preamble__\n  slug: preamble\n  filename: 00-preamble.md\n"
+        )
+
+        from docspan.backends.google_docs import backend as backend_module
+
+        call_count = {"n": 0}
+        real_render = backend_module.render_nodes_to_markdown
+
+        def _flaky_render(nodes):
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                raise RuntimeError("simulated write failure")
+            return real_render(nodes)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(backend_module, "render_nodes_to_markdown", _flaky_render)
+            result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "error"
+        # The original directory's prior contents are completely untouched —
+        # no partial set of new section files, no stray temp directory
+        # promoted into place.
+        assert (local_dir / "00-preamble.md").read_text() == "prior preamble\n"
+        assert sorted(p.name for p in local_dir.iterdir()) == [
+            "00-preamble.md",
+            "_manifest.yaml",
+        ]
+        # No leftover temp directories beside it either.
+        siblings = [p.name for p in tmp_path.iterdir()]
+        assert siblings == ["doc"]
+
+    def test_pull_sectioned_should_atomically_swap_temp_directory_into_place_on_success(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+        (local_dir / "00-preamble.md").write_text("stale preamble\n")
+        (local_dir / "_manifest.yaml").write_text(
+            "entries:\n- heading_id: __preamble__\n  slug: preamble\n  filename: 00-preamble.md\n"
+        )
+
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "ok", result.message
+        written = sorted(p.name for p in local_dir.iterdir())
+        assert written == [
+            "00-preamble.md",
+            "01-section-1.md",
+            "02-section-2.md",
+            "03-section-3.md",
+            "04-section-4.md",
+            "05-section-5.md",
+            "_manifest.yaml",
+        ]
+        # The new content replaced the stale file — no old content survives.
+        assert (local_dir / "00-preamble.md").read_text() != "stale preamble\n"
+        # No stray temp/backup directories left beside the target directory.
+        siblings = [p.name for p in tmp_path.iterdir()]
+        assert siblings == ["doc"]
+
+    def test_pull_sectioned_should_write_one_comments_sidecar_per_section(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        fake_client.get_doc_info.return_value = {"name": "Sectioned Doc"}
+        fake_client.get_comments.return_value = [
+            {
+                "id": "c-sec3",
+                "author": {"displayName": "Reviewer"},
+                "resolved": False,
+                "quotedFileContent": {"value": "Body of section 3."},
+                "content": "Question about section 3.",
+            },
+            {
+                "id": "c-sec5",
+                "author": {"displayName": "Reviewer"},
+                "resolved": False,
+                "quotedFileContent": {"value": "Body of section 5."},
+                "content": "Question about section 5.",
+            },
+            {
+                "id": "c-unmatched",
+                "author": {"displayName": "Reviewer"},
+                "resolved": False,
+                "quotedFileContent": {"value": "text that appears nowhere in the doc"},
+                "content": "Orphaned comment.",
+            },
+        ]
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "ok", result.message
+        comment_sidecars = sorted(p.name for p in local_dir.glob("*.comments.md"))
+        assert comment_sidecars == ["03-section-3.md.comments.md", "05-section-5.md.comments.md"]
+
+        section_3_comments = (local_dir / "03-section-3.md.comments.md").read_text()
+        assert "Question about section 3." in section_3_comments
+        assert "Question about section 5." not in section_3_comments
+
+        section_5_comments = (local_dir / "05-section-5.md.comments.md").read_text()
+        assert "Question about section 5." in section_5_comments
+        assert "Question about section 3." not in section_5_comments
+
+        # The unmatched comment is surfaced as residue, not silently attached
+        # to any section, and doesn't get its own sidecar either.
+        assert "text that appears nowhere" not in section_3_comments
+        assert "text that appears nowhere" not in section_5_comments
+        for entry in local_dir.iterdir():
+            if entry.name.endswith(".comments.md"):
+                assert "c-unmatched" not in entry.read_text()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# push_sectioned() — gdocs-sectioned-sync Epic 3: reassemble a sectioned
+# mapping's section files (in manifest order) and reuse push()'s diff/
+# request-emission tail unchanged (_execute_push).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestPushSectioned:
+    def test_push_sectioned_should_error_when_manifest_missing(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "error"
+        assert "manifest" in (result.message or "").lower()
+        fake_client.get_document.assert_not_called()
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_should_reassemble_sections_in_manifest_order_not_filesystem_order(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        # Manifest lists section 2 before section 1, but the *files* are
+        # still named 01-section-1.md / 02-section-2.md (filesystem/glob
+        # order would put section 1 first). The live doc already has
+        # section 2 before section 1 (i.e. it matches manifest order) — if
+        # push_sectioned reassembled by filename order instead of manifest
+        # order, it would (wrongly) see a reorder diff and write something;
+        # reassembling in manifest order produces zero diff.
+        backend, fake_client = make_backend()
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+        (local_dir / "01-section-1.md").write_text("# Section 1\n\nBody of section 1.\n")
+        (local_dir / "02-section-2.md").write_text("# Section 2\n\nBody of section 2.\n")
+        (local_dir / "_manifest.yaml").write_text(
+            "entries:\n"
+            "- heading_id: h.section2\n  slug: section-2\n  filename: 02-section-2.md\n"
+            "- heading_id: h.section1\n  slug: section-1\n  filename: 01-section-1.md\n"
+        )
+        fake_client.get_document.return_value = {
+            "revisionId": "rev-order",
+            "body": {
+                "content": [
+                    _heading_paragraph("Section 2", heading_id="h.section2"),
+                    _body_paragraph("Body of section 2."),
+                    _heading_paragraph("Section 1", heading_id="h.section1"),
+                    _body_paragraph("Body of section 1."),
+                ]
+            },
+        }
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "skipped", result.message
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_should_push_modified_section_content(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        section_3 = local_dir / "03-section-3.md"
+        section_3.write_text(
+            section_3.read_text().replace(
+                "Body of section 3.", "Body of section 3, updated."
+            )
+        )
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        assert fake_client.batch_update.call_count >= 1
+        _, kwargs = fake_client.batch_update.call_args_list[0]
+        assert kwargs["required_revision_id"] == "rev-sectioned"
+        serialized = json.dumps(fake_client.batch_update.call_args_list[0][0][1])
+        assert "updated" in serialized
+
+    def test_push_sectioned_should_push_added_section(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        (local_dir / "06-section-6.md").write_text("# Section 6\n\nBody of section 6.\n")
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        assert fake_client.batch_update.call_count >= 1
+        serialized = json.dumps(fake_client.batch_update.call_args_list[0][0][1])
+        assert "Section 6" in serialized
+
+    def test_push_sectioned_should_push_deleted_section(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        (local_dir / "03-section-3.md").unlink()
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status in ("ok", "warning"), result.message
+        assert fake_client.batch_update.call_count >= 1
+
+    def test_push_sectioned_reorder_should_preserve_heading_ids_via_in_place_move(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Named for validation.md's literal test name. The resolved design
+        (see push_sectioned's docstring / _classify_section_reorder) found
+        Google Docs' batchUpdate API has no "move paragraph" primitive
+        anywhere in docs_request_builder.py's build() — only equal/delete/
+        insert/replace opcodes exist. For a *pure* reorder (manifest order
+        changed, section content itself untouched — the scenario here),
+        docs_request_builder.py's `_repair` step recognizes the swapped
+        run's content pairs as literally unchanged and folds them back to
+        `equal` opcodes rather than delete+insert (verified directly via
+        `DocsRequestBuilder._opcodes()`: the reordered current/target runs
+        come back as two `equal` opcodes, not `delete`+`insert`). So
+        heading_ids ARE preserved here — literally, because nothing is
+        deleted or reinserted — and zero batch_update requests are emitted;
+        the live document's paragraph order is left as-is (Docs has no
+        notion of order independent of content identity). Because nothing
+        is actually written, this is a true no-op push (status "skipped",
+        no batch_update call, no reorder warning attached — see
+        push_sectioned's docstring on why the warning is only attached to a
+        push that writes something) rather than literal API-level move
+        support, which does not exist.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        import yaml
+
+        manifest_path = local_dir / "_manifest.yaml"
+        raw = yaml.safe_load(manifest_path.read_text())
+        entries = raw["entries"]
+        # Swap section 1 and section 2's manifest entries (indices 1, 2 —
+        # index 0 is the preamble) without touching the section files or
+        # their filenames, simulating a user hand-editing the manifest to
+        # reorder sections since the last pull.
+        entries[1], entries[2] = entries[2], entries[1]
+        manifest_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "skipped", result.message
+        assert fake_client.batch_update.call_count == 0
+
+    def test_push_sectioned_reorder_with_content_edit_should_accept_heading_id_churn_and_warn(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """plan.md's Story 7.3 second Given/When/Then: a section that is both
+        reordered *and* content-edited in the same push. ADR-002's Consequences
+        (rung 3 of the fallback ladder, formally recorded after Task 3.2.2's
+        spike found no Docs API move primitive) documents that this combination
+        cannot be folded back to a no-op the way a pure reorder can — the
+        differ sees genuine content change, emits an ordinary delete+insert,
+        heading_id does not survive, and push_sectioned must surface a warning
+        naming the reordered section(s) rather than silently losing that
+        identity. This is the one acceptance case
+        test_push_sectioned_reorder_should_preserve_heading_ids_via_in_place_move
+        does not cover (it only exercises reorder with content untouched)."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        import yaml
+
+        manifest_path = local_dir / "_manifest.yaml"
+        raw = yaml.safe_load(manifest_path.read_text())
+        entries = raw["entries"]
+        # Swap section 1 and section 2's manifest entries, same as the
+        # pure-reorder test — but this time also edit one of the swapped
+        # sections' actual content, so the differ can't fold the pair back
+        # to `equal`.
+        entries[1], entries[2] = entries[2], entries[1]
+        manifest_path.write_text(yaml.safe_dump(raw, sort_keys=False))
+        section_1_file = local_dir / "01-section-1.md"
+        section_1_file.write_text(
+            section_1_file.read_text() + "\nAn extra edited line.\n"
+        )
+
+        fake_client.batch_update.return_value = {}
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "warning", result.message
+        assert "reordered" in (result.message or "")
+        # Unlike the pure-reorder no-op, the content edit forces an actual
+        # write — this is the documented heading_id-churn path, not a skip.
+        assert fake_client.batch_update.call_count > 0
+
+    def test_push_sectioned_should_return_blocked_status_without_partial_batch_update_when_diff_too_expensive(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        monkeypatch.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "blocked"
+        assert result.message == str(DiffTooExpensive("document", 6000, 3000))
+        fake_client.batch_update.assert_not_called()
+
+    def test_diff_too_expensive_status_diverges_between_push_and_push_sectioned_by_design(
+        self, tmp_path, monkeypatch, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Locks in the intentional status divergence documented in
+        push_sectioned's own docstring: the same DiffTooExpensive exception,
+        raised from the same single guard point in docs_request_builder.py
+        with no sectioned-specific override, is surfaced as `status="error"`
+        by push() (TestDiffTooExpensiveSurfacesAsUserFacingError, historical
+        behavior) but `status="blocked"` by push_sectioned() (a refused
+        write, not an unexpected fault). Both code paths are exercised here
+        side-by-side against the identical exception instance so a future
+        change that accidentally unifies or flips either status fails loudly
+        rather than only breaking whichever of the two pre-existing tests
+        happens to run first.
+        """
+        from docspan.backends.google_docs.docs_request_builder import (
+            DiffTooExpensive,
+            DocsRequestBuilder,
+        )
+
+        def _raise_too_expensive(*args: object, **kwargs: object) -> None:
+            raise DiffTooExpensive("document", 6000, 3000)
+
+        # Non-sectioned push(): historical status="error".
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+            legacy_result = backend.push(str(local), "doc-1")
+        assert legacy_result.status == "error"
+        assert legacy_result.message == str(DiffTooExpensive("document", 6000, 3000))
+        fake_client.batch_update.assert_not_called()
+
+        # Sectioned push_sectioned(): status="blocked" for the identical guard.
+        sectioned_backend, sectioned_client = make_backend()
+        sectioned_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        sectioned_backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(DocsRequestBuilder, "build", _raise_too_expensive)
+            sectioned_result = sectioned_backend.push_sectioned(str(local_dir), "doc-1")
+        assert sectioned_result.status == "blocked"
+        assert sectioned_result.message == str(DiffTooExpensive("document", 6000, 3000))
+        sectioned_client.batch_update.assert_not_called()
+
+        # Same exception, deliberately different reported status — this is
+        # the divergence being locked in, not an oversight.
+        assert legacy_result.status != sectioned_result.status
+
+    def test_push_sectioned_should_report_error_without_partial_state_when_batch_update_fails(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        section_3 = local_dir / "03-section-3.md"
+        edited = section_3.read_text().replace(
+            "Body of section 3.", "Body of section 3, updated."
+        )
+        section_3.write_text(edited)
+        fake_client.batch_update.side_effect = RuntimeError("network exploded mid push")
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "error"
+        assert "network exploded" in (result.message or "")
+        assert result.url is None
+        # Exactly one batch_update attempt — pass 1 raised, so pass 2 (and
+        # any further write) never runs; no partial-apply-then-fail state.
+        assert fake_client.batch_update.call_count == 1
+        # Local section files are never touched by push_sectioned itself —
+        # the edit made above is still exactly what was written.
+        assert section_3.read_text() == edited
+
+    def test_push_sectioned_pull_then_push_with_no_edits_should_produce_zero_diff(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Fixpoint invariant (plan.md/validation.md): pull -> push with zero
+        local edits must be a true no-op — zero diff, zero batch_update
+        calls. validation.md names this scenario
+        tests/test_gdocs_push_pipeline.py::
+        test_sectioned_pull_then_push_with_no_edits_should_produce_zero_diff,
+        a file outside this task's declared scope
+        (tests/test_google_docs_backend.py only); the scenario is
+        implemented here instead so the gate is still covered, with the
+        location/name mismatch flagged for follow-up.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "skipped", result.message
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_should_return_error_when_section_file_unreadable(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        monkeypatch,
+    ) -> None:  # type: ignore[no-untyped-def]
+        """A section file present in the manifest but unreadable at push
+        time (e.g. a permissions problem) must surface as
+        `PushResult(status="error", ...)`, matching the `ManifestStore.load`
+        failure a few lines above — not an unhandled OSError bubbling out of
+        push_sectioned.
+
+        Simulates the unreadable file via `monkeypatch` on
+        `pathlib.Path.read_text` rather than `chmod(0o000)`: the latter is a
+        no-op when the test suite runs as root (common in CI containers),
+        which made this test pass vacuously there.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        section_3 = local_dir / "03-section-3.md"
+        real_read_text = pathlib.Path.read_text
+
+        def _raising_read_text(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if self == section_3:
+                raise OSError("simulated permission denied")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", _raising_read_text)
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "error"
+        assert "03-section-3.md" in (result.message or "") or "cannot push sectioned mapping" in (
+            result.message or ""
+        )
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_should_warn_when_two_sections_reference_same_image_filename_with_different_sources(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Two sections referencing an image with the same filename but a
+        different underlying source must be surfaced as a push warning
+        naming both originating sections and the shared filename, per
+        plan.md's Observability Plan ("Two sections reference
+        identically-named-but-different images at push time")."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+        local_dir = tmp_path / "doc"
+        backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        (local_dir / "assets").mkdir()
+        (local_dir / "other").mkdir()
+        (local_dir / "assets" / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+        (local_dir / "other" / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\nsecond")
+
+        section_1 = local_dir / "01-section-1.md"
+        section_2 = local_dir / "02-section-2.md"
+        section_1.write_text(section_1.read_text() + "\n![one](assets/diagram.png)\n")
+        section_2.write_text(section_2.read_text() + "\n![two](other/diagram.png)\n")
+
+        result = backend.push_sectioned(str(local_dir), "doc-1")
+
+        assert result.status == "warning", result.message
+        assert "diagram.png" in (result.message or "")
+        assert "01-section-1.md" in (result.message or "")
+        assert "02-section-2.md" in (result.message or "")

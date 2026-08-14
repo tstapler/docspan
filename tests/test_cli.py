@@ -14,7 +14,12 @@ import yaml
 from typer.testing import CliRunner
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
-from docspan.cli.main import LIVE_WEDDING_DOC_ID, SCRATCH_VERIFIED_MARKER, app
+from docspan.cli.main import (
+    LIVE_WEDDING_DOC_ID,
+    SCRATCH_VERIFIED_MARKER,
+    app,
+    resolve_mapping_for_path,
+)
 from docspan.config import ConfigConflictError, Mapping, MarkgateConfig
 from docspan.core.orchestrator import PullOutcome, PushOutcome
 from docspan.core.state import MappingState, SyncState, sha256_of_content
@@ -247,6 +252,27 @@ class TestPush:
         with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local="other.md"))):
             result = runner.invoke(app, ["push", "nonexistent.md", "--config", cfg])
         assert result.exit_code == 1
+
+    def test_push_should_resolve_sectioned_mapping_when_given_a_section_file_path(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # Gap 5 fix: `push <section-file>` must resolve via resolve_mapping_for_path
+        # (Specification pattern), not the old exact `m.local in files` check, since
+        # a sectioned mapping's `local` is a directory, never equal to any section path.
+        cfg = _cfg_file(tmp_path)
+        sectioned = Mapping(
+            local="docs/big-doc", backend="fake", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        outcome = PushOutcome(
+            local_path=sectioned.local,
+            result=PushResult(status="ok", doc_id="doc-1", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(sectioned)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "docs/big-doc/02-intro.md", "--config", cfg])
+        assert result.exit_code == 0
+        assert "docs/big-doc" in result.output
 
     def test_unknown_backend_exits_nonzero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
@@ -634,6 +660,27 @@ class TestPull:
             result = runner.invoke(app, ["pull", "--config", cfg])
         assert result.exit_code == 1
 
+    def test_pull_should_resolve_sectioned_mapping_when_given_a_section_file_path(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # Gap 5 fix: `pull <section-file>` must resolve via resolve_mapping_for_path
+        # (Specification pattern), not the old exact `m.local in files` check, since
+        # a sectioned mapping's `local` is a directory, never equal to any section path.
+        cfg = _cfg_file(tmp_path)
+        sectioned = Mapping(
+            local="docs/big-doc", backend="fake", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        outcome = PullOutcome(
+            local_path=sectioned.local,
+            action="fast-forward",
+            result=PullResult(status="ok", doc_id="doc-1", local_path=sectioned.local),
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(sectioned)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_pull", return_value=outcome):
+            result = runner.invoke(app, ["pull", "docs/big-doc/02-intro.md", "--config", cfg])
+        assert result.exit_code == 0
+        assert "docs/big-doc" in result.output
+
     def test_up_to_date_prints_message(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
         cfg = _cfg_file(tmp_path)
@@ -1004,3 +1051,35 @@ class TestGroupLevelOptions:
         assert "--prefix" in output
         # The group help text must survive adding a callback.
         assert "Push and pull markdown" in output
+
+
+class TestResolveMappingForPath:
+    """resolve_mapping_for_path (Specification pattern) replaces the old
+    exact `m.local == file` checks at the map/comments-respond/conflicts-resolve
+    call sites so a path inside a sectioned mapping's directory resolves to
+    that mapping too, not just an exact single-file match."""
+
+    def test_resolve_mapping_for_path_should_match_sectioned_mapping_when_path_is_a_file_inside_its_directory(self) -> None:  # type: ignore[no-untyped-def]
+        sectioned = Mapping(
+            local="docs/big-doc", backend="google_docs", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        other = Mapping(local="docs/other.md", backend="google_docs", remote_id="doc-2")
+
+        result = resolve_mapping_for_path([other, sectioned], "docs/big-doc/02-intro.md")
+
+        assert result is sectioned
+
+    def test_resolve_mapping_for_path_should_return_none_when_path_is_outside_any_mapping_directory(self) -> None:  # type: ignore[no-untyped-def]
+        sectioned = Mapping(
+            local="docs/big-doc", backend="google_docs", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        single_file = Mapping(local="docs/other.md", backend="google_docs", remote_id="doc-2")
+
+        # "docs/big-doc-appendix.md" shares a string prefix with "docs/big-doc"
+        # but is not a path *inside* that directory — a naive prefix check
+        # (without the os.sep boundary) would wrongly match it.
+        result = resolve_mapping_for_path([sectioned, single_file], "docs/big-doc-appendix.md")
+
+        assert result is None

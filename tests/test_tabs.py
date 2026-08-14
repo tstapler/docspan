@@ -248,3 +248,126 @@ def test_is_pure_and_does_not_mutate_the_input_document() -> None:
     before = json.loads(json.dumps(doc))
     heading_ids_by_tab(doc)
     assert doc == before
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REQ-13 tab_id x sectioned matrix (validation.md rows 43-45)
+#
+# sectioned=true/tab_id=set (a), sectioned=true/tab_id=unset (b), and
+# sectioned=false/tab_id=set (c, regression) must all behave independently:
+# the sectioned split logic (section_splitter.split_nodes) never reads
+# start_index/end_index (confirmed by inspection — those fields don't appear
+# in section_splitter.py at all), so unlike the push-side diffing fixtures
+# elsewhere in this feature, these pull-only fixtures don't need realistic
+# contiguous indices.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _full_heading_paragraph(text: str, heading_id: str, style: str = "HEADING_1") -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": style, "headingId": heading_id},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        }
+    }
+
+
+def _full_body_paragraph(text: str) -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        }
+    }
+
+
+def test_pull_sectioned_should_target_specified_tab_and_use_structural_path(tmp_path, make_backend) -> None:
+    # Matrix cell (a): sectioned=true, tab_id=set.
+    doc = {
+        "revisionId": "r1",
+        "body": {"content": []},
+        "tabs": [
+            _tab_with_content(
+                "t.first",
+                "Overview",
+                [
+                    _full_heading_paragraph("Wrong Tab Heading", "h.wrong"),
+                    _full_body_paragraph("This lives in the first tab and must not be pulled."),
+                ],
+            ),
+            _tab_with_content(
+                "t.second",
+                "Details",
+                [
+                    _full_heading_paragraph("Alpha", "h.alpha"),
+                    _full_body_paragraph("Alpha body content."),
+                    _full_heading_paragraph("Beta", "h.beta"),
+                    _full_body_paragraph("Beta body content."),
+                ],
+            ),
+        ],
+    }
+    backend, fake_client = make_backend()
+    fake_client.get_document.return_value = doc
+
+    local_dir = tmp_path / "doc"
+    result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1", tab_id="t.second")
+
+    assert result.status == "ok", result.message
+    written = sorted(p.name for p in local_dir.iterdir())
+    assert written == ["00-preamble.md", "01-alpha.md", "02-beta.md", "_manifest.yaml"]
+
+    alpha_text = (local_dir / "01-alpha.md").read_text()
+    assert "Alpha body content." in alpha_text
+    assert "Wrong Tab Heading" not in alpha_text
+    all_text = "\n".join((local_dir / f).read_text() for f in written if f.endswith(".md"))
+    assert "This lives in the first tab" not in all_text
+
+    # Sectioned pull always uses the structural path, never Drive's HTML export.
+    fake_client.get_doc_content.assert_not_called()
+
+
+def test_pull_sectioned_should_be_unaffected_by_absent_tab_id(tmp_path, make_backend) -> None:
+    # Matrix cell (b): sectioned=true, tab_id unset — legacy single-doc shape
+    # with no `tabs` key at all, matching Story 7.1's original fixture shape.
+    doc = {
+        "revisionId": "r1",
+        "body": {
+            "content": [
+                _full_heading_paragraph("Alpha", "h.alpha"),
+                _full_body_paragraph("Alpha body content."),
+                _full_heading_paragraph("Beta", "h.beta"),
+                _full_body_paragraph("Beta body content."),
+            ]
+        },
+    }
+    backend, fake_client = make_backend()
+    fake_client.get_document.return_value = doc
+
+    local_dir = tmp_path / "doc"
+    result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+    assert result.status == "ok", result.message
+    written = sorted(p.name for p in local_dir.iterdir())
+    assert written == ["00-preamble.md", "01-alpha.md", "02-beta.md", "_manifest.yaml"]
+    assert "Alpha body content." in (local_dir / "01-alpha.md").read_text()
+    assert "Beta body content." in (local_dir / "02-beta.md").read_text()
+    fake_client.get_doc_content.assert_not_called()
+
+
+def test_pull_tab_scoped_should_be_unaffected_by_sectioned_mode_code_when_sectioned_false(
+    tmp_path, make_backend
+) -> None:
+    # Matrix cell (c) / regression: tab_id=set, sectioned=false must be
+    # byte-for-byte the pre-existing tab-scoped pull() path, untouched by any
+    # of the sectioned-mode code added for this feature.
+    backend, fake_client = make_backend()
+    fake_client.get_document.return_value = MULTI_TAB_DOC
+
+    local_path = tmp_path / "doc.md"
+    result = backend.pull("doc-1", str(local_path), tab_id="t.second")
+
+    assert result.status == "ok", result.message
+    content = local_path.read_text()
+    assert "second tab content" in content
+    assert "first tab content" not in content
+    fake_client.get_doc_content.assert_not_called()
