@@ -874,3 +874,30 @@ class TestBlankHeadingIdGuard:
         orphans = orchestrator_module._detect_orphaned_sections(str(old_dir), str(new_dir))
 
         assert {e.filename for e in orphans} == {"01-alpha.md", "02-beta.md"}
+
+
+class TestRekeyRenamedSectionsCollision:
+    """A rename-target collision must be visible, not silently swallowed."""
+
+    def test_logs_warning_and_leaves_old_file_when_new_physical_path_exists(
+        self, tmp_path, caplog
+    ) -> None:  # type: ignore[no-untyped-def]
+        physical_dir = tmp_path / "physical"
+        physical_dir.mkdir()
+        (physical_dir / "01-old.md").write_text("old content\n", encoding="utf-8")
+        (physical_dir / "02-new.md").write_text("colliding content\n", encoding="utf-8")
+
+        state = SyncState()
+
+        with caplog.at_level("WARNING", logger=orchestrator_module.logger.name):
+            orchestrator_module._rekey_renamed_sections(
+                str(physical_dir), str(physical_dir), state, [("01-old.md", "02-new.md")]
+            )
+
+        # Neither file was clobbered.
+        assert (physical_dir / "01-old.md").read_text(encoding="utf-8") == "old content\n"
+        assert (physical_dir / "02-new.md").read_text(encoding="utf-8") == "colliding content\n"
+        assert any(
+            "01-old.md" in record.getMessage() and "02-new.md" in record.getMessage()
+            for record in caplog.records
+        )

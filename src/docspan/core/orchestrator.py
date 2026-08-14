@@ -175,8 +175,23 @@ def _rekey_renamed_sections(
 
         old_physical = os.path.join(physical_dir, old_filename)
         new_physical = os.path.join(physical_dir, new_filename)
-        if os.path.exists(old_physical) and not os.path.exists(new_physical):
-            os.rename(old_physical, new_physical)
+        if os.path.exists(old_physical):
+            if os.path.exists(new_physical):
+                # The state entry above was already rekeyed to `new_filename`,
+                # but the physical rename can't proceed without clobbering
+                # whatever is already there. Leaving this unlogged would
+                # silently strand `old_physical` as an untracked file that
+                # can never be flagged as orphaned again (its heading_id now
+                # matches the new entry) — surface it instead of losing it
+                # quietly.
+                logger.warning(
+                    "Skipping rename of %r to %r during sectioned pull: "
+                    "target already exists. The state entry has been rekeyed, "
+                    "but %r was left in place untracked — resolve manually.",
+                    old_physical, new_physical, old_physical,
+                )
+            else:
+                os.rename(old_physical, new_physical)
 
 
 def _detect_orphaned_sections(
