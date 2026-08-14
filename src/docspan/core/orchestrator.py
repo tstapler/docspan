@@ -571,6 +571,172 @@ def _merge_pull(
     )
 
 
+def _merge_section_files(
+    tmp_dir: str,
+    canonical_dir: str,
+    staging_dir: str,
+    state: SyncState,
+    state_dir: str,
+    state_path: str,
+    mapping: "Mapping",
+    remote_version: str,
+) -> tuple[bool, bool, int, int, int]:
+    """Per-section first-sync/fast-forward/local-only/three-way-merge loop.
+
+    Extracted out of `_orchestrate_pull_sectioned` (pure extraction, no
+    behavior change) — writes go to `staged_section_path` under
+    `staging_dir`, state updates use `save=False` (the caller persists
+    once, after the atomic swap succeeds).
+
+    Returns `(any_merge, any_conflicts, conflict_total, written_files,
+    first_sync_files)`.
+    """
+    any_merge = False
+    any_conflicts = False
+    conflict_total = 0
+    written_files = 0
+    first_sync_files = 0
+
+    for filename in _section_files(tmp_dir):
+        theirs_path = os.path.join(tmp_dir, filename)
+        # `local_section_path` is the canonical (real, post-swap)
+        # path — used only as the `state` key, since that key must
+        # survive the eventual swap unchanged. `staged_section_path`
+        # is both where this loop writes *and* where it reads the
+        # section's current local content from: `staging_dir` was
+        # seeded from `canonical_dir` and already has any rename
+        # from `_rekey_renamed_sections` applied, so it (not
+        # `canonical_dir`, which for a renamed section is still
+        # sitting under the *old* filename) is the accurate source
+        # for "what does this section look like right now."
+        local_section_path = os.path.join(canonical_dir, filename)
+        staged_section_path = os.path.join(staging_dir, filename)
+        with open(theirs_path, encoding="utf-8") as fh:
+            theirs_content = fh.read()
+
+        entry = state.get(local_section_path)
+
+        if entry is None:
+            with open(staged_section_path, "w", encoding="utf-8") as fh:
+                fh.write(theirs_content)
+            _record_state(
+                state, state_path, state_dir, local_section_path, mapping,
+                theirs_content, remote_version, save=False,
+            )
+            written_files += 1
+            first_sync_files += 1
+            continue
+
+        local_exists = os.path.exists(staged_section_path)
+        local_content = ""
+        if local_exists:
+            with open(staged_section_path, encoding="utf-8") as fh:
+                local_content = fh.read()
+
+        current_local_hash = sha256_of_content(local_content) if local_exists else ""
+        local_changed = local_exists and current_local_hash != entry.local_hash
+        remote_changed = sha256_of_content(theirs_content) != entry.base_hash
+
+        if not remote_changed and not local_changed:
+            continue
+
+        if remote_changed and not local_changed:
+            with open(staged_section_path, "w", encoding="utf-8") as fh:
+                fh.write(theirs_content)
+            _record_state(
+                state, state_path, state_dir, local_section_path, mapping,
+                theirs_content, remote_version, save=False,
+            )
+            written_files += 1
+            continue
+
+        if local_changed and not remote_changed:
+            # Local-only edit to this section — leave it for the user to push.
+            continue
+
+        # Both sides changed this section — three-way merge, scoped to it alone.
+        # Mirror _merge_pull's .orig backup so `conflicts resolve --accept
+        # local` has the pre-merge section content to restore instead of
+        # silently falling back to the merge base.
+        any_merge = True
+        written_files += 1
+        orig_path = staged_section_path + ORIG_SUFFIX
+        with open(orig_path, "w", encoding="utf-8") as fh:
+            fh.write(local_content)
+        base_content = get_base_content(state_dir, entry.base_hash)
+        merge_result = three_way_merge(base_content, theirs_content, local_content)
+        with open(staged_section_path, "w", encoding="utf-8") as fh:
+            fh.write(merge_result.merged)
+        _record_state(
+            state, state_path, state_dir, local_section_path, mapping,
+            merge_result.merged, remote_version, save=False,
+        )
+        if merge_result.has_conflicts:
+            any_conflicts = True
+            conflict_total += merge_result.conflict_count
+
+    return any_merge, any_conflicts, conflict_total, written_files, first_sync_files
+
+
+def _convert_orphans_to_conflicts(
+    orphaned_entries: "list[SectionManifestEntry]",
+    canonical_dir: str,
+    staging_dir: str,
+    state: SyncState,
+    state_dir: str,
+    state_path: str,
+    mapping: "Mapping",
+    remote_version: str,
+) -> tuple[bool, int, int]:
+    """Convert sections orphaned by this pull into explicit conflicts.
+
+    Extracted out of `_orchestrate_pull_sectioned` (pure extraction, no
+    behavior change). Orphaned sections are present in the prior manifest
+    but absent from this pull's fresh manifest. Per plan.md's Domain
+    Glossary this must be "surfaced as conflict, never silently dropped"
+    — so rather than leaving the staged copy (inherited unchanged from
+    `canonical_dir` via the caller's copytree) as if nothing happened, or
+    deleting it, this converts it into an explicit conflict in its own
+    file, exactly like a genuine two-sided merge conflict, so `docspan
+    conflicts list/resolve` finds it.
+
+    Returns `(any_conflicts, conflict_total, written_files)`.
+    """
+    any_conflicts = False
+    conflict_total = 0
+    written_files = 0
+
+    for orphan_entry in orphaned_entries:
+        local_section_path = os.path.join(canonical_dir, orphan_entry.filename)
+        staged_section_path = os.path.join(staging_dir, orphan_entry.filename)
+        if not os.path.exists(staged_section_path):
+            continue  # nothing local survives to protect
+        with open(staged_section_path, encoding="utf-8") as fh:
+            local_content = fh.read()
+
+        orig_path = staged_section_path + ORIG_SUFFIX
+        with open(orig_path, "w", encoding="utf-8") as fh:
+            fh.write(local_content)
+
+        conflict_content = (
+            "<<<<<<< ours\n"
+            f"{local_content}"
+            "=======\n"
+            ">>>>>>> theirs (section removed upstream)\n"
+        )
+        with open(staged_section_path, "w", encoding="utf-8") as fh:
+            fh.write(conflict_content)
+        _record_state(
+            state, state_path, state_dir, local_section_path, mapping,
+            conflict_content, remote_version, save=False,
+        )
+        any_conflicts = True
+        conflict_total += 1
+        written_files += 1
+
+    return any_conflicts, conflict_total, written_files
+
+
 def _orchestrate_pull_sectioned(
     mapping: "Mapping",
     backend: Backend,
@@ -654,126 +820,22 @@ def _orchestrate_pull_sectioned(
                     fresh_manifest_path, os.path.join(staging_dir, MANIFEST_FILENAME)
                 )
 
-            any_merge = False
-            any_conflicts = False
-            conflict_total = 0
-            written_files = 0
-            first_sync_files = 0
-
-            for filename in _section_files(tmp_dir):
-                theirs_path = os.path.join(tmp_dir, filename)
-                # `local_section_path` is the canonical (real, post-swap)
-                # path — used only as the `state` key, since that key must
-                # survive the eventual swap unchanged. `staged_section_path`
-                # is both where this loop writes *and* where it reads the
-                # section's current local content from: `staging_dir` was
-                # seeded from `canonical_dir` and already has any rename
-                # from `_rekey_renamed_sections` applied, so it (not
-                # `canonical_dir`, which for a renamed section is still
-                # sitting under the *old* filename) is the accurate source
-                # for "what does this section look like right now."
-                local_section_path = os.path.join(canonical_dir, filename)
-                staged_section_path = os.path.join(staging_dir, filename)
-                with open(theirs_path, encoding="utf-8") as fh:
-                    theirs_content = fh.read()
-
-                entry = state.get(local_section_path)
-
-                if entry is None:
-                    with open(staged_section_path, "w", encoding="utf-8") as fh:
-                        fh.write(theirs_content)
-                    _record_state(
-                        state, state_path, state_dir, local_section_path, mapping,
-                        theirs_content, remote_version, save=False,
-                    )
-                    written_files += 1
-                    first_sync_files += 1
-                    continue
-
-                local_exists = os.path.exists(staged_section_path)
-                local_content = ""
-                if local_exists:
-                    with open(staged_section_path, encoding="utf-8") as fh:
-                        local_content = fh.read()
-
-                current_local_hash = sha256_of_content(local_content) if local_exists else ""
-                local_changed = local_exists and current_local_hash != entry.local_hash
-                remote_changed = sha256_of_content(theirs_content) != entry.base_hash
-
-                if not remote_changed and not local_changed:
-                    continue
-
-                if remote_changed and not local_changed:
-                    with open(staged_section_path, "w", encoding="utf-8") as fh:
-                        fh.write(theirs_content)
-                    _record_state(
-                        state, state_path, state_dir, local_section_path, mapping,
-                        theirs_content, remote_version, save=False,
-                    )
-                    written_files += 1
-                    continue
-
-                if local_changed and not remote_changed:
-                    # Local-only edit to this section — leave it for the user to push.
-                    continue
-
-                # Both sides changed this section — three-way merge, scoped to it alone.
-                # Mirror _merge_pull's .orig backup so `conflicts resolve --accept
-                # local` has the pre-merge section content to restore instead of
-                # silently falling back to the merge base.
-                any_merge = True
-                written_files += 1
-                orig_path = staged_section_path + ORIG_SUFFIX
-                with open(orig_path, "w", encoding="utf-8") as fh:
-                    fh.write(local_content)
-                base_content = get_base_content(state_dir, entry.base_hash)
-                merge_result = three_way_merge(base_content, theirs_content, local_content)
-                with open(staged_section_path, "w", encoding="utf-8") as fh:
-                    fh.write(merge_result.merged)
-                _record_state(
-                    state, state_path, state_dir, local_section_path, mapping,
-                    merge_result.merged, remote_version, save=False,
+            any_merge, any_conflicts, conflict_total, written_files, first_sync_files = (
+                _merge_section_files(
+                    tmp_dir, canonical_dir, staging_dir, state, state_dir, state_path,
+                    mapping, remote_version,
                 )
-                if merge_result.has_conflicts:
-                    any_conflicts = True
-                    conflict_total += merge_result.conflict_count
+            )
 
-            # Orphaned sections: present in the prior manifest but absent
-            # from this pull's fresh manifest. Per plan.md's Domain
-            # Glossary this must be "surfaced as conflict, never silently
-            # dropped" — so rather than leaving the staged copy (inherited
-            # unchanged from `canonical_dir` via the copytree above) as if
-            # nothing happened, or deleting it, convert it into an explicit
-            # conflict in its own file, exactly like a genuine two-sided
-            # merge conflict above, so `docspan conflicts list/resolve`
-            # finds it.
-            for orphan_entry in orphaned_entries:
-                local_section_path = os.path.join(canonical_dir, orphan_entry.filename)
-                staged_section_path = os.path.join(staging_dir, orphan_entry.filename)
-                if not os.path.exists(staged_section_path):
-                    continue  # nothing local survives to protect
-                with open(staged_section_path, encoding="utf-8") as fh:
-                    local_content = fh.read()
-
-                orig_path = staged_section_path + ORIG_SUFFIX
-                with open(orig_path, "w", encoding="utf-8") as fh:
-                    fh.write(local_content)
-
-                conflict_content = (
-                    "<<<<<<< ours\n"
-                    f"{local_content}"
-                    "=======\n"
-                    ">>>>>>> theirs (section removed upstream)\n"
+            orphan_any_conflicts, orphan_conflict_total, orphan_written_files = (
+                _convert_orphans_to_conflicts(
+                    orphaned_entries, canonical_dir, staging_dir, state, state_dir,
+                    state_path, mapping, remote_version,
                 )
-                with open(staged_section_path, "w", encoding="utf-8") as fh:
-                    fh.write(conflict_content)
-                _record_state(
-                    state, state_path, state_dir, local_section_path, mapping,
-                    conflict_content, remote_version, save=False,
-                )
-                any_conflicts = True
-                conflict_total += 1
-                written_files += 1
+            )
+            any_conflicts = any_conflicts or orphan_any_conflicts
+            conflict_total += orphan_conflict_total
+            written_files += orphan_written_files
 
             _atomic_replace_dir(staging_dir, canonical_dir)
         except Exception:
