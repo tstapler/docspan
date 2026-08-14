@@ -82,6 +82,7 @@ from docspan.backends.google_docs.tabs import (
     heading_ids_by_tab,
     resolve_document_tab,
 )
+from docspan.core.atomic_dir import atomic_replace_dir
 from docspan.core.paths import COMMENTS_SUFFIX
 
 if TYPE_CHECKING:
@@ -1384,51 +1385,12 @@ class GoogleDocsBackend(Backend):
     def _atomic_replace_dir(tmp_dir: pathlib.Path, target_dir: pathlib.Path) -> None:
         """Swap a fully-populated `tmp_dir` into place as `target_dir`.
 
-        `os.replace` refuses to replace a non-empty directory outright
-        (POSIX rename semantics), so a direct `os.replace(tmp_dir,
-        target_dir)` would raise `OSError` whenever `target_dir` already has
-        section files in it — the common re-pull case. Instead, an existing
-        `target_dir` is first moved aside to an empty sibling temp
-        directory (itself a single atomic rename), then `tmp_dir` takes its
-        place. Both are individually atomic renames on the same filesystem;
-        a crash between them leaves the prior content recoverable, still
-        intact, at the `.old.` sibling rather than lost.
+        Delegates to `core.atomic_dir.atomic_replace_dir` (shared with
+        `core/orchestrator.py`'s string-path callers) — kept as a method
+        here since callers in this class already invoke it as
+        `self._atomic_replace_dir(...)`.
         """
-        old_dir: Optional[pathlib.Path] = None
-        if target_dir.exists():
-            old_dir = pathlib.Path(
-                tempfile.mkdtemp(
-                    dir=str(target_dir.parent), prefix=f".{target_dir.name}.old.", suffix=".tmp"
-                )
-            )
-            os.replace(str(target_dir), str(old_dir))
-        try:
-            os.replace(str(tmp_dir), str(target_dir))
-        except Exception as swap_exc:
-            if old_dir is not None:
-                try:
-                    os.replace(str(old_dir), str(target_dir))
-                except Exception as restore_exc:
-                    # Double failure: the swap-in failed *and* restoring the
-                    # prior contents from the `.old.` sibling also failed.
-                    # Letting `restore_exc` propagate unguarded would
-                    # silently mask `swap_exc` with no record of either --
-                    # log both before raising the restore failure (the more
-                    # urgent of the two: `target_dir` may now be missing
-                    # entirely), chained to the original for full context.
-                    logger.error(
-                        "Failed to swap %r into %r: %r", tmp_dir, target_dir, swap_exc,
-                        exc_info=swap_exc,
-                    )
-                    logger.error(
-                        "Restoring %r from %r after the failed swap also failed: %r",
-                        target_dir, old_dir, restore_exc, exc_info=restore_exc,
-                    )
-                    raise restore_exc from swap_exc
-            raise
-        else:
-            if old_dir is not None:
-                shutil.rmtree(old_dir, ignore_errors=True)
+        atomic_replace_dir(tmp_dir, target_dir)
 
     def _recover_checkbox_state(
         self, doc_id: str, structural_nodes: list, markdown_content: str

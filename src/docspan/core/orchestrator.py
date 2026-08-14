@@ -23,6 +23,7 @@ from docspan.backends.google_docs.manifest import (
     ManifestStore,
     SectionManifestEntry,
 )
+from docspan.core.atomic_dir import atomic_replace_dir
 from docspan.core.merge import three_way_merge
 from docspan.core.paths import BASE_FILE_SUFFIX, BASE_STORE_DIR, ORIG_SUFFIX, STATE_FILENAME
 from docspan.core.state import MappingState, SyncState, sha256_of_content
@@ -216,54 +217,13 @@ def _detect_orphaned_sections(
     return [e for e in old_entries if not e.heading_id or e.heading_id not in new_ids]
 
 
-def _atomic_replace_dir(tmp_dir: str, target_dir: str) -> None:
-    """Atomically replace `target_dir`'s contents with `tmp_dir`'s.
-
-    String-path analog of `backends/google_docs/backend.py`'s
-    `GoogleDocsBackend._atomic_replace_dir` (the pattern `pull_sectioned`
-    already uses for its own directory swap): move any existing target
-    aside to a sibling `.old.` directory via `os.replace` (same filesystem,
-    so this step alone can't partially fail), then `os.replace` the staged
-    directory into the target's place; on any failure, restore the
-    original target from the `.old.` sibling before re-raising, so a crash
-    at any point leaves `target_dir` either fully absent (first sync only)
-    or fully intact — never half-written.
-    """
-    old_dir: Optional[str] = None
-    if os.path.exists(target_dir):
-        old_dir = tempfile.mkdtemp(
-            dir=os.path.dirname(os.path.abspath(target_dir)),
-            prefix=f".{os.path.basename(target_dir)}.old.",
-            suffix=".tmp",
-        )
-        os.replace(target_dir, old_dir)
-    try:
-        os.replace(tmp_dir, target_dir)
-    except Exception as swap_exc:
-        if old_dir is not None:
-            try:
-                os.replace(old_dir, target_dir)
-            except Exception as restore_exc:
-                # Double failure: the swap-in failed *and* restoring the
-                # prior contents from the `.old.` sibling also failed.
-                # Letting `restore_exc` propagate unguarded would silently
-                # mask `swap_exc` with no record of either -- log both
-                # before raising the restore failure (the more urgent of
-                # the two: `target_dir` may now be missing entirely),
-                # chained to the original for full context.
-                logger.error(
-                    "Failed to swap %r into %r: %r", tmp_dir, target_dir, swap_exc,
-                    exc_info=swap_exc,
-                )
-                logger.error(
-                    "Restoring %r from %r after the failed swap also failed: %r",
-                    target_dir, old_dir, restore_exc, exc_info=restore_exc,
-                )
-                raise restore_exc from swap_exc
-        raise
-    else:
-        if old_dir is not None:
-            shutil.rmtree(old_dir, ignore_errors=True)
+# `_atomic_replace_dir` used to be a string-path-only reimplementation of
+# `backends/google_docs/backend.py`'s pathlib-based `_atomic_replace_dir` —
+# both bodies were identical apart from `str` vs. `pathlib.Path`. They now
+# share one implementation (`core.atomic_dir.atomic_replace_dir`, which
+# accepts either); this alias keeps this module's existing call sites and
+# any external references to `orchestrator._atomic_replace_dir` working.
+_atomic_replace_dir = atomic_replace_dir
 
 
 # ─────────────────────────────────────────────────────────────────────────────
