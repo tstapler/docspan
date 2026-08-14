@@ -122,8 +122,14 @@ def _detect_section_renames(
     """
     old_entries = _load_manifest_entries(old_dir)
     new_entries = _load_manifest_entries(new_dir)
-    old_by_id = {e.heading_id: e for e in old_entries}
-    new_by_id = {e.heading_id: e for e in new_entries}
+    # A heading missing a Docs-assigned heading_id lands here as `""`
+    # (section_splitter.py's `heading_id or ""`). Two or more such headings
+    # in the same pull would otherwise collapse onto the same `""` dict key
+    # and silently clobber each other's rename-detection entry, so blank
+    # ids are excluded from the identity map entirely — they're always
+    # treated as new/unmatched rather than merged.
+    old_by_id = {e.heading_id: e for e in old_entries if e.heading_id}
+    new_by_id = {e.heading_id: e for e in new_entries if e.heading_id}
 
     renumbered_only: list[tuple[str, str]] = []
     content_renamed: list[tuple[str, str]] = []
@@ -186,8 +192,13 @@ def _detect_orphaned_sections(
     or silently kept as if nothing happened.
     """
     old_entries = _load_manifest_entries(old_dir)
-    new_ids = {e.heading_id for e in _load_manifest_entries(new_dir)}
-    return [e for e in old_entries if e.heading_id not in new_ids]
+    # Blank heading_ids (missing Docs-assigned id) are excluded from the
+    # "known ids" set for the same reason as `_detect_section_renames`:
+    # they must never be treated as matching each other, so a
+    # heading_id-less old entry is always reported as orphaned rather than
+    # spuriously "found" via an unrelated blank-id new entry.
+    new_ids = {e.heading_id for e in _load_manifest_entries(new_dir) if e.heading_id}
+    return [e for e in old_entries if not e.heading_id or e.heading_id not in new_ids]
 
 
 def _atomic_replace_dir(tmp_dir: str, target_dir: str) -> None:

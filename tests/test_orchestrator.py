@@ -805,3 +805,72 @@ class TestOrchestrateSectioned:
 
         assert backend.pushed == [(str(local), "doc-123")]
         assert not backend.pushed_sectioned
+
+
+class TestBlankHeadingIdGuard:
+    """Two+ sections missing a Docs-assigned heading_id must never collide.
+
+    `section_splitter.py` falls back to `heading_id or ""` when the Docs API
+    omits `headingId` for a heading. Without a guard, `_detect_section_renames`
+    and `_detect_orphaned_sections`'s identity dict-comprehensions would key
+    both such sections under the same `""` entry, silently clobbering one.
+    """
+
+    def test_detect_section_renames_does_not_collapse_two_blank_heading_ids(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        old_dir.mkdir()
+        new_dir.mkdir()
+        ManifestStore.save(
+            str(old_dir / MANIFEST_FILENAME),
+            [
+                SectionManifestEntry(heading_id="", slug="alpha", filename="01-alpha.md"),
+                SectionManifestEntry(heading_id="", slug="beta", filename="02-beta.md"),
+            ],
+        )
+        ManifestStore.save(
+            str(new_dir / MANIFEST_FILENAME),
+            [
+                SectionManifestEntry(heading_id="", slug="alpha", filename="09-alpha.md"),
+                SectionManifestEntry(heading_id="", slug="beta", filename="10-beta.md"),
+            ],
+        )
+
+        renumbered_only, content_renamed = orchestrator_module._detect_section_renames(
+            str(old_dir), str(new_dir)
+        )
+
+        # Blank-heading_id entries are never matched to each other, so
+        # neither pair is (mis)reported as a rename.
+        assert renumbered_only == []
+        assert content_renamed == []
+
+    def test_detect_orphaned_sections_treats_blank_heading_id_as_always_orphaned(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        old_dir = tmp_path / "old"
+        new_dir = tmp_path / "new"
+        old_dir.mkdir()
+        new_dir.mkdir()
+        ManifestStore.save(
+            str(old_dir / MANIFEST_FILENAME),
+            [
+                SectionManifestEntry(heading_id="", slug="alpha", filename="01-alpha.md"),
+                SectionManifestEntry(heading_id="", slug="beta", filename="02-beta.md"),
+            ],
+        )
+        # A blank-heading_id entry survives in the fresh manifest too, but
+        # since identity can't be trusted for either, neither is spuriously
+        # matched to "found" the other.
+        ManifestStore.save(
+            str(new_dir / MANIFEST_FILENAME),
+            [
+                SectionManifestEntry(heading_id="", slug="alpha", filename="01-alpha.md"),
+            ],
+        )
+
+        orphans = orchestrator_module._detect_orphaned_sections(str(old_dir), str(new_dir))
+
+        assert {e.filename for e in orphans} == {"01-alpha.md", "02-beta.md"}
