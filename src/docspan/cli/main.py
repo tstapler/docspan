@@ -220,7 +220,12 @@ def push(
     mappings = config.mappings
 
     if files:
-        mappings = [m for m in mappings if m.local in files]
+        resolved_mappings: list[Mapping] = []
+        for f in files:
+            m = resolve_mapping_for_path(mappings, f)
+            if m is not None and not any(m is existing for existing in resolved_mappings):
+                resolved_mappings.append(m)
+        mappings = resolved_mappings
         if not mappings:
             err_console.print(f"No mappings found for: {files}")
             raise typer.Exit(1)
@@ -369,7 +374,15 @@ def pull(
     mappings = config.mappings
 
     if files:
-        mappings = [m for m in mappings if m.local in files]
+        resolved_mappings: list[Mapping] = []
+        for f in files:
+            m = resolve_mapping_for_path(mappings, f)
+            if m is not None and not any(m is existing for existing in resolved_mappings):
+                resolved_mappings.append(m)
+        mappings = resolved_mappings
+        if not mappings:
+            err_console.print(f"No mappings found for: {files}")
+            raise typer.Exit(1)
 
     if not mappings:
         err_console.print("No mappings configured.")

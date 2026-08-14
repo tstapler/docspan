@@ -248,6 +248,27 @@ class TestPush:
             result = runner.invoke(app, ["push", "nonexistent.md", "--config", cfg])
         assert result.exit_code == 1
 
+    def test_push_should_resolve_sectioned_mapping_when_given_a_section_file_path(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # Gap 5 fix: `push <section-file>` must resolve via resolve_mapping_for_path
+        # (Specification pattern), not the old exact `m.local in files` check, since
+        # a sectioned mapping's `local` is a directory, never equal to any section path.
+        cfg = _cfg_file(tmp_path)
+        sectioned = Mapping(
+            local="docs/big-doc", backend="fake", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        outcome = PushOutcome(
+            local_path=sectioned.local,
+            result=PushResult(status="ok", doc_id="doc-1", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(sectioned)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "docs/big-doc/02-intro.md", "--config", cfg])
+        assert result.exit_code == 0
+        assert "docs/big-doc" in result.output
+
     def test_unknown_backend_exits_nonzero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
         local.write_text("content\n", encoding="utf-8")
@@ -633,6 +654,27 @@ class TestPull:
         with patch("docspan.cli.main.load_config", return_value=_config()):
             result = runner.invoke(app, ["pull", "--config", cfg])
         assert result.exit_code == 1
+
+    def test_pull_should_resolve_sectioned_mapping_when_given_a_section_file_path(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        # Gap 5 fix: `pull <section-file>` must resolve via resolve_mapping_for_path
+        # (Specification pattern), not the old exact `m.local in files` check, since
+        # a sectioned mapping's `local` is a directory, never equal to any section path.
+        cfg = _cfg_file(tmp_path)
+        sectioned = Mapping(
+            local="docs/big-doc", backend="fake", remote_id="doc-1",
+            sectioned=True, split_level="HEADING_1",
+        )
+        outcome = PullOutcome(
+            local_path=sectioned.local,
+            action="fast-forward",
+            result=PullResult(status="ok", doc_id="doc-1", local_path=sectioned.local),
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(sectioned)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_pull", return_value=outcome):
+            result = runner.invoke(app, ["pull", "docs/big-doc/02-intro.md", "--config", cfg])
+        assert result.exit_code == 0
+        assert "docs/big-doc" in result.output
 
     def test_up_to_date_prints_message(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
