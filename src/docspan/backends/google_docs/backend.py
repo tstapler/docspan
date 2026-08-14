@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import pathlib
+import shutil
+import tempfile
 from typing import TYPE_CHECKING, List, Optional
 
 from googleapiclient.errors import HttpError
@@ -42,6 +44,12 @@ from docspan.backends.google_docs.heading_anchors import (
     upgrade_heading_id_anchors,
 )
 from docspan.backends.google_docs.image_source import resolve_document_images
+from docspan.backends.google_docs.manifest import (
+    MANIFEST_FILENAME,
+    ManifestError,
+    ManifestStore,
+    SectionManifestEntry,
+)
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
@@ -58,6 +66,7 @@ from docspan.backends.google_docs.projection import (
     describe_target_residue,
     project,
 )
+from docspan.backends.google_docs.section_splitter import SectionSplitError, split_nodes
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -958,6 +967,124 @@ class GoogleDocsBackend(Backend):
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
         except Exception as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))
+
+    def pull_sectioned(
+        self,
+        doc_id: str,
+        local_dir: str,
+        split_level: str,
+        tab_id: Optional[str] = None,
+    ) -> PullResult:
+        """Fetch the Google Doc, split it at `split_level`, write one file per section.
+
+        Always uses the structural path (DocsStructureParser + project()),
+        never Drive's HTML export — HTML export always returns the whole
+        document and cannot be scoped to a heading range (plan.md Task
+        2.1.3). `local_dir` ends up holding `NN-slug.md` per section plus a
+        `_manifest.yaml` sidecar (manifest.py) recording each section's
+        `heading_id`/slug/filename in order.
+
+        Every section file and the manifest are written to a temp directory
+        first, then swapped into place with two `os.replace` calls (Task
+        6.1.1, Epic 6's atomicity requirement folded in here): a crash
+        during the write loop leaves `local_dir` completely untouched, and a
+        crash between the two replaces is recoverable by hand from the
+        `.<name>.old.*` sibling directory left behind — never a half-written
+        set of section files.
+        """
+        self._ensure_client()
+        assert self._client is not None
+        target_dir = pathlib.Path(local_dir)
+        try:
+            doc = self._client.get_document(doc_id)
+            doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
+            nodes = DocsStructureParser().parse(doc)
+            nodes, residue = project(nodes)
+
+            existing_entries: List[SectionManifestEntry] = []
+            manifest_path = target_dir / MANIFEST_FILENAME
+            if manifest_path.exists():
+                try:
+                    existing_entries = ManifestStore.load(str(manifest_path))
+                except ManifestError:
+                    existing_entries = []
+
+            sections = split_nodes(nodes, split_level, existing_entries=existing_entries)
+            width = max(2, len(str(len(sections) - 1)))
+
+            tmp_parent = target_dir.parent if str(target_dir.parent) else pathlib.Path(".")
+            tmp_parent.mkdir(parents=True, exist_ok=True)
+            tmp_dir = pathlib.Path(
+                tempfile.mkdtemp(dir=str(tmp_parent), prefix=f".{target_dir.name}.", suffix=".tmp")
+            )
+            try:
+                entries: List[SectionManifestEntry] = []
+                for index, section in enumerate(sections):
+                    filename = f"{str(index).zfill(width)}-{section.slug}.md"
+                    content = render_nodes_to_markdown(section.nodes) if section.nodes else ""
+                    (tmp_dir / filename).write_text(content)
+                    entries.append(
+                        SectionManifestEntry(
+                            heading_id=section.heading_id,
+                            slug=section.slug,
+                            filename=filename,
+                            title=section.title or None,
+                        )
+                    )
+                ManifestStore.save(str(tmp_dir / MANIFEST_FILENAME), entries)
+                self._atomic_replace_dir(tmp_dir, target_dir)
+            except Exception:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise
+
+            residue_note = describe_residue(
+                [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
+            )
+            if residue_note:
+                return PullResult(
+                    status="warning", doc_id=doc_id, local_path=local_dir, message=f"⚠ {residue_note}"
+                )
+            return PullResult(status="ok", doc_id=doc_id, local_path=local_dir)
+        except TabNotFoundError as exc:
+            return PullResult(status="error", doc_id=doc_id, local_path=local_dir, message=str(exc))
+        except SectionSplitError as exc:
+            return PullResult(status="error", doc_id=doc_id, local_path=local_dir, message=str(exc))
+        except DiffTooExpensive as exc:
+            return PullResult(status="error", doc_id=doc_id, local_path=local_dir, message=str(exc))
+        except Exception as exc:
+            return PullResult(status="error", doc_id=doc_id, local_path=local_dir, message=str(exc))
+
+    @staticmethod
+    def _atomic_replace_dir(tmp_dir: pathlib.Path, target_dir: pathlib.Path) -> None:
+        """Swap a fully-populated `tmp_dir` into place as `target_dir`.
+
+        `os.replace` refuses to replace a non-empty directory outright
+        (POSIX rename semantics), so a direct `os.replace(tmp_dir,
+        target_dir)` would raise `OSError` whenever `target_dir` already has
+        section files in it — the common re-pull case. Instead, an existing
+        `target_dir` is first moved aside to an empty sibling temp
+        directory (itself a single atomic rename), then `tmp_dir` takes its
+        place. Both are individually atomic renames on the same filesystem;
+        a crash between them leaves the prior content recoverable, still
+        intact, at the `.old.` sibling rather than lost.
+        """
+        old_dir: Optional[pathlib.Path] = None
+        if target_dir.exists():
+            old_dir = pathlib.Path(
+                tempfile.mkdtemp(
+                    dir=str(target_dir.parent), prefix=f".{target_dir.name}.old.", suffix=".tmp"
+                )
+            )
+            os.replace(str(target_dir), str(old_dir))
+        try:
+            os.replace(str(tmp_dir), str(target_dir))
+        except Exception:
+            if old_dir is not None:
+                os.replace(str(old_dir), str(target_dir))
+            raise
+        else:
+            if old_dir is not None:
+                shutil.rmtree(old_dir, ignore_errors=True)
 
     def _recover_checkbox_state(
         self, doc_id: str, structural_nodes: list, markdown_content: str

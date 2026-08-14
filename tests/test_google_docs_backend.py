@@ -2007,3 +2007,174 @@ class TestCreate:
         assert result.doc_id == "new-doc-1"
         assert result.title == "My Doc"
         assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pull_sectioned() — gdocs-sectioned-sync Epic 2: split a doc into one
+# NN-slug.md file per split_level heading plus _manifest.yaml, always via the
+# structural path, written atomically (temp dir + os.replace).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _heading_paragraph(text: str, heading_id: str, style: str = "HEADING_1") -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": style, "headingId": heading_id},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _body_paragraph(text: str) -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{"textRun": {"content": text + "\n"}}],
+        },
+    }
+
+
+def _sectioned_doc(revision_id: str = "rev-sectioned") -> dict:
+    """5 HEADING_1 sections plus preamble content — Story 2.1's own example."""
+    content = [_body_paragraph("Preamble content.")]
+    for i in range(1, 6):
+        content.append(_heading_paragraph(f"Section {i}", heading_id=f"h.section{i}"))
+        content.append(_body_paragraph(f"Body of section {i}."))
+    return {"revisionId": revision_id, "body": {"content": content}}
+
+
+class TestPullSectioned:
+    def test_pull_sectioned_should_write_section_files_and_manifest_using_structural_path(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "ok", result.message
+        # Never falls back to Drive's HTML export — it can't be scoped to a
+        # heading range.
+        fake_client.get_doc_content.assert_not_called()
+
+        written = sorted(p.name for p in local_dir.iterdir())
+        assert written == [
+            "00-preamble.md",
+            "01-section-1.md",
+            "02-section-2.md",
+            "03-section-3.md",
+            "04-section-4.md",
+            "05-section-5.md",
+            "_manifest.yaml",
+        ]
+        assert "Preamble content." in (local_dir / "00-preamble.md").read_text()
+        section_3 = (local_dir / "03-section-3.md").read_text()
+        assert "# Section 3" in section_3
+        assert "Body of section 3." in section_3
+
+        import yaml
+
+        manifest = yaml.safe_load((local_dir / "_manifest.yaml").read_text())
+        assert len(manifest["entries"]) == 6
+        assert manifest["entries"][0]["heading_id"] == "__preamble__"
+        assert manifest["entries"][3]["heading_id"] == "h.section3"
+        assert manifest["entries"][3]["filename"] == "03-section-3.md"
+
+    def test_pull_sectioned_should_return_error_for_unknown_tab_id(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned(
+            "doc-1", str(local_dir), split_level="HEADING_1", tab_id="t.nonexistent"
+        )
+
+        assert result.status == "error"
+        assert "t.nonexistent" in (result.message or "")
+
+    def test_pull_sectioned_should_return_error_when_split_level_absent_from_doc(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_2")
+
+        assert result.status == "error"
+        assert "HEADING_2" in (result.message or "")
+
+    def test_pull_sectioned_should_leave_prior_directory_intact_when_write_fails_partway(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+        (local_dir / "00-preamble.md").write_text("prior preamble\n")
+        (local_dir / "_manifest.yaml").write_text(
+            "entries:\n- heading_id: __preamble__\n  slug: preamble\n  filename: 00-preamble.md\n"
+        )
+
+        from docspan.backends.google_docs import backend as backend_module
+
+        call_count = {"n": 0}
+        real_render = backend_module.render_nodes_to_markdown
+
+        def _flaky_render(nodes):
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                raise RuntimeError("simulated write failure")
+            return real_render(nodes)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(backend_module, "render_nodes_to_markdown", _flaky_render)
+            result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "error"
+        # The original directory's prior contents are completely untouched —
+        # no partial set of new section files, no stray temp directory
+        # promoted into place.
+        assert (local_dir / "00-preamble.md").read_text() == "prior preamble\n"
+        assert sorted(p.name for p in local_dir.iterdir()) == [
+            "00-preamble.md",
+            "_manifest.yaml",
+        ]
+        # No leftover temp directories beside it either.
+        siblings = [p.name for p in tmp_path.iterdir()]
+        assert siblings == ["doc"]
+
+    def test_pull_sectioned_should_atomically_swap_temp_directory_into_place_on_success(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc()
+
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+        (local_dir / "00-preamble.md").write_text("stale preamble\n")
+        (local_dir / "_manifest.yaml").write_text(
+            "entries:\n- heading_id: __preamble__\n  slug: preamble\n  filename: 00-preamble.md\n"
+        )
+
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "ok", result.message
+        written = sorted(p.name for p in local_dir.iterdir())
+        assert written == [
+            "00-preamble.md",
+            "01-section-1.md",
+            "02-section-2.md",
+            "03-section-3.md",
+            "04-section-4.md",
+            "05-section-5.md",
+            "_manifest.yaml",
+        ]
+        # The new content replaced the stale file — no old content survives.
+        assert (local_dir / "00-preamble.md").read_text() != "stale preamble\n"
+        # No stray temp/backup directories left beside the target directory.
+        siblings = [p.name for p in tmp_path.iterdir()]
+        assert siblings == ["doc"]
