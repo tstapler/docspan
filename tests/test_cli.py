@@ -14,7 +14,12 @@ import yaml
 from typer.testing import CliRunner
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
-from docspan.cli.main import LIVE_WEDDING_DOC_ID, SCRATCH_VERIFIED_MARKER, app, resolve_mapping_for_path
+from docspan.cli.main import (
+    LIVE_WEDDING_DOC_ID,
+    SCRATCH_VERIFIED_MARKER,
+    app,
+    resolve_mapping_for_path,
+)
 from docspan.config import ConfigConflictError, Mapping, MarkgateConfig
 from docspan.core.orchestrator import PullOutcome, PushOutcome
 from docspan.core.state import MappingState, SyncState, sha256_of_content

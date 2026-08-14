@@ -143,7 +143,8 @@ class CommentBucketResult:
 
 
 def _quoted_text(comment: dict) -> str:
-    return (comment.get("quotedFileContent") or {}).get("value", "").strip()
+    value = (comment.get("quotedFileContent") or {}).get("value", "")
+    return str(value).strip()
 
 
 def bucket_comments_by_section(

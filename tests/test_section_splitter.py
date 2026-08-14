@@ -7,7 +7,6 @@ from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 from docspan.backends.google_docs.manifest import PREAMBLE_HEADING_ID, SectionManifestEntry
 from docspan.backends.google_docs.section_splitter import (
     PREAMBLE_SLUG,
-    Section,
     SectionSplitError,
     split_nodes,
 )

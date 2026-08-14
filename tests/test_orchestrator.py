@@ -9,7 +9,11 @@ import pytest
 
 import docspan.core.orchestrator as orchestrator_module
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
-from docspan.backends.google_docs.manifest import MANIFEST_FILENAME, ManifestStore, SectionManifestEntry
+from docspan.backends.google_docs.manifest import (
+    MANIFEST_FILENAME,
+    ManifestStore,
+    SectionManifestEntry,
+)
 from docspan.config import Mapping
 from docspan.core.orchestrator import (
     get_base_content,

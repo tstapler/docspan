@@ -7,8 +7,6 @@ copy (one string-path, one pathlib) of this same directory-swap logic.
 
 from __future__ import annotations
 
-import pathlib
-
 import pytest
 
 from docspan.core import atomic_dir as atomic_dir_module

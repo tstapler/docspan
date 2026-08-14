@@ -9,7 +9,7 @@ import pathlib
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
 
 from googleapiclient.errors import HttpError
 
@@ -46,7 +46,12 @@ from docspan.backends.google_docs.heading_anchors import (
     unresolved_anchors,
     upgrade_heading_id_anchors,
 )
-from docspan.backends.google_docs.image_source import UrlSource, build_source, resolve_document_images
+from docspan.backends.google_docs.image_source import (
+    LocalPathSource,
+    UrlSource,
+    build_source,
+    resolve_document_images,
+)
 from docspan.backends.google_docs.manifest import (
     MANIFEST_FILENAME,
     ManifestError,
@@ -69,7 +74,6 @@ from docspan.backends.google_docs.projection import (
     describe_target_residue,
     project,
 )
-from docspan.backends.google_docs.section_splitter import SectionSplitError, split_nodes
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -77,6 +81,7 @@ from docspan.backends.google_docs.push_preview import (
     render_available_anchors,
     render_high_risk,
 )
+from docspan.backends.google_docs.section_splitter import SectionSplitError, split_nodes
 from docspan.backends.google_docs.tabs import (
     TabNotFoundError,
     heading_ids_by_tab,
@@ -461,7 +466,7 @@ class GoogleDocsBackend(Backend):
         tab_id: Optional[str],
         resolver: Optional["cross_doc_links.CrossDocLinkResolver"],
         content: Optional[str] = None,
-        diff_too_expensive_status: str = "error",
+        diff_too_expensive_status: Literal["error", "blocked"] = "error",
     ) -> PushResult:
         """Shared diff/request-emission tail for push() and push_sectioned().
 
@@ -1057,7 +1062,15 @@ class GoogleDocsBackend(Backend):
                 if not basename:
                     continue
                 source = build_source(section_path, ref)
-                identity = source.url if isinstance(source, UrlSource) else source.path
+                if isinstance(source, UrlSource):
+                    identity = source.url
+                elif isinstance(source, LocalPathSource):
+                    identity = source.path
+                else:
+                    # InMemorySource / MermaidSource have no stable on-disk or
+                    # URL identity; their repr (which includes all fields)
+                    # is enough to distinguish genuinely different sources.
+                    identity = repr(source)
                 seen.setdefault(basename, []).append((section_filename, identity))
 
         warnings = []
@@ -1317,8 +1330,9 @@ class GoogleDocsBackend(Backend):
         self,
         doc_id: str,
         local_dir: str,
-        split_level: str,
+        split_level: Optional[str] = None,
         tab_id: Optional[str] = None,
+        **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, split it at `split_level`, write one file per section.
 
@@ -1337,6 +1351,8 @@ class GoogleDocsBackend(Backend):
         `.<name>.old.*` sibling directory left behind — never a half-written
         set of section files.
         """
+        if split_level is None:
+            raise ValueError("pull_sectioned requires split_level")
         self._ensure_client()
         assert self._client is not None
         target_dir = pathlib.Path(local_dir)
