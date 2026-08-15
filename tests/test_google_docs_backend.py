@@ -1102,6 +1102,86 @@ class TestPullTabId:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# unreadable_links — bookmark/tabId links reported as a pull warning, but only
+# on the tab-scoped structural path (issue #38). The default path's markdown
+# comes from Drive's HTML export, which renders these correctly — reporting
+# there was the exact regression shipped on feat/internal-anchors-full
+# (f0294a8) and corrected by 62aa8d1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bookmark_link_tab(tab_id: str, title: str) -> dict:
+    text = "see it"
+    return {
+        "tabProperties": {"tabId": tab_id, "title": title},
+        "documentTab": {
+            "body": {
+                "content": [
+                    {
+                        "startIndex": 1,
+                        "endIndex": 1 + len(text) + 1,
+                        "paragraph": {
+                            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                            "elements": [
+                                {"textRun": {
+                                    "content": text,
+                                    "textStyle": {"link": {"bookmarkId": "kix.b1"}},
+                                }},
+                                {"textRun": {"content": "\n", "textStyle": {}}},
+                            ],
+                        },
+                    }
+                ]
+            },
+            "lists": {},
+        },
+        "childTabs": [],
+    }
+
+
+def _single_tab_doc_with_bookmark_link(revision_id: str = "rev-bookmark") -> dict:
+    """A doc with exactly one tab (no multi-tab ambiguity) whose only link is
+    a bookmark link — unreadable on the structural path, fine on Drive's
+    HTML export."""
+    return {
+        "revisionId": revision_id,
+        "body": {"content": []},
+        "tabs": [_bookmark_link_tab("t.only", "Only")],
+    }
+
+
+class TestPullReportsUnreadableLinks:
+    def test_tab_scoped_pull_warns_and_names_the_bookmark_link(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _single_tab_doc_with_bookmark_link()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local), tab_id="t.only")
+
+        assert result.status == "warning"
+        assert "bookmark link" in (result.message or "")
+
+    def test_default_pull_never_reports_unreadable_links_for_the_same_doc(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """The exact regression guard: the same doc that warns under
+        --tab-id must not warn (or must not warn about links) when pulled
+        the default way, since Drive's HTML export renders the bookmark link
+        correctly and the throwaway DocsStructureParser built only for the
+        heading-slug map must never be consulted for unreadable_links here."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _single_tab_doc_with_bookmark_link()
+        fake_client.get_doc_content.return_value = '<p><a href="#bookmark=kix.b1">see it</a></p>'
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "ok"
+        assert result.message is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Default (non-tab) path — checkbox round trip regression (AC4, issue #17).
 #
 # The tab-scoped path's zero-edit corruption came from DocsRequestBuilder's
