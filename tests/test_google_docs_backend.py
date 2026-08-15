@@ -2149,6 +2149,30 @@ def _sectioned_doc(revision_id: str = "rev-sectioned") -> dict:
     return {"revisionId": revision_id, "body": {"content": content}}
 
 
+def _bookmark_link_paragraph(text: str = "see it") -> dict:
+    return {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"textRun": {"content": text, "textStyle": {"link": {"bookmarkId": "kix.b1"}}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }
+
+
+def _sectioned_doc_with_bookmark_link(revision_id: str = "rev-sectioned-bookmark") -> dict:
+    """One HEADING_1 section whose body contains a bookmark link —
+    unreadable on this structural path (issue #38), same shape as
+    _single_tab_doc_with_bookmark_link but split across section files."""
+    content = [
+        _heading_paragraph("Section 1", heading_id="h.section1"),
+        _bookmark_link_paragraph(),
+    ]
+    content = _with_real_indices(content)
+    return {"revisionId": revision_id, "body": {"content": content}}
+
+
 class TestPullSectioned:
     def test_pull_sectioned_should_write_section_files_and_manifest_using_structural_path(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
@@ -2186,6 +2210,22 @@ class TestPullSectioned:
         assert manifest["entries"][0]["heading_id"] == "__preamble__"
         assert manifest["entries"][3]["heading_id"] == "h.section3"
         assert manifest["entries"][3]["filename"] == "03-section-3.md"
+
+    def test_pull_sectioned_should_warn_and_name_the_bookmark_link(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Same structural-path property as pull()'s tab-scoped branch: each
+        section file's markdown is the parser's own output, so an
+        unreadable link is genuinely absent from the file just written
+        (issue #38)."""
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _sectioned_doc_with_bookmark_link()
+
+        local_dir = tmp_path / "doc"
+        result = backend.pull_sectioned("doc-1", str(local_dir), split_level="HEADING_1")
+
+        assert result.status == "warning"
+        assert "bookmark link" in (result.message or "")
 
     def test_pull_sectioned_should_return_error_for_unknown_tab_id(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]

@@ -1390,7 +1390,8 @@ class GoogleDocsBackend(Backend):
         try:
             doc = self._client.get_document(doc_id)
             doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
-            nodes = DocsStructureParser().parse(doc)
+            parser = DocsStructureParser()
+            nodes = parser.parse(doc)
             nodes, residue = project(nodes)
 
             existing_entries: List[SectionManifestEntry] = []
@@ -1435,9 +1436,21 @@ class GoogleDocsBackend(Backend):
             residue_note = describe_residue(
                 [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
             )
-            if residue_note:
+            # Collected, not raced — one warning must not hide the other. Like
+            # tab-scoped pull() above, this path's per-section markdown *is*
+            # the parser's own output, so an unreadable link is genuinely
+            # absent from every file just written (see #38).
+            messages = [
+                message
+                for message in (
+                    f"⚠ {residue_note}" if residue_note else None,
+                    self._render_unreadable_links(parser.unreadable_links),
+                )
+                if message
+            ]
+            if messages:
                 return PullResult(
-                    status="warning", doc_id=doc_id, local_path=local_dir, message=f"⚠ {residue_note}"
+                    status="warning", doc_id=doc_id, local_path=local_dir, message="\n".join(messages)
                 )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_dir)
         except TabNotFoundError as exc:
