@@ -584,3 +584,49 @@ def test_parse_does_not_flag_ordinary_or_final_paragraphs() -> None:
     ])
     nodes = parser.parse(doc)
     assert [n.precedes_structural_element for n in nodes] == [False, False]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# unreadable_links — bookmark/tabId links _parse_link cannot express, now
+# recorded instead of silently dropped (issue #38).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _table_cell_link_doc(link: dict) -> dict:
+    """A one-cell table whose only run carries the given `Link` dict."""
+    return _doc_with_content([{
+        "startIndex": 1, "endIndex": 20,
+        "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [{
+                "content": [{
+                    "startIndex": 2, "endIndex": 10,
+                    "paragraph": {"elements": [
+                        {"textRun": {
+                            "content": "see it",
+                            "textStyle": {"link": link},
+                        }},
+                        {"textRun": {"content": "\n"}},
+                    ]},
+                }],
+            }]},
+        ]},
+    }])
+
+
+def test_table_cell_with_bookmark_link_is_reported_unreadable() -> None:
+    """Post-#51, cell runs route through the same _parse_link as body text —
+    a bookmark link inside a cell must be caught by that same fallthrough,
+    not just at the top level."""
+    fresh = DocsStructureParser()
+    fresh.parse(_table_cell_link_doc({"bookmarkId": "kix.b1"}))
+    assert fresh.unreadable_links == ["bookmark link"]
+
+
+def test_table_cell_with_url_link_still_renders_and_is_not_reported() -> None:
+    """Regression guard for #51: a resolvable url link in a cell must not be
+    swept up as unreadable just because it shares _parse_link with bookmarks."""
+    fresh = DocsStructureParser()
+    nodes = fresh.parse(_table_cell_link_doc({"url": "https://example.com"}))
+    table = nodes[0]
+    assert isinstance(table, DocsTableNode)
+    assert table.rows[0][0].spans[0].link == "https://example.com"
+    assert fresh.unreadable_links == []

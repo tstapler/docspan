@@ -1182,6 +1182,26 @@ class GoogleDocsBackend(Backend):
             lines.append(f"    • …and {more} more")
         return "\n".join(lines)
 
+    @staticmethod
+    def _render_unreadable_links(kinds: list[str]) -> Optional[str]:
+        """Report link kinds a tab-scoped pull could not express in markdown.
+
+        These are dropped from the written file — until now dropped in
+        silence, the same failure heading anchors were fixed for on sibling
+        members of the same `Link` union, plus table cells. The Doc still has
+        them, so nothing is lost yet; the warning buys the author finding out
+        now rather than after a later push rewrites the paragraph and takes
+        the link with it.
+        """
+        if not kinds:
+            return None
+        lines = [
+            f"⚠ {len(kinds)} kind(s) of link could not be represented in markdown "
+            f"and are absent from the pulled file (the Doc still has them):"
+        ]
+        lines += [f"    • {kind}" for kind in kinds]
+        return "\n".join(lines)
+
     def _fetch_target_headings(self, doc_id: str, tab_id: Optional[str]) -> list:
         """CrossDocLinkResolver's FetchHeadings callback for this backend.
 
@@ -1241,7 +1261,8 @@ class GoogleDocsBackend(Backend):
             if tab_id is not None:
                 doc = self._client.get_document(doc_id)
                 doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
-                nodes = DocsStructureParser().parse(doc)
+                parser = DocsStructureParser()
+                nodes = parser.parse(doc)
                 # Render what markdown can represent, and nothing else. The
                 # renderer had no way to express a TITLE, so it emitted the bare
                 # text, which re-parsed as NORMAL_TEXT and made the next push
@@ -1265,12 +1286,21 @@ class GoogleDocsBackend(Backend):
                 residue_note = describe_residue(
                     [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
                 )
-                if residue_note:
+                # Collected, not raced — one warning must not hide the other.
+                messages = [
+                    message
+                    for message in (
+                        f"⚠ {residue_note}" if residue_note else None,
+                        self._render_unreadable_links(parser.unreadable_links),
+                    )
+                    if message
+                ]
+                if messages:
                     return PullResult(
                         status="warning",
                         doc_id=doc_id,
                         local_path=local_path,
-                        message=f"⚠ {residue_note}",
+                        message="\n".join(messages),
                     )
                 return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
 
@@ -1300,12 +1330,13 @@ class GoogleDocsBackend(Backend):
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
 
-            # Note for the link-reporting follow-up (#38): a report built from a
-            # structural parse would be *false* here. This path's markdown comes
-            # from Drive's HTML export, which does write a bookmark href and a
-            # table-cell link — the parse above serves only the id->slug map. Only
-            # the tab-scoped path can report what the file lacks, because there the
-            # parser's output *is* the file.
+            # NOT reporting DocsStructureParser().unreadable_links here (see #38).
+            # This path's markdown comes from Drive's HTML export, which does
+            # write a bookmark href and a table-cell link — the structural parse
+            # above serves only the id->slug map. Reporting it would claim those
+            # links are "absent from the pulled file" while they sit in the file
+            # just written. Only the tab-scoped path above can report what the
+            # file lacks, because there the parser's output *is* the file.
             messages = [w for w in (warning, checkbox_warning) if w]
             if messages:
                 return PullResult(
@@ -1359,7 +1390,8 @@ class GoogleDocsBackend(Backend):
         try:
             doc = self._client.get_document(doc_id)
             doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
-            nodes = DocsStructureParser().parse(doc)
+            parser = DocsStructureParser()
+            nodes = parser.parse(doc)
             nodes, residue = project(nodes)
 
             existing_entries: List[SectionManifestEntry] = []
@@ -1404,9 +1436,21 @@ class GoogleDocsBackend(Backend):
             residue_note = describe_residue(
                 [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
             )
-            if residue_note:
+            # Collected, not raced — one warning must not hide the other. Like
+            # tab-scoped pull() above, this path's per-section markdown *is*
+            # the parser's own output, so an unreadable link is genuinely
+            # absent from every file just written (see #38).
+            messages = [
+                message
+                for message in (
+                    f"⚠ {residue_note}" if residue_note else None,
+                    self._render_unreadable_links(parser.unreadable_links),
+                )
+                if message
+            ]
+            if messages:
                 return PullResult(
-                    status="warning", doc_id=doc_id, local_path=local_dir, message=f"⚠ {residue_note}"
+                    status="warning", doc_id=doc_id, local_path=local_dir, message="\n".join(messages)
                 )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_dir)
         except TabNotFoundError as exc:

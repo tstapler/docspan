@@ -1039,6 +1039,85 @@ class TestTabsAwareLinkUnion:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# unreadable_links — bookmark/tabId links _parse_link cannot express are named
+# and reported once per kind, rather than dropped in silence (issue #38).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestUnreadableLinksAreReported:
+    @pytest.mark.parametrize(
+        "link, expected",
+        [
+            ({"bookmarkId": "kix.b1"}, "bookmark link"),
+            ({"bookmark": {"id": "kix.b1", "tabId": "t.0"}}, "bookmark link"),
+            ({"tabId": "t.1"}, "link to a tab"),
+        ],
+    )
+    def test_each_unreadable_member_is_named(self, link: dict, expected: str) -> None:
+        parser = DocsStructureParser()
+        assert parser._parse_link(link) is None
+        assert parser.unreadable_links == [expected]
+
+    def test_a_resolvable_heading_link_is_not_reported(self) -> None:
+        parser = DocsStructureParser()
+        assert parser._parse_link({"headingId": "h.abc"}) == "#h.abc"
+        assert parser.unreadable_links == []
+
+    def test_each_kind_is_reported_once(self) -> None:
+        parser = DocsStructureParser()
+        parser._parse_link({"bookmarkId": "kix.b1"})
+        parser._parse_link({"bookmarkId": "kix.b2"})
+        assert parser.unreadable_links == ["bookmark link"]
+
+    def test_a_mixed_doc_reports_only_the_unresolvable_link(self) -> None:
+        """A resolvable heading link and an unreadable bookmark link in the
+        same document: the good link renders, and only the bad one is named —
+        one must not mask or crowd out the other."""
+        doc = _doc(
+            _paragraph("Current state", 1, "HEADING_2", "h.cur"),
+            _paragraph("see it and this", 16, runs=[
+                {"textRun": {
+                    "content": "see it",
+                    "textStyle": {"link": {"headingId": "h.cur"}},
+                }},
+                {"textRun": {"content": " and ", "textStyle": {}}},
+                {"textRun": {
+                    "content": "this",
+                    "textStyle": {"link": {"bookmarkId": "kix.b1"}},
+                }},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+        )
+        parser = DocsStructureParser()
+        markdown_out = render_nodes_to_markdown(parser.parse(doc))
+        assert "[see it](#current-state)" in markdown_out
+        assert parser.unreadable_links == ["bookmark link"]
+
+    def test_the_list_does_not_leak_between_instances(self) -> None:
+        first = DocsStructureParser()
+        first._parse_link({"bookmarkId": "kix.b1"})
+        second = DocsStructureParser()
+        assert second.unreadable_links == []
+
+    def test_the_list_does_not_leak_between_parse_calls_on_one_instance(self) -> None:
+        parser = DocsStructureParser()
+        with_bookmark = _doc(
+            _paragraph("see it", 1, runs=[
+                {"textRun": {
+                    "content": "see it",
+                    "textStyle": {"link": {"bookmarkId": "kix.b1"}},
+                }},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ]),
+        )
+        parser.parse(with_bookmark)
+        assert parser.unreadable_links == ["bookmark link"]
+
+        clean = _doc(_paragraph("Just a paragraph", 1))
+        parser.parse(clean)
+        assert parser.unreadable_links == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Normalization must not silently pick a winner
 # ─────────────────────────────────────────────────────────────────────────────
 
