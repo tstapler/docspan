@@ -786,6 +786,206 @@ class TestFailedResolutionOfNewImageDropsNodeInsteadOfEmptyUri:
         fake_client.batch_update.assert_not_called()
 
 
+class TestFailedResolutionOfNewPlainImageDropsNodeInsteadOfEmptyUri:
+    """Same drop-vs-substitute decision as the mermaid case above, but for a
+    plain `![alt](path)` reference to a missing local file -- the generic
+    (non-mermaid) new-image path through the same substituted_images/
+    existing_image_alts logic in backend.py, previously only exercised via
+    ```mermaid fences."""
+
+    def test_build_push_plan_emits_no_empty_uri_insert_for_new_plain_image(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("![a diagram](./missing.png)\n", encoding="utf-8")
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert plan.image_warnings and "missing.png" in plan.image_warnings[0]
+        assert not any("insertInlineImage" in r for r in plan.requests)
+        fake_client.upload_temp_image.assert_not_called()
+
+    def test_push_reports_skipped_not_a_failed_batch_update_for_new_plain_image(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.return_value = []
+
+        local = tmp_path / "doc.md"
+        local.write_text("![a diagram](./missing.png)\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
+def _doc_with_existing_mermaid_image(alt: str) -> dict:
+    """Same shape as `_doc_with_existing_image`, but keyed by a caller-supplied
+    alt so a test can match it against `_mermaid_image_node`'s content-hash alt
+    (`f"mermaid diagram {sha256(diagram)[:12]}"`)."""
+    return {
+        "revisionId": "ALm37abc",
+        "body": {
+            "content": [
+                {
+                    "startIndex": 1,
+                    "endIndex": 2,
+                    "paragraph": {
+                        "elements": [
+                            {"inlineObjectElement": {"inlineObjectId": "kix.obj1"}},
+                        ]
+                    },
+                },
+                {
+                    "startIndex": 2,
+                    "endIndex": 3,
+                    "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+                },
+            ]
+        },
+        "inlineObjects": {
+            "kix.obj1": {
+                "inlineObjectProperties": {
+                    "embeddedObject": {
+                        "contentUri": "https://docs.google.com/existing-content-uri",
+                        "description": alt,
+                    }
+                }
+            }
+        },
+    }
+
+
+class TestFailedReRenderOfExistingMermaidImageDoesNotDeleteIt:
+    """The already-synced counterpart to
+    TestFailedResolutionOfNewImageDropsNodeInsteadOfEmptyUri: a mermaid
+    diagram that was successfully pushed before (so the live doc has an
+    image whose alt matches this fence's content-hash alt) must survive a
+    later re-render failure via the existing_image_alts fallback, not be
+    dropped/deleted."""
+
+    _DIAGRAM = "graph TD; A-->B;"
+
+    @staticmethod
+    def _alt_for(diagram: str) -> str:
+        import hashlib
+
+        digest = hashlib.sha256(diagram.encode("utf-8")).hexdigest()[:12]
+        return f"mermaid diagram {digest}"
+
+    def test_build_push_plan_falls_back_to_original_node_not_a_delete(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+        from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError
+
+        backend, fake_client = make_backend()
+        alt = self._alt_for(self._DIAGRAM)
+        fake_client.get_document.return_value = _doc_with_existing_mermaid_image(alt)
+        fake_client.list_comments.return_value = []
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise MermaidRenderError("mmdc not found")
+
+        monkeypatch.setattr(image_source, "render_mermaid_png", _raise)
+
+        local = tmp_path / "doc.md"
+        local.write_text(f"```mermaid\n{self._DIAGRAM}\n```\n", encoding="utf-8")
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert plan.image_warnings and "mermaid render failed" in plan.image_warnings[0]
+        assert not any("deleteContentRange" in r for r in plan.requests)
+        assert not any("insertInlineImage" in r for r in plan.requests)
+        fake_client.upload_temp_image.assert_not_called()
+
+    def test_push_reports_skipped_not_a_delete(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+        from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError
+
+        backend, fake_client = make_backend()
+        alt = self._alt_for(self._DIAGRAM)
+        fake_client.get_document.return_value = _doc_with_existing_mermaid_image(alt)
+        fake_client.list_comments.return_value = []
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise MermaidRenderError("mmdc not found")
+
+        monkeypatch.setattr(image_source, "render_mermaid_png", _raise)
+
+        local = tmp_path / "doc.md"
+        local.write_text(f"```mermaid\n{self._DIAGRAM}\n```\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
+class TestMixedImageResolutionOutcomes:
+    """Two images in the same push, one resolving and one (brand-new) failing
+    -- exercises the shared `subst_iter`/zip(resolved_images, image_nodes)
+    splice in backend.py across more than one image, where an off-by-one
+    would misattribute a success/failure outcome to the wrong node."""
+
+    def test_failed_new_image_is_dropped_while_the_other_still_gets_inserted(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+        from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.return_value = []
+        fake_client.upload_temp_image.return_value = {
+            "file_id": "file-1",
+            "uri": "https://drive.example.com/file-1",
+        }
+
+        def _fail_second_diagram_only(diagram: str, *args: object, **kwargs: object) -> bytes:
+            if "B-->C" in diagram:
+                raise MermaidRenderError("mmdc not found")
+            return b"\x89PNG\r\n\x1a\n" + b"pngbytes"
+
+        monkeypatch.setattr(image_source, "render_mermaid_png", _fail_second_diagram_only)
+
+        local = tmp_path / "doc.md"
+        local.write_text(
+            "```mermaid\ngraph TD; A-->B;\n```\n\n"
+            "```mermaid\ngraph TD; B-->C;\n```\n",
+            encoding="utf-8",
+        )
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert len(plan.image_warnings) == 1
+        assert "mermaid render failed" in plan.image_warnings[0]
+        insert_uris = [
+            r["insertInlineImage"]["uri"]
+            for r in plan.requests
+            if "insertInlineImage" in r
+        ]
+        assert insert_uris == ["https://drive.example.com/file-1"]
+        fake_client.upload_temp_image.assert_called_once()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.upload_temp_image / delete_temp_upload -- direct coverage
 # against a mocked docs_service/drive_service (previously untested at this
