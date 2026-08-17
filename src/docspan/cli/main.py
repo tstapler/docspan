@@ -217,7 +217,15 @@ def push(
 ) -> None:
     """Push local markdown to remote docs."""
     config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+    # `mappings` (all of config.mappings) is passed to orchestrate_push()
+    # below for cross-doc link resolution — it must stay the full set even
+    # when `files` narrows which mappings actually get pushed this run.
+    # Narrowing it here used to make a relative link's target mapping
+    # invisible to the resolver whenever the target wasn't also named in
+    # `files`, so every single-file push wrote such links as a literal,
+    # unresolved relative href instead of the target's Google Doc URL.
     mappings = config.mappings
+    mappings_to_push = mappings
 
     if files:
         resolved_mappings: list[Mapping] = []
@@ -225,12 +233,12 @@ def push(
             m = resolve_mapping_for_path(mappings, f)
             if m is not None and not any(m is existing for existing in resolved_mappings):
                 resolved_mappings.append(m)
-        mappings = resolved_mappings
-        if not mappings:
+        mappings_to_push = resolved_mappings
+        if not mappings_to_push:
             err_console.print(f"No mappings found for: {files}")
             raise typer.Exit(1)
 
-    if not mappings:
+    if not mappings_to_push:
         err_console.print("No mappings configured. Add entries to markgate.yaml.")
         raise typer.Exit(1)
 
@@ -245,7 +253,7 @@ def push(
     # to the same target would fetch that target N times, once per pushing
     # backend instance, instead of once for the whole run.
     cross_doc_cache: dict = {}
-    for mapping in mappings:
+    for mapping in mappings_to_push:
         if mapping.direction == "pull":
             console.print(f"[dim]Skipping {mapping.local} (pull-only)[/dim]")
             continue
