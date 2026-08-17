@@ -3,6 +3,7 @@
 Split of concerns:
 - config  ($XDG_CONFIG_HOME/docspan)  — central config.yaml + cached OAuth tokens
 - state   ($XDG_STATE_HOME/docspan)   — sync state + content-addressed base store, per prefix
+- cache   ($XDG_CACHE_HOME/docspan)   — regenerable derived artifacts (e.g. rendered mermaid PNGs)
 
 See https://specifications.freedesktop.org/basedir-spec/latest/
 """
@@ -34,9 +35,18 @@ def xdg_data_home() -> pathlib.Path:
     return _home_dir("XDG_DATA_HOME", ".local/share")
 
 
+def xdg_cache_home() -> pathlib.Path:
+    return _home_dir("XDG_CACHE_HOME", ".cache")
+
+
 def config_home() -> pathlib.Path:
     """docspan's config dir: $XDG_CONFIG_HOME/docspan."""
     return xdg_config_home() / APP
+
+
+def cache_home() -> pathlib.Path:
+    """docspan's cache dir: $XDG_CACHE_HOME/docspan."""
+    return xdg_cache_home() / APP
 
 
 def state_home() -> pathlib.Path:

@@ -9,12 +9,15 @@ none of this repo's existing dependencies cover it, so this shells out.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional
+
+from docspan.core.xdg import cache_home
 
 RENDER_TIMEOUT_SECONDS = 30
 
@@ -29,6 +32,18 @@ RENDER_SCALE = 3
 
 class MermaidRenderError(Exception):
     """Raised when mermaid-cli is missing, fails, or produces no output."""
+
+
+def _cache_dir() -> Path:
+    return cache_home() / "mermaid"
+
+
+def _cache_key(diagram: str) -> str:
+    # RENDER_SCALE is baked into the key, not just the diagram text, since it
+    # changes the rendered bytes for the same diagram source.
+    digest = hashlib.sha256(diagram.encode("utf-8"))
+    digest.update(str(RENDER_SCALE).encode("utf-8"))
+    return digest.hexdigest()
 
 
 # Puppeteer's sandboxed Chromium needs extra namespace permissions that many
@@ -66,7 +81,26 @@ def render_mermaid_png(diagram: str, *, timeout: Optional[float] = None) -> byte
     exit, timeout, no output produced) -- callers (image_source.py) are
     expected to catch this and surface it as a push warning, never let it
     crash the push.
+
+    Renders are cached on disk keyed by a hash of the diagram text (plus
+    RENDER_SCALE) under $XDG_CACHE_HOME/docspan/mermaid -- unchanged fences
+    are the common case across repeat pushes, and skipping mmdc/Puppeteer
+    entirely is the only way to make those instant rather than merely
+    faster. A failed render is never cached, so a transient failure (e.g. a
+    missing mmdc) doesn't stick once the diagram itself is fine.
     """
+    cache_path = _cache_dir() / f"{_cache_key(diagram)}.png"
+    if cache_path.is_file():
+        return cache_path.read_bytes()
+
+    data = _render_uncached(diagram, timeout=timeout)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(data)
+    return data
+
+
+def _render_uncached(diagram: str, *, timeout: Optional[float] = None) -> bytes:
     with tempfile.TemporaryDirectory(prefix="docspan-mermaid-") as tmpdir:
         tmp = Path(tmpdir)
         input_path = tmp / "diagram.mmd"
