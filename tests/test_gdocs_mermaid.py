@@ -191,3 +191,43 @@ def test_render_mermaid_png_does_not_cache_a_failed_render(tmp_path, monkeypatch
     result = render_mermaid_png(diagram)
     assert result == _PNG_MAGIC + diagram.encode("utf-8")
     assert calls == [diagram, diagram]  # failure wasn't cached, second call re-rendered
+
+
+def test_render_mermaid_png_cache_key_changes_with_render_scale(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._mmdc_version", lambda: "1.0.0"
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer(calls),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    render_mermaid_png(diagram)
+    monkeypatch.setattr("docspan.backends.google_docs.mermaid_renderer.RENDER_SCALE", 5)
+    render_mermaid_png(diagram)
+
+    assert calls == [diagram, diagram]  # scale change busts the cache, not a hit
+
+
+def test_render_mermaid_png_cache_key_changes_with_mmdc_version(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    calls: list = []
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer(calls),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._mmdc_version", lambda: "1.0.0"
+    )
+    render_mermaid_png(diagram)
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._mmdc_version", lambda: "2.0.0"
+    )
+    render_mermaid_png(diagram)
+
+    assert calls == [diagram, diagram]  # mmdc upgrade busts the cache, not a hit
