@@ -204,30 +204,11 @@ class GoogleDocsBackend(Backend):
         image_nodes = [n for n in target_nodes if isinstance(n, DocsImageNode)]
         image_warnings: list[str] = []
         temp_drive_file_ids: list[str] = []
+        resolved_images: list[DocsImageNode | None] = []
         if image_nodes:
             resolved_images, image_warnings, temp_drive_file_ids = resolve_document_images(
                 image_nodes, local_path, self._client.upload_temp_image
             )
-            # A failed resolution (renamed/unreadable/oversized file, a
-            # transient upload error) must NOT drop the node from
-            # target_nodes: DocsRequestBuilder.build() treats "present in
-            # current, absent in target" as a delete, so dropping it here
-            # would silently delete a previously-synced image from the live
-            # doc on the very push that failed to re-resolve it. Substitute
-            # the original (unresolved) DocsImageNode instead — its
-            # alt/width_pt/height_pt are untouched, which is exactly the
-            # identity _node_key/_content_key use for images (src is
-            # deliberately excluded from both, see their docstrings), so the
-            # diff sees "same image, no change" rather than "removed".
-            substituted_images = [
-                resolved if resolved is not None else original
-                for resolved, original in zip(resolved_images, image_nodes)
-            ]
-            subst_iter = iter(substituted_images)
-            target_nodes = [
-                next(subst_iter) if isinstance(n, DocsImageNode) else n
-                for n in target_nodes
-            ]
 
         try:
             whole_doc = self._client.get_document(doc_id)
@@ -241,6 +222,42 @@ class GoogleDocsBackend(Backend):
             # the diff read that asymmetry as "the user deleted this" — issue #17.
             # See projection.project for the rule and the trade it makes.
             current_nodes, current_residue = project(current_nodes)
+
+            if image_nodes:
+                # An unresolved image can only safely fall back to its original
+                # (pre-resolution) node when that node is already synced to the
+                # live doc — the fallback exists to stop a transient failure from
+                # reading as "the user deleted this image" (see below), which only
+                # applies to an image the doc already has. A brand-new image
+                # (never pushed before) has no such node to protect, and for a
+                # ```mermaid fence the "original" node was never given a real
+                # src to begin with (_mermaid_image_node sets only
+                # mermaid_source, so src stays "" — see DocsImageNode's
+                # default) -- falling back to it produced an insertInlineImage
+                # with an empty uri, which the Docs API rejects with
+                # "The URL should not be empty." So: preserve the original only
+                # if a same-alt image already exists in current_nodes; otherwise
+                # drop the node rather than emit a request that can't succeed.
+                existing_image_alts = {
+                    n.alt for n in current_nodes if isinstance(n, DocsImageNode)
+                }
+                substituted_images = [
+                    resolved
+                    if resolved is not None
+                    else (original if original.alt in existing_image_alts else None)
+                    for resolved, original in zip(resolved_images, image_nodes)
+                ]
+                subst_iter = iter(substituted_images)
+                new_target_nodes = []
+                for n in target_nodes:
+                    if isinstance(n, DocsImageNode):
+                        substituted = next(subst_iter)
+                        if substituted is not None:
+                            new_target_nodes.append(substituted)
+                    else:
+                        new_target_nodes.append(n)
+                target_nodes = new_target_nodes
+
             # Projecting the target is NOT a no-op any more. This comment used to say
             # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
             # nothing on this side to drop" — splitting fenced code blocks per line

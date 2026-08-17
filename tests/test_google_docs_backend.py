@@ -720,6 +720,72 @@ class TestFailedImageResolutionDoesNotDeleteExistingImage:
         fake_client.batch_update.assert_not_called()
 
 
+class TestFailedResolutionOfNewImageDropsNodeInsteadOfEmptyUri:
+    """The actual reported bug: a brand-new (never-before-synced) mermaid
+    diagram whose render fails has no existing-doc node to fall back to, and
+    the pre-resolution node's `src` is always "" for a ```mermaid fence
+    (_mermaid_image_node never sets it). Falling back to it produced an
+    insertInlineImage request with an empty uri, rejected by the Docs API
+    with "The URL should not be empty." The fix drops the node instead.
+    """
+
+    def test_build_push_plan_emits_no_empty_uri_insert_when_new_mermaid_render_fails(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+        from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.return_value = []
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise MermaidRenderError("mmdc not found")
+
+        monkeypatch.setattr(image_source, "render_mermaid_png", _raise)
+
+        local = tmp_path / "doc.md"
+        local.write_text("```mermaid\ngraph TD; A-->B;\n```\n", encoding="utf-8")
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert plan.image_warnings and "mermaid render failed" in plan.image_warnings[0]
+        assert not any(
+            "insertInlineImage" in r and not r["insertInlineImage"].get("uri")
+            for r in plan.requests
+        )
+        fake_client.upload_temp_image.assert_not_called()
+
+    def test_push_reports_skipped_not_a_failed_batch_update(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+        from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+        fake_client.list_comments.return_value = []
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise MermaidRenderError("mmdc not found")
+
+        monkeypatch.setattr(image_source, "render_mermaid_png", _raise)
+
+        local = tmp_path / "doc.md"
+        local.write_text("```mermaid\ngraph TD; A-->B;\n```\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.upload_temp_image / delete_temp_upload -- direct coverage
 # against a mocked docs_service/drive_service (previously untested at this
