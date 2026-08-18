@@ -9,12 +9,10 @@ from typing import Dict, Iterator, List, Literal, Optional, Set, Tuple, Union
 
 from docspan.backends.google_docs import cross_doc_links
 from docspan.backends.google_docs.docs_structure_parser import (
-    # Re-exported here, unused within this module until Story 2.2's
-    # `_blockquote_paragraph_style_fields` consumes them — imported now so
-    # docs_structure_parser stays sole owner (Story 1.1) rather than this
-    # module copying the literals later.
-    BLOCKQUOTE_BORDER_MARKER,  # noqa: F401
-    BLOCKQUOTE_INDENT_PT_PER_LEVEL,  # noqa: F401
+    # docs_structure_parser stays sole owner of these literals (Story 1.1);
+    # `_blockquote_paragraph_style_fields` below is the consumer.
+    BLOCKQUOTE_BORDER_MARKER,
+    BLOCKQUOTE_INDENT_PT_PER_LEVEL,
     DocsImageNode,
     DocsParagraphNode,
     DocsStructureParser,
@@ -2556,11 +2554,17 @@ class DocsRequestBuilder:
                 "startIndex": paragraph_start,
                 "endIndex": paragraph_start + text_len,
             }
+            paragraph_style: dict = {"namedStyleType": node.style}
+            style_fields = ["namedStyleType"]
+            blockquote_style, blockquote_fields = self._blockquote_paragraph_style_fields(node)
+            if blockquote_fields:
+                paragraph_style.update(blockquote_style)
+                style_fields.extend(blockquote_fields)
             requests.append({
                 "updateParagraphStyle": {
                     "range": paragraph_range,
-                    "paragraphStyle": {"namedStyleType": node.style},
-                    "fields": "namedStyleType",
+                    "paragraphStyle": paragraph_style,
+                    "fields": ",".join(style_fields),
                 }
             })
             if node.is_list_item:
@@ -2693,6 +2697,36 @@ class DocsRequestBuilder:
         return requests
 
     @staticmethod
+    def _blockquote_paragraph_style_fields(node: Node) -> Tuple[dict, List[str]]:
+        """paragraphStyle fields that give ``node`` its native blockquote look.
+
+        Empty dict/fields for anything that isn't a blockquote paragraph, so
+        callers can unconditionally merge the result without an extra
+        ``is_blockquote`` guard of their own.
+
+        Composes with list nesting without any extra logic (Story 2.6,
+        decided in plan.md): `indentStart` here carries only the
+        quote-depth contribution. A node that is both `is_list_item` and
+        `is_blockquote` gets its list indent from `createParagraphBullets`
+        applying the Bullets preset relative to whatever `indentStart`
+        baseline this helper wrote — bullet nesting is derived from
+        leading-tab count in the paragraph's *text*
+        (see `_restyles`'s comment below), never from `paragraphStyle`, so
+        the two indent sources are independent and additive by construction.
+        No combined-indent computation is written here or anywhere else.
+        """
+        if not isinstance(node, DocsParagraphNode) or not node.is_blockquote:
+            return {}, []
+        style = {
+            "indentStart": {
+                "magnitude": node.quote_depth * BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+                "unit": "PT",
+            },
+            "borderLeft": BLOCKQUOTE_BORDER_MARKER,
+        }
+        return style, ["indentStart", "borderLeft"]
+
+    @staticmethod
     def _restyles(current_node: Node, target_node: Node) -> bool:
         """Whether two same-text nodes differ in a paragraph attribute.
 
@@ -2715,6 +2749,8 @@ class DocsRequestBuilder:
         return (
             current_node.style != target_node.style
             or current_node.is_list_item != target_node.is_list_item
+            or current_node.is_blockquote != target_node.is_blockquote
+            or current_node.quote_depth != target_node.quote_depth
         )
 
     def _make_style_update_requests(self, current_node: Node, target_node: Node) -> List[dict]:
@@ -2751,12 +2787,34 @@ class DocsRequestBuilder:
             "endIndex": current_node.end_index,
         }
 
-        if current_node.style != target_node.style:
+        blockquote_style, blockquote_fields = self._blockquote_paragraph_style_fields(target_node)
+        blockquote_changed = (
+            current_node.is_blockquote != target_node.is_blockquote
+            or current_node.quote_depth != target_node.quote_depth
+        )
+        # Fires whenever namedStyleType differs OR the blockquote flag/depth
+        # differs — a pure blockquote change (text and namedStyleType both
+        # unchanged) must still emit this request, so the guard is an `or`,
+        # not nested inside the style check.
+        #
+        # Known gap: `blockquote_fields` is computed from `target_node`, so
+        # a blockquote -> plain transition (target_node.is_blockquote is
+        # False) merges no indentStart/borderLeft fields into the request at
+        # all — it never explicitly clears the border/indent a prior push
+        # wrote. The paragraph reverts to NORMAL_TEXT but silently keeps the
+        # stale visual indent/border. Left as a known gap rather than papered
+        # over with a guessed "clear to default" request.
+        if current_node.style != target_node.style or blockquote_changed:
+            paragraph_style: dict = {"namedStyleType": target_node.style}
+            style_fields = ["namedStyleType"]
+            if blockquote_fields:
+                paragraph_style.update(blockquote_style)
+                style_fields.extend(blockquote_fields)
             requests.append({
                 "updateParagraphStyle": {
                     "range": dict(paragraph_range),
-                    "paragraphStyle": {"namedStyleType": target_node.style},
-                    "fields": "namedStyleType",
+                    "paragraphStyle": paragraph_style,
+                    "fields": ",".join(style_fields),
                 }
             })
 

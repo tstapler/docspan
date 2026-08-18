@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import re
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Union, cast
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -275,14 +276,15 @@ def _nodes_from_code_block(
     `emit_language_marker` carries mistune's `token.attrs.info` (the fence
     language) through the node-list representation via a literal,
     non-monospace `FENCE_MARKER + lang` line written ahead of the code lines
-    (see `FENCE_MARKER`'s docstring). Only the top-level call site
-    (`parse()`) passes True. `nodes_to_markdown.py`'s `_is_language_marker`
-    (like `_is_pure_code_line`) requires `not node.is_list_item`, so a marker
-    emitted for a list item would never decode back. A blockquote's
-    `_prefix_node_text` rewrites the marker's leading "```" into "> ```"
-    anyway, breaking the match on `FENCE_MARKER` the same way. Either way the
-    marker would just be a stray literal line, so list items and blockquotes
-    stay marker-less on purpose.
+    (see `FENCE_MARKER`'s docstring). The top-level call site (`parse()`) and
+    `_walk_block_quote` (a fence nested in a blockquote) both pass True.
+    `nodes_to_markdown.py`'s `_is_language_marker` (like `_is_pure_code_line`)
+    requires `not node.is_list_item`, so a marker emitted for a list item
+    would never decode back — that path stays marker-less on purpose. A
+    blockquote's marker node has no such guard against it: it carries
+    `is_blockquote=True`/`quote_depth` like every other node
+    `_walk_block_quote` tags, which does not affect `_is_language_marker`'s
+    checks.
     """
     nodes: List[DocsParagraphNode] = []
     if emit_language_marker:
@@ -342,60 +344,64 @@ def _mermaid_image_node(token: dict) -> DocsImageNode:
     )
 
 
-def _prefix_node_text(node: DocsParagraphNode, prefix: str) -> DocsParagraphNode:
-    """Return a copy of node with prefix prepended to its text and first span.
-
-    Used to render block-quote lines as literal "> "-prefixed text (same
-    approach as ADR-001's literal checklist markers) so the quote survives
-    push→pull round-trips even though Google Docs has no native blockquote
-    paragraph style to map onto.
-    """
-    spans = list(node.spans)
-    if spans:
-        spans = [TextSpan(text=prefix)] + spans
-    return DocsParagraphNode(
-        style=node.style, text=prefix + node.text, is_list_item=node.is_list_item,
-        nesting_level=node.nesting_level, start_index=node.start_index,
-        end_index=node.end_index, spans=spans,
-    )
-
-
 def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNode]:
-    """Walk a block_quote token, prefixing each contained line with '> ' markers.
+    """Walk a block_quote token, tagging each contained paragraph as a blockquote.
 
-    Nested block_quote tokens increase quote_depth (rendered as repeated
-    '> > ' markers), matching standard Markdown nesting syntax.
+    Google Docs has a native blockquote look (`BLOCKQUOTE_BORDER_MARKER`/
+    `BLOCKQUOTE_INDENT_PT_PER_LEVEL` in `docs_structure_parser.py`, applied via
+    `docs_request_builder._blockquote_paragraph_style_fields`), so — unlike the
+    old approach this replaces — no literal "> " marker is written into a
+    node's text or spans. Instead every produced node carries
+    `is_blockquote=True`/`quote_depth=<depth>`, which is what
+    `_node_key`/`_structural_score` use for identity and what the style-fields
+    helper reads to write the border/indent.
+
+    Nested block_quote tokens increase quote_depth, matching standard Markdown
+    nesting syntax.
     """
-    prefix = "> " * quote_depth
     nodes: List[DocsParagraphNode] = []
+
+    def _tagged(n: DocsParagraphNode) -> DocsParagraphNode:
+        return replace(n, is_blockquote=True, quote_depth=quote_depth)
+
     for child in token.get("children", []):
         ctype = child.get("type")
         if ctype == "paragraph":
             spans = _spans_from_inline(child.get("children", []))
-            nodes.append(_prefix_node_text(
-                DocsParagraphNode(style="NORMAL_TEXT", text=_text_of(spans).strip(),
-                                  start_index=0, end_index=0,
-                                  spans=spans if _has_styling(spans) else []),
-                prefix,
-            ))
+            nodes.append(_tagged(DocsParagraphNode(
+                style="NORMAL_TEXT", text=_text_of(spans).strip(),
+                start_index=0, end_index=0,
+                spans=spans if _has_styling(spans) else [],
+            )))
         elif ctype == "list":
-            nodes.extend(
-                _prefix_node_text(n, prefix) for n in _walk_list_items(child, nesting_level=0)
-            )
+            nodes.extend(_tagged(n) for n in _walk_list_items(child, nesting_level=0))
         elif ctype == "block_code":
-            # A blank line inside the fence becomes a bare "> " line rather than
-            # being dropped: `_prefix_node_text` turns the empty text into a
-            # non-empty one, so it survives projection's blank-drop rule (which
-            # is keyed on text == "") — intentionally, so the quote's visual
-            # continuity isn't broken by a vanishing line mid-block. It carries
-            # no monospace span, matching every other blank code line.
+            # emit_language_marker=True mirrors the top-level parse() call
+            # site (CodeTokenConverter.convert) so a fenced code block's
+            # language tag survives inside a quote too — this call used to
+            # always pass the default False, so `lang` resolved to None on
+            # pull for any ```lang fence inside a blockquote. The marker node
+            # is tagged is_blockquote/quote_depth exactly like the code-line
+            # nodes it precedes, so `_group_blockquote_runs` (Story 3.2)
+            # includes it in the same run before `_group_code_runs` looks for
+            # it.
             nodes.extend(
-                _prefix_node_text(n, prefix) for n in _nodes_from_code_block(child)
+                _tagged(n)
+                for n in _nodes_from_code_block(child, emit_language_marker=True)
             )
         elif ctype == "block_quote":
             nodes.extend(_walk_block_quote(child, quote_depth + 1))
         elif ctype == "blank_line":
-            continue
+            # An empty quote line ("> " with nothing after it) is meaningful
+            # structure, not a separator to discard — unlike a bare blank
+            # line at the top level (BlankLineTokenConverter), which really
+            # is just a separator. Emitting an explicit empty, tagged node
+            # here (rather than `continue`-ing past it as before) is what
+            # lets projection.py's blockquote carve-out (Story 2.5) keep it
+            # instead of dropping it as an ordinary blank paragraph.
+            nodes.append(_tagged(DocsParagraphNode(
+                style="NORMAL_TEXT", text="", start_index=0, end_index=0, spans=[],
+            )))
         # nested tables inside a block quote are rare; fall back to skipping
         # rather than mis-rendering them.
     return nodes
@@ -503,10 +509,9 @@ class CodeTokenConverter(MarkdownTokenConverter):
     token_type = "block_code"
 
     def convert(self, token: dict) -> List[Node]:
-        # Top level is the only one of the three `_nodes_from_code_block`
-        # call sites (here, `_walk_list_items`, `_walk_block_quote`) that
-        # carries the fence's language through a marker line — see the
-        # helper's docstring for why list items and blockquotes stay
+        # Top level and `_walk_block_quote` both carry the fence's language
+        # through a marker line; `_walk_list_items` doesn't — see
+        # `_nodes_from_code_block`'s docstring for why list items stay
         # marker-less. A *native* Google Docs code block (typed in the Docs
         # UI, not pushed by this tool) never has a marker either, and
         # matching push's target against that live structure depends on the

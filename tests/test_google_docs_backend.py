@@ -3256,3 +3256,40 @@ class TestRepairDoesNotCrossPairBlockquoteAndPlainParagraph:
         # blockquote), not current[0] (the plain paragraph) — and vice versa.
         assert by_target_start[0][:3] == ("equal", 1, 2)
         assert by_target_start[1][:3] == ("equal", 0, 1)
+
+
+class TestProjectionBlockquoteBlankLineCarveOut:
+    """Story 2.5: `project()`'s blank-paragraph-drop rule must not drop an
+    empty blockquote line — `MarkdownToParagraphParser` now emits a real,
+    empty-text node with `is_blockquote=True` for one (unlike an ordinary
+    blank line, which produces no node at all), so it is representable and
+    the asymmetry the drop rule exists to paper over does not apply."""
+
+    def test_projection_should_KeepEmptyBlockquoteParagraph_When_TextIsBlank(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.projection import project
+
+        node = DocsParagraphNode(
+            style="NORMAL_TEXT", text="", is_blockquote=True, quote_depth=1,
+            start_index=1, end_index=2,
+        )
+
+        kept, residue = project([node])
+
+        assert kept == [node]
+        assert residue == []
+
+    def test_projection_should_DropEmptyParagraph_When_TextIsBlankAndNotBlockquote(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.projection import project
+
+        node = DocsParagraphNode(style="NORMAL_TEXT", text="", start_index=1, end_index=2)
+
+        kept, residue = project([node])
+
+        assert kept == []
+        assert len(residue) == 1

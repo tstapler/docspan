@@ -85,6 +85,13 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     no-op instead of a silent deletion of someone's blank line, and blank
     paragraphs are load-bearing layout in real documents.
 
+    Carved out for ``is_blockquote`` paragraphs (Story 2.5): an empty markdown
+    quote line (``"> "``) *is* representable — ``MarkdownToParagraphParser``
+    now emits an empty-text node with ``is_blockquote=True`` for it (unlike an
+    ordinary blank line, which has no such node) — so the asymmetry this rule
+    exists to paper over does not apply, and dropping it would instead lose a
+    real, empty-but-styled line inside the quote.
+
     It also retires residue docspan manufactures itself: a delete trimmed to
     protect the newline anchoring a Table/ToC/SectionBreak leaves an empty
     paragraph behind, so the tool was creating the very state it could not
@@ -145,7 +152,11 @@ def project(nodes: Sequence[Node]) -> Tuple[List[Node], List[Residue]]:
     kept: List[Node] = []
     residue: List[Residue] = []
     for index, node in enumerate(nodes):
-        if isinstance(node, DocsParagraphNode) and node.text == "":
+        if (
+            isinstance(node, DocsParagraphNode)
+            and node.text == ""
+            and not node.is_blockquote
+        ):
             residue.append(
                 Residue(
                     kind="empty_paragraph",

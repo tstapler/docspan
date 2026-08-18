@@ -727,6 +727,126 @@ def test_edited_paragraph_with_link_style_loses_text_style_request_confirming_ga
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Native blockquotes (gdocs-native-blockquotes Epic 2, Stories 2.2/2.3/2.4/2.6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _quote_para(
+    text: str,
+    quote_depth: int = 1,
+    style: str = "NORMAL_TEXT",
+    start: int = 1,
+    end: int = 10,
+    is_list_item: bool = False,
+) -> DocsParagraphNode:
+    return DocsParagraphNode(
+        style=style,
+        text=text,
+        start_index=start,
+        end_index=end,
+        is_list_item=is_list_item,
+        is_blockquote=True,
+        quote_depth=quote_depth,
+    )
+
+
+def test_blockquote_paragraph_style_fields_should_return_indent_and_border_when_node_is_blockquote() -> None:
+    node = _quote_para("Quoted", quote_depth=2)
+    style, fields = DocsRequestBuilder._blockquote_paragraph_style_fields(node)
+    assert fields == ["indentStart", "borderLeft"]
+    assert style["indentStart"] == {
+        "magnitude": 2 * docs_request_builder_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+        "unit": "PT",
+    }
+    assert style["borderLeft"] == docs_request_builder_module.BLOCKQUOTE_BORDER_MARKER
+
+
+def test_blockquote_paragraph_style_fields_should_return_empty_when_node_is_not_blockquote() -> None:
+    node = _para("Plain text")
+    style, fields = DocsRequestBuilder._blockquote_paragraph_style_fields(node)
+    assert style == {}
+    assert fields == []
+
+
+def test_make_insert_requests_should_include_blockquote_fields_when_inserting_new_blockquote_node() -> None:
+    node = _quote_para("New quoted text", quote_depth=1, start=0, end=0)
+    requests = DocsRequestBuilder()._make_insert_requests(
+        [node], insert_at_index=8, bare_last=True
+    )
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert len(style_requests) == 1
+    paragraph_style = style_requests[0]["updateParagraphStyle"]["paragraphStyle"]
+    fields = style_requests[0]["updateParagraphStyle"]["fields"]
+    assert "indentStart" in fields
+    assert "borderLeft" in fields
+    assert paragraph_style["indentStart"] == {
+        "magnitude": docs_request_builder_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+        "unit": "PT",
+    }
+    assert paragraph_style["borderLeft"] == docs_request_builder_module.BLOCKQUOTE_BORDER_MARKER
+
+
+def test_restyles_should_return_true_when_only_blockquote_fields_differ() -> None:
+    current = _para("Same text", start=1, end=10)
+    target = _quote_para("Same text", quote_depth=1, start=1, end=10)
+    assert DocsRequestBuilder._restyles(current, target) is True
+
+
+def test_make_style_update_requests_should_merge_blockquote_fields_when_restyling_to_blockquote() -> None:
+    current = _para("Same text", start=1, end=10)
+    target = _quote_para("Same text", quote_depth=1, start=1, end=10)
+    requests = builder._make_style_update_requests(current, target)
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert len(style_requests) == 1
+    paragraph_style = style_requests[0]["updateParagraphStyle"]["paragraphStyle"]
+    fields = style_requests[0]["updateParagraphStyle"]["fields"]
+    assert "namedStyleType" in fields
+    assert "indentStart" in fields
+    assert "borderLeft" in fields
+    assert paragraph_style["borderLeft"] == docs_request_builder_module.BLOCKQUOTE_BORDER_MARKER
+
+
+@pytest.mark.skip(
+    reason=(
+        "Table-cell inheritance of a blockquote's borderLeft/indentStart is "
+        "an open question per epic-0-spike-findings.md: the finding is "
+        "reasoned from the public API schema, not confirmed against a real "
+        "documents.get echo. Table-cell-fill code (docs_request_builder.py's "
+        "pass-2 cell fill, ~L2257) is intentionally left unchanged until that "
+        "spike actually runs — this is a placeholder pinning the open "
+        "question, not a passing/failing assertion about behavior."
+    )
+)
+def test_cell_fill_request_should_clear_blockquote_fields_when_cell_adjacent_to_blockquote_inherits_style() -> None:
+    pass
+
+
+def test_make_style_update_requests_should_compose_list_and_blockquote_indent_when_node_is_both_list_item_and_blockquote() -> None:
+    # Story 2.6 (additive-by-construction, no combined-indent computation):
+    # a node that is both is_list_item and is_blockquote gets
+    # `indentStart`/`borderLeft` purely from quote_depth here; list nesting
+    # comes from createParagraphBullets deriving level from the paragraph's
+    # own leading-tab text, independent of paragraphStyle. No code path
+    # computes a combined indent value.
+    current = _para("Item", start=1, end=6, is_list_item=True)
+    target = _quote_para("Item", quote_depth=1, start=1, end=6, is_list_item=True)
+    requests = builder._make_style_update_requests(current, target)
+
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert len(style_requests) == 1
+    paragraph_style = style_requests[0]["updateParagraphStyle"]["paragraphStyle"]
+    assert paragraph_style["indentStart"] == {
+        "magnitude": docs_request_builder_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+        "unit": "PT",
+    }
+    # is_list_item unchanged on both sides, so no bullet request is emitted —
+    # only the style request carries the blockquote fields.
+    assert not any("createParagraphBullets" in r for r in requests)
+    assert not any("deleteParagraphBullets" in r for r in requests)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # diff_summary() — human-oriented dry-run diff (plan.md Story 1.2.1)
 # ─────────────────────────────────────────────────────────────────────────────
 
