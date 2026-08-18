@@ -94,6 +94,30 @@ def test_mid_document_insert_does_not_merge_into_previous_paragraph() -> None:
     assert insert_requests[0]["insertText"]["text"] == "B\n"
 
 
+def test_mid_document_insert_after_a_code_block_does_not_target_the_dropped_chrome_paragraph() -> None:
+    """Regression (#113): inserting a new paragraph right after a Docs-native
+    code block used to target `previous.end_index`, which lands on the start
+    of the code block's trailing glyph-only "chrome" paragraph — a residue
+    paragraph DocsStructureParser drops, so it's invisible here but Google's
+    API still rejects an insert that isn't inside a real paragraph's bounds.
+    render_prefix on the last code-block line is the only surviving trace of
+    that dropped paragraph, and must trigger the same before_newline handling
+    as an insert before a Table/ToC/SectionBreak (#22)."""
+    code_line = replace(_para("code", start=1, end=3), render_prefix="")
+    trailer = _para("After", start=3, end=5)
+    current = [code_line, trailer]
+    target = [code_line, _para("New", start=0, end=0), trailer]
+    requests = builder.build(current, target, doc_end_index=5)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    # Must land one index back, inside the code line's own paragraph, with the
+    # newline moved to the front — not at index 3, the dropped chrome
+    # paragraph's start, which Google's API rejects.
+    assert insert_requests[0]["insertText"]["location"]["index"] == 2
+    assert insert_requests[0]["insertText"]["text"] == "\nNew"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Delete
 # ─────────────────────────────────────────────────────────────────────────────

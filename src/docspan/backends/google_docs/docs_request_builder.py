@@ -1223,12 +1223,22 @@ class DocsRequestBuilder:
                 #    DocsStructureParser drops those elements, so
                 #    precedes_structural_element is the only trace of them.
                 #
+                # 3. Inserting directly after a Docs-native code block (#113).
+                #    Every paragraph belonging to such a block is prefixed with
+                #    a private-use-area glyph, including a trailing glyph-only
+                #    "chrome" paragraph after the block's last real line.
+                #    DocsStructureParser drops that glyph-only paragraph as
+                #    residue, so `previous.end_index` (the last real line's end)
+                #    is actually the dropped chrome paragraph's start — not an
+                #    ordinary paragraph boundary — and is rejected the same way
+                #    as case 2. `render_prefix` on `previous` is the only trace
+                #    of the block.
+                #
                 # See _make_insert_requests(before_newline=...) for why the
                 # newline then has to move to the front of the inserted text.
                 at_body_end = insert_at >= doc_end_index
-                before_boundary = (
-                    isinstance(previous, DocsParagraphNode)
-                    and previous.precedes_structural_element
+                before_boundary = isinstance(previous, DocsParagraphNode) and (
+                    previous.precedes_structural_element or bool(previous.render_prefix)
                 )
                 if at_body_end:
                     insert_at = doc_end_index - 1
