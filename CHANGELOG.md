@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/tstapler/docspan/compare/docspan-v0.5.0...docspan-v0.6.0) (2026-08-18)
+
+
+### Features
+
+* **google-docs:** add blockquote identity fields to paragraph diff model (Epic 1) ([2b31ddf](https://github.com/tstapler/docspan/commit/2b31ddfcd1d3aa62b170818ca8a5dd95f966df95))
+* **google-docs:** cache rendered mermaid PNGs on disk ([#112](https://github.com/tstapler/docspan/issues/112)) ([8c13a03](https://github.com/tstapler/docspan/commit/8c13a039b309f52833294c034f1aebf16d016f74))
+* **google-docs:** pull native blockquote styling back to markdown (Epic 3) ([20aabc9](https://github.com/tstapler/docspan/commit/20aabc9cd64fbef48180219bbf60334f853d0693))
+* **google-docs:** push blockquotes as native indent/borderLeft styling (Epic 2) ([06881a5](https://github.com/tstapler/docspan/commit/06881a51909cc5bab09d5b61cf58046045262070))
+* **google-docs:** warn and add CI signal for legacy blockquote style upgrades (Epic 4) ([984a2e8](https://github.com/tstapler/docspan/commit/984a2e8bc24e48372e321bbf53008079bcc58c5c))
+
+
+### Bug Fixes
+
+* **cli:** pass full mapping set to cross-doc link resolver on single-file push ([c86dadb](https://github.com/tstapler/docspan/commit/c86dadb532600fd1580e8556a7e0409dac3e44e2))
+* **google-docs:** drop unresolvable new images instead of emitting an empty insertInlineImage uri ([#111](https://github.com/tstapler/docspan/issues/111)) ([bc1883d](https://github.com/tstapler/docspan/commit/bc1883dc995b7887f04c08e3d33ab226bf8649cd))
+* **google-docs:** report unreadable bookmark/tab links on tab-scoped pull ([#107](https://github.com/tstapler/docspan/issues/107)) ([be048ca](https://github.com/tstapler/docspan/commit/be048ca00d5e4c40e5d9e617666517d87accb6ae))
+* **google-docs:** tolerate 8-bit RGB quantization in blockquote border detection ([2898434](https://github.com/tstapler/docspan/commit/2898434b5edc2511e552d71ef01ea7393f22ab50))
+
 ## [Unreleased]
 
 * **google-docs:** removed the `docspan lint`/style-guide warning against `>` blockquotes now that push emits native blockquote styling instead of literal `>`-prefixed text; if a rendering edge case still misrenders a quote post-push, spot it via `push --dry-run`'s structural diff or by visually inspecting the pushed Doc, since no automated check remains for it.
