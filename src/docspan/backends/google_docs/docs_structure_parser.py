@@ -76,29 +76,63 @@ _MONOSPACE_FONT_MARKERS = (
 )
 
 
-# Sub-fields of BLOCKQUOTE_BORDER_MARKER docspan actually writes on push
-# (`docs_request_builder._blockquote_paragraph_style_fields`). Detection below
-# compares only these, not the whole `borderLeft` dict, against a live Doc's
-# echo — Docs is free to round-trip additional normalized defaults (e.g. a
-# `padding` Docs fills in itself) that docspan never specified, and a
-# whole-dict `==` would then read every real match as a non-match. See
-# Story 3.1's Given-When-Then and Unresolved Question 2.
-_BLOCKQUOTE_BORDER_SUBFIELDS = ("color", "width", "dashStyle")
+# Detection below compares only `color`/`width`/`dashStyle` — the sub-fields of
+# BLOCKQUOTE_BORDER_MARKER docspan actually writes on push
+# (`docs_request_builder._blockquote_paragraph_style_fields`) — not the whole
+# `borderLeft` dict, against a live Doc's echo. Docs is free to round-trip
+# additional normalized defaults (e.g. a `padding` Docs fills in itself) that
+# docspan never specified, and a whole-dict `==` would then read every real
+# match as a non-match. See Story 3.1's Given-When-Then and Unresolved
+# Question 2.
+
+# A live Doc echoes `color.color.rgbColor`'s components quantized to 8-bit
+# RGB (confirmed via the Epic 0 live spike, 2026-08-17: sent 0.494 came back
+# as 0.49411765 == round(0.494*255)/255). Exact `==` on that sub-field would
+# therefore never match a real round trip, only the hand-built test fixtures
+# that predated the spike. Max quantization error is 1/(2*255) ≈ 0.00196;
+# 0.003 clears that with a small margin without getting anywhere near a
+# genuinely different human-applied color (e.g. pure red differs by ~0.1+).
+_COLOR_TOLERANCE = 0.003
+
+
+def _rgb_close(a: Optional[dict], b: Optional[dict]) -> bool:
+    """True if two `color.color.rgbColor`-shaped dicts match within 8-bit RGB quantization."""
+    if a == b:
+        return True
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    a_rgb = a.get("color", {}).get("rgbColor", {})
+    b_rgb = b.get("color", {}).get("rgbColor", {})
+    if not isinstance(a_rgb, dict) or not isinstance(b_rgb, dict):
+        return False
+    if set(a_rgb) != set(b_rgb):
+        return False
+    return all(
+        isinstance(a_rgb[k], (int, float))
+        and isinstance(b_rgb[k], (int, float))
+        and abs(a_rgb[k] - b_rgb[k]) < _COLOR_TOLERANCE
+        for k in a_rgb
+    )
 
 
 def _detect_blockquote_depth(paragraph_style: dict) -> int:
     """0 if `paragraph_style` carries no docspan-written blockquote border,
     else the quote depth implied by `indentStart`.
 
-    Matches iff every sub-field in `_BLOCKQUOTE_BORDER_SUBFIELDS` is present
+    Matches iff every one of `color`/`width`/`dashStyle` is present
     on `borderLeft` and equals the corresponding sub-field of
     `BLOCKQUOTE_BORDER_MARKER` — sub-field-by-sub-field, not `borderLeft ==
-    BLOCKQUOTE_BORDER_MARKER` wholesale (see module comment above).
+    BLOCKQUOTE_BORDER_MARKER` wholesale (see module comment above). `color` is
+    compared with tolerance for 8-bit RGB quantization (`_rgb_close`);
+    `width`/`dashStyle` echo back byte-identical on a live Doc, so those stay
+    exact.
     """
     border_left = paragraph_style.get("borderLeft")
     if not isinstance(border_left, dict):
         return 0
-    for key in _BLOCKQUOTE_BORDER_SUBFIELDS:
+    if not _rgb_close(border_left.get("color"), BLOCKQUOTE_BORDER_MARKER.get("color")):
+        return 0
+    for key in ("width", "dashStyle"):
         if border_left.get(key) != BLOCKQUOTE_BORDER_MARKER.get(key):
             return 0
     indent_start = paragraph_style.get("indentStart")

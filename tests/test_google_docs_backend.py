@@ -3052,30 +3052,31 @@ class TestPushSectioned:
 # Epic 0 (gdocs-native-blockquotes) — live-Doc spike, re-runnable
 #
 # project_plans/gdocs-native-blockquotes/implementation/epic-0-spike-findings.md
-# documents that BLOCKQUOTE_BORDER_MARKER/BLOCKQUOTE_INDENT_PT_PER_LEVEL below are an
-# ENGINEERING DECISION PENDING LIVE VERIFICATION, not a captured live-Doc result: no
-# batchUpdate/documents.get call was made against the real Google Docs API to produce
-# tests/fixtures/blockquote_border_marker_spike.json. This test only replays that
-# hand-built fixture through the mocked client boundary — it can confirm the fixture's
-# internal shape is self-consistent, not that a real Doc echoes these bytes back.
+# documents that BLOCKQUOTE_BORDER_MARKER/BLOCKQUOTE_INDENT_PT_PER_LEVEL below were
+# LIVE-VERIFIED on 2026-08-17: a real batchUpdate/documents.get round trip was run
+# against a throwaway Doc to produce tests/fixtures/blockquote_border_marker_spike.json.
+# See epic-0-spike-findings.md for the full writeup, including the pull-side detection
+# bug the spike surfaced (borderLeft.color echoes quantized to 8-bit RGB) and its fix.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestEpic0LiveDocSpike:
-    @pytest.mark.skip("requires live Docs API credentials")
     def test_live_doc_spike_should_ReproduceRecordedBorderBehavior_When_RerunAgainstFixture(
         self, make_client: Callable[[], GoogleDocsClient]
     ) -> None:  # type: ignore[no-untyped-def]
-        """Re-runnable scaffold for Epic 0/Story 0.1's live-Doc spike.
+        """Epic 0/Story 0.1's live-Doc spike, now run for real on 2026-08-17.
 
-        Skipped in CI because it requires a real, explicitly-authorized throwaway
-        Google Doc and live OAuth credentials — see "How to actually run this spike"
-        in epic-0-spike-findings.md for the steps a maintainer follows to unskip this.
-        Once unskipped, this should send the fixture's `batch_update_request` against a
-        real throwaway document, `documents.get` the same range back, and assert the
-        real response's `paragraphStyle.borderLeft`/`indentStart` matches (or, if it
-        diverges, that divergence becomes the new recorded fixture and this test is
-        updated to match reality rather than the other way around).
+        The fixture is a real captured request/response pair: a throwaway Doc was
+        created, styled with the candidate `BLOCKQUOTE_BORDER_MARKER`/indent, read
+        back, and deleted — see epic-0-spike-findings.md. The live echo diverges
+        from what was sent (`borderLeft.color` is quantized to 8-bit RGB), so this asserts
+        through the production detection function (`_detect_blockquote_depth`)
+        rather than raw dict equality — that function is what has to tolerate the
+        divergence, and this is the regression test for it.
         """
+        from docspan.backends.google_docs.docs_structure_parser import (
+            _detect_blockquote_depth,
+        )
+
         fixtures_dir = pathlib.Path(__file__).parent / "fixtures"
         fixture = json.loads(
             (fixtures_dir / "blockquote_border_marker_spike.json").read_text()
@@ -3084,22 +3085,20 @@ class TestEpic0LiveDocSpike:
         client = make_client()
         client.batch_update("live-spike-doc-id", fixture["batch_update_request"]["requests"])
 
-        # A real spike run replaces this mocked return_value with an actual
-        # `documents.get` call against the throwaway Doc created in step 2 of
-        # epic-0-spike-findings.md's runbook.
         client.docs_service.documents().get().execute.return_value = fixture[
             "documents_get_response_paragraph_style_echo"
         ]
         echoed = client.docs_service.documents().get().execute()
+        echoed_style = echoed["paragraphStyle"]
 
+        # Sent vs. echoed color genuinely differs byte-wise (8-bit RGB quantization) —
+        # confirms this fixture is real live-API output, not a hand-built echo.
         assert (
-            echoed["paragraphStyle"]["borderLeft"]
-            == fixture["candidate_blockquote_border_marker"]
+            echoed_style["borderLeft"]["color"]
+            != fixture["candidate_blockquote_border_marker"]["color"]
         )
-        assert (
-            echoed["paragraphStyle"]["indentStart"]["magnitude"]
-            == fixture["candidate_blockquote_indent_pt_per_level"]
-        )
+        # ...but production detection still recognizes it as a blockquote marker.
+        assert _detect_blockquote_depth(echoed_style) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3395,6 +3394,52 @@ class TestDetectBlockquoteDepth:
         }
 
         assert _detect_blockquote_depth(paragraph_style) == 2
+
+    def test__detect_blockquote_depth_should_Match_When_DocsEchoesQuantizedColor(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_BORDER_MARKER,
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            _detect_blockquote_depth,
+        )
+
+        # Confirmed via the Epic 0 live spike (2026-08-17): a real Google Doc
+        # quantizes borderLeft.color.color.rgbColor to 8-bit RGB
+        # (round(x*255)/255), not the double literal that was sent. Exact
+        # `==` would read every real round trip as "not a blockquote".
+        border_left = dict(BLOCKQUOTE_BORDER_MARKER)
+        border_left["color"] = {
+            "color": {"rgbColor": {"red": 0.49411765, "green": 0.54901963, "blue": 0.6117647}}
+        }
+        paragraph_style = {
+            "borderLeft": border_left,
+            "indentStart": {"magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL, "unit": "PT"},
+        }
+
+        assert _detect_blockquote_depth(paragraph_style) == 1
+
+    def test__detect_blockquote_depth_should_NotMatch_When_ColorDivergesBeyondQuantizationTolerance(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_BORDER_MARKER,
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            _detect_blockquote_depth,
+        )
+
+        # Guards against _COLOR_TOLERANCE being loose enough to swallow a
+        # genuinely different, human-applied border color.
+        border_left = dict(BLOCKQUOTE_BORDER_MARKER)
+        border_left["color"] = {
+            "color": {"rgbColor": {"red": 0.6, "green": 0.549, "blue": 0.612}}
+        }
+        paragraph_style = {
+            "borderLeft": border_left,
+            "indentStart": {"magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL, "unit": "PT"},
+        }
+
+        assert _detect_blockquote_depth(paragraph_style) == 0
 
 
 class TestLegacyBlockquotePassthrough:

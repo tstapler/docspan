@@ -1,38 +1,57 @@
 # Epic 0 / Story 0.1 — Findings
 
-## Status: ENGINEERING DECISION — PENDING LIVE VERIFICATION
+## Status: LIVE-VERIFIED (2026-08-17)
 
-**This is not a completed live-Doc spike.** No `batchUpdate`/`documents.get` call was made
-against the real Google Docs API while producing this document. The values below are a
-documented engineering decision, reasoned from the public Docs API v1 schema and WCAG contrast
-math, not an empirical finding. Epic 1 may proceed by importing these values as
-`BLOCKQUOTE_BORDER_MARKER`/`BLOCKQUOTE_INDENT_PT_PER_LEVEL` in
-`src/docspan/backends/google_docs/docs_structure_parser.py`, but plan.md's Unresolved Questions
-1-3 and ADR-001's two empirical unknowns (§"Consequences", last bullet) remain open until a human
-explicitly authorizes and runs the live spike described under "How to actually run this spike"
-below.
+The live spike described below was run for real on 2026-08-17, with explicit human
+authorization to use the cached OAuth credential at `~/.config/docspan/google_token.json`. A
+throwaway Doc (`docspan-epic0-spike-DELETE-ME-2026-08-17`) was created, styled with the
+candidate `BLOCKQUOTE_BORDER_MARKER`/indent values via `batchUpdate`, read back via
+`documents.get`, diffed, and deleted.
 
-### Why this ran as a documented decision, not a live spike
+**Result: the candidate values themselves are unchanged, but the live spike found a real bug**
+in the pull-side detection code, since fixed:
+
+- `borderLeft.width`, `borderLeft.dashStyle`, and `borderLeft.padding` echoed back
+  byte-identical to what was sent.
+- `indentStart.magnitude` echoed back as int `18` vs. the sent float `18.0` — numerically
+  equal (`18 == 18.0` in Python), not a real divergence.
+- `borderLeft.color.color.rgbColor` echoed back **quantized to 8-bit RGB**
+  (`round(sent*255)/255`): sent `{"red": 0.494, "green": 0.549, "blue": 0.612}`, echoed
+  `{"red": 0.49411765, "green": 0.54901963, "blue": 0.6117647}` — confirmed by computing
+  `round(sent*255)/255` for each channel and matching it exactly to the echoed value.
+- `_detect_blockquote_depth` in `docs_structure_parser.py` compared the `color` sub-field with
+  exact Python `!=`, which would evaluate every real round trip as "not a blockquote" — the
+  feature passed all 1096 existing (mock-based) unit tests but was silently broken against any
+  real Google Doc. Fixed by adding `_rgb_close` (tolerance `0.003` per RGB channel — comfortably
+  above the max 8-bit quantization error of `1/510 ≈ 0.00196`, far below a genuinely different
+  color) and using it only for the `color` sub-field; `width`/`dashStyle` still compare exactly
+  since they echoed identically. `tests/fixtures/blockquote_border_marker_spike.json` now holds
+  the real captured
+  request/response pair (replacing the hand-built one), and
+  `TestEpic0LiveDocSpike::test_live_doc_spike_should_ReproduceRecordedBorderBehavior_When_RerunAgainstFixture`
+  is unskipped and asserts through `_detect_blockquote_depth` against the real echo.
+
+This settles plan.md's Unresolved Questions 1/2 (no `padding` surprise beyond what was already
+handled; the only real divergence is the color quantization) and ADR-001's two empirical
+unknowns for the single-paragraph case. Border-coalescing across adjacent paragraphs, visual
+contrast/legibility, and cross-account/Workspace rendering remain **not** verified by this spike
+— see "Explicitly left unverified" below, which still applies.
+
+### Why this initially ran as a documented decision, not a live spike
 
 A working, non-expired, write-scoped OAuth credential was found on this machine at
 `~/.config/docspan/google_token.json` (`auth.py`'s `default_token_path()`), with a `refresh_token`
-and `documents`/`drive`/`spreadsheets.readonly` scopes (`PUSH_SCOPES`). This contradicts the task
-assumption that no live credentials would be present, and is called out here explicitly since it
-may warrant separate human follow-up.
+and `documents`/`drive`/`spreadsheets.readonly` scopes (`PUSH_SCOPES`), tied to what appears to be
+a real personal/work Google account rather than a designated disposable test account. Creating a
+document — even a throwaway one — under an unattended agent run has real side effects under that
+real identity (it appears in the account's real Drive, consumes API quota, and is an action taken
+as that user), so this agent initially treated running the spike as a decision for a human to make
+explicitly rather than one implied by "spike this and report back," and proceeded only with the
+documented engineering decision below.
 
-It was deliberately **not** used to run the spike autonomously:
-
-- The credential is tied to what appears to be a real personal/work Google account (the harness's
-  own secret-redaction fired when this agent inspected the token's `account` field), not a
-  designated disposable test account.
-- Creating a document — even a throwaway one — under an unattended agent run has real side
-  effects under that real identity (it appears in the account's real Drive, consumes API quota,
-  and is an action taken as that user) that this agent judged to be a decision for a human to
-  make explicitly, not one implied by "spike this and report back."
-- The task's own escape hatch required judging the live path "safe to use" before any network
-  call; this agent could not make that judgment call on the user's behalf without confirmation.
-
-No raw token/secret value was read, logged, or committed at any point.
+The human then explicitly authorized running the live spike against that account, which is what
+"Status: LIVE-VERIFIED" above reflects. No raw token/secret value was read, logged, or committed at
+any point, before or during the live run.
 
 ### Decided values
 
@@ -85,32 +104,27 @@ entirety"), not because it participates in detection.
 
 ### Fixture and re-runnable test scaffold
 
-- `tests/fixtures/blockquote_border_marker_spike.json` — a hand-constructed (not captured)
-  `batchUpdate` request / `documents.get` response pair built from the values above, explicitly
-  labeled as not live-API output.
+- `tests/fixtures/blockquote_border_marker_spike.json` — the real captured
+  `batchUpdate` request / `documents.get` response pair from the 2026-08-17 live run (replacing the
+  earlier hand-constructed placeholder).
 - `tests/test_google_docs_backend.py::TestEpic0LiveDocSpike::test_live_doc_spike_should_ReproduceRecordedBorderBehavior_When_RerunAgainstFixture`
-  — `@pytest.mark.skip("requires live Docs API credentials")`, replays the fixture through the
-  mocked client boundary. This exercises the fixture's internal shape consistency; it does **not**
-  and cannot confirm that a real Doc echoes these exact bytes back.
+  — unskipped, replays the fixture through the mocked client boundary and asserts through the
+  production `_detect_blockquote_depth` function that the real echoed style is still recognized as
+  a blockquote marker despite the color quantization.
 
-### How to actually run this spike (for a future maintainer, once authorized)
+### How this spike was run (2026-08-17, for reference)
 
-1. Confirm `google_token.json` (or a fresh consented OAuth run via `GoogleAuthenticator`) is a
-   credential explicitly designated for throwaway test documents — not a shared/production
-   account — before making any write call.
-2. Create one throwaway Doc via the Drive API, name it unambiguously (e.g.
-   `docspan-epic0-spike-DELETE-ME-<date>`).
-3. Send one `batchUpdate` with an `insertText` + `updateParagraphStyle` using the candidate
+1. Confirmed `google_token.json` was the credential to use, with explicit human authorization to
+   create a throwaway document under that real account.
+2. Created one throwaway Doc via the Drive API (`docspan-epic0-spike-DELETE-ME-2026-08-17`).
+3. Sent one `batchUpdate` with an `insertText` + `updateParagraphStyle` using the candidate
    `BLOCKQUOTE_BORDER_MARKER`/indent above, then `documents.get` the same range back.
-4. Diff the echoed `paragraphStyle.borderLeft`/`indentStart` against what was sent. Record any
-   divergence (added defaults, unit normalization, etc.) — this settles plan.md's Unresolved
-   Question 1/2.
-5. Update `BLOCKQUOTE_BORDER_MARKER`/`BLOCKQUOTE_INDENT_PT_PER_LEVEL` in
-   `docs_structure_parser.py` if the values need adjustment, capture the *real* request/response
-   pair as the new fixture (replacing the hand-built one), and remove the `pytest.mark.skip`.
-6. Delete the throwaway Doc.
-7. Separately perform the manual UX checks below — they require visual inspection and cannot be
-   automated.
+4. Diffed the echoed `paragraphStyle.borderLeft`/`indentStart` against what was sent — see
+   "Result" above for the one real divergence found (8-bit RGB color quantization).
+5. `BLOCKQUOTE_BORDER_MARKER`/`BLOCKQUOTE_INDENT_PT_PER_LEVEL` needed no value changes; the real
+   request/response pair replaced the hand-built fixture and the `pytest.mark.skip` was removed.
+6. Deleted the throwaway Doc.
+7. The manual UX checks below still require visual inspection and remain unautomated.
 
 ### Explicitly left unverified (do not treat as passing)
 
