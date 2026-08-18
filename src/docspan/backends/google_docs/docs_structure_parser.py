@@ -76,6 +76,39 @@ _MONOSPACE_FONT_MARKERS = (
 )
 
 
+# Sub-fields of BLOCKQUOTE_BORDER_MARKER docspan actually writes on push
+# (`docs_request_builder._blockquote_paragraph_style_fields`). Detection below
+# compares only these, not the whole `borderLeft` dict, against a live Doc's
+# echo — Docs is free to round-trip additional normalized defaults (e.g. a
+# `padding` Docs fills in itself) that docspan never specified, and a
+# whole-dict `==` would then read every real match as a non-match. See
+# Story 3.1's Given-When-Then and Unresolved Question 2.
+_BLOCKQUOTE_BORDER_SUBFIELDS = ("color", "width", "dashStyle")
+
+
+def _detect_blockquote_depth(paragraph_style: dict) -> int:
+    """0 if `paragraph_style` carries no docspan-written blockquote border,
+    else the quote depth implied by `indentStart`.
+
+    Matches iff every sub-field in `_BLOCKQUOTE_BORDER_SUBFIELDS` is present
+    on `borderLeft` and equals the corresponding sub-field of
+    `BLOCKQUOTE_BORDER_MARKER` — sub-field-by-sub-field, not `borderLeft ==
+    BLOCKQUOTE_BORDER_MARKER` wholesale (see module comment above).
+    """
+    border_left = paragraph_style.get("borderLeft")
+    if not isinstance(border_left, dict):
+        return 0
+    for key in _BLOCKQUOTE_BORDER_SUBFIELDS:
+        if border_left.get(key) != BLOCKQUOTE_BORDER_MARKER.get(key):
+            return 0
+    indent_start = paragraph_style.get("indentStart")
+    magnitude = indent_start.get("magnitude") if isinstance(indent_start, dict) else None
+    if not isinstance(magnitude, (int, float)) or magnitude <= 0:
+        return 0
+    depth = round(magnitude / BLOCKQUOTE_INDENT_PT_PER_LEVEL)
+    return depth if depth > 0 else 0
+
+
 def _is_all_private_use(text: str) -> bool:
     """True when `text` is non-empty and holds nothing but PUA, ignoring surrounding whitespace."""
     stripped = text.strip()
@@ -630,6 +663,8 @@ class DocsStructureParser:
         nesting_level = bullet.get("nestingLevel", 0) if bullet else 0
         is_native_checkbox = self._resolve_is_native_checkbox(bullet, lists or {})
 
+        quote_depth = _detect_blockquote_depth(paragraph_style)
+
         return DocsParagraphNode(
             style=style,
             text=text,
@@ -641,6 +676,8 @@ class DocsStructureParser:
             render_prefix=render_prefix,
             is_native_checkbox=is_native_checkbox,
             heading_id=paragraph_style.get("headingId"),
+            is_blockquote=quote_depth > 0,
+            quote_depth=quote_depth,
         )
 
     @staticmethod

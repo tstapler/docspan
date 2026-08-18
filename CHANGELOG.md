@@ -131,6 +131,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **google-docs:** both pull paths now emit the heading's slug. A default (no `tab_id`) pull
   goes through Drive's HTML export, which carries the Doc's opaque `#h.abc123` through
   verbatim; it is upgraded to the slug, so the pulled markdown works as markdown.
+- **google-docs:** a Markdown `> ...` blockquote now pushes as a native indented,
+  left-bordered paragraph (`indentStart`/`borderLeft`) instead of literal `>` text, and
+  pulling it back reconstructs the `> ` prefix from that styling, byte-for-byte round trip
+  for plain, nested, list-in-quote, and code-fence-in-quote quotes. A Doc still carrying a
+  pre-migration literal-`>` blockquote pulls unchanged and is migrated to the native styling
+  the next time its file is pushed for any reason — a one-time rewrite that, like any other
+  paragraph rewrite, drops comments anchored to it (see the comments-destroyed limitation
+  below).
 
 ### Changed
 - **google-docs:** pass 2 parses and aligns the document once per push instead of three

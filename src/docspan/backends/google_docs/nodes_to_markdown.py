@@ -399,6 +399,61 @@ def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
     return groups
 
 
+def _group_blockquote_runs(nodes: List[Node]) -> List[Tuple]:
+    """Partition nodes into ("node", node)/("code", lang, [...]) passthroughs
+    (via `_group_code_runs`, applied to each contiguous non-quote stretch —
+    see below) and ("blockquote", depth, inner_groups) runs of contiguous
+    native-blockquote paragraphs, keyed on `node.is_blockquote`/
+    `node.quote_depth` — the marker Story 3.1's `_detect_blockquote_depth`
+    sets during structure parsing, not any textual `>` prefix (there is none
+    to key off; Epic 2 dropped it from the pushed text).
+
+    A run's reported `depth` is its first node's `quote_depth`, used only as
+    the common case's shorthand — a run is contiguous `is_blockquote=True`
+    nodes, which may still mix depths (e.g. `"> outer\\n> > inner\\n"`, no
+    blank line between the two): CommonMark reads adjacent `>`-prefixed lines
+    with no blank between them as one nested quote structure, not two
+    sibling blockquotes, so a depth change alone must not end a run or
+    `render_nodes_to_markdown` would insert a blank line where the source had
+    none. `BlockquoteNodeRenderer` reads each line's own node for its actual
+    depth rather than trusting the run-level shorthand uniformly.
+
+    This is now the sole outer grouping stage `render_nodes_to_markdown`
+    calls (replacing a bare `_group_code_runs(nodes)`), so a non-quote
+    stretch must still get top-level fence detection: `_group_code_runs` is
+    applied to it exactly as it would have been before this story existed.
+    A quote run's own inner node list is separately passed through
+    `_group_code_runs` too, composing the two stages the way
+    `BlockquoteNodeRenderer` expects to recurse into `_render_code_group`.
+    """
+    groups: List[Tuple] = []
+    i, n = 0, len(nodes)
+    while i < n:
+        node = nodes[i]
+        if isinstance(node, DocsParagraphNode) and node.is_blockquote:
+            depth = node.quote_depth
+            run: List[Node] = [node]
+            j = i + 1
+            while (
+                j < n
+                and isinstance(nodes[j], DocsParagraphNode)
+                and nodes[j].is_blockquote
+            ):
+                run.append(nodes[j])
+                j += 1
+            groups.append(("blockquote", depth, _group_code_runs(run)))
+            i = j
+        else:
+            j = i
+            plain_run: List[Node] = []
+            while j < n and not (isinstance(nodes[j], DocsParagraphNode) and nodes[j].is_blockquote):
+                plain_run.append(nodes[j])
+                j += 1
+            groups.extend(_group_code_runs(plain_run))
+            i = j
+    return groups
+
+
 def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
     # code_nodes are only ever populated via _is_pure_code_line/
     # _is_blank_code_line, both of which require DocsParagraphNode; assert
@@ -505,6 +560,77 @@ class ImageNodeRenderer(MarkdownNodeRenderer):
         return f"![{node.alt}]({node.src})"
 
 
+def _render_group_lines(node: Node) -> str:
+    """Render one non-code, non-blockquote group's node via the pull registry."""
+    key = _dispatch_key(node)
+    renderer = _PULL_REGISTRY.get(key)
+    if renderer is None:
+        raise ValueError(f"no renderer registered for dispatch key {key!r}")
+    return renderer.render(node)
+
+
+class BlockquoteNodeRenderer(MarkdownNodeRenderer):
+    """Renders a `("blockquote", depth, inner_groups)` tuple from
+    `_group_blockquote_runs` — `node` here is `(depth, inner_groups)`, not a
+    DocsParagraphNode; the pull registry's `render(self, node: Any)` contract
+    is generic enough to carry that (see registry.py's module docstring on
+    synthesized dispatch keys).
+
+    Unlike top-level `render_nodes_to_markdown`, no blank line is inserted
+    between a run's inner lines: CommonMark reads a blank `> ` line as
+    closing one paragraph and opening another *inside the same blockquote*,
+    which is not what a multi-line source quote (`"> first line\\n> second
+    line\\n"`) means — every inner line gets exactly one `"> " * depth`
+    prefix and the lines are joined directly.
+
+    Each line's prefix comes from *that line's own* node depth, not a single
+    depth shared by the whole run: a run may mix depths (see
+    `_group_blockquote_runs`'s docstring on `"> outer\\n> > inner\\n"`), and
+    the `depth` this renderer is called with is only ever the run's first
+    node's depth, kept as a fallback for a group (e.g. a fenced code run)
+    that doesn't carry its own node to read a depth from.
+    """
+
+    node_key = "blockquote"
+
+    def render(self, node: Tuple[int, List[Tuple]]) -> str:
+        depth, inner_groups = node
+        lines: List[Tuple[int, str]] = []
+        for group in inner_groups:
+            if group[0] == "code":
+                _, lang, code_nodes = group
+                line_depth = (
+                    code_nodes[0].quote_depth
+                    if code_nodes and isinstance(code_nodes[0], DocsParagraphNode)
+                    else depth
+                )
+                code_lines = _render_code_group(lang, code_nodes)
+                # _render_code_group always appends a trailing "" for the
+                # top-level blank-line-between-blocks convention, which does
+                # not apply inside a quote run — see class docstring.
+                if code_lines and code_lines[-1] == "":
+                    code_lines.pop()
+                lines.extend((line_depth, line) for line in code_lines)
+            else:
+                inner_node = group[1]
+                line_depth = (
+                    inner_node.quote_depth
+                    if isinstance(inner_node, DocsParagraphNode)
+                    else depth
+                )
+                lines.append((line_depth, _render_group_lines(inner_node)))
+        # An empty line gets the bare ">"-per-level marker with no trailing
+        # space, matching what a human (or MarkdownToParagraphParser on the
+        # way in) writes for an empty quoted line -- "> " for an empty line
+        # would carry a trailing space no source line has, breaking the
+        # byte-identical round trip (Story 3.3's push_pull_roundtrip test).
+        rendered = []
+        for line_depth, line in lines:
+            prefix = "> " * line_depth
+            rendered.append(f"{prefix}{line}" if line else prefix.rstrip())
+        return "\n".join(rendered)
+
+
 def _build_pull_registry() -> MarkdownRenderRegistry:
     registry = MarkdownRenderRegistry()
     registry.register("table", TableNodeRenderer())
@@ -512,6 +638,7 @@ def _build_pull_registry() -> MarkdownRenderRegistry:
     registry.register("list_item", ListItemNodeRenderer())
     registry.register("paragraph", ParagraphNodeRenderer())
     registry.register("image", ImageNodeRenderer())
+    registry.register("blockquote", BlockquoteNodeRenderer())
     return registry
 
 
@@ -521,18 +648,22 @@ _PULL_REGISTRY = _build_pull_registry()
 def render_nodes_to_markdown(nodes: List[Node]) -> str:
     """Render a parsed node list (document order) back into Markdown text."""
     lines: List[str] = []
-    for group in _group_code_runs(nodes):
+    for group in _group_blockquote_runs(nodes):
         if group[0] == "code":
             _, lang, code_nodes = group
             lines.extend(_render_code_group(lang, code_nodes))
             continue
 
+        if group[0] == "blockquote":
+            _, depth, inner_groups = group
+            renderer = _PULL_REGISTRY.get("blockquote")
+            assert renderer is not None  # registered in _build_pull_registry
+            lines.append(renderer.render((depth, inner_groups)))
+            lines.append("")
+            continue
+
         node = group[1]
-        key = _dispatch_key(node)
-        renderer = _PULL_REGISTRY.get(key)
-        if renderer is None:
-            raise ValueError(f"no renderer registered for dispatch key {key!r}")
-        lines.append(renderer.render(node))
+        lines.append(_render_group_lines(node))
         lines.append("")
 
     return "\n".join(lines).rstrip("\n") + "\n"
