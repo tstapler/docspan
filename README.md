@@ -151,6 +151,14 @@ docspan status [--config PATH]
 
 Display all configured mappings in a table showing local file, backend, remote ID, and direction.
 
+### `docspan style-guide`
+
+```
+docspan style-guide [--backend google_docs|confluence] [--write FILE]
+```
+
+Print backend authoring guidance (e.g. "one image per line on google_docs"). This ships inside the installed package, so re-running it after a `docspan` upgrade picks up new guidance without hand-copying anything. With `--write FILE`, embed it as a marked, idempotent block in a file in your own repo (a `CLAUDE.md`, a style guide doc, etc.) — re-running updates docspan's managed block in place instead of duplicating it.
+
 ### `docspan auth setup`
 
 ```

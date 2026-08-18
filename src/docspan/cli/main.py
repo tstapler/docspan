@@ -600,6 +600,49 @@ def status(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# style-guide command — print/embed backend authoring guidance into a repo
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command("style-guide")
+def style_guide_cmd(
+    backend: Optional[str] = typer.Option(
+        None, "--backend", "-b", help="google_docs, confluence, or omit for all backends"
+    ),
+    write: Optional[str] = typer.Option(
+        None, "--write", "-w",
+        help="File to write/update (e.g. a project CLAUDE.md). Updates docspan's "
+        "managed block in place if the file already has one; appends otherwise.",
+    ),
+) -> None:
+    """Print backend authoring guidance (e.g. "one image per line on google_docs").
+
+    Ships inside the installed package, so re-running this after a docspan
+    upgrade picks up new guidance without hand-copying anything. With
+    --write, embed it as a marked, idempotent block in a file in your own
+    repo (a CLAUDE.md, a style-guide doc, etc.) instead of just printing it.
+    """
+    from docspan.style_guide import STYLE_GUIDES, render_style_guide, upsert_managed_block
+
+    if backend is not None and backend not in STYLE_GUIDES:
+        err_console.print(f"Unknown backend '{backend}'. Available: {list(STYLE_GUIDES.keys())}")
+        raise typer.Exit(1)
+
+    content = render_style_guide(backend)
+
+    if write is None:
+        console.print(escape(content))
+        return
+
+    existing = ""
+    if os.path.exists(write):
+        existing = open(write, encoding="utf-8").read()
+    updated = upsert_managed_block(existing, backend)
+    with open(write, "w", encoding="utf-8") as f:
+        f.write(updated)
+    console.print(f"[green]✓[/green] Wrote style guide to {write}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # comments subcommand — respond to / resolve pulled comments
 # ─────────────────────────────────────────────────────────────────────────────
 

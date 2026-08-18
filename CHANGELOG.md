@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+* **google-docs:** removed the `docspan lint`/style-guide warning against `>` blockquotes now that push emits native blockquote styling instead of literal `>`-prefixed text; if a rendering edge case still misrenders a quote post-push, spot it via `push --dry-run`'s structural diff or by visually inspecting the pushed Doc, since no automated check remains for it.
+
 ## [0.5.0](https://github.com/tstapler/docspan/compare/docspan-v0.4.0...docspan-v0.5.0) (2026-08-14)
 
 
