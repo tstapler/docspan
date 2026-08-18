@@ -3099,3 +3099,160 @@ class TestEpic0LiveDocSpike:
             echoed["paragraphStyle"]["indentStart"]["magnitude"]
             == fixture["candidate_blockquote_indent_pt_per_level"]
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Epic 1: Domain Model — Identity Fields (is_blockquote/quote_depth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBlockquoteIdentityFields:
+    """Story 1.1: is_blockquote/quote_depth fields, invariant, marker constants."""
+
+    def test_DocsParagraphNode_should_AcceptBlockquoteFields_When_ConstructedWithValidPair(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        node = DocsParagraphNode(
+            style="NORMAL_TEXT", text="quoted", is_blockquote=True, quote_depth=2
+        )
+
+        assert node.is_blockquote is True
+        assert node.quote_depth == 2
+
+    def test_DocsParagraphNode_should_DefaultBlockquoteFieldsToFalseAndZero_When_Unset(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        node = DocsParagraphNode(style="NORMAL_TEXT", text="plain")
+
+        assert node.is_blockquote is False
+        assert node.quote_depth == 0
+
+    @pytest.mark.parametrize("is_blockquote, quote_depth", [(False, 2), (True, 0)])
+    def test_DocsParagraphNode_should_RaiseValueError_When_ConstructedWithIllegalBlockquotePair(
+        self, is_blockquote: bool, quote_depth: int
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        with pytest.raises(ValueError):
+            DocsParagraphNode(
+                style="NORMAL_TEXT",
+                text="x",
+                is_blockquote=is_blockquote,
+                quote_depth=quote_depth,
+            )
+
+    def test_DocsRequestBuilder_should_ImportSameMarkerObject_When_ComparedByIdentity(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs import (
+            docs_request_builder as docs_request_builder_module,
+        )
+        from docspan.backends.google_docs import (
+            docs_structure_parser as docs_structure_parser_module,
+        )
+
+        assert (
+            docs_request_builder_module.BLOCKQUOTE_BORDER_MARKER
+            is docs_structure_parser_module.BLOCKQUOTE_BORDER_MARKER
+        )
+        assert (
+            docs_request_builder_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL
+            is docs_structure_parser_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL
+        )
+
+
+class TestNodeKeyContentKeyBlockquoteIdentity:
+    """Story 1.2: `_node_key` includes blockquote identity, `_content_key` doesn't."""
+
+    def test__node_key_should_DifferByBlockquoteFields_When_TextIsIdentical(self) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        builder = DocsRequestBuilder()
+        plain = DocsParagraphNode(style="NORMAL_TEXT", text="See the docs")
+        quoted = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", is_blockquote=True, quote_depth=1
+        )
+
+        assert builder._node_key(plain) != builder._node_key(quoted)
+
+    def test__content_key_should_IgnoreBlockquoteFields_When_TextIsIdentical(self) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        builder = DocsRequestBuilder()
+        plain = DocsParagraphNode(style="NORMAL_TEXT", text="See the docs")
+        quoted = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", is_blockquote=True, quote_depth=1
+        )
+
+        assert builder._content_key(plain) == builder._content_key(quoted)
+
+
+class TestRepairDoesNotCrossPairBlockquoteAndPlainParagraph:
+    """Story 1.3: `_structural_score`/`_prefer_structural_pairing` cross-doc pooling.
+
+    Epic 1 Task 1 finding (Story 1.3): before this story, `_structural_score`
+    inspected only `style`/`is_heading_style`/`is_list_item` — nothing there read
+    blockquote identity, so two same-text, same-style, same-list-item paragraphs
+    (one a blockquote, one not) pooled by `_repair`'s global `_content_key` pass
+    scored identically on every existing term and could be assigned to each
+    other's slot by list-position tie-break alone. Fixed by adding
+    `is_blockquote`/`quote_depth` equality terms to `_structural_score`.
+    """
+
+    def test__repair_should_NotCrossPairBlockquoteAndPlainParagraph_When_TextIsIdentical(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        builder = DocsRequestBuilder()
+
+        plain_current = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", start_index=1, end_index=10
+        )
+        quote_current = DocsParagraphNode(
+            style="NORMAL_TEXT",
+            text="See the docs",
+            is_blockquote=True,
+            quote_depth=1,
+            start_index=11,
+            end_index=20,
+        )
+        current = [plain_current, quote_current]
+
+        quote_target = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", is_blockquote=True, quote_depth=1
+        )
+        plain_target = DocsParagraphNode(style="NORMAL_TEXT", text="See the docs")
+        target = [quote_target, plain_target]
+
+        # Two standalone singleton "delete" candidates (current[0]=plain,
+        # current[1]=blockquote) and two standalone singleton "insert" slots
+        # (target[0]=blockquote, target[1]=plain) — the exact shape
+        # `_repair`'s global content-key pooling produces when a blockquote
+        # and a plain paragraph sharing identical text land in unrelated
+        # opcodes elsewhere in the same document (see `_prefer_structural_pairing`
+        # docstring). All four share one `_content_key` (text-only), so without
+        # the blockquote-aware scoring terms this is fixing, the two slots tie
+        # on every other term and resolve by list-position alone.
+        pending = [
+            ("delete", 0, 1, 0, 0),
+            ("delete", 1, 2, 0, 0),
+            ("insert", 0, 0, 0, 1),
+            ("insert", 0, 0, 1, 2),
+        ]
+        origin = [0, 0, 0, 0]
+
+        result = builder._prefer_structural_pairing(pending, origin, current, target)
+
+        by_target_start = {op[3]: op for op in result}
+
+        # target[0] (the blockquote) must resolve to current[1] (the
+        # blockquote), not current[0] (the plain paragraph) — and vice versa.
+        assert by_target_start[0][:3] == ("equal", 1, 2)
+        assert by_target_start[1][:3] == ("equal", 0, 1)

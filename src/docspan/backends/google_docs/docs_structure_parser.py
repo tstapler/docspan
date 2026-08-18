@@ -34,6 +34,24 @@ UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 # loud failure, not corruption.
 _PRIVATE_USE = range(0xE000, 0xF900)
 
+# `docs_structure_parser` is the sole owner of both blockquote-marker constants
+# below — any other module (e.g. `docs_request_builder._blockquote_paragraph_style_fields`)
+# imports them by name rather than redefining or copying their values, so there is
+# exactly one place a future format change is made.
+#
+# Values are an engineering decision documented in
+# project_plans/gdocs-native-blockquotes/implementation/epic-0-spike-findings.md,
+# reasoned from the public Docs API v1 schema and WCAG contrast math — NOT yet
+# confirmed against a live `documents.get` echo. See that file's "Explicitly left
+# unverified" section before treating these as final.
+BLOCKQUOTE_BORDER_MARKER: dict = {
+    "color": {"color": {"rgbColor": {"red": 0.494, "green": 0.549, "blue": 0.612}}},
+    "width": {"magnitude": 1, "unit": "PT"},
+    "dashStyle": "SOLID",
+    "padding": {"magnitude": 1, "unit": "PT"},
+}
+BLOCKQUOTE_INDENT_PT_PER_LEVEL: float = 18.0
+
 # Fonts Google Docs' own code-block picker offers, beyond "Courier"/"mono" — the
 # "Courier"/"mono" check this extends. Not exhaustive — an arbitrary custom
 # monospace font will still miss — but "Courier"/"mono" alone missed every
@@ -186,6 +204,28 @@ class DocsParagraphNode:
     # identity would make every freshly written heading look like a different
     # paragraph from the one the markdown describes.
     heading_id: Optional[str] = None
+    # Part of the diff key (`_node_key`), NOT `_content_key`: a blockquote
+    # restyle-in-place should still fold to `equal` via `_repair`, but a
+    # blockquote paragraph and a plain paragraph sharing identical text are
+    # not the same live paragraph to align against. True iff quote_depth > 0
+    # — see __post_init__.
+    is_blockquote: bool = False
+    # Nesting depth of a markdown blockquote ("> " = 1, "> > " = 2, ...).
+    # Part of the diff key alongside is_blockquote, same rationale. 0 iff
+    # is_blockquote is False — see __post_init__.
+    quote_depth: int = 0
+
+    def __post_init__(self) -> None:
+        # is_blockquote/quote_depth are an intentionally-paired invariant, not
+        # two independent fields: quote_depth only means anything when
+        # is_blockquote is True, and there is no such thing as a depth-0
+        # blockquote. Enforcing this at construction time closes the illegal
+        # states (False, 2) and (True, 0) without a wider field-shape change.
+        if self.is_blockquote != (self.quote_depth > 0):
+            raise ValueError(
+                "DocsParagraphNode: is_blockquote and quote_depth must agree "
+                f"(is_blockquote={self.is_blockquote!r}, quote_depth={self.quote_depth!r})"
+            )
 
 
 @dataclass
