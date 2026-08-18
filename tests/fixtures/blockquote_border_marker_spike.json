@@ -1,0 +1,50 @@
+{
+  "_provenance": "Hand-constructed for Epic 0 of project_plans/gdocs-native-blockquotes. NOT captured from a real Google Docs API call — no live batchUpdate/documents.get was made while producing this fixture. See project_plans/gdocs-native-blockquotes/implementation/epic-0-spike-findings.md for the full rationale behind the candidate values below and why this is a documented engineering decision, not a spike finding.",
+  "_verification_status": "ENGINEERING DECISION — PENDING LIVE VERIFICATION",
+  "_deviations": {
+    "documents_get_response_paragraph_style_echo": "Modeled as an exact byte-for-byte echo of the request's paragraphStyle. This is the optimistic case. Whether Google Docs actually echoes indentStart/borderLeft unchanged, or normalizes/adds default sub-fields (e.g. a default padding, unit coercion), is exactly the open question this fixture cannot answer — see plan.md's Unresolved Questions 1-2 and ADR-001's 'Consequences' section."
+  },
+  "candidate_blockquote_border_marker": {
+    "color": {"color": {"rgbColor": {"red": 0.494, "green": 0.549, "blue": 0.612}}},
+    "width": {"magnitude": 1, "unit": "PT"},
+    "dashStyle": "SOLID",
+    "padding": {"magnitude": 1, "unit": "PT"}
+  },
+  "candidate_blockquote_indent_pt_per_level": 18.0,
+  "batch_update_request": {
+    "requests": [
+      {
+        "insertText": {
+          "location": {"index": 1},
+          "text": "This is a blockquote paragraph.\n"
+        }
+      },
+      {
+        "updateParagraphStyle": {
+          "range": {"startIndex": 1, "endIndex": 34},
+          "paragraphStyle": {
+            "indentStart": {"magnitude": 18, "unit": "PT"},
+            "borderLeft": {
+              "color": {"color": {"rgbColor": {"red": 0.494, "green": 0.549, "blue": 0.612}}},
+              "width": {"magnitude": 1, "unit": "PT"},
+              "dashStyle": "SOLID",
+              "padding": {"magnitude": 1, "unit": "PT"}
+            }
+          },
+          "fields": "indentStart,borderLeft"
+        }
+      }
+    ]
+  },
+  "documents_get_response_paragraph_style_echo": {
+    "paragraphStyle": {
+      "indentStart": {"magnitude": 18, "unit": "PT"},
+      "borderLeft": {
+        "color": {"color": {"rgbColor": {"red": 0.494, "green": 0.549, "blue": 0.612}}},
+        "width": {"magnitude": 1, "unit": "PT"},
+        "dashStyle": "SOLID",
+        "padding": {"magnitude": 1, "unit": "PT"}
+      }
+    }
+  }
+}
