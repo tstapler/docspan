@@ -26,6 +26,7 @@ def _para(
     end: int = 10,
     is_list_item: bool = False,
     precedes_structural_element: bool = False,
+    precedes_dropped_glyph_paragraph: bool = False,
 ) -> DocsParagraphNode:
     return DocsParagraphNode(
         style=style,
@@ -34,6 +35,7 @@ def _para(
         end_index=end,
         is_list_item=is_list_item,
         precedes_structural_element=precedes_structural_element,
+        precedes_dropped_glyph_paragraph=precedes_dropped_glyph_paragraph,
     )
 
 
@@ -92,6 +94,55 @@ def test_mid_document_insert_does_not_merge_into_previous_paragraph() -> None:
     # not index 2 (current[0].end_index - 1, the position of "A"'s own "\n").
     assert insert_requests[0]["insertText"]["location"]["index"] == 3
     assert insert_requests[0]["insertText"]["text"] == "B\n"
+
+
+def test_mid_document_insert_after_a_code_block_does_not_target_the_dropped_chrome_paragraph() -> None:
+    """Regression (#113): inserting a new paragraph right after a Docs-native
+    code block's last real line used to target `previous.end_index`, which
+    lands on the start of the code block's trailing glyph-only "chrome"
+    paragraph — a residue paragraph DocsStructureParser drops, so it's
+    invisible here but Google's API still rejects an insert that isn't
+    inside a real paragraph's bounds. `precedes_dropped_glyph_paragraph` on
+    the last code-block line is the only surviving trace of that dropped
+    paragraph, and must trigger the same before_newline handling as an
+    insert before a Table/ToC/SectionBreak (#22)."""
+    code_line = replace(
+        _para("code", start=1, end=3, precedes_dropped_glyph_paragraph=True),
+        render_prefix="",
+    )
+    trailer = _para("After", start=3, end=5)
+    current = [code_line, trailer]
+    target = [code_line, _para("New", start=0, end=0), trailer]
+    requests = builder.build(current, target, doc_end_index=5)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    # Must land one index back, inside the code line's own paragraph, with the
+    # newline moved to the front — not at index 3, the dropped chrome
+    # paragraph's start, which Google's API rejects.
+    assert insert_requests[0]["insertText"]["location"]["index"] == 2
+    assert insert_requests[0]["insertText"]["text"] == "\nNew"
+
+
+def test_mid_document_insert_between_ordinary_code_block_lines_is_unaffected() -> None:
+    """Every line of a rendered code block carries `render_prefix`, not just
+    the one immediately before the dropped chrome paragraph (#113) — only
+    that specific line sets `precedes_dropped_glyph_paragraph`. Inserting
+    between two ordinary, unchanged mid-block lines must land at the
+    ordinary boundary (the next kept line's start), not take the
+    before_newline path meant for the dropped-paragraph case."""
+    line1 = replace(_para("code1", start=1, end=3), render_prefix="")
+    line2 = replace(_para("code2", start=3, end=5), render_prefix="")
+    current = [line1, line2]
+    target = [line1, _para("New", start=0, end=0), line2]
+    requests = builder.build(current, target, doc_end_index=5)
+
+    insert_requests = [r for r in requests if "insertText" in r]
+    assert len(insert_requests) == 1
+    # line1 does not precede a dropped glyph paragraph (line2 is a real,
+    # kept node) — insert_at stays at line1.end_index, an ordinary boundary.
+    assert insert_requests[0]["insertText"]["location"]["index"] == 3
+    assert insert_requests[0]["insertText"]["text"] == "New\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
