@@ -180,6 +180,19 @@ class DocsParagraphNode:
     # only trace of them). NOT part of the diff key — consumed solely by
     # DocsRequestBuilder._make_delete_requests.
     precedes_structural_element: bool = False
+    # True when the very next content element is a paragraph that is *entirely*
+    # the Private-Use chrome glyph (e.g. the paragraph Docs writes right after
+    # the last line of a native code block). `projection.project()` drops that
+    # paragraph as `Residue(kind="private_use_glyph", ...)` — it never reaches
+    # `kept`, so `DocsRequestBuilder` never sees it as a node. That makes this
+    # paragraph's `end_index` an unsafe anchor for a new insertion: it lands on
+    # the start of the invisible, dropped paragraph rather than an ordinary
+    # paragraph boundary, and the API rejects it (#113). Deliberately narrower
+    # than `render_prefix`, which is set on *every* line of a rendered block —
+    # only the line immediately before the dropped chrome paragraph needs the
+    # same before_newline handling as precedes_structural_element; an insert
+    # between two ordinary mid-block code lines must not get it.
+    precedes_dropped_glyph_paragraph: bool = False
     # paragraphStyle.headingId — Docs' own id for a heading, and the only thing
     # a `headingId` link can point at. Present on headings, None elsewhere.
     # NOT part of the diff key: it is assigned by Docs, so treating it as
@@ -346,6 +359,9 @@ class DocsStructureParser:
                 node.precedes_structural_element = self._precedes_structural_element(
                     content, position
                 )
+                node.precedes_dropped_glyph_paragraph = (
+                    self._precedes_dropped_glyph_paragraph(content, position)
+                )
                 nodes.append(node)
             elif "table" in element:
                 nodes.append(self._parse_table(element))
@@ -454,6 +470,26 @@ class DocsStructureParser:
         if not isinstance(following, dict):
             return False
         return any(key in following for key in UNDELETABLE_BOUNDARY_KEYS)
+
+    @staticmethod
+    def _precedes_dropped_glyph_paragraph(content: List[dict], position: int) -> bool:
+        """Whether content[position] is directly followed by a paragraph that
+        `projection.project()` will drop entirely because it is nothing but the
+        Private-Use chrome glyph (see `_is_all_private_use`).
+
+        Reads the raw element rather than a parsed `DocsParagraphNode` because
+        that dropped paragraph never becomes a node at all — `_parse_paragraph`
+        runs on it same as any other, but the caller here needs the answer
+        before deciding whether *this* paragraph is safe to insert-after.
+        """
+        following = content[position + 1] if position + 1 < len(content) else None
+        if not isinstance(following, dict) or "paragraph" not in following:
+            return False
+        elements = following["paragraph"].get("elements", [])
+        text = "".join(
+            pe.get("textRun", {}).get("content", "") for pe in elements
+        ).rstrip("\n")
+        return _is_all_private_use(text)
 
     def _parse_table(self, element: dict) -> DocsTableNode:
         """Parse a structural element that contains a table into a DocsTableNode."""

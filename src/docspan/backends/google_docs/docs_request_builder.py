@@ -1223,22 +1223,25 @@ class DocsRequestBuilder:
                 #    DocsStructureParser drops those elements, so
                 #    precedes_structural_element is the only trace of them.
                 #
-                # 3. Inserting directly after a Docs-native code block (#113).
-                #    Every paragraph belonging to such a block is prefixed with
-                #    a private-use-area glyph, including a trailing glyph-only
-                #    "chrome" paragraph after the block's last real line.
-                #    DocsStructureParser drops that glyph-only paragraph as
-                #    residue, so `previous.end_index` (the last real line's end)
-                #    is actually the dropped chrome paragraph's start — not an
-                #    ordinary paragraph boundary — and is rejected the same way
-                #    as case 2. `render_prefix` on `previous` is the only trace
-                #    of the block.
+                # 3. Inserting directly after a Docs-native code block's last
+                #    real line (#113). That line is followed by a trailing
+                #    glyph-only "chrome" paragraph Docs writes after the
+                #    block, which DocsStructureParser drops as residue, so
+                #    `previous.end_index` (the last real line's end) is
+                #    actually that dropped paragraph's start — not an ordinary
+                #    paragraph boundary — and is rejected the same way as case
+                #    2. `precedes_dropped_glyph_paragraph` is the only trace of
+                #    it. Deliberately narrower than `render_prefix`, which is
+                #    set on every line of the block: an insert between two
+                #    ordinary mid-block code lines lands on the next real,
+                #    kept line and must not take this path.
                 #
                 # See _make_insert_requests(before_newline=...) for why the
                 # newline then has to move to the front of the inserted text.
                 at_body_end = insert_at >= doc_end_index
                 before_boundary = isinstance(previous, DocsParagraphNode) and (
-                    previous.precedes_structural_element or bool(previous.render_prefix)
+                    previous.precedes_structural_element
+                    or previous.precedes_dropped_glyph_paragraph
                 )
                 if at_body_end:
                     insert_at = doc_end_index - 1
