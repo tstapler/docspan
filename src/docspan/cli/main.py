@@ -75,6 +75,20 @@ def _status_display(status: str) -> tuple[str, str]:
     """Look up the (icon, style) pair for a push/pull result status."""
     return STATUS_DISPLAY.get(status, _DEFAULT_STATUS_DISPLAY)
 
+
+def _count_style_upgrades(high_risk: object) -> int:
+    """Count HighRiskParagraph entries whose reasons include "style_upgrade".
+
+    Used to build STYLE_UPGRADE_COUNT (Story 4.3). Takes a bare list rather
+    than the push_preview module's HighRiskParagraph type so this file
+    doesn't need a backend-specific import for a single duck-typed field
+    read; any falsy/missing `high_risk` (e.g. a backend without
+    preview_push()) counts as 0.
+    """
+    if not high_risk:
+        return 0
+    return sum(1 for hr in high_risk if "style_upgrade" in getattr(hr, "reasons", ()))
+
 # The live wedding planning doc — Story 1.2.5's ScratchVerificationMarker
 # confirmation prompt is a targeted tripwire for this one doc_id specifically,
 # never for wedding-scratch.md or any other mapping. See
@@ -214,6 +228,15 @@ def push(
     force: bool = typer.Option(
         False, "--force", help="Proceed with a push even if push() flags a comment-risk paragraph"
     ),
+    fail_on_comment_loss: bool = typer.Option(
+        False,
+        "--fail-on-comment-loss",
+        help=(
+            "Exit non-zero if any paragraph was (or would be) rewritten to add native "
+            "blockquote styling, losing an anchored comment. Reporting only — never "
+            "blocks the write itself; see STYLE_UPGRADE_COUNT in the output."
+        ),
+    ),
 ) -> None:
     """Push local markdown to remote docs."""
     config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
@@ -247,6 +270,13 @@ def push(
     state = _load_state(state_path)
 
     had_error = False
+    # Count of HighRiskParagraph entries whose reasons include "style_upgrade"
+    # across every mapping pushed this run — reported via STYLE_UPGRADE_COUNT
+    # (Story 4.3). Purely a reporting aggregate: it is never consulted to
+    # decide whether to skip a write (that stays push()'s job, per the
+    # Story 1.2.3/1.2.4 note below) — only --fail-on-comment-loss's post-hoc
+    # exit-code check reads it.
+    style_upgrade_count = 0
     # Shared across every mapping's push() call below (criterion 11): each
     # mapping gets its own backend instance via _get_backend(), so without a
     # cache threaded in from here a push --all run with N documents linking
@@ -274,6 +304,7 @@ def push(
                 # markers, which Rich's console markup would otherwise parse
                 # as (and silently swallow) style tags.
                 console.print(escape(preview.render()))
+                style_upgrade_count += _count_style_upgrades(getattr(preview, "high_risk", None))
                 if getattr(preview, "error", None):
                     had_error = True
             else:
@@ -342,6 +373,22 @@ def push(
                 with open(marker_path, "w", encoding="utf-8") as fh:
                     fh.write("verified\n")
 
+        # Best-effort, reporting-only: a pre-push preview_push() call solely
+        # to count style_upgrade paragraphs for STYLE_UPGRADE_COUNT (Story
+        # 4.3). Must run BEFORE orchestrate_push(), which is the only call
+        # that decides whether to write and what happens if it fails — a
+        # preview fetched after the write would see the doc already
+        # upgraded and undercount. Never gates the push: any exception here
+        # is swallowed and simply contributes 0.
+        if hasattr(backend, "preview_push"):
+            try:
+                pre_preview = backend.preview_push(
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                )
+                style_upgrade_count += _count_style_upgrades(getattr(pre_preview, "high_risk", None))
+            except Exception:
+                pass
+
         outcome = orchestrate_push(
             mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
             cross_doc_cache=cross_doc_cache,
@@ -359,6 +406,15 @@ def push(
             console.print("   [yellow]Warning: could not save sync state[/yellow]")
         if result.status in ("error", "blocked", "conflict", "warning"):
             had_error = True
+
+    # Emitted on every run (dry-run or real), always, even when 0 — see
+    # docs/backends/google-docs.md. No color/glyphs: this line is meant to be
+    # machine-parsed (e.g. from CI). --fail-on-comment-loss is a purely
+    # post-hoc check here (never gates the write itself, which stays push()'s
+    # job per the Story 1.2.3/1.2.4 note above).
+    console.print(f"STYLE_UPGRADE_COUNT={style_upgrade_count}")
+    if fail_on_comment_loss and style_upgrade_count > 0:
+        had_error = True
 
     if had_error:
         raise typer.Exit(1)
