@@ -89,7 +89,7 @@ from docspan.backends.google_docs.tabs import (
     resolve_document_tab,
 )
 from docspan.core.atomic_dir import atomic_replace_dir
-from docspan.core.paths import COMMENTS_SUFFIX
+from docspan.core.paths import COMMENTS_SUFFIX, find_data_uris
 
 if TYPE_CHECKING:
     from docspan.config import GoogleDocsConfig, MarkgateConfig
@@ -1288,6 +1288,7 @@ class GoogleDocsBackend(Backend):
                 # markdown *does* have, so pull/push is a fixpoint.
                 nodes, residue = project(nodes)
                 markdown_content = render_nodes_to_markdown(nodes)
+                data_uris = find_data_uris(markdown_content)
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
                 self._write_comment_sidecar(doc_id, local_path)
@@ -1305,11 +1306,19 @@ class GoogleDocsBackend(Backend):
                     [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
                 )
                 # Collected, not raced — one warning must not hide the other.
+                data_uri_note = (
+                    f"pulled markdown still contains {len(data_uris)} data: URI(s) "
+                    f"(e.g. {data_uris[0]}) -- this is a bug in docspan's own "
+                    "rendering, not something you did; please report it"
+                    if data_uris
+                    else None
+                )
                 messages = [
                     message
                     for message in (
                         f"⚠ {residue_note}" if residue_note else None,
                         self._render_unreadable_links(parser.unreadable_links),
+                        data_uri_note,
                     )
                     if message
                 ]
@@ -1354,6 +1363,18 @@ class GoogleDocsBackend(Backend):
             recovery = recover_pulled_images(markdown_content, image_nodes)
             markdown_content = recovery.markdown
 
+            # Backstop for any data: URI recover_pulled_images() didn't catch
+            # (e.g. its positional-correlation guard bailed out) -- surfaced
+            # as a warning, never a reason to withhold the file.
+            data_uris = find_data_uris(markdown_content)
+            data_uri_warning = (
+                f"pulled markdown still contains {len(data_uris)} data: URI(s) "
+                f"(e.g. {data_uris[0]}) -- this is a bug in docspan's own "
+                "rendering, not something you did; please report it"
+                if data_uris
+                else None
+            )
+
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)
             self._write_comment_sidecar(doc_id, local_path)
@@ -1365,7 +1386,7 @@ class GoogleDocsBackend(Backend):
             # links are "absent from the pulled file" while they sit in the file
             # just written. Only the tab-scoped path above can report what the
             # file lacks, because there the parser's output *is* the file.
-            messages = [w for w in (warning, checkbox_warning) if w]
+            messages = [w for w in (warning, checkbox_warning, data_uri_warning) if w]
             if messages:
                 return PullResult(
                     status="warning",
@@ -1438,12 +1459,14 @@ class GoogleDocsBackend(Backend):
             tmp_dir = pathlib.Path(
                 tempfile.mkdtemp(dir=str(tmp_parent), prefix=f".{target_dir.name}.", suffix=".tmp")
             )
+            section_data_uris: List[str] = []
             try:
                 entries: List[SectionManifestEntry] = []
                 section_texts: List[Tuple[str, str]] = []
                 for index, section in enumerate(sections):
                     filename = f"{str(index).zfill(width)}-{section.slug}.md"
                     content = render_nodes_to_markdown(section.nodes) if section.nodes else ""
+                    section_data_uris.extend(find_data_uris(content))
                     (tmp_dir / filename).write_text(content)
                     section_texts.append((filename, content))
                     entries.append(
@@ -1468,11 +1491,19 @@ class GoogleDocsBackend(Backend):
             # tab-scoped pull() above, this path's per-section markdown *is*
             # the parser's own output, so an unreadable link is genuinely
             # absent from every file just written (see #38).
+            data_uri_note = (
+                f"pulled markdown still contains {len(section_data_uris)} data: URI(s) "
+                f"(e.g. {section_data_uris[0]}) -- this is a bug in docspan's own "
+                "rendering, not something you did; please report it"
+                if section_data_uris
+                else None
+            )
             messages = [
                 message
                 for message in (
                     f"⚠ {residue_note}" if residue_note else None,
                     self._render_unreadable_links(parser.unreadable_links),
+                    data_uri_note,
                 )
                 if message
             ]
@@ -1602,7 +1633,10 @@ class GoogleDocsBackend(Backend):
             if not section_comments:
                 continue
             sidecar = tmp_dir / (filename + COMMENTS_SUFFIX)
-            sidecar.write_text(format_comments_markdown(title, section_comments))
+            content = format_comments_markdown(title, section_comments)
+            if find_data_uris(content):
+                logger.warning("Comment sidecar %s contains a data: URI — unexpected.", sidecar)
+            sidecar.write_text(content)
 
     def _write_comment_sidecar(self, doc_id: str, local_path: str) -> None:
         """Write a {file}.comments.md sidecar of the doc's comments (best-effort)."""
@@ -1619,7 +1653,10 @@ class GoogleDocsBackend(Backend):
                 title = self._client.get_doc_info(doc_id).get("name", doc_id)
             except Exception:
                 title = doc_id
-            sidecar.write_text(format_comments_markdown(title, comments))
+            content = format_comments_markdown(title, comments)
+            if find_data_uris(content):
+                logger.warning("Comment sidecar %s contains a data: URI — unexpected.", sidecar)
+            sidecar.write_text(content)
         elif sidecar.exists():
             sidecar.unlink()  # no comments anymore — drop a stale sidecar
 
