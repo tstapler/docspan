@@ -74,6 +74,7 @@ from docspan.backends.google_docs.projection import (
     describe_target_residue,
     project,
 )
+from docspan.backends.google_docs.pulled_image_recovery import recover_pulled_images
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -1342,6 +1343,16 @@ class GoogleDocsBackend(Backend):
             markdown_content, checkbox_warning = self._recover_checkbox_state(
                 doc_id, structural_nodes, markdown_content
             )
+
+            # Drive's HTML export inlines every embedded image (including a
+            # pushed ```mermaid fence's rendered diagram) as a
+            # data:image/...;base64,... URI -- confirmed live, a two-diagram
+            # doc round-tripped into 401KB of embedded PNG data. Swap each
+            # one for a restored mermaid fence (local render-cache hit) or
+            # the structural node's real, non-bloated image URL.
+            image_nodes = [n for n in structural_nodes if isinstance(n, DocsImageNode)]
+            recovery = recover_pulled_images(markdown_content, image_nodes)
+            markdown_content = recovery.markdown
 
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown_content)

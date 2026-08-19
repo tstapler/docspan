@@ -40,6 +40,64 @@ def _cache_dir() -> Path:
     return cache_home() / "mermaid"
 
 
+def _by_hash_dir() -> Path:
+    """Reverse-lookup cache: sha256(png bytes) -> original diagram source.
+
+    Google Docs has no API-writable place to stash the diagram text on the
+    inserted image itself (insertInlineImage only accepts uri/objectSize,
+    and the API's Request union has no way to set an EmbeddedObject's
+    title/description -- alt text is UI-only, verified against
+    https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request).
+    So the only place left to recover "this pulled image was originally a
+    ```mermaid fence" is a local, content-addressed cache written at push
+    time and consulted at pull time -- see pulled_image_recovery.py. Keyed
+    by the rendered bytes (not the diagram text) because pull only ever has
+    the bytes, never the source.
+    """
+    return cache_home() / "mermaid" / "by-hash"
+
+
+def _record_reverse_lookup(diagram: str, png_bytes: bytes) -> None:
+    """Best-effort: remember that these exact PNG bytes came from `diagram`.
+
+    Never raises -- a failure to write this optional reverse-cache entry
+    must not break the push it's piggybacking on. Idempotent: an existing
+    entry for the same hash is left alone rather than rewritten.
+    """
+    try:
+        path = _by_hash_dir() / f"{hashlib.sha256(png_bytes).hexdigest()}.mmd"
+        if path.is_file():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(diagram)
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise
+    except OSError:
+        pass
+
+
+def lookup_mermaid_source(png_bytes: bytes) -> Optional[str]:
+    """Recover the original ```mermaid fence text for previously-rendered bytes.
+
+    Returns None on a cache miss (bytes never rendered by this diagram, or
+    rendered on a different machine/user that never pushed here) -- this is
+    the expected, non-error outcome for any image this local cache doesn't
+    know about, not a failure.
+    """
+    path = _by_hash_dir() / f"{hashlib.sha256(png_bytes).hexdigest()}.mmd"
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 @lru_cache(maxsize=1)
 def _mmdc_version() -> str:
     """Best-effort version fingerprint of the resolved mmdc binary.
@@ -115,7 +173,11 @@ def render_mermaid_png(diagram: str, *, timeout: Optional[float] = None) -> byte
     """
     cache_path = _cache_dir() / f"{_cache_key(diagram)}.png"
     if cache_path.is_file():
-        return cache_path.read_bytes()
+        data = cache_path.read_bytes()
+        # Idempotent and cheap (checks is_file() before writing) -- covers a
+        # PNG cached before the reverse-lookup cache existed.
+        _record_reverse_lookup(diagram, data)
+        return data
 
     data = _render_uncached(diagram, timeout=timeout)
 
@@ -131,6 +193,7 @@ def render_mermaid_png(diagram: str, *, timeout: Optional[float] = None) -> byte
     except BaseException:
         os.unlink(tmp_name)
         raise
+    _record_reverse_lookup(diagram, data)
     return data
 
 

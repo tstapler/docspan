@@ -16,6 +16,7 @@ from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownTo
 from docspan.backends.google_docs.mermaid_renderer import (
     MermaidRenderError,
     _mmdc_command,
+    lookup_mermaid_source,
     render_mermaid_png,
 )
 
@@ -210,6 +211,54 @@ def test_render_mermaid_png_cache_key_changes_with_render_scale(tmp_path, monkey
     render_mermaid_png(diagram)
 
     assert calls == [diagram, diagram]  # scale change busts the cache, not a hit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# reverse lookup: rendered bytes -> original diagram source (pull-side recovery)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_lookup_mermaid_source_recovers_diagram_after_render(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer([]),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    png_bytes = render_mermaid_png(diagram)
+
+    assert lookup_mermaid_source(png_bytes) == diagram
+
+
+def test_lookup_mermaid_source_recovers_diagram_on_cache_hit_too(tmp_path, monkeypatch) -> None:
+    """A second render_mermaid_png call (disk-cache hit, no re-render) must
+    still populate the reverse lookup -- it's the only call site that knows
+    the (bytes, diagram) pairing, so a cache-hit call that skipped this
+    would leave the reverse lookup permanently empty for that diagram."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer([]),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    render_mermaid_png(diagram)
+    # Simulate starting fresh with only the forward PNG cache surviving
+    # (e.g. an XDG_CACHE_HOME populated before this feature existed).
+    by_hash_dir = tmp_path / "docspan" / "mermaid" / "by-hash"
+    for f in by_hash_dir.glob("*.mmd"):
+        f.unlink()
+    assert not any(by_hash_dir.glob("*.mmd"))
+
+    png_bytes = render_mermaid_png(diagram)  # disk-cache hit, not a fresh render
+
+    assert lookup_mermaid_source(png_bytes) == diagram
+
+
+def test_lookup_mermaid_source_returns_none_on_miss(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert lookup_mermaid_source(b"\x89PNG\r\n\x1a\nnot a real render") is None
 
 
 def test_render_mermaid_png_cache_key_changes_with_mmdc_version(tmp_path, monkeypatch) -> None:
