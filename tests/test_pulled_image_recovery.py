@@ -8,6 +8,7 @@ rendered diagram.
 
 import base64
 
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
 from docspan.backends.google_docs.mermaid_renderer import _by_hash_dir
 from docspan.backends.google_docs.pulled_image_recovery import recover_pulled_images
@@ -111,6 +112,49 @@ def test_multiple_images_correlated_in_document_order(tmp_path, monkeypatch) -> 
     assert "```mermaid\ngraph TD\n  A --> B\n```" in result.markdown
     assert "![second](https://example.com/b)" in result.markdown
     assert "base64" not in result.markdown
+
+
+def test_falls_back_to_committed_sidecar_when_local_cache_is_empty(tmp_path, monkeypatch) -> None:
+    """Simulates a pull on a different machine: the local XDG mermaid cache
+    (mermaid_renderer.py) has never seen this diagram, but the committed
+    sidecar (mermaid_cache_sidecar.py, next to the .md file) has -- because
+    it was pushed from a different machine and the sidecar was committed."""
+    other_xdg_home = tmp_path / "other-machines-xdg-cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(other_xdg_home))
+
+    md_path = tmp_path / "argocd-crd-backed-client" / "README.md"
+    md_path.parent.mkdir(parents=True)
+    diagram = "sequenceDiagram\n  Caller->>API: request"
+    png_bytes = _PNG_MAGIC + b"a-sequence-diagram-rendered-elsewhere"
+    mermaid_cache_sidecar.record(str(md_path), png_bytes, diagram)
+
+    markdown = f"![mermaid diagram xyz]({_data_uri(png_bytes)})\n"
+    image_nodes = [DocsImageNode(src="https://lh3.googleusercontent.com/temp3", alt="")]
+
+    result = recover_pulled_images(markdown, image_nodes, markdown_path=str(md_path))
+
+    assert result.mermaid_restored == 1
+    assert f"```mermaid\n{diagram}\n```" in result.markdown
+    assert "base64" not in result.markdown
+
+
+def test_no_markdown_path_means_no_sidecar_lookup(tmp_path, monkeypatch) -> None:
+    """Without a markdown_path, there's nowhere to find a sidecar -- must
+    degrade to the base64-deflated fallback, not raise."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    diagram = "graph TD\n  A --> B"
+    png_bytes = _PNG_MAGIC + b"some-diagram"
+    md_path = tmp_path / "doc.md"
+    mermaid_cache_sidecar.record(str(md_path), png_bytes, diagram)
+
+    markdown = f"![x]({_data_uri(png_bytes)})\n"
+    image_nodes = [DocsImageNode(src="https://example.com/img", alt="")]
+
+    result = recover_pulled_images(markdown, image_nodes)  # markdown_path omitted
+
+    assert result.mermaid_restored == 0
+    assert result.base64_deflated == 1
+    assert result.markdown == "![x](https://example.com/img)\n"
 
 
 def test_preserves_real_alt_text_from_the_export_on_fallback(tmp_path, monkeypatch) -> None:

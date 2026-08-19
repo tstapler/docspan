@@ -271,6 +271,9 @@ docspan generates these files in your project directory after first sync:
 | `.markgate-base/` | Content-addressed store of merge bases |
 | `{file}.orig` | Backup of local file before merge; deleted after conflict resolution |
 | `{file}.comments.md` | Comment sidecar (Google Docs + Confluence); written during pull if comments exist |
+| `{file}.mermaid-cache.yaml` | Google Docs: maps each pushed `​```mermaid` fence's rendered-PNG hash back to its source, so a *different* machine pulling the doc can still restore the fence instead of a bare image link. Written during push if the file has any mermaid fences. |
+
+**Commit `.markgate-state.json`, `.markgate-base/`, and `{file}.mermaid-cache.yaml` — do not gitignore them.** `.markgate-state.json`/`.markgate-base/` need to be shared for three-way merge to work across machines/teammates; `{file}.mermaid-cache.yaml` is what makes mermaid-fence recovery work across machines at all (Google Docs has no API-writable place to store a diagram's source, only the rendered image — see `mermaid_cache_sidecar.py`'s module docstring for why). `{file}.orig` and `{file}.comments.md` are transient/informational and safe to gitignore if you prefer.
 
 ---
 

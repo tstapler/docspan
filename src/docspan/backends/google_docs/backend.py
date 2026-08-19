@@ -1360,7 +1360,7 @@ class GoogleDocsBackend(Backend):
             # one for a restored mermaid fence (local render-cache hit) or
             # the structural node's real, non-bloated image URL.
             image_nodes = [n for n in structural_nodes if isinstance(n, DocsImageNode)]
-            recovery = recover_pulled_images(markdown_content, image_nodes)
+            recovery = recover_pulled_images(markdown_content, image_nodes, markdown_path=local_path)
             markdown_content = recovery.markdown
 
             # Backstop for any data: URI recover_pulled_images() didn't catch

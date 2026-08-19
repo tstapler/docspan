@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Match, Optional
 
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
 from docspan.backends.google_docs.mermaid_renderer import lookup_mermaid_source
 
@@ -39,15 +40,19 @@ class ImageRecoveryResult:
 
 
 def recover_pulled_images(
-    markdown_content: str, image_nodes: List[DocsImageNode]
+    markdown_content: str,
+    image_nodes: List[DocsImageNode],
+    markdown_path: Optional[str] = None,
 ) -> ImageRecoveryResult:
     """Replace each base64 data-URI image in `markdown_content`.
 
     A match is replaced with a restored ```mermaid fence when its exact
     rendered bytes are found in the local mermaid render cache (see
-    mermaid_renderer.lookup_mermaid_source), or with the corresponding
-    structural node's real image URL otherwise -- either way, the inline
-    blob is gone.
+    mermaid_renderer.lookup_mermaid_source) or, failing that, the
+    git-committed cross-machine sidecar (mermaid_cache_sidecar.py, checked
+    only when `markdown_path` is given -- the sidecar lives next to that
+    file). Falls back to the corresponding structural node's real image URL
+    when neither has it -- either way, the inline blob is gone.
 
     Matches are correlated to `image_nodes` positionally, in document order:
     both are read from the same pulled document top-to-bottom. If the counts
@@ -67,7 +72,7 @@ def recover_pulled_images(
     cursor = 0
     for match, node in zip(matches, image_nodes):
         pieces.append(markdown_content[cursor : match.start()])
-        text, is_mermaid = _replacement_for(match, node)
+        text, is_mermaid = _replacement_for(match, node, markdown_path)
         if is_mermaid:
             mermaid_restored += 1
         else:
@@ -82,10 +87,16 @@ def recover_pulled_images(
     )
 
 
-def _replacement_for(match: "Match[str]", node: DocsImageNode) -> tuple:
+def _replacement_for(
+    match: "Match[str]", node: DocsImageNode, markdown_path: Optional[str]
+) -> tuple:
     alt, data_uri = match.group(1), match.group(2)
     png_bytes = _decode_data_uri(data_uri)
-    diagram = lookup_mermaid_source(png_bytes) if png_bytes is not None else None
+    diagram = None
+    if png_bytes is not None:
+        diagram = lookup_mermaid_source(png_bytes)
+        if diagram is None and markdown_path is not None:
+            diagram = mermaid_cache_sidecar.lookup(markdown_path, png_bytes)
     if diagram is not None:
         return f"```mermaid\n{diagram}\n```", True
     # No cache hit -- still worth losing the blob. node.src is the doc's

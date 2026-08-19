@@ -6,6 +6,7 @@ renderer (never a real mermaid-cli subprocess in these tests), and uploaded
 through the same image_source.py pipeline as any other image.
 """
 
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
     MermaidSource,
@@ -89,6 +90,27 @@ def test_resolve_document_images_uses_mermaid_source_over_src(tmp_path) -> None:
     assert warnings == []
     assert out[0].src == "https://drive.example.com/temp123"
     assert temp_ids == ["temp123"]
+
+
+def test_resolve_document_images_records_mermaid_source_in_committed_sidecar(tmp_path) -> None:
+    md_path = str(tmp_path / "doc.md")
+    node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
+
+    resolve_document_images([node], md_path, _fake_uploader, renderer=_fake_renderer)
+
+    png_bytes = _fake_renderer("graph TD\n  A --> B")
+    assert mermaid_cache_sidecar.lookup(md_path, png_bytes) == "graph TD\n  A --> B"
+
+
+def test_resolve_document_images_does_not_record_non_mermaid_images(tmp_path) -> None:
+    md_path = str(tmp_path / "doc.md")
+    real_image = tmp_path / "photo.png"
+    real_image.write_bytes(_PNG_MAGIC + b"a-real-photo")
+    node = DocsImageNode(alt="a photo", src="photo.png")
+
+    resolve_document_images([node], md_path, _fake_uploader)
+
+    assert mermaid_cache_sidecar.load(md_path) == {}
 
 
 def test_mermaid_render_failure_is_a_warning_not_a_crash(tmp_path) -> None:

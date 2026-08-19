@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
 from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError, render_mermaid_png
 
@@ -74,6 +75,11 @@ class ResolvedImage:
 
     uri: str
     temp_drive_file_id: Optional[str] = None
+    # Set only when this resolution rendered a ```mermaid fence -- the raw
+    # PNG bytes, so resolve_document_images() can record them in the
+    # cross-machine mermaid-cache sidecar (mermaid_cache_sidecar.py) without
+    # re-rendering. None for every other image source kind.
+    rendered_bytes: Optional[bytes] = None
 
 
 @dataclass
@@ -178,7 +184,11 @@ def _resolve_one(source: ImageSource, uploader: Uploader, renderer: Renderer) ->
         )
 
     result = uploader(data, filename, mime_type)
-    return ResolvedImage(uri=result["uri"], temp_drive_file_id=result["file_id"])
+    return ResolvedImage(
+        uri=result["uri"],
+        temp_drive_file_id=result["file_id"],
+        rendered_bytes=data if isinstance(source, MermaidSource) else None,
+    )
 
 
 def _read_local(path: str) -> Tuple[bytes, str]:
@@ -252,6 +262,15 @@ def resolve_document_images(
     temp_drive_file_ids = [
         r.temp_drive_file_id for r in resolved.values() if r.temp_drive_file_id
     ]
+
+    # Persist mermaid renders to the committed sidecar (mermaid_cache_sidecar.py)
+    # so a pull on a different machine, which never had the local XDG render
+    # cache populated, can still restore the ```mermaid fence instead of
+    # falling back to a bare image link.
+    for i, node in enumerate(nodes):
+        result = resolved.get(str(i))
+        if node.mermaid_source and result is not None and result.rendered_bytes is not None:
+            mermaid_cache_sidecar.record(markdown_path, result.rendered_bytes, node.mermaid_source)
 
     out: List[Optional[DocsImageNode]] = []
     for i, node in enumerate(nodes):
