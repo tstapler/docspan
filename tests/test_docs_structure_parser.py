@@ -495,8 +495,9 @@ def test_parse_paragraph_sets_is_native_checkbox_true_for_checkbox_glyph_bullet(
 
 
 def test_parse_paragraph_sets_is_native_checkbox_false_for_ordinary_bullet() -> None:
-    """An ordinary disc/circle/square bullet (non-checkbox glyphType) must
-    resolve to is_native_checkbox=False."""
+    """A DECIMAL-glyph (ordered-list) bullet is not a checkbox glyph, so it
+    must resolve to is_native_checkbox=False -- separately, is_ordered_list
+    resolution for this same DECIMAL glyphType is covered below."""
     doc = _doc_with_lists(
         [
             _make_para_element(
@@ -537,6 +538,133 @@ def test_parse_paragraph_is_native_checkbox_false_for_non_bullet_paragraph() -> 
     nodes = parser.parse(doc)
     assert len(nodes) == 1
     assert nodes[0].is_native_checkbox is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# is_ordered_list / ordered_number resolution (Part C1 — ordered-list gap)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_paragraph_sets_is_ordered_list_true_for_decimal_glyph_bullet() -> None:
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "First item",
+                bullet={"listId": "kix.def", "nestingLevel": 0},
+                start=1,
+                end=12,
+            )
+        ],
+        {"kix.def": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}}},
+    )
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_ordered_list is True
+    assert nodes[0].ordered_number == 1
+
+
+def test_parse_paragraph_is_ordered_list_false_for_checkbox_glyph_bullet() -> None:
+    """GLYPH_TYPE_UNSPECIFIED (checkbox) must not be misclassified as ordered."""
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "[ ] task",
+                bullet={"listId": "kix.abc", "nestingLevel": 0},
+                start=1,
+                end=10,
+            )
+        ],
+        {"kix.abc": {"listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}}},
+    )
+    nodes = parser.parse(doc)
+    assert len(nodes) == 1
+    assert nodes[0].is_ordered_list is False
+    assert nodes[0].ordered_number is None
+
+
+def test_parse_paragraph_ordered_number_increments_within_same_list_and_level() -> None:
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "First", bullet={"listId": "kix.def", "nestingLevel": 0}, start=1, end=7,
+            ),
+            _make_para_element(
+                "Second", bullet={"listId": "kix.def", "nestingLevel": 0}, start=7, end=14,
+            ),
+            _make_para_element(
+                "Third", bullet={"listId": "kix.def", "nestingLevel": 0}, start=14, end=20,
+            ),
+        ],
+        {"kix.def": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}}},
+    )
+    nodes = parser.parse(doc)
+    assert [n.ordered_number for n in nodes] == [1, 2, 3]
+
+
+def test_parse_paragraph_ordered_number_tracked_separately_per_list_id() -> None:
+    """Two distinct ordered lists (different listId) must each start their
+    own numbering run, not share one counter."""
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "List A first", bullet={"listId": "kix.a", "nestingLevel": 0}, start=1, end=13,
+            ),
+            _make_para_element(
+                "List B first", bullet={"listId": "kix.b", "nestingLevel": 0}, start=13, end=25,
+            ),
+            _make_para_element(
+                "List A second", bullet={"listId": "kix.a", "nestingLevel": 0}, start=25, end=38,
+            ),
+        ],
+        {
+            "kix.a": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}},
+            "kix.b": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}},
+        },
+    )
+    nodes = parser.parse(doc)
+    assert [n.ordered_number for n in nodes] == [1, 1, 2]
+
+
+def test_parse_paragraph_ordered_number_tracked_separately_per_nesting_level() -> None:
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "Top 1", bullet={"listId": "kix.def", "nestingLevel": 0}, start=1, end=8,
+            ),
+            _make_para_element(
+                "Nested 1",
+                bullet={"listId": "kix.def", "nestingLevel": 1},
+                start=8,
+                end=17,
+            ),
+            _make_para_element(
+                "Top 2", bullet={"listId": "kix.def", "nestingLevel": 0}, start=17, end=24,
+            ),
+        ],
+        {
+            "kix.def": {
+                "listProperties": {
+                    "nestingLevels": [{"glyphType": "DECIMAL"}, {"glyphType": "DECIMAL"}]
+                }
+            }
+        },
+    )
+    nodes = parser.parse(doc)
+    assert [n.ordered_number for n in nodes] == [1, 1, 2]
+
+
+def test_reparsing_same_instance_resets_ordered_number_counters() -> None:
+    doc = _doc_with_lists(
+        [
+            _make_para_element(
+                "Only item", bullet={"listId": "kix.def", "nestingLevel": 0}, start=1, end=11,
+            ),
+        ],
+        {"kix.def": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}}},
+    )
+    first_pass = parser.parse(doc)
+    second_pass = parser.parse(doc)
+    assert first_pass[0].ordered_number == 1
+    assert second_pass[0].ordered_number == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

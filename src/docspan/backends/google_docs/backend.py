@@ -1288,6 +1288,21 @@ class GoogleDocsBackend(Backend):
                 # markdown *does* have, so pull/push is a fixpoint.
                 nodes, residue = project(nodes)
                 markdown_content = render_nodes_to_markdown(nodes)
+
+                # NOT calling _recover_checkbox_state here, deliberately.
+                # Investigated and reverted: even gated to single-tab docs
+                # (where Drive's tab-unscopable markdown export is
+                # unambiguous), patching a native-checkbox line whose raw
+                # paragraph text already contains prior force-pushed literal
+                # "[x] "/"[ ] " text (see TestSecondRoundTripAfterForcePush,
+                # issue #17 AC6) produces a push request that doubles that
+                # literal text AND replaces the native checkbox glyph with a
+                # plain disc bullet -- confirmed live via a batch_update
+                # inspection, not a hypothetical. Fixing this needs either
+                # patch_checkbox_lines() or push's bracket-stripping _key()
+                # to account for the other, which is real follow-up work,
+                # not a safe same-change fix. Tab-scoped pull continues to
+                # render every native checkbox unchecked (documented gap).
                 data_uris = find_data_uris(markdown_content)
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
