@@ -101,6 +101,15 @@ class Mapping(BaseModel):
     # None (default) targets the doc's first/default tab — preserves pre-tabs
     # behavior. Ignored by backends that don't support tabs (e.g. Confluence).
     tab_id: Optional[str] = None
+    # Which pull code path to use for google_docs. "auto" (default) preserves
+    # today's behavior: tab_id decides (None -> Drive HTML export, set ->
+    # tab-scoped structural render). "structural" forces the tab-scoped
+    # structural render even with tab_id=None, targeting the doc's first/
+    # default tab via resolve_document_tab(doc, None) same as "auto" would
+    # for tab selection, but through the cleaner renderer instead of Drive's
+    # lossy HTML export. Ignored by backends that don't have two pull paths
+    # (e.g. Confluence).
+    pull_strategy: Literal["auto", "structural"] = "auto"
     # Sectioned sync (gdocs-sectioned-sync): when True, `local` names a
     # directory of `NN-slug.md` section files + `_manifest.yaml` instead of a
     # single markdown file. Requires `split_level` to be set (see validator

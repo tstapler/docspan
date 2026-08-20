@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -830,9 +830,12 @@ def conflicts_resolve(
     # doc's first tab.
     mapping = resolve_mapping_for_path(config.mappings, file)
     tab_id = mapping.tab_id if mapping is not None else None
+    pull_strategy = mapping.pull_strategy if mapping is not None else "auto"
 
     if accept == "remote":
-        _resolve_remote(file, entry, backend, state, state_path, state_dir, tab_id=tab_id)
+        _resolve_remote(
+            file, entry, backend, state, state_path, state_dir, tab_id=tab_id, pull_strategy=pull_strategy,
+        )
     elif accept == "local":
         _resolve_local(file, entry, state, state_path, state_dir)
     elif accept == "merged":
@@ -847,8 +850,9 @@ def _resolve_remote(
     state_path: str,
     state_dir: str,
     tab_id: Optional[str] = None,
+    pull_strategy: Literal["auto", "structural"] = "auto",
 ) -> None:
-    result = backend.pull(entry.doc_id, file, tab_id=tab_id)
+    result = backend.pull(entry.doc_id, file, tab_id=tab_id, pull_strategy=pull_strategy)
     if result.status != "ok":
         err_console.print(f"Could not re-fetch remote: {result.message}")
         raise typer.Exit(1)

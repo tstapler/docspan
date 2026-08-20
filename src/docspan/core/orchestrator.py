@@ -478,7 +478,9 @@ def _first_sync_pull(
     remote_version: str,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
-    result = backend.pull(mapping.remote_id, mapping.local, tab_id=mapping.tab_id)
+    result = backend.pull(
+        mapping.remote_id, mapping.local, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+    )
     outcome = PullOutcome(local_path=mapping.local, action="first-sync", result=result)
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
         with open(mapping.local, encoding="utf-8") as fh:
@@ -499,7 +501,9 @@ def _fast_forward_pull(
     remote_version: str,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
-    result = backend.pull(mapping.remote_id, mapping.local, tab_id=mapping.tab_id)
+    result = backend.pull(
+        mapping.remote_id, mapping.local, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+    )
     outcome = PullOutcome(local_path=mapping.local, action="fast-forward", result=result)
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
         with open(mapping.local, encoding="utf-8") as fh:
@@ -529,7 +533,9 @@ def _merge_pull(
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
             tmp_path = tmp.name
-        tmp_result = backend.pull(mapping.remote_id, tmp_path, tab_id=mapping.tab_id)
+        tmp_result = backend.pull(
+            mapping.remote_id, tmp_path, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+        )
         if tmp_result.status in ("ok", "warning"):
             with open(tmp_path, encoding="utf-8") as fh:
                 theirs_content = fh.read()

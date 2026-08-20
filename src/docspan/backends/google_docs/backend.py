@@ -1255,28 +1255,37 @@ class GoogleDocsBackend(Backend):
         return None
 
     def pull(
-        self, doc_id: str, local_path: str, tab_id: Optional[str] = None, **kwargs: object
+        self,
+        doc_id: str,
+        local_path: str,
+        tab_id: Optional[str] = None,
+        pull_strategy: Literal["auto", "structural"] = "auto",
+        **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, convert to markdown, write locally.
 
-        Default (tab_id=None): unchanged pre-tabs-support behavior — export
-        via Drive's HTML export (files.export) and run it through
-        DocumentConverter.html_to_markdown(). Drive export always returns the
-        doc's first/default tab and cannot target a specific tab; if the doc
-        has more than one tab, status is escalated to "warning" (not "ok")
-        so a silent wrong-tab pull (the bug this parameter exists to fix)
-        is surfaced instead of hidden.
+        Default (tab_id=None, pull_strategy="auto"): unchanged pre-tabs-support
+        behavior — export via Drive's HTML export (files.export) and run it
+        through DocumentConverter.html_to_markdown(). Drive export always
+        returns the doc's first/default tab and cannot target a specific tab;
+        if the doc has more than one tab, status is escalated to "warning"
+        (not "ok") so a silent wrong-tab pull (the bug this parameter exists
+        to fix) is surfaced instead of hidden.
 
-        Explicit tab_id: Drive export can't select a tab, so this instead
-        re-fetches structurally (get_document + resolve_document_tab +
-        DocsStructureParser.parse) and renders back to markdown with
-        render_nodes_to_markdown() — the same structural machinery push()
-        uses, run in reverse.
+        Explicit tab_id, or pull_strategy="structural": Drive export can't
+        select a tab (and, separately, is the lossier path per Mapping.
+        pull_strategy's docstring), so this instead re-fetches structurally
+        (get_document + resolve_document_tab + DocsStructureParser.parse) and
+        renders back to markdown with render_nodes_to_markdown() — the same
+        structural machinery push() uses, run in reverse. resolve_document_tab
+        accepts tab_id=None as "no preference" (resolves to the first/default
+        tab), so pull_strategy="structural" with tab_id=None still targets the
+        right tab.
         """
         self._ensure_client()
         assert self._client is not None
         try:
-            if tab_id is not None:
+            if tab_id is not None or pull_strategy == "structural":
                 doc = self._client.get_document(doc_id)
                 doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
                 parser = DocsStructureParser()
