@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -197,6 +198,30 @@ def render_mermaid_png(diagram: str, *, timeout: Optional[float] = None) -> byte
     return data
 
 
+_JS_STACK_FRAME = re.compile(r":\d+:\d+\)?\s*$")
+
+
+def _clean_stderr(stderr: str) -> str:
+    """Drop the Puppeteer/JS stack frames mmdc appends after its own error message.
+
+    mmdc's real diagnostic (e.g. a "Parse error on line N: ... Expecting ...")
+    is always the leading lines; every line after that is a JS stack trace
+    (`Parser.parseError (file://...:409:21)`, `    at ...(...:402:19)`)
+    pointing into mermaid-cli's own bundled JS -- noise to a docspan user, since
+    it names no file or line of *their* diagram and just buries the actual
+    message. Frames are recognized generically by their trailing `:line:col)`,
+    since the URL scheme in front (`file://`, or a proxy-rewritten `https://`)
+    isn't reliable.
+    """
+    kept = []
+    for line in stderr.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("at ") or _JS_STACK_FRAME.search(stripped):
+            break
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
 def _render_uncached(diagram: str, *, timeout: Optional[float] = None) -> bytes:
     with tempfile.TemporaryDirectory(prefix="docspan-mermaid-") as tmpdir:
         tmp = Path(tmpdir)
@@ -225,7 +250,7 @@ def _render_uncached(diagram: str, *, timeout: Optional[float] = None) -> bytes:
 
         if result.returncode != 0:
             stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
-            raise MermaidRenderError(f"mermaid-cli failed: {stderr or 'no error output'}")
+            raise MermaidRenderError(f"mermaid-cli failed: {_clean_stderr(stderr) or 'no error output'}")
         if not output_path.is_file():
             raise MermaidRenderError("mermaid-cli reported success but produced no output file")
         return output_path.read_bytes()

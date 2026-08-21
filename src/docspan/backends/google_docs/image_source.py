@@ -225,6 +225,23 @@ def _sniff_mime_type(data: bytes) -> Optional[str]:
     return None
 
 
+def _describe_source(source: ImageSource) -> str:
+    """Short, single-line label for a warning -- never the raw dataclass repr.
+
+    `MermaidSource.diagram` is the full (often multi-line) fence text; its
+    default dataclass repr would dump that whole text, escaped onto one line,
+    into a push warning. Callers just need enough to find which image failed.
+    """
+    if isinstance(source, MermaidSource):
+        first_line = next((ln.strip() for ln in source.diagram.splitlines() if ln.strip()), "")
+        return f"mermaid diagram ({first_line})" if first_line else "mermaid diagram"
+    if isinstance(source, LocalPathSource):
+        return source.path
+    if isinstance(source, UrlSource):
+        return source.url
+    return repr(source)
+
+
 def resolve_document_images(
     nodes: List[DocsImageNode],
     markdown_path: str,
@@ -258,7 +275,7 @@ def resolve_document_images(
     }
     resolved, errors = resolve_images(sources, uploader, renderer)
 
-    warnings = [f"image {sources[e.key]!r}: {e.reason}" for e in errors]
+    warnings = [f"image {_describe_source(sources[e.key])}: {e.reason}" for e in errors]
     temp_drive_file_ids = [
         r.temp_drive_file_id for r in resolved.values() if r.temp_drive_file_id
     ]
