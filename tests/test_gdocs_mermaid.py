@@ -84,7 +84,7 @@ def test_resolve_images_renders_mermaid_source_via_injected_renderer() -> None:
 
 def test_resolve_document_images_uses_mermaid_source_over_src(tmp_path) -> None:
     node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
-    out, warnings, temp_ids = resolve_document_images(
+    out, warnings, temp_ids, mermaid_entries = resolve_document_images(
         [node], str(tmp_path / "doc.md"), _fake_uploader, renderer=_fake_renderer
     )
     assert warnings == []
@@ -118,7 +118,7 @@ def test_mermaid_render_failure_is_a_warning_not_a_crash(tmp_path) -> None:
         raise MermaidRenderError("mermaid-cli not found")
 
     node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
-    out, warnings, temp_ids = resolve_document_images(
+    out, warnings, temp_ids, mermaid_entries = resolve_document_images(
         [node], str(tmp_path / "doc.md"), _fake_uploader, renderer=_failing_renderer
     )
     assert out == [None]

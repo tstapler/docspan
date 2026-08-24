@@ -9,6 +9,7 @@ resolution failure into a push warning instead of a crash.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -247,14 +248,14 @@ def resolve_document_images(
     markdown_path: str,
     uploader: Uploader,
     renderer: Optional[Renderer] = None,
-) -> Tuple[List[Optional[DocsImageNode]], List[str], List[str]]:
+) -> Tuple[List[Optional[DocsImageNode]], List[str], List[str], List[Tuple[str, str]]]:
     """Resolve every `DocsImageNode.src` in `nodes` to a fetchable URI, in place-equivalent form.
 
     Convenience wrapper over `resolve_images()` for the `backend.py` push
     pre-pass: builds an `ImageSource` per node -- a `MermaidSource` when
     `node.mermaid_source` is set (a ```mermaid fence), otherwise from its raw
     markdown `src` via `build_source` -- resolves them all, and returns
-    `(nodes, warnings, temp_drive_file_ids)`.
+    `(nodes, warnings, temp_drive_file_ids, mermaid_entries)`.
 
     The returned `nodes` list is positional -- same length and order as the
     input, one slot per input node -- so a caller splicing these back into a
@@ -265,7 +266,10 @@ def resolve_document_images(
     `warnings`, matching the `_render_unstyled`/`_render_dead_anchors`
     residue-warning pattern in `backend.py`) and the caller drops it.
     `temp_drive_file_ids` lets the caller delete on success or retry on
-    failure (criterion 5/7/8).
+    failure (criterion 5/7/8). `mermaid_entries` is
+    `[(sha256_of_png_bytes, diagram_source), ...]`, in document order, for
+    `mermaid_appendix.build_appendix_nodes` -- the same key domain the
+    committed sidecar below already uses.
     """
     sources: Dict[str, ImageSource] = {
         str(i): MermaidSource(diagram=node.mermaid_source)
@@ -284,13 +288,16 @@ def resolve_document_images(
     # so a pull on a different machine, which never had the local XDG render
     # cache populated, can still restore the ```mermaid fence instead of
     # falling back to a bare image link.
+    mermaid_entries: List[Tuple[str, str]] = []
     for i, node in enumerate(nodes):
         result = resolved.get(str(i))
         if node.mermaid_source and result is not None and result.rendered_bytes is not None:
             mermaid_cache_sidecar.record(markdown_path, result.rendered_bytes, node.mermaid_source)
+            sha256_hex = hashlib.sha256(result.rendered_bytes).hexdigest()
+            mermaid_entries.append((sha256_hex, node.mermaid_source))
 
     out: List[Optional[DocsImageNode]] = []
     for i, node in enumerate(nodes):
         result = resolved.get(str(i))
         out.append(replace(node, src=result.uri) if result else None)
-    return out, warnings, temp_drive_file_ids
+    return out, warnings, temp_drive_file_ids, mermaid_entries

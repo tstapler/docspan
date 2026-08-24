@@ -59,6 +59,7 @@ from docspan.backends.google_docs.manifest import (
     SectionManifestEntry,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs import mermaid_appendix
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
     OAUTH_HELP,
@@ -74,7 +75,10 @@ from docspan.backends.google_docs.projection import (
     describe_target_residue,
     project,
 )
-from docspan.backends.google_docs.pulled_image_recovery import recover_pulled_images
+from docspan.backends.google_docs.pulled_image_recovery import (
+    recover_pulled_images,
+    recover_structural_mermaid_images,
+)
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -239,8 +243,9 @@ class GoogleDocsBackend(Backend):
         image_warnings: list[str] = []
         temp_drive_file_ids: list[str] = []
         resolved_images: list[DocsImageNode | None] = []
+        mermaid_entries: list[tuple[str, str]] = []
         if image_nodes:
-            resolved_images, image_warnings, temp_drive_file_ids = resolve_document_images(
+            resolved_images, image_warnings, temp_drive_file_ids, mermaid_entries = resolve_document_images(
                 image_nodes, local_path, self._client.upload_temp_image
             )
 
@@ -308,6 +313,12 @@ class GoogleDocsBackend(Backend):
             # design change, not a patch. Until then the author is told, which is the
             # difference between a known limitation and silent data loss.
             target_nodes, target_residue = project(target_nodes)
+
+            # Doc-only recovery aid (Part D): rebuilt fresh every push from the
+            # current mermaid images, never read back from a previous push --
+            # the local markdown never has this section, so there is nothing
+            # to preserve here.
+            target_nodes = target_nodes + mermaid_appendix.build_appendix_nodes(mermaid_entries)
 
             body_content = doc.get("body", {}).get("content", [])
             doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
@@ -1296,7 +1307,32 @@ class GoogleDocsBackend(Backend):
                 # demote the title. project() maps it to the nearest style
                 # markdown *does* have, so pull/push is a fixpoint.
                 nodes, residue = project(nodes)
+
+                # The appendix (mermaid_appendix.py) is Doc-only -- pulled
+                # markdown must never carry it forward, or it would grow
+                # without bound across push/pull cycles. Extract its entries
+                # for recovery below, then strip it before rendering.
+                appendix_boundary = mermaid_appendix.find_appendix_boundary(nodes)
+                appendix_entries = mermaid_appendix.extract_appendix_entries(nodes)
+                if appendix_boundary is not None:
+                    nodes = nodes[:appendix_boundary]
                 markdown_content = render_nodes_to_markdown(nodes)
+
+                # Unlike the default (Drive HTML export) path below, this
+                # renderer never embeds base64 image data -- each image link
+                # is the Docs API's real contentUri (docs_structure_parser.py).
+                # recover_pulled_images's data-URI regex can never match here,
+                # so mermaid-fence recovery needs its own fetch-then-hash path.
+                # See recover_structural_mermaid_images's docstring.
+                image_nodes = [n for n in nodes if isinstance(n, DocsImageNode)]
+                if image_nodes:
+                    image_recovery = recover_structural_mermaid_images(
+                        markdown_content,
+                        image_nodes,
+                        markdown_path=local_path,
+                        appendix_entries=appendix_entries or None,
+                    )
+                    markdown_content = image_recovery.markdown
 
                 # NOT calling _recover_checkbox_state here, deliberately.
                 # Investigated and reverted: even gated to single-tab docs
@@ -1369,6 +1405,10 @@ class GoogleDocsBackend(Backend):
             # the document fetched just above for the tab check. Ids the document
             # does not know are left exactly as they are.
             structural_nodes, _residue = project(DocsStructureParser().parse(resolved_doc))
+            appendix_entries = mermaid_appendix.extract_appendix_entries(structural_nodes)
+            appendix_boundary = mermaid_appendix.find_appendix_boundary(structural_nodes)
+            if appendix_boundary is not None:
+                structural_nodes = structural_nodes[:appendix_boundary]
             markdown_content = upgrade_heading_id_anchors(
                 markdown_content, heading_id_to_slug(structural_nodes)
             )
@@ -1377,14 +1417,27 @@ class GoogleDocsBackend(Backend):
                 doc_id, structural_nodes, markdown_content
             )
 
+            # The appendix (mermaid_appendix.py) is Doc-only -- strip its
+            # literal text back out of the HTML-exported markdown before it's
+            # written to disk. Node-list slicing above (structural_nodes)
+            # doesn't touch this string: it comes from Drive's HTML export,
+            # not from the node list.
+            markdown_content = mermaid_appendix.strip_appendix_from_markdown(markdown_content)
+
             # Drive's HTML export inlines every embedded image (including a
             # pushed ```mermaid fence's rendered diagram) as a
             # data:image/...;base64,... URI -- confirmed live, a two-diagram
             # doc round-tripped into 401KB of embedded PNG data. Swap each
-            # one for a restored mermaid fence (local render-cache hit) or
-            # the structural node's real, non-bloated image URL.
+            # one for a restored mermaid fence (local render-cache hit,
+            # committed sidecar, or the in-doc appendix) or the structural
+            # node's real, non-bloated image URL.
             image_nodes = [n for n in structural_nodes if isinstance(n, DocsImageNode)]
-            recovery = recover_pulled_images(markdown_content, image_nodes, markdown_path=local_path)
+            recovery = recover_pulled_images(
+                markdown_content,
+                image_nodes,
+                markdown_path=local_path,
+                appendix_entries=appendix_entries or None,
+            )
             markdown_content = recovery.markdown
 
             # Backstop for any data: URI recover_pulled_images() didn't catch
@@ -1467,6 +1520,14 @@ class GoogleDocsBackend(Backend):
             nodes = parser.parse(doc)
             nodes, residue = project(nodes)
 
+            # The appendix (mermaid_appendix.py) is Doc-only -- it must not
+            # become one more section file. Extract its entries for recovery
+            # below, then drop it before splitting.
+            appendix_entries = mermaid_appendix.extract_appendix_entries(nodes)
+            appendix_boundary = mermaid_appendix.find_appendix_boundary(nodes)
+            if appendix_boundary is not None:
+                nodes = nodes[:appendix_boundary]
+
             existing_entries: List[SectionManifestEntry] = []
             manifest_path = target_dir / MANIFEST_FILENAME
             if manifest_path.exists():
@@ -1490,6 +1551,16 @@ class GoogleDocsBackend(Backend):
                 for index, section in enumerate(sections):
                     filename = f"{str(index).zfill(width)}-{section.slug}.md"
                     content = render_nodes_to_markdown(section.nodes) if section.nodes else ""
+                    section_image_nodes = [
+                        n for n in section.nodes if isinstance(n, DocsImageNode)
+                    ]
+                    if section_image_nodes:
+                        content = recover_structural_mermaid_images(
+                            content,
+                            section_image_nodes,
+                            markdown_path=str(target_dir / filename),
+                            appendix_entries=appendix_entries or None,
+                        ).markdown
                     section_data_uris.extend(find_data_uris(content))
                     (tmp_dir / filename).write_text(content)
                     section_texts.append((filename, content))

@@ -7,11 +7,15 @@ rendered diagram.
 """
 
 import base64
+import hashlib
 
 from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
 from docspan.backends.google_docs.mermaid_renderer import _by_hash_dir
-from docspan.backends.google_docs.pulled_image_recovery import recover_pulled_images
+from docspan.backends.google_docs.pulled_image_recovery import (
+    recover_pulled_images,
+    recover_structural_mermaid_images,
+)
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -170,3 +174,72 @@ def test_preserves_real_alt_text_from_the_export_on_fallback(tmp_path, monkeypat
     result = recover_pulled_images(markdown, image_nodes)
 
     assert result.markdown == "![architecture overview](https://example.com/img)\n"
+
+
+def test_restores_from_appendix_entries_alone_no_local_cache_no_sidecar(
+    tmp_path, monkeypatch
+) -> None:
+    """Third recovery tier (mermaid_appendix.py): no XDG cache hit, no
+    sidecar (markdown_path omitted entirely), only appendix_entries."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    diagram = "graph TD\n  A --> B"
+    png_bytes = _PNG_MAGIC + b"a-diagram-only-known-via-the-appendix"
+    appendix_entries = {hashlib.sha256(png_bytes).hexdigest(): diagram}
+
+    markdown = f"![mermaid diagram]({_data_uri(png_bytes)})\n"
+    image_nodes = [DocsImageNode(src="https://lh3.googleusercontent.com/temp4", alt="")]
+
+    result = recover_pulled_images(markdown, image_nodes, appendix_entries=appendix_entries)
+
+    assert result.mermaid_restored == 1
+    assert f"```mermaid\n{diagram}\n```" in result.markdown
+    assert "base64" not in result.markdown
+
+
+def test_appendix_miss_falls_back_to_real_url(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    png_bytes = _PNG_MAGIC + b"not-in-the-appendix-either"
+    appendix_entries = {"some-other-hash": "graph TD\n  X --> Y"}
+
+    markdown = f"![a photo]({_data_uri(png_bytes)})\n"
+    image_nodes = [DocsImageNode(src="https://example.com/photo", alt="")]
+
+    result = recover_pulled_images(markdown, image_nodes, appendix_entries=appendix_entries)
+
+    assert result.mermaid_restored == 0
+    assert result.markdown == "![a photo](https://example.com/photo)\n"
+
+
+def test_structural_recovery_restores_from_appendix_entries_alone(tmp_path, monkeypatch) -> None:
+    """recover_structural_mermaid_images's own three-tier chain, appendix-only."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    diagram = "graph TD\n  A --> B"
+    png_bytes = _PNG_MAGIC + b"fetched-over-http-and-only-in-the-appendix"
+    appendix_entries = {hashlib.sha256(png_bytes).hexdigest(): diagram}
+
+    markdown = "![a diagram](https://docs.google.com/content-uri-1)\n"
+    image_nodes = [DocsImageNode(src="https://docs.google.com/content-uri-1", alt="")]
+
+    def fake_fetch(url: str):
+        assert url == "https://docs.google.com/content-uri-1"
+        return png_bytes
+
+    result = recover_structural_mermaid_images(
+        markdown, image_nodes, fetch=fake_fetch, appendix_entries=appendix_entries
+    )
+
+    assert result.mermaid_restored == 1
+    assert f"```mermaid\n{diagram}\n```" in result.markdown
+
+
+def test_structural_recovery_fetch_failure_leaves_link_untouched(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    markdown = "![a diagram](https://docs.google.com/content-uri-2)\n"
+    image_nodes = [DocsImageNode(src="https://docs.google.com/content-uri-2", alt="")]
+
+    result = recover_structural_mermaid_images(
+        markdown, image_nodes, fetch=lambda url: None, appendix_entries={}
+    )
+
+    assert result.mermaid_restored == 0
+    assert result.markdown == markdown

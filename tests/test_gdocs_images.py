@@ -268,7 +268,7 @@ def test_resolve_document_images_is_positional_with_none_for_failures(tmp_path) 
     def uploader(data: bytes, filename: str, mime_type: str) -> dict:
         return {"file_id": "drive-1", "uri": "https://drive.example.com/drive-1"}
 
-    resolved, warnings, temp_ids = resolve_document_images(nodes, str(md_path), uploader)
+    resolved, warnings, temp_ids, mermaid_entries = resolve_document_images(nodes, str(md_path), uploader)
 
     assert len(resolved) == 3
     assert resolved[0] is not None and resolved[0].src == "https://drive.example.com/drive-1"
