@@ -6,6 +6,8 @@ renderer (never a real mermaid-cli subprocess in these tests), and uploaded
 through the same image_source.py pipeline as any other image.
 """
 
+import hashlib
+
 from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
@@ -90,6 +92,8 @@ def test_resolve_document_images_uses_mermaid_source_over_src(tmp_path) -> None:
     assert warnings == []
     assert out[0].src == "https://drive.example.com/temp123"
     assert temp_ids == ["temp123"]
+    expected_hash = hashlib.sha256(_fake_renderer("graph TD\n  A --> B")).hexdigest()
+    assert mermaid_entries == [(expected_hash, "graph TD\n  A --> B")]
 
 
 def test_resolve_document_images_records_mermaid_source_in_committed_sidecar(tmp_path) -> None:
@@ -125,6 +129,7 @@ def test_mermaid_render_failure_is_a_warning_not_a_crash(tmp_path) -> None:
     assert len(warnings) == 1
     assert "mermaid render failed" in warnings[0]
     assert temp_ids == []
+    assert mermaid_entries == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

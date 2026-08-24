@@ -287,14 +287,19 @@ def resolve_document_images(
     # Persist mermaid renders to the committed sidecar (mermaid_cache_sidecar.py)
     # so a pull on a different machine, which never had the local XDG render
     # cache populated, can still restore the ```mermaid fence instead of
-    # falling back to a bare image link.
+    # falling back to a bare image link. Collected into one dict and written
+    # once via record_many() rather than once per node -- record() alone
+    # would do a full sidecar read-modify-write per diagram, O(N) file I/O
+    # for an N-diagram doc.
     mermaid_entries: List[Tuple[str, str]] = []
+    sidecar_entries: Dict[str, str] = {}
     for i, node in enumerate(nodes):
         result = resolved.get(str(i))
         if node.mermaid_source and result is not None and result.rendered_bytes is not None:
-            mermaid_cache_sidecar.record(markdown_path, result.rendered_bytes, node.mermaid_source)
             sha256_hex = hashlib.sha256(result.rendered_bytes).hexdigest()
+            sidecar_entries[sha256_hex] = node.mermaid_source
             mermaid_entries.append((sha256_hex, node.mermaid_source))
+    mermaid_cache_sidecar.record_many(markdown_path, sidecar_entries)
 
     out: List[Optional[DocsImageNode]] = []
     for i, node in enumerate(nodes):

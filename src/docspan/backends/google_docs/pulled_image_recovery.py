@@ -23,6 +23,7 @@ import base64
 import binascii
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Match, Optional
 
@@ -38,6 +39,12 @@ _DATA_URI_IMAGE = re.compile(r"!\[([^\]]*)\]\((data:image/[^)]+)\)")
 # recover_structural_mermaid_images's docstring for why this needs a
 # separate fetch-then-hash path instead of _DATA_URI_IMAGE's regex match.
 _FETCH_TIMEOUT_SECONDS = 10
+
+# Bounds the worker pool for recover_structural_mermaid_images's parallel
+# fetch -- a doc with far more than this many *unique* diagram URLs is not
+# the case this is optimizing for, and an unbounded pool risks hammering
+# Drive with one connection per image.
+_MAX_FETCH_WORKERS = 8
 
 Fetcher = Callable[[str], Optional[bytes]]
 
@@ -185,10 +192,24 @@ def recover_structural_mermaid_images(
 
     Correlates matches to `image_nodes` positionally, same reasoning and
     same all-or-nothing guard as `recover_pulled_images`.
+
+    Fetches are deduped by URL (a repeated `contentUri` -- e.g. the same
+    diagram embedded twice -- is only fetched once) and run concurrently via
+    a bounded thread pool: `fetch` is a blocking network call, so a doc with
+    N diagrams otherwise pays N serial round trips (worst case ~150s for 15
+    diagrams at the 10s timeout above) for no benefit, since each fetch is
+    independent of the others.
     """
     matches = list(re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", markdown_content))
     if not matches or len(matches) != len(image_nodes):
         return ImageRecoveryResult(markdown=markdown_content, mermaid_restored=0, base64_deflated=0)
+
+    unique_urls = list({node.src for node in image_nodes if node.src})
+    fetched_by_url: Dict[str, Optional[bytes]] = {}
+    if unique_urls:
+        with ThreadPoolExecutor(max_workers=min(_MAX_FETCH_WORKERS, len(unique_urls))) as pool:
+            for url, png_bytes in zip(unique_urls, pool.map(fetch, unique_urls)):
+                fetched_by_url[url] = png_bytes
 
     mermaid_restored = 0
     pieces: List[str] = []
@@ -197,7 +218,7 @@ def recover_structural_mermaid_images(
         pieces.append(markdown_content[cursor : match.start()])
         alt = match.group(1)
         diagram = None
-        png_bytes = fetch(node.src) if node.src else None
+        png_bytes = fetched_by_url.get(node.src) if node.src else None
         if png_bytes is not None:
             diagram = lookup_mermaid_source(png_bytes)
             if diagram is None and markdown_path is not None:

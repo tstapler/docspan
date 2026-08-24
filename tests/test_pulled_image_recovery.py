@@ -243,3 +243,58 @@ def test_structural_recovery_fetch_failure_leaves_link_untouched(tmp_path, monke
 
     assert result.mermaid_restored == 0
     assert result.markdown == markdown
+
+
+def test_structural_recovery_dedupes_repeated_urls_to_a_single_fetch(tmp_path, monkeypatch) -> None:
+    """A repeated contentUri (same diagram embedded twice) is fetched once, not once per node."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    diagram = "graph TD\n  A --> B"
+    png_bytes = _PNG_MAGIC + b"same-diagram-both-places"
+    appendix_entries = {hashlib.sha256(png_bytes).hexdigest(): diagram}
+    repeated_url = "https://docs.google.com/content-uri-shared"
+    markdown = f"![a]({repeated_url})\n![b]({repeated_url})\n"
+    image_nodes = [
+        DocsImageNode(src=repeated_url, alt=""),
+        DocsImageNode(src=repeated_url, alt=""),
+    ]
+
+    fetch_calls: list = []
+
+    def fake_fetch(url: str):
+        fetch_calls.append(url)
+        return png_bytes
+
+    result = recover_structural_mermaid_images(
+        markdown, image_nodes, fetch=fake_fetch, appendix_entries=appendix_entries
+    )
+
+    assert fetch_calls == [repeated_url]
+    assert result.mermaid_restored == 2
+
+
+def test_structural_recovery_fetches_multiple_distinct_urls_concurrently(
+    tmp_path, monkeypatch
+) -> None:
+    """Distinct URLs are all still resolved even when fetched off the calling thread."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    diagram_a, diagram_b = "graph TD\n  A --> B", "graph TD\n  X --> Y"
+    png_a = _PNG_MAGIC + b"diagram-a"
+    png_b = _PNG_MAGIC + b"diagram-b"
+    appendix_entries = {
+        hashlib.sha256(png_a).hexdigest(): diagram_a,
+        hashlib.sha256(png_b).hexdigest(): diagram_b,
+    }
+    url_a, url_b = "https://docs.google.com/content-uri-a", "https://docs.google.com/content-uri-b"
+    markdown = f"![a]({url_a})\n![b]({url_b})\n"
+    image_nodes = [DocsImageNode(src=url_a, alt=""), DocsImageNode(src=url_b, alt="")]
+
+    def fake_fetch(url: str):
+        return {url_a: png_a, url_b: png_b}[url]
+
+    result = recover_structural_mermaid_images(
+        markdown, image_nodes, fetch=fake_fetch, appendix_entries=appendix_entries
+    )
+
+    assert result.mermaid_restored == 2
+    assert f"```mermaid\n{diagram_a}\n```" in result.markdown
+    assert f"```mermaid\n{diagram_b}\n```" in result.markdown
