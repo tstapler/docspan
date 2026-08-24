@@ -687,3 +687,115 @@ def test_find_churn_pairs_1to1_matches_two_full_pairs_without_double_claiming() 
     assert remove_a in claimed_removes
     assert remove_b in claimed_removes
     assert claimed_removes[0] is not claimed_removes[1]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Epic 4 (gdocs-native-blockquotes): style_upgrade detection/rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_HighRiskParagraph_reasons_should_IncludeStyleUpgrade_When_LegacyBlockquoteRewrittenWithSameText() -> None:
+    """A legacy '> text' paragraph rewritten to native blockquote styling with
+    no author-visible text change (current_text minus its '> ' prefix equals
+    target_text) is a "change" DiffEntry — the one-time migration case."""
+    entries = [
+        DiffEntry(
+            kind="change",
+            current_text="> A note worth calling out",
+            target_text="A note worth calling out",
+            style="NORMAL_TEXT",
+        )
+    ]
+
+    result = find_high_risk_paragraphs(entries, comments=[])
+
+    assert result == [
+        HighRiskParagraph(
+            paragraph_text="> A note worth calling out",
+            reasons=["style_upgrade"],
+        )
+    ]
+
+
+def test_find_high_risk_paragraphs_should_NotTagStyleUpgrade_When_TextActuallyChanged() -> None:
+    """A legacy blockquote whose text the author also edited (not just the
+    marker prefix stripped) must NOT be tagged style_upgrade — that's a real
+    content edit, not a no-op rendering-rule upgrade."""
+    entries = [
+        DiffEntry(
+            kind="change",
+            current_text="> A note worth calling out",
+            target_text="A completely different note",
+            style="NORMAL_TEXT",
+        )
+    ]
+
+    result = find_high_risk_paragraphs(entries, comments=[])
+
+    assert result == []
+
+
+def test_render_high_risk_should_EmitDistinctWording_When_OnlyReasonIsStyleUpgrade() -> None:
+    high_risk = [
+        HighRiskParagraph(paragraph_text="> A note worth calling out", reasons=["style_upgrade"])
+    ]
+
+    rendered = render_high_risk(high_risk)
+
+    assert "native blockquote styling" in rendered
+    assert "one-time upgrade" in rendered
+    assert "lost" in rendered.lower()
+    # Distinct from the other two reasons' wording.
+    assert "COMMENT AT RISK" not in rendered
+    assert "NATIVE CHECKBOX GLYPH" not in rendered
+
+
+def test_render_high_risk_should_SummarizeCount_When_FiveOrMoreStyleUpgradeParagraphsPresent() -> None:
+    high_risk = [
+        HighRiskParagraph(paragraph_text=f"> Note {i}", reasons=["style_upgrade"])
+        for i in range(5)
+    ]
+
+    rendered = render_high_risk(high_risk)
+
+    assert "5 paragraphs rewritten to add native blockquote styling" in rendered
+    # Collapsed into one summarized block, not one per paragraph.
+    assert rendered.count("native blockquote styling") == 1
+    for i in range(5):
+        assert f"> Note {i}" not in rendered
+
+
+def test_render_churn_note_should_UseStyleUpgradeWording_When_PairReasonIsStyleUpgrade() -> None:
+    remove = DiffEntry(
+        kind="remove", current_text="A note worth calling out", target_text=None,
+        style="NORMAL_TEXT", edit_group=0,
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="A note worth calling out",
+        style="NORMAL_TEXT", edit_group=0,
+    )
+    high_risk = [
+        HighRiskParagraph(paragraph_text="A note worth calling out", reasons=["style_upgrade"])
+    ]
+
+    note = render_churn_note([(remove, add)], high_risk)
+
+    assert note == (
+        "⚠ 1 paragraph rewritten to add native blockquote styling (one-time upgrade) "
+        "— comment on it is lost."
+    )
+
+
+def test_render_churn_note_should_UseGenericWording_When_PairHasNoStyleUpgradeReason() -> None:
+    remove = DiffEntry(
+        kind="remove", current_text="Same paragraph", target_text=None, style="NORMAL_TEXT", edit_group=0
+    )
+    add = DiffEntry(
+        kind="add", current_text=None, target_text="Same paragraph", style="NORMAL_TEXT", edit_group=0
+    )
+
+    note = render_churn_note([(remove, add)], high_risk=[])
+
+    assert "comment" in note.lower()
+    assert "lost" in note.lower()
+    assert "one-time upgrade" not in note

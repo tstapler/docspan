@@ -14,6 +14,7 @@ import yaml
 from typer.testing import CliRunner
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
+from docspan.backends.google_docs.push_preview import HighRiskParagraph
 from docspan.cli.main import (
     LIVE_WEDDING_DOC_ID,
     SCRATCH_VERIFIED_MARKER,
@@ -64,9 +65,14 @@ class FakeBackend(Backend):
 class FakePushPreview:
     """Minimal stand-in for push_preview.PushPreview — just needs .render()
     and (optionally) .error, mirroring the real dataclass's error field used
-    by the CLI's dry-run error handling (getattr(preview, "error", None))."""
+    by the CLI's dry-run error handling (getattr(preview, "error", None)).
+    `high_risk` defaults to [] (deliberately absent from most existing
+    fixtures' construction) — the CLI reads it via getattr(...,
+    "high_risk", None) precisely so a stand-in/backend without this field
+    doesn't crash STYLE_UPGRADE_COUNT counting (Story 4.3)."""
     text: str = "Preview: 1 change(s), 0 addition(s), 0 removal(s), 0 unchanged\n  ~ [ ] Splitwise → [x] Splitwise"
     error: Optional[str] = None
+    high_risk: list = field(default_factory=list)
 
     def render(self) -> str:
         return self.text
@@ -78,13 +84,14 @@ class FakeBackendWithPreview(FakeBackend):
     name: str = "fake"
     preview_text: Optional[str] = None
     preview_error: Optional[str] = None
+    preview_high_risk: list = field(default_factory=list)
 
     def preview_push(self, local_path: str, doc_id: str, tab_id: Optional[str] = None) -> FakePushPreview:
         if self.preview_error is not None:
             return FakePushPreview(text=f"✗ dry-run failed: {self.preview_error}", error=self.preview_error)
         if self.preview_text is not None:
-            return FakePushPreview(text=self.preview_text)
-        return FakePushPreview()
+            return FakePushPreview(text=self.preview_text, high_risk=self.preview_high_risk)
+        return FakePushPreview(high_risk=self.preview_high_risk)
 
 
 def _config(*mappings: Mapping) -> MarkgateConfig:
@@ -345,6 +352,132 @@ class TestPush:
         assert result.exit_code == 1
         assert "⚠" in result.output
         assert "✓" not in result.output
+
+    # ─────────────────────────────────────────────────────────────────
+    # STYLE_UPGRADE_COUNT / --fail-on-comment-loss (Epic 4, Story 4.3)
+    # ─────────────────────────────────────────────────────────────────
+
+    def test_dry_run_prints_style_upgrade_count_zero_when_no_style_upgrades(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview()
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
+        assert result.exit_code == 0
+        assert "STYLE_UPGRADE_COUNT=0" in result.output
+
+    def test_dry_run_prints_style_upgrade_count_matching_high_risk_entries(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("# Hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview(
+            preview_high_risk=[
+                HighRiskParagraph(paragraph_text="> A note", reasons=["style_upgrade"]),
+                HighRiskParagraph(paragraph_text="> Another note", reasons=["style_upgrade"]),
+            ]
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["push", "--dry-run", "--config", cfg])
+        assert result.exit_code == 0
+        assert "STYLE_UPGRADE_COUNT=2" in result.output
+
+    def test_real_push_prints_style_upgrade_count_from_pre_push_preview(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview(
+            preview_high_risk=[
+                HighRiskParagraph(paragraph_text="> A note", reasons=["style_upgrade"]),
+            ]
+        )
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id="doc-123", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--config", cfg])
+        assert result.exit_code == 0
+        assert "STYLE_UPGRADE_COUNT=1" in result.output
+
+    def test_real_push_prints_style_upgrade_count_zero_when_backend_has_no_preview(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id="doc-123", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--config", cfg])
+        assert result.exit_code == 0
+        assert "STYLE_UPGRADE_COUNT=0" in result.output
+
+    def test_fail_on_comment_loss_not_passed_leaves_exit_code_zero_despite_style_upgrades(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview(
+            preview_high_risk=[
+                HighRiskParagraph(paragraph_text="> A note", reasons=["style_upgrade"]),
+            ]
+        )
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id="doc-123", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--config", cfg])
+        assert result.exit_code == 0
+        assert "STYLE_UPGRADE_COUNT=1" in result.output
+
+    def test_fail_on_comment_loss_passed_with_style_upgrades_exits_nonzero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackendWithPreview(
+            preview_high_risk=[
+                HighRiskParagraph(paragraph_text="> A note", reasons=["style_upgrade"]),
+            ]
+        )
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id="doc-123", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--fail-on-comment-loss", "--config", cfg])
+        assert result.exit_code == 1
+        assert "STYLE_UPGRADE_COUNT=1" in result.output
+
+    def test_fail_on_comment_loss_passed_with_zero_style_upgrades_stays_exit_zero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("content\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        outcome = PushOutcome(
+            local_path=str(local),
+            result=PushResult(status="ok", doc_id="doc-123", url="https://example.com/doc"),
+            state_saved=True,
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()), \
+             patch("docspan.cli.main.orchestrate_push", return_value=outcome):
+            result = runner.invoke(app, ["push", "--fail-on-comment-loss", "--config", cfg])
+        assert result.exit_code == 0
+        assert "STYLE_UPGRADE_COUNT=0" in result.output
 
 
 # ─────────────────────────────────────────────────────────────────────────────

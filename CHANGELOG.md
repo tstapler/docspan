@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+* **google-docs:** removed the `docspan lint`/style-guide warning against `>` blockquotes now that push emits native blockquote styling instead of literal `>`-prefixed text; if a rendering edge case still misrenders a quote post-push, spot it via `push --dry-run`'s structural diff or by visually inspecting the pushed Doc, since no automated check remains for it.
+
 ## [0.5.0](https://github.com/tstapler/docspan/compare/docspan-v0.4.0...docspan-v0.5.0) (2026-08-14)
 
 
@@ -137,6 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   One-way: push has no ordered-list concept (every markdown list becomes an unordered
   bullet regardless of source syntax), so a round-trip through push still loses the
   numbering — pre-existing, unconditional on both pull paths, not introduced by this fix.
+- **google-docs:** a Markdown `> ...` blockquote now pushes as a native indented,
+  left-bordered paragraph (`indentStart`/`borderLeft`) instead of literal `>` text, and
+  pulling it back reconstructs the `> ` prefix from that styling, byte-for-byte round trip
+  for plain, nested, list-in-quote, and code-fence-in-quote quotes. A Doc still carrying a
+  pre-migration literal-`>` blockquote pulls unchanged and is migrated to the native styling
+  the next time its file is pushed for any reason — a one-time rewrite that, like any other
+  paragraph rewrite, drops comments anchored to it (see the comments-destroyed limitation
+  below).
 
 ### Changed
 - **google-docs:** pass 2 parses and aligns the document once per push instead of three

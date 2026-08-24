@@ -43,6 +43,24 @@ _ORDERED_GLYPH_TYPES = frozenset(
 # loud failure, not corruption.
 _PRIVATE_USE = range(0xE000, 0xF900)
 
+# `docs_structure_parser` is the sole owner of both blockquote-marker constants
+# below — any other module (e.g. `docs_request_builder._blockquote_paragraph_style_fields`)
+# imports them by name rather than redefining or copying their values, so there is
+# exactly one place a future format change is made.
+#
+# Values are an engineering decision documented in
+# project_plans/gdocs-native-blockquotes/implementation/epic-0-spike-findings.md,
+# reasoned from the public Docs API v1 schema and WCAG contrast math — NOT yet
+# confirmed against a live `documents.get` echo. See that file's "Explicitly left
+# unverified" section before treating these as final.
+BLOCKQUOTE_BORDER_MARKER: dict = {
+    "color": {"color": {"rgbColor": {"red": 0.494, "green": 0.549, "blue": 0.612}}},
+    "width": {"magnitude": 1, "unit": "PT"},
+    "dashStyle": "SOLID",
+    "padding": {"magnitude": 1, "unit": "PT"},
+}
+BLOCKQUOTE_INDENT_PT_PER_LEVEL: float = 18.0
+
 # Fonts Google Docs' own code-block picker offers, beyond "Courier"/"mono" — the
 # "Courier"/"mono" check this extends. Not exhaustive — an arbitrary custom
 # monospace font will still miss — but "Courier"/"mono" alone missed every
@@ -65,6 +83,73 @@ _MONOSPACE_FONT_MARKERS = (
     "pt mono",
     "andale mono",
 )
+
+
+# Detection below compares only `color`/`width`/`dashStyle` — the sub-fields of
+# BLOCKQUOTE_BORDER_MARKER docspan actually writes on push
+# (`docs_request_builder._blockquote_paragraph_style_fields`) — not the whole
+# `borderLeft` dict, against a live Doc's echo. Docs is free to round-trip
+# additional normalized defaults (e.g. a `padding` Docs fills in itself) that
+# docspan never specified, and a whole-dict `==` would then read every real
+# match as a non-match. See Story 3.1's Given-When-Then and Unresolved
+# Question 2.
+
+# A live Doc echoes `color.color.rgbColor`'s components quantized to 8-bit
+# RGB (confirmed via the Epic 0 live spike, 2026-08-17: sent 0.494 came back
+# as 0.49411765 == round(0.494*255)/255). Exact `==` on that sub-field would
+# therefore never match a real round trip, only the hand-built test fixtures
+# that predated the spike. Max quantization error is 1/(2*255) ≈ 0.00196;
+# 0.003 clears that with a small margin without getting anywhere near a
+# genuinely different human-applied color (e.g. pure red differs by ~0.1+).
+_COLOR_TOLERANCE = 0.003
+
+
+def _rgb_close(a: Optional[dict], b: Optional[dict]) -> bool:
+    """True if two `color.color.rgbColor`-shaped dicts match within 8-bit RGB quantization."""
+    if a == b:
+        return True
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    a_rgb = a.get("color", {}).get("rgbColor", {})
+    b_rgb = b.get("color", {}).get("rgbColor", {})
+    if not isinstance(a_rgb, dict) or not isinstance(b_rgb, dict):
+        return False
+    if set(a_rgb) != set(b_rgb):
+        return False
+    return all(
+        isinstance(a_rgb[k], (int, float))
+        and isinstance(b_rgb[k], (int, float))
+        and abs(a_rgb[k] - b_rgb[k]) < _COLOR_TOLERANCE
+        for k in a_rgb
+    )
+
+
+def _detect_blockquote_depth(paragraph_style: dict) -> int:
+    """0 if `paragraph_style` carries no docspan-written blockquote border,
+    else the quote depth implied by `indentStart`.
+
+    Matches iff every one of `color`/`width`/`dashStyle` is present
+    on `borderLeft` and equals the corresponding sub-field of
+    `BLOCKQUOTE_BORDER_MARKER` — sub-field-by-sub-field, not `borderLeft ==
+    BLOCKQUOTE_BORDER_MARKER` wholesale (see module comment above). `color` is
+    compared with tolerance for 8-bit RGB quantization (`_rgb_close`);
+    `width`/`dashStyle` echo back byte-identical on a live Doc, so those stay
+    exact.
+    """
+    border_left = paragraph_style.get("borderLeft")
+    if not isinstance(border_left, dict):
+        return 0
+    if not _rgb_close(border_left.get("color"), BLOCKQUOTE_BORDER_MARKER.get("color")):
+        return 0
+    for key in ("width", "dashStyle"):
+        if border_left.get(key) != BLOCKQUOTE_BORDER_MARKER.get(key):
+            return 0
+    indent_start = paragraph_style.get("indentStart")
+    magnitude = indent_start.get("magnitude") if isinstance(indent_start, dict) else None
+    if not isinstance(magnitude, (int, float)) or magnitude <= 0:
+        return 0
+    depth = round(magnitude / BLOCKQUOTE_INDENT_PT_PER_LEVEL)
+    return depth if depth > 0 else 0
 
 
 def _is_all_private_use(text: str) -> bool:
@@ -223,6 +308,28 @@ class DocsParagraphNode:
     # identity would make every freshly written heading look like a different
     # paragraph from the one the markdown describes.
     heading_id: Optional[str] = None
+    # Part of the diff key (`_node_key`), NOT `_content_key`: a blockquote
+    # restyle-in-place should still fold to `equal` via `_repair`, but a
+    # blockquote paragraph and a plain paragraph sharing identical text are
+    # not the same live paragraph to align against. True iff quote_depth > 0
+    # — see __post_init__.
+    is_blockquote: bool = False
+    # Nesting depth of a markdown blockquote ("> " = 1, "> > " = 2, ...).
+    # Part of the diff key alongside is_blockquote, same rationale. 0 iff
+    # is_blockquote is False — see __post_init__.
+    quote_depth: int = 0
+
+    def __post_init__(self) -> None:
+        # is_blockquote/quote_depth are an intentionally-paired invariant, not
+        # two independent fields: quote_depth only means anything when
+        # is_blockquote is True, and there is no such thing as a depth-0
+        # blockquote. Enforcing this at construction time closes the illegal
+        # states (False, 2) and (True, 0) without a wider field-shape change.
+        if self.is_blockquote != (self.quote_depth > 0):
+            raise ValueError(
+                "DocsParagraphNode: is_blockquote and quote_depth must agree "
+                f"(is_blockquote={self.is_blockquote!r}, quote_depth={self.quote_depth!r})"
+            )
 
 
 @dataclass
@@ -658,6 +765,8 @@ class DocsStructureParser:
             self._next_ordered_number(bullet, nesting_level) if is_ordered_list else None
         )
 
+        quote_depth = _detect_blockquote_depth(paragraph_style)
+
         return DocsParagraphNode(
             style=style,
             text=text,
@@ -671,6 +780,8 @@ class DocsStructureParser:
             is_ordered_list=is_ordered_list,
             ordered_number=ordered_number,
             heading_id=paragraph_style.get("headingId"),
+            is_blockquote=quote_depth > 0,
+            quote_depth=quote_depth,
         )
 
     def _next_ordered_number(self, bullet: Optional[dict], nesting_level: int) -> int:

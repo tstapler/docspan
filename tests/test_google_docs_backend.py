@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import pathlib
 from typing import Callable, List
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
@@ -3252,3 +3253,608 @@ class TestPushSectioned:
         assert "diagram.png" in (result.message or "")
         assert "01-section-1.md" in (result.message or "")
         assert "02-section-2.md" in (result.message or "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Epic 0 (gdocs-native-blockquotes) — live-Doc spike, re-runnable
+#
+# project_plans/gdocs-native-blockquotes/implementation/epic-0-spike-findings.md
+# documents that BLOCKQUOTE_BORDER_MARKER/BLOCKQUOTE_INDENT_PT_PER_LEVEL below were
+# LIVE-VERIFIED on 2026-08-17: a real batchUpdate/documents.get round trip was run
+# against a throwaway Doc to produce tests/fixtures/blockquote_border_marker_spike.json.
+# See epic-0-spike-findings.md for the full writeup, including the pull-side detection
+# bug the spike surfaced (borderLeft.color echoes quantized to 8-bit RGB) and its fix.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEpic0LiveDocSpike:
+    def test_live_doc_spike_should_ReproduceRecordedBorderBehavior_When_RerunAgainstFixture(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Epic 0/Story 0.1's live-Doc spike, now run for real on 2026-08-17.
+
+        The fixture is a real captured request/response pair: a throwaway Doc was
+        created, styled with the candidate `BLOCKQUOTE_BORDER_MARKER`/indent, read
+        back, and deleted — see epic-0-spike-findings.md. The live echo diverges
+        from what was sent (`borderLeft.color` is quantized to 8-bit RGB), so this asserts
+        through the production detection function (`_detect_blockquote_depth`)
+        rather than raw dict equality — that function is what has to tolerate the
+        divergence, and this is the regression test for it.
+        """
+        from docspan.backends.google_docs.docs_structure_parser import (
+            _detect_blockquote_depth,
+        )
+
+        fixtures_dir = pathlib.Path(__file__).parent / "fixtures"
+        fixture = json.loads(
+            (fixtures_dir / "blockquote_border_marker_spike.json").read_text()
+        )
+
+        client = make_client()
+        client.batch_update("live-spike-doc-id", fixture["batch_update_request"]["requests"])
+
+        client.docs_service.documents().get().execute.return_value = fixture[
+            "documents_get_response_paragraph_style_echo"
+        ]
+        echoed = client.docs_service.documents().get().execute()
+        echoed_style = echoed["paragraphStyle"]
+
+        # Sent vs. echoed color genuinely differs byte-wise (8-bit RGB quantization) —
+        # confirms this fixture is real live-API output, not a hand-built echo.
+        assert (
+            echoed_style["borderLeft"]["color"]
+            != fixture["candidate_blockquote_border_marker"]["color"]
+        )
+        # ...but production detection still recognizes it as a blockquote marker.
+        assert _detect_blockquote_depth(echoed_style) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Epic 1: Domain Model — Identity Fields (is_blockquote/quote_depth)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBlockquoteIdentityFields:
+    """Story 1.1: is_blockquote/quote_depth fields, invariant, marker constants."""
+
+    def test_DocsParagraphNode_should_AcceptBlockquoteFields_When_ConstructedWithValidPair(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        node = DocsParagraphNode(
+            style="NORMAL_TEXT", text="quoted", is_blockquote=True, quote_depth=2
+        )
+
+        assert node.is_blockquote is True
+        assert node.quote_depth == 2
+
+    def test_DocsParagraphNode_should_DefaultBlockquoteFieldsToFalseAndZero_When_Unset(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        node = DocsParagraphNode(style="NORMAL_TEXT", text="plain")
+
+        assert node.is_blockquote is False
+        assert node.quote_depth == 0
+
+    @pytest.mark.parametrize("is_blockquote, quote_depth", [(False, 2), (True, 0)])
+    def test_DocsParagraphNode_should_RaiseValueError_When_ConstructedWithIllegalBlockquotePair(
+        self, is_blockquote: bool, quote_depth: int
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        with pytest.raises(ValueError):
+            DocsParagraphNode(
+                style="NORMAL_TEXT",
+                text="x",
+                is_blockquote=is_blockquote,
+                quote_depth=quote_depth,
+            )
+
+    def test_DocsRequestBuilder_should_ImportSameMarkerObject_When_ComparedByIdentity(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs import (
+            docs_request_builder as docs_request_builder_module,
+        )
+        from docspan.backends.google_docs import (
+            docs_structure_parser as docs_structure_parser_module,
+        )
+
+        assert (
+            docs_request_builder_module.BLOCKQUOTE_BORDER_MARKER
+            is docs_structure_parser_module.BLOCKQUOTE_BORDER_MARKER
+        )
+        assert (
+            docs_request_builder_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL
+            is docs_structure_parser_module.BLOCKQUOTE_INDENT_PT_PER_LEVEL
+        )
+
+
+class TestNodeKeyContentKeyBlockquoteIdentity:
+    """Story 1.2: `_node_key` includes blockquote identity, `_content_key` doesn't."""
+
+    def test__node_key_should_DifferByBlockquoteFields_When_TextIsIdentical(self) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        builder = DocsRequestBuilder()
+        plain = DocsParagraphNode(style="NORMAL_TEXT", text="See the docs")
+        quoted = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", is_blockquote=True, quote_depth=1
+        )
+
+        assert builder._node_key(plain) != builder._node_key(quoted)
+
+    def test__content_key_should_IgnoreBlockquoteFields_When_TextIsIdentical(self) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        builder = DocsRequestBuilder()
+        plain = DocsParagraphNode(style="NORMAL_TEXT", text="See the docs")
+        quoted = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", is_blockquote=True, quote_depth=1
+        )
+
+        assert builder._content_key(plain) == builder._content_key(quoted)
+
+
+class TestRepairDoesNotCrossPairBlockquoteAndPlainParagraph:
+    """Story 1.3: `_structural_score`/`_prefer_structural_pairing` cross-doc pooling.
+
+    Epic 1 Task 1 finding (Story 1.3): before this story, `_structural_score`
+    inspected only `style`/`is_heading_style`/`is_list_item` — nothing there read
+    blockquote identity, so two same-text, same-style, same-list-item paragraphs
+    (one a blockquote, one not) pooled by `_repair`'s global `_content_key` pass
+    scored identically on every existing term and could be assigned to each
+    other's slot by list-position tie-break alone. Fixed by adding
+    `is_blockquote`/`quote_depth` equality terms to `_structural_score`.
+    """
+
+    def test__repair_should_NotCrossPairBlockquoteAndPlainParagraph_When_TextIsIdentical(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        builder = DocsRequestBuilder()
+
+        plain_current = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", start_index=1, end_index=10
+        )
+        quote_current = DocsParagraphNode(
+            style="NORMAL_TEXT",
+            text="See the docs",
+            is_blockquote=True,
+            quote_depth=1,
+            start_index=11,
+            end_index=20,
+        )
+        current = [plain_current, quote_current]
+
+        quote_target = DocsParagraphNode(
+            style="NORMAL_TEXT", text="See the docs", is_blockquote=True, quote_depth=1
+        )
+        plain_target = DocsParagraphNode(style="NORMAL_TEXT", text="See the docs")
+        target = [quote_target, plain_target]
+
+        # Two standalone singleton "delete" candidates (current[0]=plain,
+        # current[1]=blockquote) and two standalone singleton "insert" slots
+        # (target[0]=blockquote, target[1]=plain) — the exact shape
+        # `_repair`'s global content-key pooling produces when a blockquote
+        # and a plain paragraph sharing identical text land in unrelated
+        # opcodes elsewhere in the same document (see `_prefer_structural_pairing`
+        # docstring). All four share one `_content_key` (text-only), so without
+        # the blockquote-aware scoring terms this is fixing, the two slots tie
+        # on every other term and resolve by list-position alone.
+        pending = [
+            ("delete", 0, 1, 0, 0),
+            ("delete", 1, 2, 0, 0),
+            ("insert", 0, 0, 0, 1),
+            ("insert", 0, 0, 1, 2),
+        ]
+        origin = [0, 0, 0, 0]
+
+        result = builder._prefer_structural_pairing(pending, origin, current, target)
+
+        by_target_start = {op[3]: op for op in result}
+
+        # target[0] (the blockquote) must resolve to current[1] (the
+        # blockquote), not current[0] (the plain paragraph) — and vice versa.
+        assert by_target_start[0][:3] == ("equal", 1, 2)
+        assert by_target_start[1][:3] == ("equal", 0, 1)
+
+
+class TestProjectionBlockquoteBlankLineCarveOut:
+    """Story 2.5: `project()`'s blank-paragraph-drop rule must not drop an
+    empty blockquote line — `MarkdownToParagraphParser` now emits a real,
+    empty-text node with `is_blockquote=True` for one (unlike an ordinary
+    blank line, which produces no node at all), so it is representable and
+    the asymmetry the drop rule exists to paper over does not apply."""
+
+    def test_projection_should_KeepEmptyBlockquoteParagraph_When_TextIsBlank(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.projection import project
+
+        node = DocsParagraphNode(
+            style="NORMAL_TEXT", text="", is_blockquote=True, quote_depth=1,
+            start_index=1, end_index=2,
+        )
+
+        kept, residue = project([node])
+
+        assert kept == [node]
+        assert residue == []
+
+    def test_projection_should_DropEmptyParagraph_When_TextIsBlankAndNotBlockquote(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.projection import project
+
+        node = DocsParagraphNode(style="NORMAL_TEXT", text="", start_index=1, end_index=2)
+
+        kept, residue = project([node])
+
+        assert kept == []
+        assert len(residue) == 1
+
+
+class TestDetectBlockquoteDepth:
+    """Story 3.1: `_detect_blockquote_depth`/`_parse_paragraph` read a live
+    paragraph's `borderLeft`/`indentStart` back into `is_blockquote`/
+    `quote_depth` — the pull-side counterpart of Epic 2's
+    `_blockquote_paragraph_style_fields` (docs_request_builder.py), which
+    writes exactly this shape on push.
+    """
+
+    def test__parse_paragraph_should_SetBlockquoteFields_When_BorderMatchesMarker(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_BORDER_MARKER,
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            DocsStructureParser,
+        )
+
+        parser = DocsStructureParser()
+        element = {
+            "startIndex": 1,
+            "endIndex": 10,
+            "paragraph": {
+                "paragraphStyle": {
+                    "namedStyleType": "NORMAL_TEXT",
+                    "borderLeft": BLOCKQUOTE_BORDER_MARKER,
+                    "indentStart": {
+                        "magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+                        "unit": "PT",
+                    },
+                },
+                "elements": [{"textRun": {"content": "quoted\n", "textStyle": {}}}],
+            },
+        }
+
+        node = parser._parse_paragraph(element)
+
+        assert node.is_blockquote is True
+        assert node.quote_depth == 1
+
+    def test__parse_paragraph_should_LeaveBlockquoteFalse_When_BorderDoesNotMatchMarker(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            DocsStructureParser,
+        )
+
+        parser = DocsStructureParser()
+        element = {
+            "startIndex": 1,
+            "endIndex": 10,
+            "paragraph": {
+                "paragraphStyle": {
+                    "namedStyleType": "NORMAL_TEXT",
+                    # A human-applied or otherwise unrelated left border --
+                    # different color than BLOCKQUOTE_BORDER_MARKER.
+                    "borderLeft": {
+                        "color": {"color": {"rgbColor": {"red": 1, "green": 0, "blue": 0}}},
+                        "width": {"magnitude": 1, "unit": "PT"},
+                        "dashStyle": "SOLID",
+                    },
+                    "indentStart": {
+                        "magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+                        "unit": "PT",
+                    },
+                },
+                "elements": [{"textRun": {"content": "not a quote\n", "textStyle": {}}}],
+            },
+        }
+
+        node = parser._parse_paragraph(element)
+
+        assert node.is_blockquote is False
+        assert node.quote_depth == 0
+
+    def test__detect_blockquote_depth_should_MatchOnSubfields_When_DocsEchoesExtraPaddingDefault(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_BORDER_MARKER,
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            _detect_blockquote_depth,
+        )
+
+        # Docs is free to echo back a normalized `padding` docspan never
+        # wrote explicitly -- detection must match on color/width/dashStyle
+        # alone, not the whole `borderLeft` dict (see Story 3.1 Unresolved
+        # Question 2).
+        border_left = dict(BLOCKQUOTE_BORDER_MARKER)
+        border_left["padding"] = {"magnitude": 99, "unit": "PT"}
+        paragraph_style = {
+            "borderLeft": border_left,
+            "indentStart": {
+                "magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL * 2,
+                "unit": "PT",
+            },
+        }
+
+        assert _detect_blockquote_depth(paragraph_style) == 2
+
+    def test__detect_blockquote_depth_should_Match_When_DocsEchoesQuantizedColor(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_BORDER_MARKER,
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            _detect_blockquote_depth,
+        )
+
+        # Confirmed via the Epic 0 live spike (2026-08-17): a real Google Doc
+        # quantizes borderLeft.color.color.rgbColor to 8-bit RGB
+        # (round(x*255)/255), not the double literal that was sent. Exact
+        # `==` would read every real round trip as "not a blockquote".
+        border_left = dict(BLOCKQUOTE_BORDER_MARKER)
+        border_left["color"] = {
+            "color": {"rgbColor": {"red": 0.49411765, "green": 0.54901963, "blue": 0.6117647}}
+        }
+        paragraph_style = {
+            "borderLeft": border_left,
+            "indentStart": {"magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL, "unit": "PT"},
+        }
+
+        assert _detect_blockquote_depth(paragraph_style) == 1
+
+    def test__detect_blockquote_depth_should_NotMatch_When_ColorDivergesBeyondQuantizationTolerance(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            BLOCKQUOTE_BORDER_MARKER,
+            BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+            _detect_blockquote_depth,
+        )
+
+        # Guards against _COLOR_TOLERANCE being loose enough to swallow a
+        # genuinely different, human-applied border color.
+        border_left = dict(BLOCKQUOTE_BORDER_MARKER)
+        border_left["color"] = {
+            "color": {"rgbColor": {"red": 0.6, "green": 0.549, "blue": 0.612}}
+        }
+        paragraph_style = {
+            "borderLeft": border_left,
+            "indentStart": {"magnitude": BLOCKQUOTE_INDENT_PT_PER_LEVEL, "unit": "PT"},
+        }
+
+        assert _detect_blockquote_depth(paragraph_style) == 0
+
+
+class TestLegacyBlockquotePassthrough:
+    """Story 3.1b: a Doc pushed under the old literal-`>`-text scheme must
+    still pull correctly unchanged -- no native-blockquote code path fires
+    for a paragraph whose `paragraphStyle` carries no border/indent marker,
+    even when its literal text looks like a quote.
+    """
+
+    def test_render_nodes_to_markdown_should_PreserveLiteralPrefix_When_ParagraphIsLegacyUnmigratedQuote(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+
+        node = DocsParagraphNode(style="NORMAL_TEXT", text="> legacy note")
+
+        assert node.is_blockquote is False
+        assert render_nodes_to_markdown([node]) == "> legacy note\n"
+
+    def test_render_nodes_to_markdown_should_PreserveLiteralPrefix_When_ParagraphIsLegacyNestedQuote(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+
+        node = DocsParagraphNode(style="NORMAL_TEXT", text="> > legacy nested")
+
+        assert node.is_blockquote is False
+        assert render_nodes_to_markdown([node]) == "> > legacy nested\n"
+
+
+class TestGroupBlockquoteRuns:
+    """Story 3.2: `_group_blockquote_runs` becomes the sole outer grouping
+    stage, partitioning a flat node list into plain/code/blockquote runs and
+    composing with `_group_code_runs` so a fence entirely inside a quote
+    nests correctly.
+    """
+
+    def test__group_blockquote_runs_should_GroupContiguousQuoteNodes_When_SequenceHasMixedNodes(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.nodes_to_markdown import _group_blockquote_runs
+
+        n0 = DocsParagraphNode(style="NORMAL_TEXT", text="before")
+        n1 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="first line", is_blockquote=True, quote_depth=1
+        )
+        n2 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="second line", is_blockquote=True, quote_depth=1
+        )
+        n3 = DocsParagraphNode(style="NORMAL_TEXT", text="after")
+
+        result = _group_blockquote_runs([n0, n1, n2, n3])
+
+        assert result == [
+            ("node", n0),
+            ("blockquote", 1, [("node", n1), ("node", n2)]),
+            ("node", n3),
+        ]
+
+    def test__group_blockquote_runs_should_PreserveCodeLanguage_When_QuoteContainsFencedCodeBlock(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import (
+            DocsParagraphNode,
+            TextSpan,
+        )
+        from docspan.backends.google_docs.nodes_to_markdown import (
+            FENCE_MARKER,
+            _group_blockquote_runs,
+        )
+
+        marker = DocsParagraphNode(
+            style="NORMAL_TEXT",
+            text=FENCE_MARKER + "python",
+            is_blockquote=True,
+            quote_depth=1,
+        )
+        code = DocsParagraphNode(
+            style="NORMAL_TEXT",
+            text="print(1)",
+            is_blockquote=True,
+            quote_depth=1,
+            spans=[TextSpan(text="print(1)", monospace=True)],
+        )
+
+        result = _group_blockquote_runs([marker, code])
+
+        assert len(result) == 1
+        kind, depth, inner_groups = result[0]
+        assert kind == "blockquote"
+        assert depth == 1
+        assert len(inner_groups) == 1
+        code_kind, lang, code_nodes = inner_groups[0]
+        assert code_kind == "code"
+        assert lang == "python"
+        assert code_nodes == [code]
+
+
+class TestBlockquoteNodeRenderer:
+    """Story 3.3: `BlockquoteNodeRenderer` prefixes every inner line with
+    `"> " * depth`, joining lines directly -- no blank line between them,
+    since CommonMark reads a blank `> ` line as starting a new paragraph
+    inside the same quote, not the multi-line source it represents.
+    """
+
+    def test_BlockquoteNodeRenderer_should_PrefixEachLine_When_RenderingPlainQuoteRun(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.nodes_to_markdown import (
+            BlockquoteNodeRenderer,
+            _group_code_runs,
+        )
+
+        n1 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="first line", is_blockquote=True, quote_depth=1
+        )
+        n2 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="second line", is_blockquote=True, quote_depth=1
+        )
+        inner_groups = _group_code_runs([n1, n2])
+
+        result = BlockquoteNodeRenderer().render((1, inner_groups))
+
+        assert result == "> first line\n> second line"
+
+    def test_BlockquoteNodeRenderer_should_DoublePrefixLines_When_RenderingDepthTwoRun(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs.nodes_to_markdown import (
+            BlockquoteNodeRenderer,
+            _group_code_runs,
+        )
+
+        n1 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="first line", is_blockquote=True, quote_depth=2
+        )
+        n2 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="second line", is_blockquote=True, quote_depth=2
+        )
+        inner_groups = _group_code_runs([n1, n2])
+
+        result = BlockquoteNodeRenderer().render((2, inner_groups))
+
+        assert result == "> > first line\n> > second line"
+
+    def test_render_nodes_to_markdown_should_CallGroupBlockquoteRunsAsOuterStage_When_SequenceHasMixedNodes(
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+        from docspan.backends.google_docs import nodes_to_markdown as n2m
+
+        n0 = DocsParagraphNode(style="NORMAL_TEXT", text="before")
+        n1 = DocsParagraphNode(
+            style="NORMAL_TEXT", text="quoted", is_blockquote=True, quote_depth=1
+        )
+        nodes = [n0, n1]
+
+        original = n2m._group_code_runs
+        calls: list = []
+
+        def spy(seq):
+            calls.append(list(seq))
+            return original(seq)
+
+        with mock.patch.object(n2m, "_group_code_runs", side_effect=spy):
+            n2m.render_nodes_to_markdown(nodes)
+
+        # _group_code_runs must never see the raw, unpartitioned sequence
+        # directly -- render_nodes_to_markdown calls _group_blockquote_runs
+        # first, which only ever hands _group_code_runs a same-kind
+        # sub-stretch (a plain run or a single blockquote run's nodes).
+        assert nodes not in calls
+
+
+class TestPushPullBlockquoteRoundtrip:
+    """Story 3.3: round-tripping markdown containing a native blockquote
+    through parse (push side) and render (pull side) must reproduce the
+    original markdown byte-for-byte, for each of: a plain multi-paragraph
+    quote, a nested quote, a list inside a quote, and a fenced code block
+    inside a quote (language tag included).
+    """
+
+    @pytest.mark.parametrize(
+        "markdown_text",
+        [
+            pytest.param("> first line\n>\n> second line\n", id="plain"),
+            pytest.param("> outer\n> > inner\n", id="nested"),
+            pytest.param("> - item one\n> - item two\n", id="list_in_quote"),
+            pytest.param("> ```python\n> print(1)\n> ```\n", id="code_in_quote"),
+        ],
+    )
+    def test_push_pull_roundtrip_should_ReproduceByteIdenticalMarkdown_When_QuoteIsPlainNestedListOrCode(
+        self, markdown_text: str
+    ) -> None:
+        from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+            MarkdownToParagraphParser,
+        )
+        from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
+
+        nodes = MarkdownToParagraphParser().parse(markdown_text)
+
+        result = render_nodes_to_markdown(nodes)
+
+        assert result == markdown_text
+        if "```python" in markdown_text:
+            assert "python" in result
