@@ -3800,8 +3800,8 @@ class TestBlockquoteNodeRenderer:
     def test_render_nodes_to_markdown_should_CallGroupBlockquoteRunsAsOuterStage_When_SequenceHasMixedNodes(
         self,
     ) -> None:
-        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
         from docspan.backends.google_docs import nodes_to_markdown as n2m
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 
         n0 = DocsParagraphNode(style="NORMAL_TEXT", text="before")
         n1 = DocsParagraphNode(

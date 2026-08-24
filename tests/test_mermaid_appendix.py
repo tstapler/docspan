@@ -5,6 +5,7 @@ independent, Doc-only recovery path (no git checkout required) alongside
 mermaid_cache_sidecar.py's committed sidecar.
 """
 
+from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 from docspan.backends.google_docs.mermaid_appendix import (
     APPENDIX_HEADING,
     build_appendix_nodes,
@@ -12,7 +13,6 @@ from docspan.backends.google_docs.mermaid_appendix import (
     find_appendix_boundary,
     strip_appendix_from_markdown,
 )
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 
 
 def test_empty_entries_produces_no_appendix() -> None:

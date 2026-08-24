@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
 from googleapiclient.errors import HttpError
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
-from docspan.backends.google_docs import cross_doc_links
+from docspan.backends.google_docs import cross_doc_links, mermaid_appendix
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
@@ -59,7 +59,6 @@ from docspan.backends.google_docs.manifest import (
     SectionManifestEntry,
 )
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
-from docspan.backends.google_docs import mermaid_appendix
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.onboarding import (
     OAUTH_HELP,
@@ -287,7 +286,7 @@ class GoogleDocsBackend(Backend):
                     for resolved, original in zip(resolved_images, image_nodes)
                 ]
                 subst_iter = iter(substituted_images)
-                new_target_nodes = []
+                new_target_nodes: list[DocsParagraphNode | DocsTableNode | DocsImageNode] = []
                 for n in target_nodes:
                     if isinstance(n, DocsImageNode):
                         substituted = next(subst_iter)
@@ -318,7 +317,7 @@ class GoogleDocsBackend(Backend):
             # current mermaid images, never read back from a previous push --
             # the local markdown never has this section, so there is nothing
             # to preserve here.
-            target_nodes = target_nodes + mermaid_appendix.build_appendix_nodes(mermaid_entries)
+            target_nodes = [*target_nodes, *mermaid_appendix.build_appendix_nodes(mermaid_entries)]
 
             body_content = doc.get("body", {}).get("content", [])
             doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
@@ -1805,7 +1804,7 @@ class GoogleDocsBackend(Backend):
         self._ensure_client()
         assert self._client is not None
         doc = self._client.get_document(doc_id)
-        return doc["revisionId"]
+        return str(doc["revisionId"])
 
     def create(self, title: str, **kwargs: object) -> CreateResult:
         """Create a new, empty Google Doc and return its id/title/url."""

@@ -429,7 +429,7 @@ class DocsStructureParser:
         self._unreadable_links: List[str] = []
         # Per-instance counters for ordered-list numbering, keyed by
         # (listId, nestingLevel) -- see DocsParagraphNode.ordered_number.
-        self._ordered_list_counters: dict = {}
+        self._ordered_list_counters: dict[tuple[str, int], int] = {}
 
     @property
     def unreadable_links(self) -> List[str]:

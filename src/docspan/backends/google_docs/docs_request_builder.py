@@ -2919,7 +2919,7 @@ class DocsRequestBuilder:
             if key in request:
                 inner = request[key]
                 if "range" in inner:
-                    return inner["range"].get("startIndex", 0)
+                    return int(inner["range"].get("startIndex", 0))
                 if "location" in inner:
-                    return inner["location"].get("index", 0)
+                    return int(inner["location"].get("index", 0))
         return 0
