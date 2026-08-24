@@ -127,6 +127,7 @@ class Backend(ABC):
         local_dir: str,
         split_level: Optional[str] = None,
         tab_id: Optional[str] = None,
+        canonical_dir: Optional[str] = None,
         **kwargs: object,
     ) -> PullResult:
         raise NotImplementedError(f"{self.name} does not support sectioned sync")

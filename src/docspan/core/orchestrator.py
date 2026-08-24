@@ -777,7 +777,11 @@ def _orchestrate_pull_sectioned(
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         pull_result = backend.pull_sectioned(
-            mapping.remote_id, tmp_dir, split_level=mapping.split_level, tab_id=mapping.tab_id,
+            mapping.remote_id,
+            tmp_dir,
+            split_level=mapping.split_level,
+            tab_id=mapping.tab_id,
+            canonical_dir=canonical_dir,
         )
         if pull_result.status not in ("ok", "warning"):
             return PullOutcome(local_path=mapping.local, action="error", result=pull_result)

@@ -1489,6 +1489,7 @@ class GoogleDocsBackend(Backend):
         local_dir: str,
         split_level: Optional[str] = None,
         tab_id: Optional[str] = None,
+        canonical_dir: Optional[str] = None,
         **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, split it at `split_level`, write one file per section.
@@ -1507,12 +1508,26 @@ class GoogleDocsBackend(Backend):
         crash between the two replaces is recoverable by hand from the
         `.<name>.old.*` sibling directory left behind — never a half-written
         set of section files.
+
+        `canonical_dir`, when given, is the *real* section directory
+        (`Mapping.local`) that `push_sectioned`/`image_source.py` write the
+        committed `{file}.mermaid-cache.yaml` sidecar next to.
+        `orchestrator.py`'s `_orchestrate_pull_sectioned` always calls this
+        method with `local_dir` pointed at a throwaway
+        `tempfile.TemporaryDirectory()` (so a merge conflict can be staged
+        before anything touches the real directory), which left the sidecar
+        lookup below checking `<temp_dir>/NN-slug.md.mermaid-cache.yaml` --
+        a path that can never exist. `canonical_dir` gives the sidecar
+        lookup the real path while every other write (section files, the
+        manifest, comment sidecars) still goes through `local_dir`/`target_dir`
+        exactly as before.
         """
         if split_level is None:
             raise ValueError("pull_sectioned requires split_level")
         self._ensure_client()
         assert self._client is not None
         target_dir = pathlib.Path(local_dir)
+        sidecar_dir = pathlib.Path(canonical_dir) if canonical_dir is not None else target_dir
         try:
             doc = self._client.get_document(doc_id)
             doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
@@ -1558,7 +1573,7 @@ class GoogleDocsBackend(Backend):
                         content = recover_structural_mermaid_images(
                             content,
                             section_image_nodes,
-                            markdown_path=str(target_dir / filename),
+                            markdown_path=str(sidecar_dir / filename),
                             appendix_entries=appendix_entries or None,
                         ).markdown
                     section_data_uris.extend(find_data_uris(content))

@@ -1,6 +1,7 @@
 """Tests for ConfluenceBackend.create() — new-page creation for `docspan map`."""
 from __future__ import annotations
 
+import pathlib
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,3 +46,37 @@ class TestCreate:
 
         with pytest.raises(ValueError, match="space key"):
             backend.create("My Page")
+
+
+class TestPull:
+    def test_pull_writes_markdown_and_returns_ok(self, tmp_path) -> None:
+        backend, client = _make_backend(base_url="https://x.atlassian.net")
+        client.get_page.return_value = {
+            "title": "My Page",
+            "body": {"storage": {"value": "<p>hello world</p>"}},
+        }
+        local_path = str(tmp_path / "page.md")
+
+        result = backend.pull("page-1", local_path)
+
+        assert result.status == "ok"
+        assert "hello world" in pathlib.Path(local_path).read_text(encoding="utf-8")
+
+    def test_pull_surfaces_a_data_uri_warning_when_one_survives_conversion(self, tmp_path) -> None:
+        """Confluence's pull has no mermaid/appendix recovery chain at all -- a
+        base64-embedded image always comes back as a literal data: URI, so the
+        `find_data_uris` backstop (core/paths.py) must always fire for it."""
+        backend, client = _make_backend(base_url="https://x.atlassian.net")
+        data_uri = "data:image/png;base64," + ("A" * 40)
+        client.get_page.return_value = {
+            "title": "My Page",
+            "body": {"storage": {"value": f'<img src="{data_uri}">'}},
+        }
+        local_path = str(tmp_path / "page.md")
+
+        result = backend.pull("page-1", local_path)
+
+        assert result.status == "warning"
+        assert result.message is not None
+        assert "data:" in result.message
+        assert data_uri in pathlib.Path(local_path).read_text(encoding="utf-8")
