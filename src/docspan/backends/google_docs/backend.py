@@ -143,6 +143,18 @@ class GoogleDocsBackend(Backend):
             "Run: docspan auth setup google_docs"
         )
 
+    @property
+    def client(self) -> GoogleDocsClient:
+        """Public accessor for callers outside this class (e.g. migration.py).
+
+        Ensures the client is initialized (`_ensure_client`) and returns it,
+        so external code never needs to reach into `_ensure_client`/`_client`
+        directly.
+        """
+        self._ensure_client()
+        assert self._client is not None
+        return self._client
+
     def _cleanup_temp_uploads(self, file_ids: List[str]) -> List[str]:
         """Best-effort delete of temp Drive uploads; returns ids that could not be deleted.
 
