@@ -16,7 +16,13 @@ from rich.markup import escape
 from rich.table import Table
 
 from docspan.backends import BACKENDS
+from docspan.backends.google_docs.migration import (
+    MigrationOutcome,
+    MigrationResult,
+    migrate_sectioned,
+)
 from docspan.config import (
+    _SECTIONED_UNSUPPORTED_BACKENDS,
     ConfigConflictError,
     Mapping,
     MarkgateConfig,
@@ -424,6 +430,173 @@ def push(
 # pull command
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _split_level_display(split_level: str) -> str:
+    """Render `"HEADING_2"` as ux.md's short `"h2"` form for status lines."""
+    if split_level.startswith("HEADING_"):
+        return "h" + split_level[len("HEADING_") :]
+    return split_level
+
+
+def _render_migration_result(
+    mapping: Mapping,
+    new_local_dir: str,
+    result: MigrationResult,
+    *,
+    dry_run: bool,
+    split_level: str,
+) -> None:
+    """Render a `MigrationResult` per ux.md's output templates (Task 5.2/5.4).
+
+    Shared by `migrate-sectioned` and `pull --to-sectioned` so the two
+    surfaces stay pixel-consistent (ux.md's cross-surface consistency
+    criterion) -- neither caller prints its own success/failure text.
+    """
+    level_display = _split_level_display(split_level)
+
+    if result.outcome == MigrationOutcome.REFUSED:
+        for message in result.messages:
+            err_console.print(f"✗  {mapping.local}: {escape(message)}")
+        return
+
+    if result.outcome == MigrationOutcome.DRY_RUN:
+        preview = result.sections[0] if result.sections else None
+        n = len(preview.rows) if preview else 0
+        console.print(
+            f"[yellow]dry-run[/yellow]  {mapping.local} → {new_local_dir}/ "
+            f"(would split into {n} sections at split_level={level_display})"
+        )
+        if preview and len(preview.rows) == 1 and not preview.rows[0].title:
+            console.print(
+                f"[yellow]⚠[/yellow]  No {level_display} headings found in {mapping.local} — "
+                f'the entire file would become a single "{preview.rows[0].filename}" section. '
+                "This is probably not what you want; pass --split-level to choose a "
+                "different boundary."
+            )
+        if preview:
+            console.print(preview.render())
+        console.print(
+            "Nothing written. Run without --dry-run to apply, or add "
+            "--split-level to change the boundary."
+        )
+        return
+
+    if result.outcome == MigrationOutcome.SUCCESS:
+        preview = result.sections[0] if result.sections else None
+        rows = preview.rows if preview else []
+        console.print(
+            f"[green]✓[/green]  {mapping.local} → {new_local_dir}/ ({len(rows)} sections)"
+        )
+        console.print()
+        for row in rows:
+            heading = f'"{row.title}"' if row.title else "(no heading — preamble)"
+            console.print(f"   {row.filename}    {escape(heading)}    {row.line_count} lines   {row.word_count} words")
+        console.print()
+        console.print(
+            f"   _manifest.yaml written · markgate.yaml updated "
+            f"(sectioned: true, split_level: {level_display})"
+        )
+        console.print(f"   SyncState updated for {len(rows)} sections")
+        console.print("   Section identity will stabilize after your next pull.")
+        if rows:
+            first_path = os.path.join(new_local_dir, rows[0].filename)
+            console.print("   git history preserved — verify with:")
+            console.print(f"     git log --follow -C20% {first_path}")
+            console.print(f"     git blame -C20% -C20% -C20% {first_path}")
+        console.print(f"MIGRATED_SECTIONS={len(rows)}")
+        return
+
+    if result.outcome == MigrationOutcome.FAILED:
+        detail = escape(result.messages[0]) if result.messages else "unknown error"
+        err_console.print(f"✗  Migration failed: {detail}")
+        console.print()
+        console.print("   Rolling back... done.")
+        console.print(f"   {mapping.local} is unchanged and markgate.yaml was not modified.")
+        console.print()
+        console.print(
+            "Nothing was written. Original file and config are exactly as they were before this run."
+        )
+        return
+
+    if result.outcome == MigrationOutcome.ROLLBACK_FAILED:
+        detail = escape(result.messages[0]) if result.messages else "unknown error"
+        rollback_detail = escape(result.messages[1]) if len(result.messages) > 1 else "unknown error"
+        err_console.print(f"✗  Migration failed: {detail}")
+        err_console.print(f"✗  Rollback FAILED: {rollback_detail}")
+        console.print()
+        console.print(
+            "   Your working tree may be in an inconsistent state. Compare against "
+            "your last commit before continuing:"
+        )
+        console.print()
+        console.print("     git status")
+        console.print("     git diff")
+        console.print(f"     git checkout -- {mapping.local} {new_local_dir}/   # discard partial migration")
+        return
+
+
+@app.command("migrate-sectioned")
+def migrate_sectioned_cmd(
+    mapping_path: str = typer.Argument(
+        ..., help="Local markdown file to migrate to a sectioned mapping"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview the split without writing"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+    split_level: str = typer.Option(
+        "HEADING_2", "--split-level", help="Heading level to split on, e.g. HEADING_1, HEADING_2"
+    ),
+) -> None:
+    """Migrate a single-file mapping to a sectioned mapping, preserving git history."""
+    config, config_path, prefix = _resolve(config_path, prefix)
+    mapping = resolve_mapping_for_path(config.mappings, mapping_path)
+    if mapping is None:
+        err_console.print(f"No mapping found for: {mapping_path}")
+        raise typer.Exit(1)
+
+    # UX sugar only — migrate_sectioned() re-checks both of these itself and
+    # is the sole authority; this only lets the CLI fail fast without
+    # touching the backend/state/lock for the two most common refusals.
+    if mapping.sectioned:
+        err_console.print(f"✗  {mapping.local} is already sectioned — nothing to migrate")
+        raise typer.Exit(1)
+    if mapping.backend in _SECTIONED_UNSUPPORTED_BACKENDS:
+        err_console.print(f"✗  backend {mapping.backend!r} does not support sectioned mode")
+        raise typer.Exit(1)
+
+    backend = _get_backend(mapping.backend, config, config_path)
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+    new_local_dir = os.path.splitext(mapping.local)[0]
+
+    if not dry_run:
+        console.print(
+            f"[yellow]migrating[/yellow]  {mapping.local} → {new_local_dir}/ "
+            "(this will create a git commit)"
+        )
+
+    result = migrate_sectioned(
+        mapping,
+        backend,
+        config,
+        config_path,
+        state,
+        state_dir,
+        state_path,
+        split_level,
+        dry_run=dry_run,
+    )
+
+    _render_migration_result(mapping, new_local_dir, result, dry_run=dry_run, split_level=split_level)
+
+    if result.outcome in (
+        MigrationOutcome.REFUSED,
+        MigrationOutcome.FAILED,
+        MigrationOutcome.ROLLBACK_FAILED,
+    ):
+        raise typer.Exit(1)
+
+
 @app.command()
 def pull(
     files: Optional[list[str]] = typer.Argument(
@@ -432,6 +605,12 @@ def pull(
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    to_sectioned: bool = typer.Option(
+        False, "--to-sectioned", help="Migrate a non-sectioned mapping to sectioned mode before pulling"
+    ),
+    split_level: str = typer.Option(
+        "HEADING_2", "--split-level", help="Heading level to split on when --to-sectioned is used"
+    ),
 ) -> None:
     """Pull remote docs into local markdown files."""
     config, config_path, prefix = _resolve(config_path, prefix)
@@ -461,6 +640,37 @@ def pull(
         if mapping.direction == "push":
             console.print(f"[dim]Skipping {mapping.local} (push-only)[/dim]")
             continue
+
+        if to_sectioned and not mapping.sectioned:
+            new_local_dir = os.path.splitext(mapping.local)[0]
+            if not dry_run:
+                console.print(
+                    f"[yellow]migrating[/yellow]  {mapping.local} → {new_local_dir}/ "
+                    "(this will create a git commit)"
+                )
+            migration_backend = _get_backend(mapping.backend, config, config_path)
+            migration_result = migrate_sectioned(
+                mapping,
+                migration_backend,
+                config,
+                config_path,
+                state,
+                state_dir,
+                state_path,
+                split_level,
+                dry_run=dry_run,
+            )
+            _render_migration_result(
+                mapping, new_local_dir, migration_result, dry_run=dry_run, split_level=split_level
+            )
+            if migration_result.outcome == MigrationOutcome.DRY_RUN:
+                continue
+            if migration_result.outcome != MigrationOutcome.SUCCESS:
+                had_error = True
+                continue
+            assert migration_result.new_mapping is not None
+            mapping = migration_result.new_mapping
+
         if dry_run:
             console.print(
                 f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local}"
