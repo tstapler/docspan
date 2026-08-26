@@ -64,13 +64,15 @@ class FakeBackend(Backend):
         local_dir: str,
         split_level: str,
         tab_id: "str | None" = None,
+        canonical_dir: "str | None" = None,
     ) -> PullResult:
         # Exact signature match to backend.py's real
-        # `pull_sectioned(self, doc_id, local_dir, split_level, tab_id=None)`
-        # (Gap 4 regression guard) — a `**kwargs`-tolerant fake would let a
-        # future signature drift between backend.py and orchestrator.py's
-        # call site pass tests silently instead of failing loudly.
-        self.pull_sectioned_calls.append((doc_id, local_dir, split_level, tab_id))
+        # `pull_sectioned(self, doc_id, local_dir, split_level, tab_id=None,
+        # canonical_dir=None)` (Gap 4 regression guard) — a `**kwargs`-tolerant
+        # fake would let a future signature drift between backend.py and
+        # orchestrator.py's call site pass tests silently instead of failing
+        # loudly.
+        self.pull_sectioned_calls.append((doc_id, local_dir, split_level, tab_id, canonical_dir))
         if self.pull_status in ("ok", "warning"):
             for filename, content in self.section_files.items():
                 with open(os.path.join(local_dir, filename), "w", encoding="utf-8") as fh:
@@ -396,9 +398,10 @@ class TestOrchestrateSectioned:
         outcome = orchestrate_pull(mapping, backend, state, str(tmp_path), state_path)
 
         assert len(backend.pull_sectioned_calls) == 1
-        doc_id, local_dir, split_level, tab_id = backend.pull_sectioned_calls[0]
+        doc_id, local_dir, split_level, tab_id, canonical_dir = backend.pull_sectioned_calls[0]
         assert doc_id == "doc-123"
         assert split_level == "HEADING_1"
+        assert canonical_dir == str(directory)
         assert not backend.pull_calls
         assert outcome.action == "first-sync"
         assert (directory / "01-intro.md").read_text(encoding="utf-8") == "intro\n"
@@ -434,6 +437,7 @@ class TestOrchestrateSectioned:
         assert call_args[1] != "doc-xyz"  # local_dir (a temp directory path)
         assert call_kwargs["split_level"] == "HEADING_1"
         assert call_kwargs["tab_id"] == "tab-1"
+        assert call_kwargs["canonical_dir"] == str(directory)
 
     def test_orchestrate_pull_should_call_legacy_pull_when_mapping_sectioned_is_false(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"

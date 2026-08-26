@@ -20,6 +20,15 @@ from docspan.backends.google_docs.heading_anchors import (
 # DocsRequestBuilder._make_delete_requests.
 UNDELETABLE_BOUNDARY_KEYS = ("table", "tableOfContents", "sectionBreak")
 
+# Docs API v1 REST NestingLevel.glyphType values that unambiguously mean a
+# numbered/lettered ordered-list glyph. Deliberately excludes
+# GLYPH_TYPE_UNSPECIFIED -- that value is documented to sometimes appear for
+# genuinely numbered lists too (a known Docs API inconsistency), so it is not
+# a safe "definitely not ordered" signal and must not be treated as one here.
+_ORDERED_GLYPH_TYPES = frozenset(
+    {"DECIMAL", "ZERO_DECIMAL", "ALPHA", "UPPER_ALPHA", "ROMAN", "UPPER_ROMAN"}
+)
+
 # Google Docs renders some blocks itself — a native code block, for one — and marks
 # each paragraph of such a block by writing a Private-Use-Area glyph in front of it
 # (U+E907 for a code block). It arrives as its **own leading textRun**, which is what
@@ -255,6 +264,21 @@ class DocsParagraphNode:
     # DocsRequestBuilder.build()'s equality/opcode logic. See ADR-001,
     # plan.md Task 1.2.2d.
     is_native_checkbox: bool = False
+    # True when this paragraph's bullet resolves to a genuine ordered-list
+    # glyph (glyphType is one of the unambiguous numbered/lettered values —
+    # see _resolve_is_ordered_list). NOT part of the diff key, same rationale
+    # as is_native_checkbox: it is resolved live from the document's `lists`
+    # map, not something push can express (see markdown_to_paragraph_parser's
+    # lack of any ordered-list concept), so treating it as identity would
+    # make every push rewrite these paragraphs.
+    is_ordered_list: bool = False
+    # 1-based position of this paragraph within its (listId, nestingLevel)
+    # run, resolved by DocsStructureParser as it walks the document in order.
+    # Only meaningful when is_ordered_list is True. A simplification: it
+    # counts occurrences of the same (listId, nestingLevel) pair regardless
+    # of interruptions by other content, so it does not model an explicit
+    # Docs "restart numbering" break. None when not an ordered-list item.
+    ordered_number: Optional[int] = None
     # True when the very next structural element in the document body is a
     # Table, TableOfContents or SectionBreak (UNDELETABLE_BOUNDARY_KEYS). This
     # paragraph's trailing newline is then the newline that anchors that
@@ -265,6 +289,19 @@ class DocsParagraphNode:
     # only trace of them). NOT part of the diff key — consumed solely by
     # DocsRequestBuilder._make_delete_requests.
     precedes_structural_element: bool = False
+    # True when the very next content element is a paragraph that is *entirely*
+    # the Private-Use chrome glyph (e.g. the paragraph Docs writes right after
+    # the last line of a native code block). `projection.project()` drops that
+    # paragraph as `Residue(kind="private_use_glyph", ...)` — it never reaches
+    # `kept`, so `DocsRequestBuilder` never sees it as a node. That makes this
+    # paragraph's `end_index` an unsafe anchor for a new insertion: it lands on
+    # the start of the invisible, dropped paragraph rather than an ordinary
+    # paragraph boundary, and the API rejects it (#113). Deliberately narrower
+    # than `render_prefix`, which is set on *every* line of a rendered block —
+    # only the line immediately before the dropped chrome paragraph needs the
+    # same before_newline handling as precedes_structural_element; an insert
+    # between two ordinary mid-block code lines must not get it.
+    precedes_dropped_glyph_paragraph: bool = False
     # paragraphStyle.headingId — Docs' own id for a heading, and the only thing
     # a `headingId` link can point at. Present on headings, None elsewhere.
     # NOT part of the diff key: it is assigned by Docs, so treating it as
@@ -390,6 +427,9 @@ class DocsStructureParser:
         # accumulate across every parse in the process and put one document's
         # warning on another's pull.
         self._unreadable_links: List[str] = []
+        # Per-instance counters for ordered-list numbering, keyed by
+        # (listId, nestingLevel) -- see DocsParagraphNode.ordered_number.
+        self._ordered_list_counters: dict[tuple[str, int], int] = {}
 
     @property
     def unreadable_links(self) -> List[str]:
@@ -438,6 +478,7 @@ class DocsStructureParser:
 
         # Reset per parse, so re-parsing the same instance does not accumulate.
         self._unreadable_links = []
+        self._ordered_list_counters = {}
 
         content = body.get("content", [])
         nodes: List[Union[DocsParagraphNode, DocsTableNode, DocsImageNode]] = []
@@ -452,6 +493,9 @@ class DocsStructureParser:
                     continue
                 node.precedes_structural_element = self._precedes_structural_element(
                     content, position
+                )
+                node.precedes_dropped_glyph_paragraph = (
+                    self._precedes_dropped_glyph_paragraph(content, position)
                 )
                 nodes.append(node)
             elif "table" in element:
@@ -561,6 +605,26 @@ class DocsStructureParser:
         if not isinstance(following, dict):
             return False
         return any(key in following for key in UNDELETABLE_BOUNDARY_KEYS)
+
+    @staticmethod
+    def _precedes_dropped_glyph_paragraph(content: List[dict], position: int) -> bool:
+        """Whether content[position] is directly followed by a paragraph that
+        `projection.project()` will drop entirely because it is nothing but the
+        Private-Use chrome glyph (see `_is_all_private_use`).
+
+        Reads the raw element rather than a parsed `DocsParagraphNode` because
+        that dropped paragraph never becomes a node at all — `_parse_paragraph`
+        runs on it same as any other, but the caller here needs the answer
+        before deciding whether *this* paragraph is safe to insert-after.
+        """
+        following = content[position + 1] if position + 1 < len(content) else None
+        if not isinstance(following, dict) or "paragraph" not in following:
+            return False
+        elements = following["paragraph"].get("elements", [])
+        text = "".join(
+            pe.get("textRun", {}).get("content", "") for pe in elements
+        ).rstrip("\n")
+        return _is_all_private_use(text)
 
     def _parse_table(self, element: dict) -> DocsTableNode:
         """Parse a structural element that contains a table into a DocsTableNode."""
@@ -696,6 +760,10 @@ class DocsStructureParser:
         is_list_item = bullet is not None
         nesting_level = bullet.get("nestingLevel", 0) if bullet else 0
         is_native_checkbox = self._resolve_is_native_checkbox(bullet, lists or {})
+        is_ordered_list = self._resolve_is_ordered_list(bullet, lists or {})
+        ordered_number = (
+            self._next_ordered_number(bullet, nesting_level) if is_ordered_list else None
+        )
 
         quote_depth = _detect_blockquote_depth(paragraph_style)
 
@@ -709,10 +777,25 @@ class DocsStructureParser:
             spans=spans,
             render_prefix=render_prefix,
             is_native_checkbox=is_native_checkbox,
+            is_ordered_list=is_ordered_list,
+            ordered_number=ordered_number,
             heading_id=paragraph_style.get("headingId"),
             is_blockquote=quote_depth > 0,
             quote_depth=quote_depth,
         )
+
+    def _next_ordered_number(self, bullet: Optional[dict], nesting_level: int) -> int:
+        """Return the next 1-based position for `bullet`'s (listId, nestingLevel).
+
+        Only called once _resolve_is_ordered_list has already confirmed
+        `bullet` is non-None and carries a listId; falls back to listId=""
+        defensively rather than raising, since a malformed bullet dict should
+        degrade to "treat as its own list" rather than crash the parse.
+        """
+        list_id = (bullet or {}).get("listId", "")
+        key = (list_id, nesting_level)
+        self._ordered_list_counters[key] = self._ordered_list_counters.get(key, 0) + 1
+        return self._ordered_list_counters[key]
 
     @staticmethod
     def _render_prefix_of(elements: List[dict]) -> str:
@@ -813,6 +896,16 @@ class DocsStructureParser:
         closed, and they are now *recorded* on the way out rather than dropped
         in silence: see `unreadable_links`. A default pull does not go through
         this parser for its content, so it is unaffected.
+
+        A plain-text fallback (e.g. the target's name) was considered and
+        rejected as not safely doable here: a bookmark has no name in the Docs
+        API at all -- only the opaque `bookmarkId` -- and resolving a tab's
+        title needs the document's `tabs` list, which `resolve_document_tab`
+        deliberately strips before this parser ever sees the doc (see its
+        docstring: keeps every tabs-unaware call site, this one included,
+        working unmodified). Doing better means threading tab metadata through
+        a parser designed not to need it -- left as follow-up, not attempted
+        as part of this fix.
         """
         if not isinstance(link, dict):
             return None
@@ -883,3 +976,39 @@ class DocsStructureParser:
             return False
 
         return level_props.get("glyphType") == "GLYPH_TYPE_UNSPECIFIED"
+
+    def _resolve_is_ordered_list(self, bullet: Optional[dict], lists: dict) -> bool:
+        """Resolve whether a bullet paragraph is a genuine ordered-list glyph.
+
+        Mirrors _resolve_is_native_checkbox's traversal exactly, but only
+        returns True for one of the Docs API's unambiguous numbered/lettered
+        glyphType values (_ORDERED_GLYPH_TYPES) -- deliberately NOT "anything
+        that isn't GLYPH_TYPE_UNSPECIFIED", because GLYPH_TYPE_UNSPECIFIED is
+        documented to sometimes appear for genuinely numbered lists too (a
+        known Docs API inconsistency), so treating it as a negative signal
+        here would risk misclassifying real bullets. Defensively returns
+        False (never raises) on any missing/malformed piece.
+        """
+        if not bullet:
+            return False
+        list_id = bullet.get("listId")
+        if not list_id:
+            return False
+        nesting_level = bullet.get("nestingLevel", 0)
+
+        list_entry = lists.get(list_id)
+        if not isinstance(list_entry, dict):
+            return False
+        list_properties = list_entry.get("listProperties")
+        if not isinstance(list_properties, dict):
+            return False
+        nesting_levels = list_properties.get("nestingLevels")
+        if not isinstance(nesting_levels, list):
+            return False
+        if not isinstance(nesting_level, int) or nesting_level < 0 or nesting_level >= len(nesting_levels):
+            return False
+        level_props = nesting_levels[nesting_level]
+        if not isinstance(level_props, dict):
+            return False
+
+        return level_props.get("glyphType") in _ORDERED_GLYPH_TYPES

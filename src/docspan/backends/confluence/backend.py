@@ -22,7 +22,7 @@ from docspan.backends.confluence.models.page import ConfluencePage
 from docspan.backends.confluence.services.confluence.client import ConfluenceClient
 from docspan.backends.confluence.services.confluence.comment_client import ConfluenceCommentClient
 from docspan.config import ConfluenceConfig
-from docspan.core.paths import COMMENTS_SUFFIX
+from docspan.core.paths import COMMENTS_SUFFIX, find_data_uris
 
 if TYPE_CHECKING:
     from docspan.config import MarkgateConfig
@@ -114,8 +114,11 @@ class ConfluenceBackend(Backend):
             lines += ["## Footer comments", ""]
             for comment in footer_comments:
                 lines += self._format_comment(comment)
+        content = "\n".join(lines)
+        if find_data_uris(content):
+            logger.warning("Comment sidecar for %s contains a data: URI — unexpected.", local_path)
         sidecar_path = str(local_path) + COMMENTS_SUFFIX
-        pathlib.Path(sidecar_path).write_text("\n".join(lines))
+        pathlib.Path(sidecar_path).write_text(content)
 
     # ── Backend interface ──────────────────────────────────────────────────
 
@@ -160,6 +163,7 @@ class ConfluenceBackend(Backend):
             page = self._client.get_page(doc_id)
             storage_html = page.get("body", {}).get("storage", {}).get("value", "")
             markdown = md_lib.markdownify(storage_html, heading_style="ATX", strip=["script", "style"])
+            data_uris = find_data_uris(markdown)
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(local_path).write_text(markdown)
 
@@ -192,6 +196,17 @@ class ConfluenceBackend(Backend):
             if inline_comments or footer_comments:
                 self._write_comment_sidecar(local_path, page_title, inline_comments, footer_comments)
 
+            if data_uris:
+                return PullResult(
+                    status="warning",
+                    doc_id=doc_id,
+                    local_path=local_path,
+                    message=(
+                        f"pulled markdown still contains {len(data_uris)} data: URI(s) "
+                        f"(e.g. {data_uris[0]}) -- this is a bug in docspan's own "
+                        "rendering, not something you did; please report it"
+                    ),
+                )
             return PullResult(status="ok", doc_id=doc_id, local_path=local_path)
         except Exception as exc:
             return PullResult(status="error", doc_id=doc_id, local_path=local_path, message=str(exc))

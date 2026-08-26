@@ -539,6 +539,14 @@ class ListItemNodeRenderer(MarkdownNodeRenderer):
             # MarkdownToParagraphParser as this exact text), not a claim
             # about the glyph's real state.
             return f"{indent}- [ ] {text}"
+        if node.is_ordered_list:
+            # Push has no ordered-list concept at all (MarkdownToParagraphParser
+            # always emits BULLET_DISC_CIRCLE_SQUARE regardless of source
+            # syntax), so this numbering is a one-way, lossy render — a
+            # round-trip through push will turn it back into a plain bullet.
+            # That's a pre-existing, unconditional asymmetry on both pull
+            # paths, not something this rendering introduces.
+            return f"{indent}{node.ordered_number or 1}. {text}"
         return f"{indent}- {text}"
 
 

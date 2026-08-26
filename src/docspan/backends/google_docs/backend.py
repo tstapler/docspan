@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
 from googleapiclient.errors import HttpError
 
 from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
-from docspan.backends.google_docs import cross_doc_links
+from docspan.backends.google_docs import cross_doc_links, mermaid_appendix
 from docspan.backends.google_docs.auth import (
     DualAccountAuth,
     GoogleAuthenticator,
@@ -74,6 +74,10 @@ from docspan.backends.google_docs.projection import (
     describe_target_residue,
     project,
 )
+from docspan.backends.google_docs.pulled_image_recovery import (
+    recover_pulled_images,
+    recover_structural_mermaid_images,
+)
 from docspan.backends.google_docs.push_preview import (
     PushPlan,
     PushPreview,
@@ -88,7 +92,7 @@ from docspan.backends.google_docs.tabs import (
     resolve_document_tab,
 )
 from docspan.core.atomic_dir import atomic_replace_dir
-from docspan.core.paths import COMMENTS_SUFFIX
+from docspan.core.paths import COMMENTS_SUFFIX, find_data_uris
 
 if TYPE_CHECKING:
     from docspan.config import GoogleDocsConfig, MarkgateConfig
@@ -238,8 +242,9 @@ class GoogleDocsBackend(Backend):
         image_warnings: list[str] = []
         temp_drive_file_ids: list[str] = []
         resolved_images: list[DocsImageNode | None] = []
+        mermaid_entries: list[tuple[str, str]] = []
         if image_nodes:
-            resolved_images, image_warnings, temp_drive_file_ids = resolve_document_images(
+            resolved_images, image_warnings, temp_drive_file_ids, mermaid_entries = resolve_document_images(
                 image_nodes, local_path, self._client.upload_temp_image
             )
 
@@ -281,7 +286,7 @@ class GoogleDocsBackend(Backend):
                     for resolved, original in zip(resolved_images, image_nodes)
                 ]
                 subst_iter = iter(substituted_images)
-                new_target_nodes = []
+                new_target_nodes: list[DocsParagraphNode | DocsTableNode | DocsImageNode] = []
                 for n in target_nodes:
                     if isinstance(n, DocsImageNode):
                         substituted = next(subst_iter)
@@ -307,6 +312,12 @@ class GoogleDocsBackend(Backend):
             # design change, not a patch. Until then the author is told, which is the
             # difference between a known limitation and silent data loss.
             target_nodes, target_residue = project(target_nodes)
+
+            # Doc-only recovery aid (Part D): rebuilt fresh every push from the
+            # current mermaid images, never read back from a previous push --
+            # the local markdown never has this section, so there is nothing
+            # to preserve here.
+            target_nodes = [*target_nodes, *mermaid_appendix.build_appendix_nodes(mermaid_entries)]
 
             body_content = doc.get("body", {}).get("content", [])
             doc_end_index = body_content[-1].get("endIndex", 1) if body_content else 1
@@ -1254,28 +1265,37 @@ class GoogleDocsBackend(Backend):
         return None
 
     def pull(
-        self, doc_id: str, local_path: str, tab_id: Optional[str] = None, **kwargs: object
+        self,
+        doc_id: str,
+        local_path: str,
+        tab_id: Optional[str] = None,
+        pull_strategy: Literal["auto", "structural"] = "auto",
+        **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, convert to markdown, write locally.
 
-        Default (tab_id=None): unchanged pre-tabs-support behavior — export
-        via Drive's HTML export (files.export) and run it through
-        DocumentConverter.html_to_markdown(). Drive export always returns the
-        doc's first/default tab and cannot target a specific tab; if the doc
-        has more than one tab, status is escalated to "warning" (not "ok")
-        so a silent wrong-tab pull (the bug this parameter exists to fix)
-        is surfaced instead of hidden.
+        Default (tab_id=None, pull_strategy="auto"): unchanged pre-tabs-support
+        behavior — export via Drive's HTML export (files.export) and run it
+        through DocumentConverter.html_to_markdown(). Drive export always
+        returns the doc's first/default tab and cannot target a specific tab;
+        if the doc has more than one tab, status is escalated to "warning"
+        (not "ok") so a silent wrong-tab pull (the bug this parameter exists
+        to fix) is surfaced instead of hidden.
 
-        Explicit tab_id: Drive export can't select a tab, so this instead
-        re-fetches structurally (get_document + resolve_document_tab +
-        DocsStructureParser.parse) and renders back to markdown with
-        render_nodes_to_markdown() — the same structural machinery push()
-        uses, run in reverse.
+        Explicit tab_id, or pull_strategy="structural": Drive export can't
+        select a tab (and, separately, is the lossier path per Mapping.
+        pull_strategy's docstring), so this instead re-fetches structurally
+        (get_document + resolve_document_tab + DocsStructureParser.parse) and
+        renders back to markdown with render_nodes_to_markdown() — the same
+        structural machinery push() uses, run in reverse. resolve_document_tab
+        accepts tab_id=None as "no preference" (resolves to the first/default
+        tab), so pull_strategy="structural" with tab_id=None still targets the
+        right tab.
         """
         self._ensure_client()
         assert self._client is not None
         try:
-            if tab_id is not None:
+            if tab_id is not None or pull_strategy == "structural":
                 doc = self._client.get_document(doc_id)
                 doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
                 parser = DocsStructureParser()
@@ -1286,7 +1306,48 @@ class GoogleDocsBackend(Backend):
                 # demote the title. project() maps it to the nearest style
                 # markdown *does* have, so pull/push is a fixpoint.
                 nodes, residue = project(nodes)
+
+                # The appendix (mermaid_appendix.py) is Doc-only -- pulled
+                # markdown must never carry it forward, or it would grow
+                # without bound across push/pull cycles. Extract its entries
+                # for recovery below, then strip it before rendering.
+                appendix_boundary = mermaid_appendix.find_appendix_boundary(nodes)
+                appendix_entries = mermaid_appendix.extract_appendix_entries(nodes)
+                if appendix_boundary is not None:
+                    nodes = nodes[:appendix_boundary]
                 markdown_content = render_nodes_to_markdown(nodes)
+
+                # Unlike the default (Drive HTML export) path below, this
+                # renderer never embeds base64 image data -- each image link
+                # is the Docs API's real contentUri (docs_structure_parser.py).
+                # recover_pulled_images's data-URI regex can never match here,
+                # so mermaid-fence recovery needs its own fetch-then-hash path.
+                # See recover_structural_mermaid_images's docstring.
+                image_nodes = [n for n in nodes if isinstance(n, DocsImageNode)]
+                if image_nodes:
+                    image_recovery = recover_structural_mermaid_images(
+                        markdown_content,
+                        image_nodes,
+                        markdown_path=local_path,
+                        appendix_entries=appendix_entries or None,
+                    )
+                    markdown_content = image_recovery.markdown
+
+                # NOT calling _recover_checkbox_state here, deliberately.
+                # Investigated and reverted: even gated to single-tab docs
+                # (where Drive's tab-unscopable markdown export is
+                # unambiguous), patching a native-checkbox line whose raw
+                # paragraph text already contains prior force-pushed literal
+                # "[x] "/"[ ] " text (see TestSecondRoundTripAfterForcePush,
+                # issue #17 AC6) produces a push request that doubles that
+                # literal text AND replaces the native checkbox glyph with a
+                # plain disc bullet -- confirmed live via a batch_update
+                # inspection, not a hypothetical. Fixing this needs either
+                # patch_checkbox_lines() or push's bracket-stripping _key()
+                # to account for the other, which is real follow-up work,
+                # not a safe same-change fix. Tab-scoped pull continues to
+                # render every native checkbox unchecked (documented gap).
+                data_uris = find_data_uris(markdown_content)
                 pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
                 pathlib.Path(local_path).write_text(markdown_content)
                 self._write_comment_sidecar(doc_id, local_path)
@@ -1304,11 +1365,19 @@ class GoogleDocsBackend(Backend):
                     [r for r in residue if r.kind in ("private_use_glyph", "ambiguous_code_prefix")]
                 )
                 # Collected, not raced — one warning must not hide the other.
+                data_uri_note = (
+                    f"pulled markdown still contains {len(data_uris)} data: URI(s) "
+                    f"(e.g. {data_uris[0]}) -- this is a bug in docspan's own "
+                    "rendering, not something you did; please report it"
+                    if data_uris
+                    else None
+                )
                 messages = [
                     message
                     for message in (
                         f"⚠ {residue_note}" if residue_note else None,
                         self._render_unreadable_links(parser.unreadable_links),
+                        data_uri_note,
                     )
                     if message
                 ]
@@ -1335,12 +1404,51 @@ class GoogleDocsBackend(Backend):
             # the document fetched just above for the tab check. Ids the document
             # does not know are left exactly as they are.
             structural_nodes, _residue = project(DocsStructureParser().parse(resolved_doc))
+            appendix_entries = mermaid_appendix.extract_appendix_entries(structural_nodes)
+            appendix_boundary = mermaid_appendix.find_appendix_boundary(structural_nodes)
+            if appendix_boundary is not None:
+                structural_nodes = structural_nodes[:appendix_boundary]
             markdown_content = upgrade_heading_id_anchors(
                 markdown_content, heading_id_to_slug(structural_nodes)
             )
 
             markdown_content, checkbox_warning = self._recover_checkbox_state(
                 doc_id, structural_nodes, markdown_content
+            )
+
+            # The appendix (mermaid_appendix.py) is Doc-only -- strip its
+            # literal text back out of the HTML-exported markdown before it's
+            # written to disk. Node-list slicing above (structural_nodes)
+            # doesn't touch this string: it comes from Drive's HTML export,
+            # not from the node list.
+            markdown_content = mermaid_appendix.strip_appendix_from_markdown(markdown_content)
+
+            # Drive's HTML export inlines every embedded image (including a
+            # pushed ```mermaid fence's rendered diagram) as a
+            # data:image/...;base64,... URI -- confirmed live, a two-diagram
+            # doc round-tripped into 401KB of embedded PNG data. Swap each
+            # one for a restored mermaid fence (local render-cache hit,
+            # committed sidecar, or the in-doc appendix) or the structural
+            # node's real, non-bloated image URL.
+            image_nodes = [n for n in structural_nodes if isinstance(n, DocsImageNode)]
+            recovery = recover_pulled_images(
+                markdown_content,
+                image_nodes,
+                markdown_path=local_path,
+                appendix_entries=appendix_entries or None,
+            )
+            markdown_content = recovery.markdown
+
+            # Backstop for any data: URI recover_pulled_images() didn't catch
+            # (e.g. its positional-correlation guard bailed out) -- surfaced
+            # as a warning, never a reason to withhold the file.
+            data_uris = find_data_uris(markdown_content)
+            data_uri_warning = (
+                f"pulled markdown still contains {len(data_uris)} data: URI(s) "
+                f"(e.g. {data_uris[0]}) -- this is a bug in docspan's own "
+                "rendering, not something you did; please report it"
+                if data_uris
+                else None
             )
 
             pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1354,7 +1462,7 @@ class GoogleDocsBackend(Backend):
             # links are "absent from the pulled file" while they sit in the file
             # just written. Only the tab-scoped path above can report what the
             # file lacks, because there the parser's output *is* the file.
-            messages = [w for w in (warning, checkbox_warning) if w]
+            messages = [w for w in (warning, checkbox_warning, data_uri_warning) if w]
             if messages:
                 return PullResult(
                     status="warning",
@@ -1380,6 +1488,7 @@ class GoogleDocsBackend(Backend):
         local_dir: str,
         split_level: Optional[str] = None,
         tab_id: Optional[str] = None,
+        canonical_dir: Optional[str] = None,
         **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, split it at `split_level`, write one file per section.
@@ -1398,18 +1507,40 @@ class GoogleDocsBackend(Backend):
         crash between the two replaces is recoverable by hand from the
         `.<name>.old.*` sibling directory left behind — never a half-written
         set of section files.
+
+        `canonical_dir`, when given, is the *real* section directory
+        (`Mapping.local`) that `push_sectioned`/`image_source.py` write the
+        committed `{file}.mermaid-cache.yaml` sidecar next to.
+        `orchestrator.py`'s `_orchestrate_pull_sectioned` always calls this
+        method with `local_dir` pointed at a throwaway
+        `tempfile.TemporaryDirectory()` (so a merge conflict can be staged
+        before anything touches the real directory), which left the sidecar
+        lookup below checking `<temp_dir>/NN-slug.md.mermaid-cache.yaml` --
+        a path that can never exist. `canonical_dir` gives the sidecar
+        lookup the real path while every other write (section files, the
+        manifest, comment sidecars) still goes through `local_dir`/`target_dir`
+        exactly as before.
         """
         if split_level is None:
             raise ValueError("pull_sectioned requires split_level")
         self._ensure_client()
         assert self._client is not None
         target_dir = pathlib.Path(local_dir)
+        sidecar_dir = pathlib.Path(canonical_dir) if canonical_dir is not None else target_dir
         try:
             doc = self._client.get_document(doc_id)
             doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
             parser = DocsStructureParser()
             nodes = parser.parse(doc)
             nodes, residue = project(nodes)
+
+            # The appendix (mermaid_appendix.py) is Doc-only -- it must not
+            # become one more section file. Extract its entries for recovery
+            # below, then drop it before splitting.
+            appendix_entries = mermaid_appendix.extract_appendix_entries(nodes)
+            appendix_boundary = mermaid_appendix.find_appendix_boundary(nodes)
+            if appendix_boundary is not None:
+                nodes = nodes[:appendix_boundary]
 
             existing_entries: List[SectionManifestEntry] = []
             manifest_path = target_dir / MANIFEST_FILENAME
@@ -1427,12 +1558,24 @@ class GoogleDocsBackend(Backend):
             tmp_dir = pathlib.Path(
                 tempfile.mkdtemp(dir=str(tmp_parent), prefix=f".{target_dir.name}.", suffix=".tmp")
             )
+            section_data_uris: List[str] = []
             try:
                 entries: List[SectionManifestEntry] = []
                 section_texts: List[Tuple[str, str]] = []
                 for index, section in enumerate(sections):
                     filename = f"{str(index).zfill(width)}-{section.slug}.md"
                     content = render_nodes_to_markdown(section.nodes) if section.nodes else ""
+                    section_image_nodes = [
+                        n for n in section.nodes if isinstance(n, DocsImageNode)
+                    ]
+                    if section_image_nodes:
+                        content = recover_structural_mermaid_images(
+                            content,
+                            section_image_nodes,
+                            markdown_path=str(sidecar_dir / filename),
+                            appendix_entries=appendix_entries or None,
+                        ).markdown
+                    section_data_uris.extend(find_data_uris(content))
                     (tmp_dir / filename).write_text(content)
                     section_texts.append((filename, content))
                     entries.append(
@@ -1457,11 +1600,19 @@ class GoogleDocsBackend(Backend):
             # tab-scoped pull() above, this path's per-section markdown *is*
             # the parser's own output, so an unreadable link is genuinely
             # absent from every file just written (see #38).
+            data_uri_note = (
+                f"pulled markdown still contains {len(section_data_uris)} data: URI(s) "
+                f"(e.g. {section_data_uris[0]}) -- this is a bug in docspan's own "
+                "rendering, not something you did; please report it"
+                if section_data_uris
+                else None
+            )
             messages = [
                 message
                 for message in (
                     f"⚠ {residue_note}" if residue_note else None,
                     self._render_unreadable_links(parser.unreadable_links),
+                    data_uri_note,
                 )
                 if message
             ]
@@ -1591,7 +1742,10 @@ class GoogleDocsBackend(Backend):
             if not section_comments:
                 continue
             sidecar = tmp_dir / (filename + COMMENTS_SUFFIX)
-            sidecar.write_text(format_comments_markdown(title, section_comments))
+            content = format_comments_markdown(title, section_comments)
+            if find_data_uris(content):
+                logger.warning("Comment sidecar %s contains a data: URI — unexpected.", sidecar)
+            sidecar.write_text(content)
 
     def _write_comment_sidecar(self, doc_id: str, local_path: str) -> None:
         """Write a {file}.comments.md sidecar of the doc's comments (best-effort)."""
@@ -1608,7 +1762,10 @@ class GoogleDocsBackend(Backend):
                 title = self._client.get_doc_info(doc_id).get("name", doc_id)
             except Exception:
                 title = doc_id
-            sidecar.write_text(format_comments_markdown(title, comments))
+            content = format_comments_markdown(title, comments)
+            if find_data_uris(content):
+                logger.warning("Comment sidecar %s contains a data: URI — unexpected.", sidecar)
+            sidecar.write_text(content)
         elif sidecar.exists():
             sidecar.unlink()  # no comments anymore — drop a stale sidecar
 
@@ -1647,7 +1804,7 @@ class GoogleDocsBackend(Backend):
         self._ensure_client()
         assert self._client is not None
         doc = self._client.get_document(doc_id)
-        return doc["revisionId"]
+        return str(doc["revisionId"])
 
     def create(self, title: str, **kwargs: object) -> CreateResult:
         """Create a new, empty Google Doc and return its id/title/url."""

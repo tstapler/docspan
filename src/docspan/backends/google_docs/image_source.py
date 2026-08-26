@@ -9,10 +9,12 @@ resolution failure into a push warning instead of a crash.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
 from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError, render_mermaid_png
 
@@ -74,6 +76,11 @@ class ResolvedImage:
 
     uri: str
     temp_drive_file_id: Optional[str] = None
+    # Set only when this resolution rendered a ```mermaid fence -- the raw
+    # PNG bytes, so resolve_document_images() can record them in the
+    # cross-machine mermaid-cache sidecar (mermaid_cache_sidecar.py) without
+    # re-rendering. None for every other image source kind.
+    rendered_bytes: Optional[bytes] = None
 
 
 @dataclass
@@ -178,7 +185,11 @@ def _resolve_one(source: ImageSource, uploader: Uploader, renderer: Renderer) ->
         )
 
     result = uploader(data, filename, mime_type)
-    return ResolvedImage(uri=result["uri"], temp_drive_file_id=result["file_id"])
+    return ResolvedImage(
+        uri=result["uri"],
+        temp_drive_file_id=result["file_id"],
+        rendered_bytes=data if isinstance(source, MermaidSource) else None,
+    )
 
 
 def _read_local(path: str) -> Tuple[bytes, str]:
@@ -215,19 +226,36 @@ def _sniff_mime_type(data: bytes) -> Optional[str]:
     return None
 
 
+def _describe_source(source: ImageSource) -> str:
+    """Short, single-line label for a warning -- never the raw dataclass repr.
+
+    `MermaidSource.diagram` is the full (often multi-line) fence text; its
+    default dataclass repr would dump that whole text, escaped onto one line,
+    into a push warning. Callers just need enough to find which image failed.
+    """
+    if isinstance(source, MermaidSource):
+        first_line = next((ln.strip() for ln in source.diagram.splitlines() if ln.strip()), "")
+        return f"mermaid diagram ({first_line})" if first_line else "mermaid diagram"
+    if isinstance(source, LocalPathSource):
+        return source.path
+    if isinstance(source, UrlSource):
+        return source.url
+    return repr(source)
+
+
 def resolve_document_images(
     nodes: List[DocsImageNode],
     markdown_path: str,
     uploader: Uploader,
     renderer: Optional[Renderer] = None,
-) -> Tuple[List[Optional[DocsImageNode]], List[str], List[str]]:
+) -> Tuple[List[Optional[DocsImageNode]], List[str], List[str], List[Tuple[str, str]]]:
     """Resolve every `DocsImageNode.src` in `nodes` to a fetchable URI, in place-equivalent form.
 
     Convenience wrapper over `resolve_images()` for the `backend.py` push
     pre-pass: builds an `ImageSource` per node -- a `MermaidSource` when
     `node.mermaid_source` is set (a ```mermaid fence), otherwise from its raw
     markdown `src` via `build_source` -- resolves them all, and returns
-    `(nodes, warnings, temp_drive_file_ids)`.
+    `(nodes, warnings, temp_drive_file_ids, mermaid_entries)`.
 
     The returned `nodes` list is positional -- same length and order as the
     input, one slot per input node -- so a caller splicing these back into a
@@ -238,7 +266,10 @@ def resolve_document_images(
     `warnings`, matching the `_render_unstyled`/`_render_dead_anchors`
     residue-warning pattern in `backend.py`) and the caller drops it.
     `temp_drive_file_ids` lets the caller delete on success or retry on
-    failure (criterion 5/7/8).
+    failure (criterion 5/7/8). `mermaid_entries` is
+    `[(sha256_of_png_bytes, diagram_source), ...]`, in document order, for
+    `mermaid_appendix.build_appendix_nodes` -- the same key domain the
+    committed sidecar below already uses.
     """
     sources: Dict[str, ImageSource] = {
         str(i): MermaidSource(diagram=node.mermaid_source)
@@ -248,13 +279,30 @@ def resolve_document_images(
     }
     resolved, errors = resolve_images(sources, uploader, renderer)
 
-    warnings = [f"image {sources[e.key]!r}: {e.reason}" for e in errors]
+    warnings = [f"image {_describe_source(sources[e.key])}: {e.reason}" for e in errors]
     temp_drive_file_ids = [
         r.temp_drive_file_id for r in resolved.values() if r.temp_drive_file_id
     ]
+
+    # Persist mermaid renders to the committed sidecar (mermaid_cache_sidecar.py)
+    # so a pull on a different machine, which never had the local XDG render
+    # cache populated, can still restore the ```mermaid fence instead of
+    # falling back to a bare image link. Collected into one dict and written
+    # once via record_many() rather than once per node -- record() alone
+    # would do a full sidecar read-modify-write per diagram, O(N) file I/O
+    # for an N-diagram doc.
+    mermaid_entries: List[Tuple[str, str]] = []
+    sidecar_entries: Dict[str, str] = {}
+    for i, node in enumerate(nodes):
+        result = resolved.get(str(i))
+        if node.mermaid_source and result is not None and result.rendered_bytes is not None:
+            sha256_hex = hashlib.sha256(result.rendered_bytes).hexdigest()
+            sidecar_entries[sha256_hex] = node.mermaid_source
+            mermaid_entries.append((sha256_hex, node.mermaid_source))
+    mermaid_cache_sidecar.record_many(markdown_path, sidecar_entries)
 
     out: List[Optional[DocsImageNode]] = []
     for i, node in enumerate(nodes):
         result = resolved.get(str(i))
         out.append(replace(node, src=result.uri) if result else None)
-    return out, warnings, temp_drive_file_ids
+    return out, warnings, temp_drive_file_ids, mermaid_entries

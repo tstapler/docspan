@@ -13,6 +13,7 @@ the pre-existing request-builder/pipeline test files:
 Criterion 6 (gated live integration) is out of default-CI scope.
 """
 
+import hashlib
 from dataclasses import replace
 
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
@@ -268,7 +269,7 @@ def test_resolve_document_images_is_positional_with_none_for_failures(tmp_path) 
     def uploader(data: bytes, filename: str, mime_type: str) -> dict:
         return {"file_id": "drive-1", "uri": "https://drive.example.com/drive-1"}
 
-    resolved, warnings, temp_ids = resolve_document_images(nodes, str(md_path), uploader)
+    resolved, warnings, temp_ids, mermaid_entries = resolve_document_images(nodes, str(md_path), uploader)
 
     assert len(resolved) == 3
     assert resolved[0] is not None and resolved[0].src == "https://drive.example.com/drive-1"
@@ -277,6 +278,32 @@ def test_resolve_document_images_is_positional_with_none_for_failures(tmp_path) 
     assert len(warnings) == 1
     assert "missing.png" in warnings[0]
     assert temp_ids == ["drive-1"]
+    assert mermaid_entries == []
+
+
+def test_resolve_document_images_mermaid_entries_keyed_by_exact_rendered_hash(tmp_path) -> None:
+    """mermaid_entries must key by sha256(rendered_bytes), not by node index or diagram text."""
+    md_path = tmp_path / "doc.md"
+    md_path.write_text("placeholder")
+    diagram = "graph TD\n  A --> B"
+    rendered_png = b"\x89PNG\r\n\x1a\n" + b"fake-render-bytes"
+
+    def renderer(source: str) -> bytes:
+        assert source == diagram
+        return rendered_png
+
+    node = DocsImageNode(mermaid_source=diagram, alt="mermaid diagram")
+
+    resolved, warnings, temp_ids, mermaid_entries = resolve_document_images(
+        [node],
+        str(md_path),
+        uploader=lambda *_: {"file_id": "drive-1", "uri": "https://drive.example.com/drive-1"},
+        renderer=renderer,
+    )
+
+    assert warnings == []
+    expected_hash = hashlib.sha256(rendered_png).hexdigest()
+    assert mermaid_entries == [(expected_hash, diagram)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

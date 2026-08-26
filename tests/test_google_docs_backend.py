@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from docspan.backends.base import PushResult
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.push_preview import HighRiskParagraph, PushPlan
@@ -1369,6 +1370,119 @@ class TestPullTabId:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Appendix stripping + data-URI/mermaid recovery wiring in pull()'s two paths.
+# Neither path had any test exercising `mermaid_appendix`/`data_uri_warning`
+# composition before this (confirmed via grep: zero "appendix"/"data_uri"
+# hits in this file) despite ~163 changed lines of wiring across both.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _styled_paragraph_element(index: int, text: str, style: str = "NORMAL_TEXT") -> tuple[dict, int]:
+    end = index + len(text) + 1
+    return (
+        {
+            "startIndex": index,
+            "endIndex": end,
+            "paragraph": {
+                "paragraphStyle": {"namedStyleType": style},
+                "elements": [{"textRun": {"content": text + "\n"}}],
+            },
+        },
+        end,
+    )
+
+
+def _doc_with_structural_appendix(sha256_hex: str, diagram: str) -> dict:
+    """A single-tab-less doc whose body is `Intro` followed by a real
+    appendix section (HEADING_2/HEADING_3/fenced-code shape `mermaid_appendix
+    .build_appendix_nodes` emits) -- for exercising the structural pull
+    path's node-based `find_appendix_boundary`/`extract_appendix_entries`."""
+    content: list = []
+    index = 1
+    for text, style in [
+        ("Intro", "HEADING_1"),
+        ("Hello world", "NORMAL_TEXT"),
+        ("Appendix: Diagram Sources", "HEADING_2"),
+        (f"Diagram {sha256_hex}", "HEADING_3"),
+        ("```text", "NORMAL_TEXT"),
+        *[(line, "NORMAL_TEXT") for line in diagram.splitlines()],
+        ("```", "NORMAL_TEXT"),
+    ]:
+        element, index = _styled_paragraph_element(index, text, style)
+        content.append(element)
+    return {"revisionId": "rev-appendix", "body": {"content": content}}
+
+
+class TestPullStripsAppendixAndSurfacesDataUriWarnings:
+    def test_default_pull_path_strips_appendix_heading_from_written_markdown(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Default (Drive HTML export) path: appendix stripping is a pure
+        regex operation on the rendered markdown string (mermaid_appendix
+        .strip_appendix_from_markdown), independent of the structural node
+        list -- so an empty structural doc is enough to prove the HTML-side
+        appendix never survives into the pulled file."""
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = (
+            "<p>Hello world</p><h2>Appendix: Diagram Sources</h2>"
+            "<h3>Diagram abc123</h3><pre><code>graph TD\n  A --&gt; B</code></pre>"
+        )
+        fake_client.get_document.return_value = _empty_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        content = local.read_text(encoding="utf-8")
+        assert "Hello world" in content
+        assert "Appendix: Diagram Sources" not in content
+        assert "graph TD" not in content
+        assert result.status in ("ok", "warning")
+
+    def test_default_pull_path_surfaces_data_uri_warning_when_recovery_cannot_fire(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """`recover_pulled_images`'s all-or-nothing positional guard no-ops
+        when the data-URI count in the markdown doesn't match the structural
+        image-node count (here: zero image nodes in `get_document`'s empty
+        doc vs. one data-URI image in the HTML export) -- proving
+        `find_data_uris`'s backstop and `data_uri_warning` composition
+        actually reach `PullResult.message`."""
+        backend, fake_client = make_backend()
+        data_uri = "data:image/png;base64," + ("A" * 40)
+        fake_client.get_doc_content.return_value = f'<p>hi</p><img src="{data_uri}">'
+        fake_client.get_document.return_value = _empty_doc()
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local))
+
+        assert result.status == "warning"
+        assert "data:" in (result.message or "")
+        assert data_uri in local.read_text(encoding="utf-8")
+
+    def test_structural_pull_path_extracts_and_strips_real_appendix_nodes(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Structural (`pull_strategy='structural'`) path: the appendix lives
+        in the parsed node list itself (mermaid_appendix.find_appendix_boundary
+        / extract_appendix_entries), not the rendered markdown string -- this
+        proves the appendix's heading/entry/fence nodes are sliced off
+        before `render_nodes_to_markdown` ever sees them."""
+        backend, fake_client = make_backend()
+        diagram = "graph TD\n  A --> B"
+        sha256_hex = "deadbeef"
+        fake_client.get_document.return_value = _doc_with_structural_appendix(sha256_hex, diagram)
+
+        local = tmp_path / "doc.md"
+        result = backend.pull("doc-1", str(local), pull_strategy="structural")
+
+        assert result.status == "ok", result.message
+        content = local.read_text(encoding="utf-8")
+        assert "Hello world" in content
+        assert "Appendix: Diagram Sources" not in content
+        assert sha256_hex not in content
+        assert "graph TD" not in content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # unreadable_links — bookmark/tabId links reported as a pull warning, but only
 # on the tab-scoped structural path (issue #38). The default path's markdown
 # comes from Drive's HTML export, which renders these correctly — reporting
@@ -2494,6 +2608,99 @@ class TestPullSectioned:
         assert result.status == "warning"
         assert "bookmark link" in (result.message or "")
 
+    def test_pull_sectioned_uses_canonical_dir_for_cross_machine_sidecar_lookup(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Regression for the sidecar-cross-machine-recovery gap: orchestrator.py
+        always routes `pull_sectioned` through a throwaway temp dir
+        (`local_dir` below), never `Mapping.local` directly, but
+        `push_sectioned`/`image_source.py` write the committed
+        `{file}.mermaid-cache.yaml` sidecar next to the *real* section
+        directory. Without `canonical_dir` threading the real path through,
+        the sidecar lookup silently misses every time on a sectioned pull.
+        """
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = {
+            "revisionId": "rev-sectioned-image",
+            "body": {
+                "content": [
+                    {
+                        "startIndex": 1,
+                        "endIndex": 11,
+                        "paragraph": {
+                            "paragraphStyle": {
+                                "namedStyleType": "HEADING_1",
+                                "headingId": "h.section1",
+                            },
+                            "elements": [{"textRun": {"content": "Section 1\n"}}],
+                        },
+                    },
+                    {
+                        "startIndex": 11,
+                        "endIndex": 12,
+                        "paragraph": {
+                            "elements": [{"inlineObjectElement": {"inlineObjectId": "kix.obj1"}}]
+                        },
+                    },
+                    {
+                        "startIndex": 12,
+                        "endIndex": 13,
+                        "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+                    },
+                ]
+            },
+            "inlineObjects": {
+                "kix.obj1": {
+                    "inlineObjectProperties": {
+                        "embeddedObject": {
+                            "contentUri": "https://docs.google.com/fake-diagram-uri",
+                        }
+                    }
+                }
+            },
+        }
+
+        # The real section directory (`Mapping.local`) -- what push_sectioned
+        # wrote the sidecar next to.
+        canonical_dir = tmp_path / "canonical"
+        canonical_dir.mkdir()
+        section_filename = "01-section-1.md"
+        png_bytes = b"fake-png-bytes-for-sidecar-cross-machine-test"
+        diagram_source = "graph TD\n  A --> B"
+        mermaid_cache_sidecar.record(
+            str(canonical_dir / section_filename), png_bytes, diagram_source
+        )
+
+        def _fake_get(url: str, timeout: float | None = None) -> MagicMock:
+            assert url == "https://docs.google.com/fake-diagram-uri"
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            response.content = png_bytes
+            return response
+
+        monkeypatch.setattr(
+            "docspan.backends.google_docs.pulled_image_recovery.requests.get", _fake_get
+        )
+
+        # `local_dir` below stands in for orchestrator.py's throwaway
+        # `tempfile.TemporaryDirectory()` -- a different path from
+        # `canonical_dir`, exactly like the real pull-sectioned call site.
+        temp_pull_dir = tmp_path / "unrelated-temp-pull-dir"
+        result = backend.pull_sectioned(
+            "doc-1",
+            str(temp_pull_dir),
+            split_level="HEADING_1",
+            canonical_dir=str(canonical_dir),
+        )
+
+        assert result.status == "ok", result.message
+        section_content = (temp_pull_dir / section_filename).read_text()
+        assert "```mermaid" in section_content
+        assert diagram_source in section_content
+
     def test_pull_sectioned_should_return_error_for_unknown_tab_id(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]
@@ -3593,8 +3800,8 @@ class TestBlockquoteNodeRenderer:
     def test_render_nodes_to_markdown_should_CallGroupBlockquoteRunsAsOuterStage_When_SequenceHasMixedNodes(
         self,
     ) -> None:
-        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
         from docspan.backends.google_docs import nodes_to_markdown as n2m
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 
         n0 = DocsParagraphNode(style="NORMAL_TEXT", text="before")
         n1 = DocsParagraphNode(

@@ -135,6 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **google-docs:** both pull paths now emit the heading's slug. A default (no `tab_id`) pull
   goes through Drive's HTML export, which carries the Doc's opaque `#h.abc123` through
   verbatim; it is upgraded to the slug, so the pulled markdown works as markdown.
+- **google-docs:** a tab-scoped structural pull now renders an ordered-list glyph
+  (`DECIMAL`/`ZERO_DECIMAL`/`ALPHA`/`UPPER_ALPHA`/`ROMAN`/`UPPER_ROMAN`) as `1.`/`2.`/…
+  instead of a plain `-` bullet, numbered per `(listId, nestingLevel)` in document order.
+  One-way: push has no ordered-list concept (every markdown list becomes an unordered
+  bullet regardless of source syntax), so a round-trip through push still loses the
+  numbering — pre-existing, unconditional on both pull paths, not introduced by this fix.
 - **google-docs:** a Markdown `> ...` blockquote now pushes as a native indented,
   left-bordered paragraph (`indentStart`/`borderLeft`) instead of literal `>` text, and
   pulling it back reconstructs the `> ` prefix from that styling, byte-for-byte round trip
@@ -154,8 +160,10 @@ Each of these is tracked as a follow-up rather than half-addressed here.
 - An anchor into a heading in a *different tab* of the same document cannot be resolved and
   is reported unresolved. The flat `headingId` member resolves against the tab named in the
   request, so expressing one needs the tabs-aware `Link.heading` member.
-- A pull cannot express a `bookmark`/`bookmarkId` link, a link to a tab, or any link inside
-  a table cell, so those are dropped from the pulled file without a report.
+- A tab-scoped structural pull cannot express a `bookmark`/`bookmarkId` link or a link to a
+  tab (including one inside a table cell — cells route through the same link parsing as
+  everywhere else). These are absent from the pulled file, but reported: `pull` names each
+  unreadable kind in its message rather than dropping them in silence.
 - Confluence writes an internal anchor as a literal `#fragment` href, which it does not
   resolve. `push` now reports this as a warning naming the anchor(s) instead of shipping it
   silently; the href itself is unchanged, since no live instance was available to establish

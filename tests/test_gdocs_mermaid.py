@@ -6,6 +6,9 @@ renderer (never a real mermaid-cli subprocess in these tests), and uploaded
 through the same image_source.py pipeline as any other image.
 """
 
+import hashlib
+
+from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
     MermaidSource,
@@ -16,6 +19,7 @@ from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownTo
 from docspan.backends.google_docs.mermaid_renderer import (
     MermaidRenderError,
     _mmdc_command,
+    lookup_mermaid_source,
     render_mermaid_png,
 )
 
@@ -82,12 +86,35 @@ def test_resolve_images_renders_mermaid_source_via_injected_renderer() -> None:
 
 def test_resolve_document_images_uses_mermaid_source_over_src(tmp_path) -> None:
     node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
-    out, warnings, temp_ids = resolve_document_images(
+    out, warnings, temp_ids, mermaid_entries = resolve_document_images(
         [node], str(tmp_path / "doc.md"), _fake_uploader, renderer=_fake_renderer
     )
     assert warnings == []
     assert out[0].src == "https://drive.example.com/temp123"
     assert temp_ids == ["temp123"]
+    expected_hash = hashlib.sha256(_fake_renderer("graph TD\n  A --> B")).hexdigest()
+    assert mermaid_entries == [(expected_hash, "graph TD\n  A --> B")]
+
+
+def test_resolve_document_images_records_mermaid_source_in_committed_sidecar(tmp_path) -> None:
+    md_path = str(tmp_path / "doc.md")
+    node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
+
+    resolve_document_images([node], md_path, _fake_uploader, renderer=_fake_renderer)
+
+    png_bytes = _fake_renderer("graph TD\n  A --> B")
+    assert mermaid_cache_sidecar.lookup(md_path, png_bytes) == "graph TD\n  A --> B"
+
+
+def test_resolve_document_images_does_not_record_non_mermaid_images(tmp_path) -> None:
+    md_path = str(tmp_path / "doc.md")
+    real_image = tmp_path / "photo.png"
+    real_image.write_bytes(_PNG_MAGIC + b"a-real-photo")
+    node = DocsImageNode(alt="a photo", src="photo.png")
+
+    resolve_document_images([node], md_path, _fake_uploader)
+
+    assert mermaid_cache_sidecar.load(md_path) == {}
 
 
 def test_mermaid_render_failure_is_a_warning_not_a_crash(tmp_path) -> None:
@@ -95,13 +122,14 @@ def test_mermaid_render_failure_is_a_warning_not_a_crash(tmp_path) -> None:
         raise MermaidRenderError("mermaid-cli not found")
 
     node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
-    out, warnings, temp_ids = resolve_document_images(
+    out, warnings, temp_ids, mermaid_entries = resolve_document_images(
         [node], str(tmp_path / "doc.md"), _fake_uploader, renderer=_failing_renderer
     )
     assert out == [None]
     assert len(warnings) == 1
     assert "mermaid render failed" in warnings[0]
     assert temp_ids == []
+    assert mermaid_entries == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -210,6 +238,54 @@ def test_render_mermaid_png_cache_key_changes_with_render_scale(tmp_path, monkey
     render_mermaid_png(diagram)
 
     assert calls == [diagram, diagram]  # scale change busts the cache, not a hit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# reverse lookup: rendered bytes -> original diagram source (pull-side recovery)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_lookup_mermaid_source_recovers_diagram_after_render(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer([]),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    png_bytes = render_mermaid_png(diagram)
+
+    assert lookup_mermaid_source(png_bytes) == diagram
+
+
+def test_lookup_mermaid_source_recovers_diagram_on_cache_hit_too(tmp_path, monkeypatch) -> None:
+    """A second render_mermaid_png call (disk-cache hit, no re-render) must
+    still populate the reverse lookup -- it's the only call site that knows
+    the (bytes, diagram) pairing, so a cache-hit call that skipped this
+    would leave the reverse lookup permanently empty for that diagram."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer([]),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    render_mermaid_png(diagram)
+    # Simulate starting fresh with only the forward PNG cache surviving
+    # (e.g. an XDG_CACHE_HOME populated before this feature existed).
+    by_hash_dir = tmp_path / "docspan" / "mermaid" / "by-hash"
+    for f in by_hash_dir.glob("*.mmd"):
+        f.unlink()
+    assert not any(by_hash_dir.glob("*.mmd"))
+
+    png_bytes = render_mermaid_png(diagram)  # disk-cache hit, not a fresh render
+
+    assert lookup_mermaid_source(png_bytes) == diagram
+
+
+def test_lookup_mermaid_source_returns_none_on_miss(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert lookup_mermaid_source(b"\x89PNG\r\n\x1a\nnot a real render") is None
 
 
 def test_render_mermaid_png_cache_key_changes_with_mmdc_version(tmp_path, monkeypatch) -> None:

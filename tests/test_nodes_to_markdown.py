@@ -276,11 +276,9 @@ def test_plain_bullet_still_renders_without_checklist_marker() -> None:
     assert "[x]" not in md
 
 
-def test_ordered_list_item_still_renders_as_bullet() -> None:
-    # DocsParagraphNode/DocsStructureParser doesn't currently distinguish
-    # ordered from unordered lists (only nestingLevel) — both render with a
-    # "-" marker. This test guards that the checkbox fix above doesn't
-    # regress that existing (non-checkbox) list-item path.
+def test_non_ordered_list_item_still_renders_as_bullet() -> None:
+    # Guards that the ordered-list rendering below doesn't regress the
+    # existing (non-ordered) list-item path.
     nodes = [
         _node(text="first", is_list_item=True, nesting_level=0),
         _node(text="second", is_list_item=True, nesting_level=0),
@@ -288,6 +286,20 @@ def test_ordered_list_item_still_renders_as_bullet() -> None:
     md = render_nodes_to_markdown(nodes)
     assert "- first" in md
     assert "- second" in md
+
+
+def test_ordered_list_item_renders_with_its_precomputed_number() -> None:
+    # DocsStructureParser resolves is_ordered_list/ordered_number at parse
+    # time (see docs_structure_parser.py's _resolve_is_ordered_list /
+    # _next_ordered_number) -- the renderer just reads them back.
+    nodes = [
+        _node(text="first", is_list_item=True, is_ordered_list=True, ordered_number=1),
+        _node(text="second", is_list_item=True, is_ordered_list=True, ordered_number=2),
+    ]
+    md = render_nodes_to_markdown(nodes)
+    assert "1. first" in md
+    assert "2. second" in md
+    assert "- first" not in md
 
 
 def test_nested_checkbox_preserves_indent() -> None:

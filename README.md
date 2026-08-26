@@ -24,6 +24,30 @@ The config file is named `markgate.yaml` — this name is preserved for backward
 pip install docspan
 ```
 
+**Optional: mermaid diagram rendering (Google Docs backend only).** Pushing a
+` ```mermaid ` fence to Google Docs renders it to a PNG via the official
+[mermaid-cli](https://github.com/mermaid-js/mermaid-cli) (`mmdc`), which
+wraps Puppeteer/headless Chrome — there is no pure-Python renderer, so this
+is a Node.js dependency, not a `uv`/`pip` one, and isn't declared in
+`pyproject.toml`. Install it globally so docspan finds a real binary instead
+of falling back to `npx` (which re-fetches on every render):
+
+```bash
+npm install -g @mermaid-js/mermaid-cli   # tested against 11.x; older 10.x should also work
+```
+
+If Puppeteer's headless Chrome cache gets corrupted (a truncated download,
+an interrupted npm install), renders fail with an error like `Could not
+find chrome-headless-shell`; re-fetch it with:
+
+```bash
+npx puppeteer browsers install chrome-headless-shell
+```
+
+Without `mmdc` installed and without network access for `npx` to fetch it
+on demand, a mermaid render failure is reported as a push warning, not a
+crash — see [Limitations](docs/backends/google-docs.md#limitations).
+
 ---
 
 ## Quick start
@@ -255,6 +279,9 @@ docspan generates these files in your project directory after first sync:
 | `.markgate-base/` | Content-addressed store of merge bases |
 | `{file}.orig` | Backup of local file before merge; deleted after conflict resolution |
 | `{file}.comments.md` | Comment sidecar (Google Docs + Confluence); written during pull if comments exist |
+| `{file}.mermaid-cache.yaml` | Google Docs: maps each pushed `​```mermaid` fence's rendered-PNG hash back to its source, so a *different* machine pulling the doc can still restore the fence instead of a bare image link. Written during push if the file has any mermaid fences. |
+
+**Commit `.markgate-state.json`, `.markgate-base/`, and `{file}.mermaid-cache.yaml` — do not gitignore them.** `.markgate-state.json`/`.markgate-base/` need to be shared for three-way merge to work across machines/teammates; `{file}.mermaid-cache.yaml` is what makes mermaid-fence recovery work across machines at all (Google Docs has no API-writable place to store a diagram's source, only the rendered image — see `mermaid_cache_sidecar.py`'s module docstring for why). `{file}.orig` and `{file}.comments.md` are transient/informational and safe to gitignore if you prefer.
 
 ---
 
