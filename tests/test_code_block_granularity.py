@@ -37,6 +37,8 @@ import pytest
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
+    BLOCKQUOTE_BORDER_MARKER,
+    BLOCKQUOTE_INDENT_PT_PER_LEVEL,
     DocsParagraphNode,
     DocsStructureParser,
 )
@@ -115,6 +117,33 @@ def _doc_of_lines(*lines: str) -> tuple[dict, int]:
             "endIndex": idx + len(text) + 1,
             "paragraph": {
                 "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{"textRun": {"content": text + "\n", "textStyle": {}}}],
+            },
+        })
+        idx += len(text) + 1
+    return {"revisionId": "rev-1", "body": {"content": content}}, idx
+
+
+def _doc_of_blockquote_lines(*specs: tuple[str, int]) -> tuple[dict, int]:
+    """Like `_doc_of_lines`, but each `(text, quote_depth)` pair can carry
+    Epic 3's native blockquote styling (`quote_depth > 0`) — the
+    `borderLeft`/`indentStart` combination `_detect_blockquote_depth` looks
+    for, matching what `_blockquote_paragraph_style_fields` writes on push.
+    """
+    content, idx = [], 1
+    for text, depth in specs:
+        style: dict = {"namedStyleType": "NORMAL_TEXT"}
+        if depth > 0:
+            style["indentStart"] = {
+                "magnitude": depth * BLOCKQUOTE_INDENT_PT_PER_LEVEL,
+                "unit": "PT",
+            }
+            style["borderLeft"] = BLOCKQUOTE_BORDER_MARKER
+        content.append({
+            "startIndex": idx,
+            "endIndex": idx + len(text) + 1,
+            "paragraph": {
+                "paragraphStyle": style,
                 "elements": [{"textRun": {"content": text + "\n", "textStyle": {}}}],
             },
         })
@@ -245,29 +274,29 @@ class TestFenceInABlockQuote:
         assert cmd.is_blockquote is True
         assert cmd.quote_depth == 2
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known cross-epic gap, not a regression: gdocs-native-blockquotes "
-            "Epic 2 (push) tags markdown-side blockquote nodes with "
-            "is_blockquote=True/quote_depth, but Epic 3 (pull — "
-            "docs_structure_parser.py reading a live paragraph's "
-            "borderLeft/indentStart back into those same fields) has not "
-            "landed yet. `_doc_of_lines` builds a live-doc paragraph with no "
-            "such styling, so `structure.parse` always produces "
-            "is_blockquote=False on the current side, which now differs from "
-            "the markdown target's is_blockquote=True and emits a restyle "
-            "request. This will start passing once Epic 3 lands; if it does "
-            "so unexpectedly (strict=True), remove this marker."
-        ),
-    )
     def test_pushing_a_document_with_a_quoted_fence_does_not_delete_it(self) -> None:
         """The item's core repro: a quoted fence already in the live doc must
         survive an unchanged push, not be diffed away as a removal.
+
+        Unlike `_doc_of_lines`, the "current" doc here must already carry
+        Epic 3's native blockquote styling (`borderLeft`/`indentStart`
+        matching `BLOCKQUOTE_BORDER_MARKER`/`BLOCKQUOTE_INDENT_PT_PER_LEVEL`)
+        on its quoted paragraphs, plus a paragraph for the blank quote line
+        and one for the fence's language marker — both of which the target
+        markdown side now emits (Story 2.5's blank-quote-line carve-out and
+        Story 2.1's `emit_language_marker=True` fix). A plain `_doc_of_lines`
+        fixture has neither, so it can never diff to `[]` regardless of
+        whether Epic 3's marker-detection code is correct.
         """
         md = "intro\n\n> Note:\n>\n> ```sh\n> kubectl get pods\n> kubectl logs -f\n> ```\n\ntail\n"
-        doc, end = _doc_of_lines(
-            "intro", "Note:", "kubectl get pods", "kubectl logs -f", "tail",
+        doc, end = _doc_of_blockquote_lines(
+            ("intro", 0),
+            ("Note:", 1),
+            ("", 1),
+            ("```sh", 1),
+            ("kubectl get pods", 1),
+            ("kubectl logs -f", 1),
+            ("tail", 0),
         )
 
         target, _ = project(markdown.parse(md))
