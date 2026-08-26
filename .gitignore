@@ -70,3 +70,6 @@ site/
 # repo deliverable (see commits 8f80a5b, bd693ca on other branches)
 .backlog-context.md
 .claude/commands/backlog/
+
+# Scratch artifacts — debug dumps, snapshots, never a repo deliverable
+.scratch/
