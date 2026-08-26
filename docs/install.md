@@ -16,11 +16,13 @@ pip install docspan
 uv add docspan
 ```
 
-## Install via pipx
+## Install via uv tool / uvx
 
 ```bash
-pipx install docspan
+uv tool install docspan
 ```
+
+To run it without installing, use `uvx docspan`.
 
 ---
 
