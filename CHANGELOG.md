@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/tstapler/docspan/compare/docspan-v0.6.1...docspan-v0.7.0) (2026-09-18)
+
+
+### Features
+
+* **google-docs:** support creating and mapping into a new tab ([#125](https://github.com/tstapler/docspan/issues/125)) ([92f4fe3](https://github.com/tstapler/docspan/commit/92f4fe33226339bc712732562dcc080362a3f935))
+
 ## [0.6.1](https://github.com/tstapler/docspan/compare/docspan-v0.6.0...docspan-v0.6.1) (2026-09-18)
 
 
