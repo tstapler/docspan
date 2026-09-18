@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -743,6 +744,19 @@ def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Map
     return None
 
 
+_H1_PATTERN = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+
+
+def _default_title(file: str) -> str:
+    """Default title for a newly mapped doc: the file's first H1, else its basename."""
+    if os.path.exists(file):
+        with open(file, "r", encoding="utf-8") as f:
+            match = _H1_PATTERN.search(f.read())
+        if match:
+            return match.group(1)
+    return os.path.splitext(os.path.basename(file))[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # map command
 # ─────────────────────────────────────────────────────────────────────────────
@@ -757,7 +771,7 @@ def map_(
         None, "--space", help="Confluence space key (required for the confluence backend unless set in markgate.yaml)"
     ),
     title: Optional[str] = typer.Option(
-        None, "--title", help="Title for the new doc/page (default: the file's basename)"
+        None, "--title", help="Title for the new doc/page (default: the file's first H1 heading, else its basename)"
     ),
     direction: str = typer.Option("both", "--direction", help="push | pull | both"),
     tab_id: Optional[str] = typer.Option(None, "--tab-id", help="Google Docs tab id to target"),
@@ -781,7 +795,7 @@ def map_(
         err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
         raise typer.Exit(1)
 
-    doc_title = title or os.path.splitext(os.path.basename(file))[0]
+    doc_title = title or _default_title(file)
     backend_instance = _get_backend(backend, config, config_path)
 
     create_kwargs: dict = {}

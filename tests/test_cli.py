@@ -748,6 +748,41 @@ class TestMap:
         assert result.exit_code == 0
         assert not backend.push_calls
 
+    def test_defaults_title_to_first_h1_not_basename(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "README.md"
+        local.write_text("# My Great Document\n\nBody text.\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 0
+        assert "'My Great Document'" in result.output
+
+    def test_explicit_title_overrides_h1(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "README.md"
+        local.write_text("# My Great Document\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(
+                app, ["map", str(local), "--backend", "google_docs", "--title", "Custom Title", "--config", cfg]
+            )
+        assert result.exit_code == 0
+        assert "'Custom Title'" in result.output
+
+    def test_falls_back_to_basename_when_no_h1(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "README.md"
+        local.write_text("Just a paragraph, no heading.\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 0
+        assert "'README'" in result.output
+
     def test_respects_prefix_resolution(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         """Criterion 11: map resolves the config via the same central-config
         machinery push/pull use, rather than a hardcoded/local-only path."""
