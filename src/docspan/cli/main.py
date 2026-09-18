@@ -746,6 +746,7 @@ def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Map
 
 _H1_PATTERN = re.compile(r"^#[ \t]+(\S.*?)\s*$", re.MULTILINE)
 _FRONTMATTER_PATTERN = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
+_CODE_FENCE_PATTERN = re.compile(r"^(```|~~~)[^\n]*\n.*?\n\1[ \t]*$\n?", re.MULTILINE | re.DOTALL)
 
 
 def _default_title(file: str) -> str:
@@ -754,11 +755,10 @@ def _default_title(file: str) -> str:
     try:
         with open(file, "r", encoding="utf-8") as f:
             content = f.read()
-    except OSError:
-        return basename
-    except UnicodeDecodeError:
+    except (OSError, UnicodeDecodeError):
         return basename
     content = _FRONTMATTER_PATTERN.sub("", content, count=1)
+    content = _CODE_FENCE_PATTERN.sub("", content)
     match = _H1_PATTERN.search(content)
     return match.group(1) if match else basename
 

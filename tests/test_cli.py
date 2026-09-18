@@ -839,6 +839,20 @@ class TestMap:
         assert result.exit_code == 0
         assert "'Real Heading'" in result.output
 
+    def test_skips_hash_comment_inside_fenced_code_block(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "README.md"
+        local.write_text(
+            "```bash\n# this is a shell comment\n```\n# Real Title\n",
+            encoding="utf-8",
+        )
+        cfg = _cfg_file(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config()), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
+        assert result.exit_code == 0
+        assert "'Real Title'" in result.output
+
     def test_respects_prefix_resolution(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         """Criterion 11: map resolves the config via the same central-config
         machinery push/pull use, rather than a hardcoded/local-only path."""
