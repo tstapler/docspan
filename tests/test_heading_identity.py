@@ -432,6 +432,66 @@ class TestTheLiveHeadingSurvives:
             f"a fresh paragraph was still inserted instead of reusing 'Dup': {opcodes}"
         )
 
+    def test_a_target_side_duplicate_trapped_in_a_replace_block_claims_the_live_node(
+        self,
+    ) -> None:
+        """Issue #71: the symmetric half of gap #2, on the *target* side.
+
+        `test_duplicate_trapped_inside_a_replace_block_still_saves_the_heading`
+        above covers a *current*-side duplicate trapped inside a multi-node
+        `replace` block. This is the mirror: the *target* range of a
+        `replace` block traps two "Setup" nodes sharing a `_content_key` —
+        one a weak structural match for the live heading (`NORMAL_TEXT`),
+        one a strong one (`HEADING_3`, matching the live heading's own
+        heading-ness and list-item-ness) — with nothing in the block's
+        *current* range content-matching either, so `_repair`'s inner
+        `SequenceMatcher` cannot split them out locally. Before
+        `_prefer_structural_pairing_target_side`, the live "Setup" heading
+        (sitting in its own unrelated `replace` slot) would be naively
+        paired with whichever "Setup" duplicate the inner matcher met
+        positionally first (the weak match), and the strong match would be
+        deleted-and-freshly-inserted instead of reusing the live paragraph
+        — demoting the real heading and fabricating a new one in its place.
+        """
+        current = [
+            DocsParagraphNode(text="Setup", style="HEADING_2", is_list_item=False),
+            DocsParagraphNode(text="Aaa", style="NORMAL_TEXT", is_list_item=False),
+        ]
+        target = [
+            DocsParagraphNode(text="Setup", style="NORMAL_TEXT", is_list_item=False),
+            DocsParagraphNode(text="Setup", style="HEADING_3", is_list_item=False),
+            DocsParagraphNode(text="Bbb", style="NORMAL_TEXT", is_list_item=False),
+        ]
+        assert builder._structural_score(current[0], target[1]) > builder._structural_score(
+            current[0], target[0]
+        ), "fixture no longer differentiates the two 'Setup' duplicates by structural score"
+
+        opcodes = builder._opcodes(current, target)
+
+        live_opcode = next(op for op in opcodes if op[1] <= 0 < op[2])
+        assert live_opcode[0] == "equal", (
+            f"the live 'Setup' heading (current index 0) was not restyled "
+            f"in place — it was deleted or replaced instead: {opcodes}"
+        )
+        assert (live_opcode[3], live_opcode[4]) == (1, 2), (
+            f"the live heading was matched to the weak-match duplicate "
+            f"(target index 0) instead of the structurally closer one "
+            f"(target index 1): {opcodes}"
+        )
+        assert not any(op[0] == "insert" and op[3] <= 1 < op[4] for op in opcodes), (
+            f"a fresh paragraph was still inserted for target index 1 "
+            f"instead of reusing the live 'Setup' heading: {opcodes}"
+        )
+        # The weak-match duplicate (target index 0) is not disposable — it
+        # must still materialize, as a fresh standalone insert.
+        assert any(op[0] == "insert" and op[3] <= 0 < op[4] for op in opcodes), (
+            f"the weak-match duplicate (target index 0) was dropped "
+            f"instead of being inserted fresh: {opcodes}"
+        )
+        # Every current and target index must be accounted for exactly once.
+        assert DocsRequestBuilder._covered_current_indices(opcodes) == {0, 1}
+        assert DocsRequestBuilder._covered_target_indices(opcodes) == {0, 1, 2}
+
     def _assert_no_destruction(self, replay: ParagraphReplay, pids, expected_styles) -> None:
         """Both original paragraphs must still exist and carry the target styles.
 

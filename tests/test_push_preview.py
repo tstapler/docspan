@@ -499,36 +499,37 @@ def test_find_churn_pairs_ignores_adjacent_entries_from_different_edit_groups() 
 
 def test_find_churn_pairs_ignores_a_real_structural_split_with_no_hand_built_entries() -> None:
     """End-to-end version of the test above: drive an actual
-    `DocsRequestBuilder.diff_summary()` call through a real
-    `_prefer_structural_pairing` structural split, instead of hand-constructing
-    `DiffEntry` objects with the `edit_group`s we want to see.
+    `DocsRequestBuilder.diff_summary()` call through the real repair
+    pipeline, instead of hand-constructing `DiffEntry` objects with the
+    `edit_group`s we want to see.
 
-    A stray "Setup" body paragraph and the live "Setup" heading share text, so
-    `_prefer_structural_pairing` awards the heading's slot to the live node and
-    demotes the stray one — landing it as a plain, unmatched `remove`. In the
-    same pass, the heading's restyle is reported as an `add` (it has no
-    surviving current-side pair once its own slot is claimed by the outer
-    "Alpha" edit's run) with identical text ("Setup") and no `equal` entry
-    between them, so they sit directly adjacent in `entries`. They come from
-    different `_opcodes()` iterations (edit_group 0 vs 2) and are not the same
-    paragraph being torn down and rebuilt — pairing them as churn would be a
-    real false positive from naive text+adjacency matching.
+    A live "TODO" heading is genuinely deleted; an unrelated "TODO" bullet is
+    genuinely inserted elsewhere (AC6 — `_structural_score` is 0: style,
+    heading-ness, and list-item-ness all differ), so neither
+    `_prefer_structural_pairing` nor its target-side sibling (issue #71) will
+    fold them into an in-place restyle. They come from different
+    `_opcodes()` iterations (different `edit_group`s) and land directly
+    adjacent in `entries` with identical text — pairing them as churn would
+    be a real false positive from naive text+adjacency matching.
+
+    (An earlier version of this fixture relied on a duplicate-content-key
+    gap that issue #71's target-side fix closes — `_prefer_structural_pairing`
+    now correctly resolves it as a restyle-in-place instead of a same-text
+    remove/add pair, so it no longer exercises this scoping at all.)
     """
     current = [
-        _para("Alpha"),
-        _para("Setup"),
-        _para("Setup", style="HEADING_2"),
+        _para("TODO", style="HEADING_2"),
+        _para("ANCHOR"),
     ]
     target = [
-        _para("AlphaX"),
-        _para("Setup", style="HEADING_3"),
-        _para("Setup"),
+        _para("ANCHOR"),
+        _para("TODO", style="BULLET", is_list_item=True),
     ]
 
     entries, _unchanged = DocsRequestBuilder().diff_summary(current, target)
 
-    adds = [e for e in entries if e.kind == "add" and e.target_text == "Setup"]
-    removes = [e for e in entries if e.kind == "remove" and e.current_text == "Setup"]
+    adds = [e for e in entries if e.kind == "add" and e.target_text == "TODO"]
+    removes = [e for e in entries if e.kind == "remove" and e.current_text == "TODO"]
     assert adds and removes, (
         "fixture no longer produces the adjacent same-text remove/add split "
         "this test depends on — re-derive it against the current "
