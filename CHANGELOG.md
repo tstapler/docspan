@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1](https://github.com/tstapler/docspan/compare/docspan-v0.6.0...docspan-v0.6.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* address code-review findings from [#120](https://github.com/tstapler/docspan/issues/120) (pageless / docspan.yaml) ([#121](https://github.com/tstapler/docspan/issues/121)) ([2106faf](https://github.com/tstapler/docspan/commit/2106faf2a4bf56e38bbf9550f84b6cb591bb4ba3))
+* **cli:** default docspan map title to file's H1, not basename ([#123](https://github.com/tstapler/docspan/issues/123)) ([1325292](https://github.com/tstapler/docspan/commit/13252928ca9eac977ea938b961109162ef6a65bb))
+
 ## [0.6.0](https://github.com/tstapler/docspan/compare/docspan-v0.5.0...docspan-v0.6.0) (2026-09-18)
 
 
