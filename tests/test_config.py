@@ -123,6 +123,58 @@ def test_load_config_mapping_without_remote_id(tmp_path) -> None:  # type: ignor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# docspan.yaml — alternate config filename (issue #96 migration ask)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_load_config_falls_back_to_docspan_yaml_when_markgate_yaml_absent(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docspan.yaml").write_text(
+        yaml.dump({"mappings": [{"local": "a.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+    cfg = load_config()
+    assert cfg.mappings[0].local == "a.md"
+
+
+def test_load_config_prefers_markgate_yaml_when_both_exist(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "markgate.yaml").write_text(
+        yaml.dump({"mappings": [{"local": "markgate.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+    (tmp_path / "docspan.yaml").write_text(
+        yaml.dump({"mappings": [{"local": "docspan.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+    cfg = load_config()
+    assert cfg.mappings[0].local == "markgate.md"
+
+
+def test_save_config_after_loading_docspan_yaml_writes_back_to_it(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docspan.yaml").write_text(yaml.dump({"mappings": []}))
+    cfg = load_config()
+    cfg.mappings.append(Mapping(local="a.md", backend="confluence", remote_id="1"))
+
+    save_config(cfg)
+
+    assert not (tmp_path / "markgate.yaml").exists()
+    reloaded = load_config()
+    assert reloaded.mappings[0].local == "a.md"
+
+
+def test_config_mtime_reads_docspan_yaml_when_markgate_yaml_absent(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docspan.yaml").write_text(yaml.dump({"mappings": []}))
+    assert config_mtime() is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Mapping.sectioned / split_level (gdocs-sectioned-sync Epic 1, Story 1.1)
 # ─────────────────────────────────────────────────────────────────────────────
 

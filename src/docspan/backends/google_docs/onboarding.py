@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 
 import yaml
 
-from docspan.config import CONFIG_FILENAME
+from docspan.config import _resolve_config_path
 
 OAUTH_HELP = """\
 Create an OAuth client — about 2 minutes:
@@ -78,11 +78,12 @@ def validate_service_account(path: str) -> Tuple[bool, str]:
 
 def persist_google_docs_config(config_path: Optional[str], updates: dict) -> str:
     """
-    Merge `updates` into backends.google_docs in markgate.yaml, preserving other keys/mappings.
+    Merge `updates` into backends.google_docs in markgate.yaml (or docspan.yaml),
+    preserving other keys/mappings.
 
     Returns the path written. (Comments are not preserved — round-trips via PyYAML.)
     """
-    path = pathlib.Path(config_path or CONFIG_FILENAME)
+    path = _resolve_config_path(config_path)
     raw: dict = {}
     if path.exists():
         raw = yaml.safe_load(path.read_text()) or {}

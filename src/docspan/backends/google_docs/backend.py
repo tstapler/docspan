@@ -453,6 +453,7 @@ class GoogleDocsBackend(Backend):
         doc_id: str,
         force: bool = False,
         tab_id: Optional[str] = None,
+        pageless: Optional[bool] = None,
         **kwargs: object,
     ) -> PushResult:
         """Convert local markdown to Google Docs format and batch-update the doc.
@@ -471,11 +472,15 @@ class GoogleDocsBackend(Backend):
         status is escalated to "warning" (message explains the doc is
         multi-tab and the choice was implicit) rather than silently writing
         to whichever tab happens to be first.
+
+        `pageless` (from Mapping.pageless) reconciles the document-wide
+        pageless/pages toggle (see `_document_style_requests`) — None leaves
+        the doc's current mode untouched.
         """
         self._ensure_client()
         resolver = self._build_cross_doc_resolver(kwargs, caller="push")
         return self._execute_push(
-            local_path, doc_id, force=force, tab_id=tab_id, resolver=resolver
+            local_path, doc_id, force=force, tab_id=tab_id, resolver=resolver, pageless=pageless
         )
 
     def _build_cross_doc_resolver(
@@ -507,6 +512,7 @@ class GoogleDocsBackend(Backend):
         resolver: Optional["cross_doc_links.CrossDocLinkResolver"],
         content: Optional[str] = None,
         diff_too_expensive_status: Literal["error", "blocked"] = "error",
+        pageless: Optional[bool] = None,
     ) -> PushResult:
         """Shared diff/request-emission tail for push() and push_sectioned().
 
@@ -530,6 +536,12 @@ class GoogleDocsBackend(Backend):
         plan: Optional[PushPlan] = None
         try:
             plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id, content=content)
+            # Document-wide, not scoped to plan.doc's resolved tab -- reads
+            # from the unresolved whole_doc fetch. Never gated by
+            # plan.high_risk/force: it's a metadata toggle, not a content
+            # edit, so a risky paragraph elsewhere in the doc shouldn't block
+            # it from converging.
+            style_requests = self._document_style_requests(plan.whole_doc, pageless)
 
             if plan.requests and plan.high_risk and not force:
                 # A blocked push is not going to be auto-retried, so cleanup
@@ -544,9 +556,10 @@ class GoogleDocsBackend(Backend):
                     ),
                 )
 
-            if plan.requests:
+            first_pass_requests = plan.requests + style_requests
+            if first_pass_requests:
                 self._client.batch_update(
-                    doc_id, plan.requests, required_revision_id=plan.doc["revisionId"]
+                    doc_id, first_pass_requests, required_revision_id=plan.doc["revisionId"]
                 )
 
             # Pass 2 — tables are inserted empty and inline styling
@@ -683,7 +696,7 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if (not plan.requests and not second and not unstyled
+            if (not plan.requests and not style_requests and not second and not unstyled
                     and not dead_anchors and not unplaced_cells and not cross_doc_issues):
                 # Nothing was applied by either pass. That is now a true
                 # statement about the document rather than an inference from an
@@ -999,6 +1012,10 @@ class GoogleDocsBackend(Backend):
         )
 
         resolver = self._build_cross_doc_resolver(kwargs, caller="push_sectioned")
+        pageless = kwargs.get("pageless")
+        assert pageless is None or isinstance(pageless, bool), (
+            f"push_sectioned() 'pageless' kwarg must be a bool, got {type(pageless).__name__}"
+        )
         result = self._execute_push(
             anchor_path,
             doc_id,
@@ -1007,6 +1024,7 @@ class GoogleDocsBackend(Backend):
             resolver=resolver,
             content=combined_content,
             diff_too_expensive_status="blocked",
+            pageless=pageless,
         )
         warnings = [w for w in (reorder_warning, duplicate_image_warning) if w]
         if warnings and result.status in ("ok", "warning"):
@@ -1127,6 +1145,38 @@ class GoogleDocsBackend(Backend):
         if not warnings:
             return None
         return "\n".join(warnings)
+
+    @staticmethod
+    def _document_style_requests(whole_doc: dict, pageless: Optional[bool]) -> List[dict]:
+        """Reconcile the document-wide pageless/pages toggle (issue #96).
+
+        `documentStyle` is a whole-document property, not scoped to any tab,
+        so this reads from the unresolved `whole_doc` fetch rather than
+        `PushPlan.doc` (narrowed to one tab's body by resolve_document_tab).
+
+        Returns [] when `pageless` is None (no preference configured in
+        markgate.yaml) or the live document's documentMode already matches,
+        so an unconfigured or already-converged mapping never emits a no-op
+        updateDocumentStyle request on every push.
+        """
+        if pageless is None:
+            return []
+        current_mode = (
+            whole_doc.get("documentStyle", {})
+            .get("documentFormat", {})
+            .get("documentMode", "PAGES")
+        )
+        desired_mode = "PAGELESS" if pageless else "PAGES"
+        if current_mode == desired_mode:
+            return []
+        return [
+            {
+                "updateDocumentStyle": {
+                    "documentStyle": {"documentFormat": {"documentMode": desired_mode}},
+                    "fields": "documentFormat.documentMode",
+                }
+            }
+        ]
 
     @staticmethod
     def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:

@@ -360,12 +360,12 @@ def orchestrate_push(
     if mapping.sectioned:
         result = backend.push_sectioned(
             mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
-            mappings=mappings, cross_doc_cache=cross_doc_cache,
+            mappings=mappings, cross_doc_cache=cross_doc_cache, pageless=mapping.pageless,
         )
     else:
         result = backend.push(
             mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
-            mappings=mappings, cross_doc_cache=cross_doc_cache,
+            mappings=mappings, cross_doc_cache=cross_doc_cache, pageless=mapping.pageless,
         )
     outcome = PushOutcome(local_path=mapping.local, result=result)
 

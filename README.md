@@ -5,7 +5,7 @@
 
 Push and pull markdown to Google Docs and Confluence from a single CLI. docspan provides bidirectional sync with three-way merge conflict detection, structural diff push that preserves comments on unchanged paragraphs, and a simple YAML-based configuration file.
 
-The config file is named `markgate.yaml` — this name is preserved for backward compatibility and will be renamed in v0.2.0.
+The config file is named `markgate.yaml` for backward compatibility. `docspan.yaml` is also recognized — if present in the working directory (and no `markgate.yaml` is there), docspan reads and writes it instead, so a project can rename its config file at its own pace.
 
 ---
 

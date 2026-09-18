@@ -159,6 +159,65 @@ class TestPushRevisionGuard:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# pageless reconciliation (issue #96) — documentStyle.documentFormat.documentMode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPagelessReconciliation:
+    def test_push_sets_pageless_when_doc_is_currently_paged(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+
+        local = tmp_path / "doc.md"
+        local.write_text("", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", pageless=True)
+
+        assert result.status == "ok"
+        args, kwargs = fake_client.batch_update.call_args
+        assert kwargs["required_revision_id"] == "ALm37abc"
+        assert args[1] == [
+            {
+                "updateDocumentStyle": {
+                    "documentStyle": {"documentFormat": {"documentMode": "PAGELESS"}},
+                    "fields": "documentFormat.documentMode",
+                }
+            }
+        ]
+
+    def test_push_is_a_noop_when_pageless_already_matches(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        doc = _empty_doc(revision_id="ALm37abc")
+        doc["documentStyle"] = {"documentFormat": {"documentMode": "PAGELESS"}}
+        fake_client.get_document.return_value = doc
+
+        local = tmp_path / "doc.md"
+        local.write_text("", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", pageless=True)
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_leaves_document_mode_untouched_when_pageless_not_configured(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = _empty_doc(revision_id="ALm37abc")
+
+        local = tmp_path / "doc.md"
+        local.write_text("", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # High-risk gate — PushPlan single-fetch invariant, blocked/force paths
 # (Epic 1.2, Story 1.2.3, plan.md Task 1.2.3d)
 # ─────────────────────────────────────────────────────────────────────────────
