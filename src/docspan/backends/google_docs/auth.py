@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pathlib
+from typing import List, Optional
 
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
@@ -47,7 +48,11 @@ SCOPES = DEFAULT_SCOPES
 class GoogleAuthenticator:
     """Handles Google API authentication"""
 
-    def __init__(self, credentials_json=None, credentials_path=None):
+    def __init__(
+        self,
+        credentials_json: Optional[str] = None,
+        credentials_path: Optional[str] = None,
+    ) -> None:
         """
         Initialize authenticator with service account credentials
 
@@ -55,7 +60,7 @@ class GoogleAuthenticator:
             credentials_json: JSON string of service account credentials
             credentials_path: Path to service account JSON file
         """
-        self.credentials = None
+        self.credentials: Optional[service_account.Credentials] = None
 
         if credentials_json:
             # Load from JSON string (for Railway env vars)
@@ -73,7 +78,7 @@ class GoogleAuthenticator:
         else:
             raise ValueError("Either credentials_json or credentials_path must be provided")
 
-    def get_credentials(self):
+    def get_credentials(self) -> service_account.Credentials:
         """
         Get valid credentials
 
@@ -100,7 +105,12 @@ class OAuthAuthenticator:
     so it can reach their own Docs plus anything shared with them.
     """
 
-    def __init__(self, client_secret_path=None, token_path=None, scopes=None):
+    def __init__(
+        self,
+        client_secret_path: Optional[str] = None,
+        token_path: Optional[str] = None,
+        scopes: Optional[List[str]] = None,
+    ) -> None:
         """
         Args:
             client_secret_path: Path to an OAuth client secret JSON (Desktop app).
@@ -111,18 +121,18 @@ class OAuthAuthenticator:
         self.client_secret_path = client_secret_path
         self.token_path = token_path or default_token_path()  # resolved effective path
         self.scopes = scopes or DEFAULT_SCOPES
-        self.credentials = None
+        self.credentials: Optional[UserCredentials] = None
 
     def _token_file(self) -> pathlib.Path:
         return pathlib.Path(os.path.expanduser(self.token_path))
 
-    def _load_cached(self):
+    def _load_cached(self) -> Optional[UserCredentials]:
         path = self._token_file()
         if path.exists():
             return UserCredentials.from_authorized_user_file(str(path), self.scopes)
         return None
 
-    def _save(self, creds) -> None:
+    def _save(self, creds: UserCredentials) -> None:
         path = self._token_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(creds.to_json())
@@ -136,7 +146,7 @@ class OAuthAuthenticator:
             return False
         return bool(creds and (creds.valid or (creds.expired and creds.refresh_token)))
 
-    def get_credentials(self, allow_interactive: bool = True):
+    def get_credentials(self, allow_interactive: bool = True) -> UserCredentials:
         """
         Return valid OAuth credentials, refreshing or launching the consent flow as needed.
 
@@ -181,13 +191,13 @@ class OAuthAuthenticator:
 class DualAccountAuth:
     """Manages authentication for both Google accounts"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize dual account authentication from environment variables"""
-        self.account_a_auth = None
-        self.account_b_auth = None
+        self.account_a_auth: Optional[GoogleAuthenticator] = None
+        self.account_b_auth: Optional[GoogleAuthenticator] = None
         self._load_from_env()
 
-    def _load_from_env(self):
+    def _load_from_env(self) -> None:
         """Load credentials from environment variables"""
         # Account A (Google Docs)
         account_a_json = os.getenv('ACCOUNT_A_CREDENTIALS')
@@ -211,7 +221,7 @@ class DualAccountAuth:
         else:
             logger.warning("Account B credentials not found in environment")
 
-    def get_account_a_credentials(self):
+    def get_account_a_credentials(self) -> service_account.Credentials:
         """
         Get credentials for Account A (Google Docs)
 
@@ -222,7 +232,7 @@ class DualAccountAuth:
             raise ValueError("Account A not authenticated. Check ACCOUNT_A_CREDENTIALS env var")
         return self.account_a_auth.get_credentials()
 
-    def get_account_b_credentials(self):
+    def get_account_b_credentials(self) -> service_account.Credentials:
         """
         Get credentials for Account B (Obsidian Vault)
 
