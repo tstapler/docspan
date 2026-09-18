@@ -13,6 +13,32 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
 CONFIG_FILENAME = "markgate.yaml"
+# Alternate config filename, matching the project's own name (docspan). Checked
+# in the cwd whenever CONFIG_FILENAME isn't present there, so a project can
+# rename markgate.yaml -> docspan.yaml at its own pace instead of a flag-day
+# migration -- both names are otherwise handled identically.
+ALT_CONFIG_FILENAME = "docspan.yaml"
+
+
+def _resolve_config_path(path: Optional[str]) -> pathlib.Path:
+    """Resolve which config file `load_config`/`config_mtime`/`save_config` use.
+
+    An explicit `path` always wins verbatim, even when it doesn't exist yet —
+    callers like `docspan map` rely on being able to point at a config file
+    that will be created on first save. Otherwise: CONFIG_FILENAME
+    (markgate.yaml) if it exists in the cwd, else ALT_CONFIG_FILENAME
+    (docspan.yaml) if *that* exists, else CONFIG_FILENAME as the default for
+    a brand-new project (unchanged from before ALT_CONFIG_FILENAME existed).
+    """
+    if path:
+        return pathlib.Path(path)
+    default = pathlib.Path(CONFIG_FILENAME)
+    if default.exists():
+        return default
+    alt = pathlib.Path(ALT_CONFIG_FILENAME)
+    if alt.exists():
+        return alt
+    return default
 
 # Round-trip YAML: preserves comments/formatting across load→mutate→save so
 # save_config() doesn't have to blow away a hand-annotated markgate.yaml just
@@ -119,6 +145,13 @@ class Mapping(BaseModel):
     # Heading style at which a sectioned pull partitions the document into
     # sections (e.g. "HEADING_1"). Only meaningful when `sectioned` is True.
     split_level: Optional[str] = None
+    # Google Docs "pageless" format toggle (documentStyle.documentFormat.
+    # documentMode = PAGELESS vs PAGES). None (default) leaves the doc's
+    # current mode untouched — docspan never sets this unless asked.
+    # Reconciled against the live document on every push, the same way
+    # content is. Ignored by backends that have no such notion (e.g.
+    # Confluence).
+    pageless: Optional[bool] = None
 
     @model_validator(mode="after")
     def _validate_sectioned_split_level(self) -> "Mapping":
@@ -157,8 +190,8 @@ class MarkgateConfig(BaseModel):
 
 
 def load_config(path: Optional[str] = None) -> MarkgateConfig:
-    """Load markgate.yaml, falling back to env vars for credentials."""
-    config_path = pathlib.Path(path or CONFIG_FILENAME)
+    """Load markgate.yaml (or docspan.yaml), falling back to env vars for credentials."""
+    config_path = _resolve_config_path(path)
 
     raw: dict = {}
     if config_path.exists():
@@ -179,8 +212,8 @@ def load_config(path: Optional[str] = None) -> MarkgateConfig:
 
 
 def config_mtime(path: Optional[str] = None) -> Optional[float]:
-    """Return markgate.yaml's current mtime, or None if it doesn't exist yet."""
-    config_path = pathlib.Path(path or CONFIG_FILENAME)
+    """Return the resolved config file's current mtime, or None if it doesn't exist yet."""
+    config_path = _resolve_config_path(path)
     if not config_path.exists():
         return None
     return config_path.stat().st_mtime
@@ -191,13 +224,13 @@ def save_config(
     path: Optional[str] = None,
     expected_mtime: Optional[float] = None,
 ) -> None:
-    """Atomically write markgate.yaml (temp file + os.replace).
+    """Atomically write the resolved config file (temp file + os.replace).
 
     If ``expected_mtime`` is given, aborts with ConfigConflictError when the
     file's mtime no longer matches — i.e. it was edited since it was loaded —
     rather than silently clobbering a concurrent edit.
     """
-    config_path = pathlib.Path(path or CONFIG_FILENAME)
+    config_path = _resolve_config_path(path)
 
     if expected_mtime is not None and config_path.exists():
         current_mtime = config_path.stat().st_mtime

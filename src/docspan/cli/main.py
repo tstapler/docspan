@@ -1030,7 +1030,8 @@ def migrate_xdg(
             shutil.move(src, target)
             moved.append(name)
 
-    markgate_abs = os.path.abspath(os.path.expanduser(config_path or "markgate.yaml"))
+    from docspan.config import _resolve_config_path
+    markgate_abs = os.path.abspath(os.path.expanduser(str(_resolve_config_path(config_path))))
     raw = _read_central_raw()
     raw.setdefault("projects", {})[prefix] = {"markgate": markgate_abs}
     if not raw.get("default_prefix"):
