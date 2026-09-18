@@ -178,6 +178,13 @@ class TestCrossDocLinkResolverResolve:
             "https://docs.google.com/document/d/TARGETID/edit#heading=h.abc123"
         )
 
+    def test_empty_string_tab_id_is_treated_like_no_tab_id(self):
+        mappings = [make_mapping("docs/target.md", remote_id="TARGETID", tab_id="")]
+        resolver = CrossDocLinkResolver(mappings, lambda d, t: [])
+        res = resolver.resolve("docs/source.md", "target.md")
+        assert res.kind == "resolved"
+        assert res.url == "https://docs.google.com/document/d/TARGETID/edit"
+
     def test_resolves_to_target_url_with_tab_id_and_no_fragment(self):
         mappings = [make_mapping("docs/target.md", remote_id="TARGETID", tab_id="t.abc")]
         resolver = CrossDocLinkResolver(mappings, lambda d, t: [])
