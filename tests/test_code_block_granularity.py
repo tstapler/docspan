@@ -32,8 +32,6 @@ from __future__ import annotations
 from typing import Callable
 from unittest.mock import MagicMock
 
-import pytest
-
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import (
