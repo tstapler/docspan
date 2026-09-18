@@ -266,6 +266,7 @@ Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env
 | `remote_id` | string | — | yes | Google Doc ID or Confluence page ID |
 | `direction` | enum | `"both"` | no | `"push"`, `"pull"`, or `"both"` |
 | `tab_id` | string | `null` | no | Google Docs tab id (e.g. `"t.moqlkhpwn82e"`) to target on a multi-tab doc. Ignored by the Confluence backend. If unset and the doc has more than one tab, push/pull still succeed but report a `"warning"` naming the tabs found, instead of silently syncing whichever tab is first. |
+| `pageless` | bool | `null` | no | Reconciles the Google Doc's pageless/pages toggle on every push. `true` sets `PAGELESS`, `false` sets `PAGES`, `null` (default) leaves the doc's current mode untouched. Ignored by the Confluence backend. |
 
 ---
 

@@ -216,6 +216,80 @@ class TestPagelessReconciliation:
         assert result.status == "skipped"
         fake_client.batch_update.assert_not_called()
 
+    def test_push_sets_pages_when_pageless_is_false_and_doc_is_currently_pageless(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        doc = _empty_doc(revision_id="ALm37abc")
+        doc["documentStyle"] = {"documentFormat": {"documentMode": "PAGELESS"}}
+        fake_client.get_document.return_value = doc
+
+        local = tmp_path / "doc.md"
+        local.write_text("", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", pageless=False)
+
+        assert result.status == "ok"
+        args, kwargs = fake_client.batch_update.call_args
+        assert args[1] == [
+            {
+                "updateDocumentStyle": {
+                    "documentStyle": {"documentFormat": {"documentMode": "PAGES"}},
+                    "fields": "documentFormat.documentMode",
+                }
+            }
+        ]
+
+    def test_push_is_a_noop_when_pageless_false_already_matches(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        # documentStyle present, but documentFormat itself absent (a plausible
+        # real-doc shape -- margins/etc. set, documentMode never touched) --
+        # must default to PAGES, not treat this as "unknown/mismatched".
+        doc = _empty_doc(revision_id="ALm37abc")
+        doc["documentStyle"] = {"marginTop": {"magnitude": 72, "unit": "PT"}}
+        fake_client.get_document.return_value = doc
+
+        local = tmp_path / "doc.md"
+        local.write_text("", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1", pageless=False)
+
+        assert result.status == "skipped"
+        fake_client.batch_update.assert_not_called()
+
+    def test_push_sectioned_reconciles_pageless(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        local_dir = tmp_path / "doc"
+        local_dir.mkdir()
+        (local_dir / "01-section-1.md").write_text("# Section 1\n\nBody of section 1.\n")
+        (local_dir / "_manifest.yaml").write_text(
+            "entries:\n- heading_id: h.section1\n  slug: section-1\n  filename: 01-section-1.md\n"
+        )
+        fake_client.get_document.return_value = {
+            "revisionId": "rev-sectioned-pageless",
+            "body": {
+                "content": [
+                    _heading_paragraph("Section 1", heading_id="h.section1"),
+                    _body_paragraph("Body of section 1."),
+                ]
+            },
+        }
+
+        result = backend.push_sectioned(str(local_dir), "doc-1", pageless=True)
+
+        assert result.status == "ok", result.message
+        args, kwargs = fake_client.batch_update.call_args
+        assert {
+            "updateDocumentStyle": {
+                "documentStyle": {"documentFormat": {"documentMode": "PAGELESS"}},
+                "fields": "documentFormat.documentMode",
+            }
+        } in args[1]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # High-risk gate — PushPlan single-fetch invariant, blocked/force paths

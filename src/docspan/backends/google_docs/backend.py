@@ -917,6 +917,7 @@ class GoogleDocsBackend(Backend):
         doc_id: str,
         force: bool = False,
         tab_id: Optional[str] = None,
+        pageless: Optional[bool] = None,
         **kwargs: object,
     ) -> PushResult:
         """Reassemble a sectioned mapping's section files and push() the result.
@@ -1012,10 +1013,6 @@ class GoogleDocsBackend(Backend):
         )
 
         resolver = self._build_cross_doc_resolver(kwargs, caller="push_sectioned")
-        pageless = kwargs.get("pageless")
-        assert pageless is None or isinstance(pageless, bool), (
-            f"push_sectioned() 'pageless' kwarg must be a bool, got {type(pageless).__name__}"
-        )
         result = self._execute_push(
             anchor_path,
             doc_id,

@@ -174,6 +174,42 @@ def test_config_mtime_reads_docspan_yaml_when_markgate_yaml_absent(
     assert config_mtime() is not None
 
 
+def test_explicit_path_bypasses_docspan_yaml_fallback_even_when_it_exists(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docspan.yaml").write_text(
+        yaml.dump({"mappings": [{"local": "cwd.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+    explicit = tmp_path / "elsewhere" / "explicit.yaml"
+    explicit.parent.mkdir()
+    explicit.write_text(
+        yaml.dump({"mappings": [{"local": "explicit.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+
+    cfg = load_config(str(explicit))
+
+    assert cfg.mappings[0].local == "explicit.md"
+
+
+def test_load_config_warns_and_prefers_markgate_yaml_when_both_files_exist(
+    tmp_path, monkeypatch, caplog
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "markgate.yaml").write_text(
+        yaml.dump({"mappings": [{"local": "markgate.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+    (tmp_path / "docspan.yaml").write_text(
+        yaml.dump({"mappings": [{"local": "docspan.md", "backend": "confluence", "remote_id": "1"}]})
+    )
+
+    with caplog.at_level("WARNING", logger="docspan.config"):
+        cfg = load_config()
+
+    assert cfg.mappings[0].local == "markgate.md"
+    assert any("Both" in r.message and "markgate.yaml" in r.message for r in caplog.records)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mapping.sectioned / split_level (gdocs-sectioned-sync Epic 1, Story 1.1)
 # ─────────────────────────────────────────────────────────────────────────────
