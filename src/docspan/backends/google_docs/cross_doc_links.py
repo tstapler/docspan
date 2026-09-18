@@ -206,6 +206,13 @@ class CrossDocLinkResolver:
             )
 
         base_url = f"https://docs.google.com/document/d/{mapping.remote_id}/edit"
+        # A tab-scoped mapping must link into that tab specifically, not the
+        # document's default tab — the heading fetched below via
+        # `_headings_for(mapping.remote_id, mapping.tab_id)` is scoped to this
+        # tab, so an untagged URL's `#heading=` fragment would resolve against
+        # the wrong tab's headings once opened.
+        if mapping.tab_id:
+            base_url += f"?tab={mapping.tab_id}"
         if parsed.fragment is None:
             return CrossDocResolution(kind="resolved", url=base_url)
 
