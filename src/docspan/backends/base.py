@@ -117,6 +117,7 @@ class Backend(ABC):
         doc_id: str,
         force: bool = False,
         tab_id: Optional[str] = None,
+        pageless: Optional[bool] = None,
         **kwargs: object,
     ) -> PushResult:
         raise NotImplementedError(f"{self.name} does not support sectioned sync")
