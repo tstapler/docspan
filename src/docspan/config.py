@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import tempfile
@@ -11,6 +12,8 @@ import yaml
 from pydantic import BaseModel, model_validator
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
+
+logger = logging.getLogger(__name__)
 
 CONFIG_FILENAME = "markgate.yaml"
 # Alternate config filename, matching the project's own name (docspan). Checked
@@ -29,13 +32,24 @@ def _resolve_config_path(path: Optional[str]) -> pathlib.Path:
     (markgate.yaml) if it exists in the cwd, else ALT_CONFIG_FILENAME
     (docspan.yaml) if *that* exists, else CONFIG_FILENAME as the default for
     a brand-new project (unchanged from before ALT_CONFIG_FILENAME existed).
+
+    If *both* files exist, markgate.yaml wins and a warning is logged —
+    silently ignoring one of two present config files (e.g. a stale
+    markgate.yaml left over from a docspan.yaml migration) would otherwise
+    discard edits with no signal at all.
     """
     if path:
         return pathlib.Path(path)
     default = pathlib.Path(CONFIG_FILENAME)
-    if default.exists():
-        return default
     alt = pathlib.Path(ALT_CONFIG_FILENAME)
+    if default.exists():
+        if alt.exists():
+            logger.warning(
+                "Both %s and %s exist in %s — using %s. Remove the unused one "
+                "to avoid confusion about which config is active.",
+                CONFIG_FILENAME, ALT_CONFIG_FILENAME, pathlib.Path.cwd(), CONFIG_FILENAME,
+            )
+        return default
     if alt.exists():
         return alt
     return default
