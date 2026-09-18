@@ -58,6 +58,32 @@ class TestBatchUpdateRevisionGuard:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsClient.add_document_tab — addDocumentTab batchUpdate request
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAddDocumentTab:
+    def test_sends_add_document_tab_request_and_returns_new_tab_id(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        execute_mock = client.docs_service.documents.return_value.batchUpdate.return_value.execute
+        execute_mock.return_value = {
+            "replies": [
+                {"addDocumentTab": {"tabProperties": {"tabId": "t.newtab", "title": "Discussion"}}}
+            ]
+        }
+
+        tab_id = client.add_document_tab("doc-1", "Discussion")
+
+        assert tab_id == "t.newtab"
+        _, kwargs = client.docs_service.documents.return_value.batchUpdate.call_args
+        assert kwargs["documentId"] == "doc-1"
+        assert kwargs["body"]["requests"] == [
+            {"addDocumentTab": {"tabProperties": {"title": "Discussion"}}}
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsBackend.push() — threads revisionId, handles stale-revision conflict
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2602,6 +2628,27 @@ class TestCreate:
         assert result.doc_id == "new-doc-1"
         assert result.title == "My Doc"
         assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GoogleDocsBackend.create_tab() — new-tab-in-existing-doc creation for
+# `docspan map --new-tab-in`
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCreateTab:
+    def test_create_tab_calls_client_and_returns_doc_id_tab_id_url(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = "t.newtab"
+
+        result = backend.create_tab("doc-1", "Discussion")
+
+        client.add_document_tab.assert_called_once_with("doc-1", "Discussion")
+        assert result.doc_id == "doc-1"
+        assert result.title == "Discussion"
+        assert result.tab_id == "t.newtab"
+        assert result.url == "https://docs.google.com/document/d/doc-1/edit?tab=t.newtab"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -781,6 +781,13 @@ def map_(
     ),
     direction: str = typer.Option("both", "--direction", help="push | pull | both"),
     tab_id: Optional[str] = typer.Option(None, "--tab-id", help="Google Docs tab id to target"),
+    new_tab_in: Optional[str] = typer.Option(
+        None,
+        "--new-tab-in",
+        help="Local file of an existing google_docs mapping; create a new tab in that "
+        "doc (titled from --title/the file's H1) instead of a new doc, and map "
+        "this file to it. Requires --backend google_docs.",
+    ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
 ) -> None:
@@ -801,6 +808,25 @@ def map_(
         err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
         raise typer.Exit(1)
 
+    parent_mapping: Optional[Mapping] = None
+    if new_tab_in is not None:
+        if backend != "google_docs":
+            err_console.print("--new-tab-in requires --backend google_docs")
+            raise typer.Exit(1)
+        if tab_id is not None:
+            err_console.print("--new-tab-in and --tab-id are mutually exclusive")
+            raise typer.Exit(1)
+        parent_mapping = resolve_mapping_for_path(config.mappings, new_tab_in)
+        if parent_mapping is None:
+            err_console.print(f"'{new_tab_in}' is not mapped in markgate.yaml")
+            raise typer.Exit(1)
+        if parent_mapping.backend != "google_docs":
+            err_console.print(
+                f"'{new_tab_in}' is mapped to backend '{parent_mapping.backend}', not "
+                "google_docs — tabs require google_docs"
+            )
+            raise typer.Exit(1)
+
     doc_title = title or _default_title(file)
     backend_instance = _get_backend(backend, config, config_path)
 
@@ -809,7 +835,10 @@ def map_(
         create_kwargs["space"] = space
 
     try:
-        create_result = backend_instance.create(doc_title, **create_kwargs)
+        if parent_mapping is not None:
+            create_result = backend_instance.create_tab(parent_mapping.remote_id, doc_title)
+        else:
+            create_result = backend_instance.create(doc_title, **create_kwargs)
     except ValueError as exc:
         err_console.print(str(exc))
         raise typer.Exit(1)
@@ -819,7 +848,7 @@ def map_(
         backend=backend,
         remote_id=create_result.doc_id,
         direction=direction,  # type: ignore[arg-type]
-        tab_id=tab_id,
+        tab_id=create_result.tab_id or tab_id,
     )
     config.mappings.append(mapping)
 
@@ -835,7 +864,8 @@ def map_(
         )
         raise typer.Exit(1)
 
-    console.print(f"[green]✓[/green]  Created {backend} doc '{create_result.title}' → {file}")
+    action = "tab" if create_result.tab_id else "doc"
+    console.print(f"[green]✓[/green]  Created {backend} {action} '{create_result.title}' → {file}")
     if create_result.url:
         console.print(f"   {create_result.url}")
 

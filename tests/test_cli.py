@@ -55,6 +55,12 @@ class FakeBackend(Backend):
     def create(self, title: str, **kwargs) -> CreateResult:
         return CreateResult(doc_id="new-doc-1", title=title, url="https://example.com/new-doc")
 
+    def create_tab(self, doc_id: str, title: str, **kwargs) -> CreateResult:
+        return CreateResult(
+            doc_id=doc_id, title=title, tab_id="t.newtab",
+            url="https://example.com/new-doc?tab=t.newtab",
+        )
+
     def auth_setup(self, config_path=None) -> None:
         self.auth_setup_called = True
 
@@ -783,6 +789,92 @@ class TestMap:
             result = runner.invoke(app, ["map", str(local), "--backend", "google_docs", "--config", cfg])
         assert result.exit_code == 0
         assert "'README'" in result.output
+
+    def _new_tab_fixtures(self, tmp_path, parent_backend: str = "google_docs"):  # type: ignore[no-untyped-def]
+        """(parent_local, new_local, cfg, parent_mapping) for --new-tab-in tests."""
+        parent_local = tmp_path / "parent.md"
+        parent_local.write_text("# Parent\n", encoding="utf-8")
+        new_local = tmp_path / "discussion.md"
+        new_local.write_text("# Discussion\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        parent_mapping = _mapping(
+            local=str(parent_local), backend=parent_backend, remote_id="parent-doc-1"
+        )
+        return parent_local, new_local, cfg, parent_mapping
+
+    def test_new_tab_in_creates_tab_in_existing_doc_and_maps_it(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend):
+            result = runner.invoke(
+                app,
+                [
+                    "map", str(new_local), "--backend", "google_docs",
+                    "--new-tab-in", str(parent_local), "--config", cfg,
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Created google_docs tab" in result.output
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        new_mapping = saved["mappings"][1]
+        assert new_mapping["local"] == str(new_local)
+        assert new_mapping["remote_id"] == "parent-doc-1"
+        assert new_mapping["tab_id"] == "t.newtab"
+
+    def test_new_tab_in_requires_google_docs_backend(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)):
+            result = runner.invoke(
+                app,
+                [
+                    "map", str(new_local), "--backend", "confluence",
+                    "--new-tab-in", str(parent_local), "--config", cfg,
+                ],
+            )
+        assert result.exit_code == 1
+        assert "requires --backend google_docs" in result.output
+
+    def test_new_tab_in_rejects_unmapped_parent(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        _parent_local, new_local, cfg, _parent_mapping = self._new_tab_fixtures(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()):
+            result = runner.invoke(
+                app,
+                [
+                    "map", str(new_local), "--backend", "google_docs",
+                    "--new-tab-in", "not-mapped.md", "--config", cfg,
+                ],
+            )
+        assert result.exit_code == 1
+        assert "is not mapped" in result.output
+
+    def test_new_tab_in_rejects_non_google_docs_parent(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(
+            tmp_path, parent_backend="confluence"
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)):
+            result = runner.invoke(
+                app,
+                [
+                    "map", str(new_local), "--backend", "google_docs",
+                    "--new-tab-in", str(parent_local), "--config", cfg,
+                ],
+            )
+        assert result.exit_code == 1
+        assert "not google_docs" in result.output
+
+    def test_new_tab_in_and_tab_id_are_mutually_exclusive(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)):
+            result = runner.invoke(
+                app,
+                [
+                    "map", str(new_local), "--backend", "google_docs",
+                    "--new-tab-in", str(parent_local), "--tab-id", "t.other", "--config", cfg,
+                ],
+            )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
 
     def test_default_title_falls_back_to_basename_when_file_is_not_utf8(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         # Exercised as a unit test on _default_title directly: routing this through
