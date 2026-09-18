@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from docspan.backends.base import PushResult
+from docspan.backends.base import Backend, CreateResult, PullResult, PushResult
 from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
@@ -62,7 +62,7 @@ class TestBatchUpdateRevisionGuard:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAddDocumentTab:
-    def test_sends_add_document_tab_request_and_returns_new_tab_id(
+    def test_sends_add_document_tab_request_and_returns_tab_properties(
         self, make_client: Callable[[], GoogleDocsClient]
     ) -> None:
         client = make_client()
@@ -73,9 +73,9 @@ class TestAddDocumentTab:
             ]
         }
 
-        tab_id = client.add_document_tab("doc-1", "Discussion")
+        tab_properties = client.add_document_tab("doc-1", "Discussion")
 
-        assert tab_id == "t.newtab"
+        assert tab_properties == {"tabId": "t.newtab", "title": "Discussion"}
         _, kwargs = client.docs_service.documents.return_value.batchUpdate.call_args
         assert kwargs["documentId"] == "doc-1"
         assert kwargs["body"]["requests"] == [
@@ -2640,7 +2640,7 @@ class TestCreateTab:
         self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]
         backend, client = make_backend()
-        client.add_document_tab.return_value = "t.newtab"
+        client.add_document_tab.return_value = {"tabId": "t.newtab", "title": "Discussion"}
 
         result = backend.create_tab("doc-1", "Discussion")
 
@@ -2649,6 +2649,56 @@ class TestCreateTab:
         assert result.title == "Discussion"
         assert result.tab_id == "t.newtab"
         assert result.url == "https://docs.google.com/document/d/doc-1/edit?tab=t.newtab"
+
+    def test_create_tab_echoes_title_from_api_response_over_requested_title(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.newtab", "title": "Discussion (2)"}
+
+        result = backend.create_tab("doc-1", "Discussion")
+
+        assert result.title == "Discussion (2)"
+
+    def test_create_tab_falls_back_to_requested_title_when_response_omits_it(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.newtab"}
+
+        result = backend.create_tab("doc-1", "Discussion")
+
+        assert result.title == "Discussion"
+
+
+class _NoTabBackend(Backend):
+    """Minimal concrete Backend that doesn't override create_tab — exercises
+    the base class's default (mirrors push_sectioned/pull_sectioned)."""
+
+    name = "no-tab"
+
+    def push(self, local_path: str, doc_id: str, **kwargs) -> PushResult:
+        raise NotImplementedError
+
+    def pull(self, doc_id: str, local_path: str, **kwargs) -> PullResult:
+        raise NotImplementedError
+
+    def create(self, title: str, **kwargs: object) -> CreateResult:
+        raise NotImplementedError
+
+    def auth_setup(self, config_path=None) -> None:
+        raise NotImplementedError
+
+    def get_remote_version(self, doc_id: str) -> str:
+        raise NotImplementedError
+
+    def validate_config(self) -> None:
+        raise NotImplementedError
+
+
+def test_create_tab_default_raises_not_implemented() -> None:
+    with pytest.raises(NotImplementedError, match="does not support tabs"):
+        _NoTabBackend().create_tab("doc-1", "Title")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

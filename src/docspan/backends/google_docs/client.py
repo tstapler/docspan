@@ -158,17 +158,22 @@ class GoogleDocsClient:
             ),
         )
 
-    def add_document_tab(self, doc_id: str, title: str) -> str:
-        """Create a new root-level tab in `doc_id` titled `title`, return its tabId.
+    def add_document_tab(self, doc_id: str, title: str) -> Dict[str, str]:
+        """Create a new root-level tab in `doc_id` titled `title`.
 
         Uses the `addDocumentTab` batchUpdate request (Docs API v1;
-        AddDocumentTabRequest.tabProperties, all fields optional).
+        AddDocumentTabRequest.tabProperties, all fields optional). Returns
+        the created tab's `tabProperties` (at least `tabId`/`title`) so the
+        caller can echo back what Google actually stored rather than
+        assuming it matches the request verbatim.
         """
         response = self.batch_update(
             doc_id,
             [{"addDocumentTab": {"tabProperties": {"title": title}}}],
         )
-        return cast(str, response["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"])
+        return cast(
+            Dict[str, str], response["replies"][0]["addDocumentTab"]["tabProperties"]
+        )
 
     def batch_update(
         self,

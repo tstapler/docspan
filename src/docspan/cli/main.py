@@ -816,6 +816,9 @@ def map_(
         if tab_id is not None:
             err_console.print("--new-tab-in and --tab-id are mutually exclusive")
             raise typer.Exit(1)
+        if space:
+            err_console.print("--space is ignored by --new-tab-in (Confluence-only option)")
+            raise typer.Exit(1)
         parent_mapping = resolve_mapping_for_path(config.mappings, new_tab_in)
         if parent_mapping is None:
             err_console.print(f"'{new_tab_in}' is not mapped in markgate.yaml")
@@ -824,6 +827,12 @@ def map_(
             err_console.print(
                 f"'{new_tab_in}' is mapped to backend '{parent_mapping.backend}', not "
                 "google_docs — tabs require google_docs"
+            )
+            raise typer.Exit(1)
+        if parent_mapping.remote_id is None:
+            err_console.print(
+                f"'{new_tab_in}' has no remote_id yet — push it (or re-run 'docspan map "
+                f"{new_tab_in} --backend google_docs') before using it as --new-tab-in"
             )
             raise typer.Exit(1)
 
@@ -855,10 +864,13 @@ def map_(
     try:
         save_config(config, config_path, expected_mtime=loaded_mtime)
     except ConfigConflictError as exc:
+        tab_line = f"  tab_id: {create_result.tab_id}\n" if create_result.tab_id else ""
+        created_kind = "tab" if create_result.tab_id else "doc/page"
         err_console.print(
             f"{exc}\n\n"
-            f"⚠ A new {backend} doc/page was created but NOT recorded in markgate.yaml:\n"
+            f"⚠ A new {backend} {created_kind} was created but NOT recorded in markgate.yaml:\n"
             f"  remote_id: {create_result.doc_id}\n"
+            f"{tab_line}"
             f"  url: {create_result.url or '(none)'}\n"
             "Add it manually (or resolve the conflict and re-run 'docspan map')."
         )
