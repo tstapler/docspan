@@ -1877,6 +1877,19 @@ class GoogleDocsBackend(Backend):
             url=f"https://docs.google.com/document/d/{doc_id}/edit",
         )
 
+    def create_tab(self, doc_id: str, title: str, **kwargs: object) -> CreateResult:
+        """Create a new tab named `title` in the existing doc `doc_id`."""
+        self._ensure_client()
+        assert self._client is not None
+        tab_properties = self._client.add_document_tab(doc_id, title)
+        tab_id = tab_properties["tabId"]
+        return CreateResult(
+            doc_id=doc_id,
+            title=tab_properties.get("title", title),
+            tab_id=tab_id,
+            url=f"https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id}",
+        )
+
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()
         token_exists = bool(pathlib.Path(os.path.expanduser(token)).exists())

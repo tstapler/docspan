@@ -48,6 +48,8 @@ class CreateResult:
     doc_id: str
     title: str
     url: Optional[str] = None
+    # Set only by create_tab(): the id of the newly created tab within doc_id.
+    tab_id: Optional[str] = None
 
 
 class Backend(ABC):
@@ -132,3 +134,9 @@ class Backend(ABC):
         **kwargs: object,
     ) -> PullResult:
         raise NotImplementedError(f"{self.name} does not support sectioned sync")
+
+    # Tab creation is only implemented by backends with a tab concept
+    # (currently google_docs). Concrete, not @abstractmethod, for the same
+    # reason as push_sectioned/pull_sectioned above.
+    def create_tab(self, doc_id: str, title: str, **kwargs: object) -> CreateResult:
+        raise NotImplementedError(f"{self.name} does not support tabs")
