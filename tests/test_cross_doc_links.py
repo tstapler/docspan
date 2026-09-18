@@ -178,6 +178,27 @@ class TestCrossDocLinkResolverResolve:
             "https://docs.google.com/document/d/TARGETID/edit#heading=h.abc123"
         )
 
+    def test_resolves_to_target_url_with_tab_id_and_no_fragment(self):
+        mappings = [make_mapping("docs/target.md", remote_id="TARGETID", tab_id="t.abc")]
+        resolver = CrossDocLinkResolver(mappings, lambda d, t: [])
+        res = resolver.resolve("docs/source.md", "target.md")
+        assert res.kind == "resolved"
+        assert res.url == "https://docs.google.com/document/d/TARGETID/edit?tab=t.abc"
+
+    def test_resolves_with_fragment_and_tab_id_includes_both(self):
+        from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+        heading_node = DocsParagraphNode(
+            text="Some Heading", style="HEADING_2", heading_id="h.abc123"
+        )
+        mappings = [make_mapping("docs/target.md", remote_id="TARGETID", tab_id="t.abc")]
+        resolver = CrossDocLinkResolver(mappings, lambda d, t: [heading_node])
+        res = resolver.resolve("docs/source.md", "target.md#some-heading")
+        assert res.kind == "resolved"
+        assert res.url == (
+            "https://docs.google.com/document/d/TARGETID/edit?tab=t.abc#heading=h.abc123"
+        )
+
     def test_fragment_matching_no_heading_is_unresolved_anchor(self):
         mappings = [make_mapping("docs/target.md", remote_id="TARGETID")]
         resolver = CrossDocLinkResolver(mappings, lambda d, t: [])
