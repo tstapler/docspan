@@ -744,17 +744,23 @@ def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Map
     return None
 
 
-_H1_PATTERN = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+_H1_PATTERN = re.compile(r"^#[ \t]+(\S.*?)\s*$", re.MULTILINE)
+_FRONTMATTER_PATTERN = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 
 
 def _default_title(file: str) -> str:
     """Default title for a newly mapped doc: the file's first H1, else its basename."""
-    if os.path.exists(file):
+    basename = os.path.splitext(os.path.basename(file))[0]
+    try:
         with open(file, "r", encoding="utf-8") as f:
-            match = _H1_PATTERN.search(f.read())
-        if match:
-            return match.group(1)
-    return os.path.splitext(os.path.basename(file))[0]
+            content = f.read()
+    except OSError:
+        return basename
+    except UnicodeDecodeError:
+        return basename
+    content = _FRONTMATTER_PATTERN.sub("", content, count=1)
+    match = _H1_PATTERN.search(content)
+    return match.group(1) if match else basename
 
 
 # ─────────────────────────────────────────────────────────────────────────────
