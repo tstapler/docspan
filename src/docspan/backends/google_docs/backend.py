@@ -99,6 +99,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# How far a pulled mermaid image's stored size may drift from the freshly
+# computed size before it's flagged as stale (mermaid_diagram_sizing's
+# rounding in _mermaid_image_size_pt is to 0.01pt, so this just needs to
+# clear float noise, not encode a real design tolerance).
+_STALE_SIZE_TOLERANCE_PT = 0.5
+
 
 class GoogleDocsBackend(Backend):
     name = "google_docs"
@@ -291,6 +297,9 @@ class GoogleDocsBackend(Backend):
                 existing_image_alts = {
                     n.alt for n in current_nodes if isinstance(n, DocsImageNode)
                 }
+                image_warnings.extend(
+                    self._stale_mermaid_size_warnings(resolved_images, current_nodes)
+                )
                 substituted_images = [
                     resolved
                     if resolved is not None
@@ -1174,6 +1183,52 @@ class GoogleDocsBackend(Backend):
                 }
             }
         ]
+
+    @staticmethod
+    def _stale_mermaid_size_warnings(
+        resolved_images: list[DocsImageNode | None],
+        current_nodes: list[DocsParagraphNode | DocsTableNode | DocsImageNode],
+    ) -> list[str]:
+        """Warn when a pulled mermaid image's stored size differs from what
+        resolve_document_images() just computed for the same diagram.
+
+        Sizing only ever applies at first insertion (see this feature's Known
+        Limitation in project_plans/mermaid-diagram-sizing/implementation/plan.md
+        -- the diff-identity key folds an unchanged `alt` to "equal" regardless
+        of width_pt/height_pt, so a re-push never resizes an existing diagram).
+        Without this, that silent no-op (pre-mortem.md Failure #5) would look
+        indistinguishable from the feature never having shipped.
+        """
+        existing_sizes = {
+            n.alt: (n.width_pt, n.height_pt)
+            for n in current_nodes
+            if isinstance(n, DocsImageNode) and n.width_pt is not None and n.height_pt is not None
+        }
+        warnings: list[str] = []
+        for resolved in resolved_images:
+            if (
+                resolved is None
+                or resolved.mermaid_source is None
+                or resolved.width_pt is None
+                or resolved.height_pt is None
+            ):
+                continue
+            old_size = existing_sizes.get(resolved.alt)
+            if old_size is None:
+                continue
+            old_w, old_h = old_size
+            if (
+                abs(old_w - resolved.width_pt) > _STALE_SIZE_TOLERANCE_PT
+                or abs(old_h - resolved.height_pt) > _STALE_SIZE_TOLERANCE_PT
+            ):
+                warnings.append(
+                    f"diagram size may be stale ({resolved.alt}): "
+                    f"doc has {old_w}x{old_h}pt, would now be "
+                    f"{resolved.width_pt}x{resolved.height_pt}pt "
+                    "-- re-create the image node or manually resize "
+                    "(this push will not resize it; see known limitation)"
+                )
+        return warnings
 
     @staticmethod
     def _render_dead_anchors(anchors: list[str], available: list[str]) -> str:

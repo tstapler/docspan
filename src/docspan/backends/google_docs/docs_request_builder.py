@@ -2846,6 +2846,19 @@ class DocsRequestBuilder:
                     requests.append({
                         "insertText": {"location": {"index": insert_at_index + 1}, "text": "\n"}
                     })
+                if node.mermaid_source is not None:
+                    paragraph_start = insert_at_index + 1 if before_newline else insert_at_index
+                    paragraph_len = 1 if is_bare_image else 2
+                    requests.append({
+                        "updateParagraphStyle": {
+                            "range": {
+                                "startIndex": paragraph_start,
+                                "endIndex": paragraph_start + paragraph_len,
+                            },
+                            "paragraphStyle": {"alignment": "CENTER"},
+                            "fields": "alignment",
+                        }
+                    })
                 continue
 
             is_bare = bare_last and node is nodes[-1]

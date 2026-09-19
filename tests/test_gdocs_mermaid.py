@@ -7,11 +7,15 @@ through the same image_source.py pipeline as any other image.
 """
 
 import hashlib
+import struct
 
 from docspan.backends.google_docs import mermaid_cache_sidecar
+from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
     MermaidSource,
+    _mermaid_image_size_pt,
+    _png_pixel_dimensions,
     resolve_document_images,
     resolve_images,
 )
@@ -22,6 +26,8 @@ from docspan.backends.google_docs.mermaid_renderer import (
     lookup_mermaid_source,
     render_mermaid_png,
 )
+
+from .conftest import minimal_png as _minimal_png
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -37,7 +43,7 @@ def _fake_uploader(data: bytes, filename: str, mime_type: str) -> dict:
 
 
 def _fake_renderer(diagram: str) -> bytes:
-    return _PNG_MAGIC + diagram.encode("utf-8")
+    return _minimal_png()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,6 +136,230 @@ def test_mermaid_render_failure_is_a_warning_not_a_crash(tmp_path) -> None:
     assert "mermaid render failed" in warnings[0]
     assert temp_ids == []
     assert mermaid_entries == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PNG dimension reading
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_png_pixel_dimensions_reads_valid_ihdr() -> None:
+    ihdr_body = struct.pack(">IIBBBBB", 2400, 1200, 8, 2, 0, 0, 0)
+    data = _PNG_MAGIC + struct.pack(">I", len(ihdr_body)) + b"IHDR" + ihdr_body
+
+    assert _png_pixel_dimensions(data) == (2400, 1200)
+
+
+def test_png_pixel_dimensions_returns_none_for_fake_png_without_ihdr() -> None:
+    data = _PNG_MAGIC + "graph TD\n  A --> B".encode("utf-8")
+
+    assert _png_pixel_dimensions(data) is None
+
+
+def test_png_pixel_dimensions_returns_none_for_truncated_bytes() -> None:
+    assert _png_pixel_dimensions(_PNG_MAGIC) is None
+
+
+def test_png_pixel_dimensions_returns_none_for_empty_bytes() -> None:
+    assert _png_pixel_dimensions(b"") is None
+
+
+def test_png_pixel_dimensions_returns_none_for_zero_width_or_height() -> None:
+    """A malformed/adversarial IHDR with a zero dimension must not be treated
+    as valid -- width==0 or height==0 breaks the downstream scale = target/width
+    division (image_source.py's own explicit guard against this)."""
+    zero_width = struct.pack(">IIBBBBB", 0, 1200, 8, 2, 0, 0, 0)
+    zero_height = struct.pack(">IIBBBBB", 2400, 0, 8, 2, 0, 0, 0)
+
+    for ihdr_body in (zero_width, zero_height):
+        data = _PNG_MAGIC + struct.pack(">I", len(ihdr_body)) + b"IHDR" + ihdr_body
+        assert _png_pixel_dimensions(data) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mermaid image sizing (px -> pt, filled to CONTENT_WIDTH_PT)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_mermaid_image_size_pt_scales_2400x1200_at_render_scale_3_to_468x234() -> None:
+    assert _mermaid_image_size_pt(_minimal_png(2400, 1200)) == (468.0, 234.0)
+
+
+def test_mermaid_image_size_pt_is_independent_of_render_scale_value(monkeypatch) -> None:
+    monkeypatch.setattr("docspan.backends.google_docs.image_source.RENDER_SCALE", 3)
+    at_scale_3 = _mermaid_image_size_pt(_minimal_png(2400, 1200))
+
+    monkeypatch.setattr("docspan.backends.google_docs.image_source.RENDER_SCALE", 6)
+    at_scale_6 = _mermaid_image_size_pt(_minimal_png(4800, 2400))
+
+    assert at_scale_3 == at_scale_6 == (468.0, 234.0)
+
+
+def test_mermaid_image_size_pt_returns_none_for_malformed_png() -> None:
+    data = _PNG_MAGIC + b"not a real png"
+
+    assert _mermaid_image_size_pt(data) is None
+
+
+def test_mermaid_image_size_pt_upscales_small_diagram_preserving_aspect_ratio() -> None:
+    assert _mermaid_image_size_pt(_minimal_png(800, 400)) == (468.0, 234.0)
+
+
+def test_mermaid_image_size_pt_is_deterministic_across_repeated_calls() -> None:
+    png_bytes = _minimal_png(2400, 1200)
+
+    first = _mermaid_image_size_pt(png_bytes)
+    second = _mermaid_image_size_pt(png_bytes)
+
+    assert first == second == (468.0, 234.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# wiring _mermaid_image_size_pt into resolve_document_images
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_resolve_document_images_sets_width_and_height_for_mermaid_image(tmp_path) -> None:
+    node = DocsImageNode(alt="mermaid diagram abc123", mermaid_source="graph TD\n  A --> B")
+
+    out, warnings, _temp_ids, _mermaid_entries = resolve_document_images(
+        [node],
+        str(tmp_path / "doc.md"),
+        _fake_uploader,
+        renderer=lambda diagram: _minimal_png(2400, 1200),
+    )
+
+    assert warnings == []
+    assert out[0].width_pt == 468.0
+    assert out[0].height_pt == 234.0
+
+
+def test_resolve_document_images_leaves_width_and_height_none_for_non_mermaid_image(
+    tmp_path,
+) -> None:
+    real_image = tmp_path / "photo.png"
+    real_image.write_bytes(_minimal_png(2400, 1200))
+    node = DocsImageNode(alt="a photo", src="photo.png")
+
+    out, warnings, _temp_ids, _mermaid_entries = resolve_document_images(
+        [node], str(tmp_path / "doc.md"), _fake_uploader
+    )
+
+    assert warnings == []
+    assert out[0].width_pt is None
+    assert out[0].height_pt is None
+
+
+def test_resolve_document_images_preserves_explicit_width_and_height_on_mermaid_node(
+    tmp_path,
+) -> None:
+    node = DocsImageNode(
+        alt="mermaid diagram abc123",
+        mermaid_source="graph TD\n  A --> B",
+        width_pt=100.0,
+        height_pt=50.0,
+    )
+
+    out, warnings, _temp_ids, _mermaid_entries = resolve_document_images(
+        [node],
+        str(tmp_path / "doc.md"),
+        _fake_uploader,
+        renderer=lambda diagram: _minimal_png(2400, 1200),
+    )
+
+    assert warnings == []
+    assert out[0].width_pt == 100.0
+    assert out[0].height_pt == 50.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Epic 1.3: fixture repair + end-to-end / regression coverage
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_fake_renderer_output_is_a_valid_png_with_known_dimensions() -> None:
+    """_fake_renderer must return real, IHDR-bearing PNG bytes (Story 1.3.1) --
+    not the old _PNG_MAGIC + diagram_bytes stub, which _png_pixel_dimensions
+    can't parse."""
+    assert _png_pixel_dimensions(_fake_renderer("graph TD\n  A --> B")) == (2400, 1200)
+
+
+def test_mermaid_image_gets_sized_and_centered_on_push(tmp_path) -> None:
+    """End-to-end: parse -> resolve_document_images() -> the request
+    builder's image-insert branch -> the emitted insertInlineImage carries
+    the fit-to-content-width objectSize and the paragraph is centered."""
+    parsed = MarkdownToParagraphParser().parse(MERMAID_MD)
+    assert len(parsed) == 1
+
+    out, warnings, _temp_ids, _mermaid_entries = resolve_document_images(
+        parsed, str(tmp_path / "doc.md"), _fake_uploader, renderer=_fake_renderer
+    )
+    assert warnings == []
+    node = out[0]
+    assert node is not None
+
+    requests = DocsRequestBuilder()._make_insert_requests([node], insert_at_index=10)
+
+    image_requests = [r["insertInlineImage"] for r in requests if "insertInlineImage" in r]
+    assert len(image_requests) == 1
+    assert image_requests[0]["objectSize"] == {
+        "height": {"magnitude": 234.0, "unit": "PT"},
+        "width": {"magnitude": 468.0, "unit": "PT"},
+    }
+
+    style_requests = [
+        r["updateParagraphStyle"] for r in requests if "updateParagraphStyle" in r
+    ]
+    assert len(style_requests) == 1
+    assert style_requests[0]["paragraphStyle"]["alignment"] == "CENTER"
+
+
+def test_repeated_mermaid_push_has_stable_node_key(tmp_path) -> None:
+    """Two independent resolve_document_images() calls against the same
+    diagram source must yield identical _node_key() tuples, so the diff
+    engine treats a second, unchanged push as a no-op (idempotency)."""
+    builder = DocsRequestBuilder()
+
+    def _resolve_once() -> DocsImageNode:
+        parsed = MarkdownToParagraphParser().parse(MERMAID_MD)
+        out, warnings, _temp_ids, _mermaid_entries = resolve_document_images(
+            parsed, str(tmp_path / "doc.md"), _fake_uploader, renderer=_fake_renderer
+        )
+        assert warnings == []
+        return out[0]
+
+    first_key = builder._node_key(_resolve_once())
+    second_key = builder._node_key(_resolve_once())
+
+    assert first_key == second_key
+    assert first_key == ("__image__", first_key[1], 468.0, 234.0)
+
+
+def test_repush_of_already_sized_mermaid_image_is_a_safe_noop() -> None:
+    """Regression (Story 1.3.3): re-pushing a mermaid diagram whose pulled
+    width_pt/height_pt differs from what this feature would now compute for
+    the same diagram (same alt) is a safe no-op -- zero requests, no crash --
+    per the Known Limitation documented in plan.md (the diff engine's
+    _content_key for an image is alt-only, so _repair folds the mismatched
+    sizes back to "equal", and _make_style_update_requests explicitly no-ops
+    for DocsImageNode)."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=100.0,
+        height_pt=50.0,
+        mermaid_source=None,
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert requests == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
