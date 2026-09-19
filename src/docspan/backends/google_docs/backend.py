@@ -1186,8 +1186,8 @@ class GoogleDocsBackend(Backend):
 
     @staticmethod
     def _stale_mermaid_size_warnings(
-        resolved_images: "list[DocsImageNode | None]",
-        current_nodes: "List[Union[DocsParagraphNode, DocsTableNode, DocsImageNode]]",
+        resolved_images: list[DocsImageNode | None],
+        current_nodes: list[DocsParagraphNode | DocsTableNode | DocsImageNode],
     ) -> list[str]:
         """Warn when a pulled mermaid image's stored size differs from what
         resolve_document_images() just computed for the same diagram.
