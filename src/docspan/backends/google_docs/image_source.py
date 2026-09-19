@@ -69,11 +69,20 @@ def _png_pixel_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
 def _mermaid_image_size_pt(png_bytes: bytes) -> Optional[Tuple[float, float]]:
     """Compute (width_pt, height_pt) for a mermaid PNG, filling CONTENT_WIDTH_PT.
 
-    Divides out RENDER_SCALE (mmdc's pure supersampling factor) before any
-    px-to-pt conversion, then derives height from width via one shared scale
-    factor rather than independently rounding each axis -- so an unchanged
-    diagram's rendered PNG always yields the identical (width_pt, height_pt)
-    pair docs_request_builder.py's diff-identity key relies on (see
+    Under this "always-fill" scaling, RENDER_SCALE and _PT_PER_CSS_PX
+    algebraically cancel out of the result -- width always becomes exactly
+    CONTENT_WIDTH_PT, and height only ever depends on the pixel aspect ratio.
+    They're computed anyway (rather than working from the raw pixel ratio
+    directly) because plan.md's Unresolved Questions records "always-fill"
+    as a reversible bet: switching to cap-only (never upscale a diagram
+    already narrower than CONTENT_WIDTH_PT, e.g. `scale = min(1.0, ...)`)
+    needs the real absolute logical_width_pt, which does depend on
+    RENDER_SCALE -- so this keeps that one-line rollback available.
+
+    Height is derived from width via one shared scale factor rather than
+    independently rounding each axis -- so an unchanged diagram's rendered
+    PNG always yields the identical (width_pt, height_pt) pair
+    docs_request_builder.py's diff-identity key relies on (see
     research/pitfalls.md #2-3).
     """
     dims = _png_pixel_dimensions(png_bytes)
@@ -361,7 +370,12 @@ def resolve_document_images(
             out.append(None)
             continue
         updates: Dict[str, object] = {"src": result.uri}
-        if node.mermaid_source and node.width_pt is None and result.rendered_bytes is not None:
+        if (
+            node.mermaid_source
+            and node.width_pt is None
+            and node.height_pt is None
+            and result.rendered_bytes is not None
+        ):
             size = _mermaid_image_size_pt(result.rendered_bytes)
             if size is not None:
                 updates["width_pt"], updates["height_pt"] = size

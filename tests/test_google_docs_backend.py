@@ -1224,6 +1224,25 @@ class TestStaleMermaidSizeWarning:
 
         assert warnings == []
 
+    def test_stale_mermaid_size_warnings_does_not_fire_exactly_at_tolerance_boundary(self) -> None:
+        """_STALE_SIZE_TOLERANCE_PT's check is a strict `>`, not `>=` -- a
+        mismatch of exactly 0.5pt (float rounding noise, not a real stale
+        size) must not warn, while 0.51pt (a step above) must."""
+        from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
+
+        resolved = DocsImageNode(
+            alt="mermaid diagram abc123",
+            mermaid_source="graph TD; A-->B;",
+            width_pt=468.0,
+            height_pt=234.0,
+        )
+
+        at_boundary = DocsImageNode(alt="mermaid diagram abc123", width_pt=467.5, height_pt=234.0)
+        assert GoogleDocsBackend._stale_mermaid_size_warnings([resolved], [at_boundary]) == []
+
+        past_boundary = DocsImageNode(alt="mermaid diagram abc123", width_pt=467.49, height_pt=234.0)
+        assert len(GoogleDocsBackend._stale_mermaid_size_warnings([resolved], [past_boundary])) == 1
+
     def test_stale_mermaid_size_warning_fires_on_size_mismatch(
         self,
         tmp_path,

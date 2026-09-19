@@ -160,6 +160,22 @@ def test_png_pixel_dimensions_returns_none_for_truncated_bytes() -> None:
     assert _png_pixel_dimensions(_PNG_MAGIC) is None
 
 
+def test_png_pixel_dimensions_returns_none_for_empty_bytes() -> None:
+    assert _png_pixel_dimensions(b"") is None
+
+
+def test_png_pixel_dimensions_returns_none_for_zero_width_or_height() -> None:
+    """A malformed/adversarial IHDR with a zero dimension must not be treated
+    as valid -- width==0 or height==0 breaks the downstream scale = target/width
+    division (image_source.py's own explicit guard against this)."""
+    zero_width = struct.pack(">IIBBBBB", 0, 1200, 8, 2, 0, 0, 0)
+    zero_height = struct.pack(">IIBBBBB", 2400, 0, 8, 2, 0, 0, 0)
+
+    for ihdr_body in (zero_width, zero_height):
+        data = _PNG_MAGIC + struct.pack(">I", len(ihdr_body)) + b"IHDR" + ihdr_body
+        assert _png_pixel_dimensions(data) is None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # mermaid image sizing (px -> pt, filled to CONTENT_WIDTH_PT)
 # ─────────────────────────────────────────────────────────────────────────────
