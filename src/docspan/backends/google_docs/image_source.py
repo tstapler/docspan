@@ -369,7 +369,7 @@ def resolve_document_images(
         if result is None:
             out.append(None)
             continue
-        updates: Dict[str, object] = {"src": result.uri}
+        size: Optional[Tuple[float, float]] = None
         if (
             node.mermaid_source
             and node.width_pt is None
@@ -377,7 +377,8 @@ def resolve_document_images(
             and result.rendered_bytes is not None
         ):
             size = _mermaid_image_size_pt(result.rendered_bytes)
-            if size is not None:
-                updates["width_pt"], updates["height_pt"] = size
-        out.append(replace(node, **updates))
+        if size is not None:
+            out.append(replace(node, src=result.uri, width_pt=size[0], height_pt=size[1]))
+        else:
+            out.append(replace(node, src=result.uri))
     return out, warnings, temp_drive_file_ids, mermaid_entries
