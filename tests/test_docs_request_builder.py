@@ -10,6 +10,7 @@ from docspan.backends.google_docs.docs_request_builder import (
     DocsRequestBuilder,
 )
 from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
     TableCell,
@@ -1389,3 +1390,85 @@ def test_guard_overhead_is_sub_quadratic_in_input_size(monkeypatch: pytest.Monke
         with pytest.raises(DiffTooExpensive) as excinfo:
             builder.build(doc, doc, DOC_END + 10000)
         assert excinfo.value.size == len(doc) * 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mermaid image paragraph centering (mermaid-diagram-sizing Epic 1.2, Story
+# 1.2.1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_mermaid_image_insert_adds_center_paragraph_style_request() -> None:
+    """Default path (before_newline=False, bare_last=False): the image's
+    insertInlineImage (1 UTF-16 unit) + insertText newline (1 unit) together
+    make up the 2-unit paragraph the CENTER request must cover."""
+    node = DocsImageNode(
+        src="https://drive.example.com/x",
+        mermaid_source="graph TD\n A-->B",
+        width_pt=468.0,
+        height_pt=234.0,
+    )
+    requests = DocsRequestBuilder()._make_insert_requests([node], insert_at_index=10)
+
+    assert "insertInlineImage" in requests[0]
+    assert requests[0]["insertInlineImage"]["location"]["index"] == 10
+    assert "insertText" in requests[1]
+    assert requests[1]["insertText"]["location"]["index"] == 11
+    assert "updateParagraphStyle" in requests[2]
+    style_request = requests[2]["updateParagraphStyle"]
+    assert style_request["range"] == {"startIndex": 10, "endIndex": 12}
+    assert style_request["paragraphStyle"] == {"alignment": "CENTER"}
+    assert style_request["fields"] == "alignment"
+
+
+def test_plain_image_insert_adds_no_paragraph_style_request() -> None:
+    """A plain (non-mermaid) image's paragraph alignment must be left
+    untouched — no updateParagraphStyle request at all."""
+    node = DocsImageNode(src="https://example.com/photo.png", alt="a photo")
+    requests = DocsRequestBuilder()._make_insert_requests([node], insert_at_index=10)
+
+    assert len(requests) == 2
+    assert "insertInlineImage" in requests[0]
+    assert "insertText" in requests[1]
+    assert not any("updateParagraphStyle" in r for r in requests)
+
+
+def test_mermaid_image_insert_adds_center_paragraph_style_request_when_bare_last() -> None:
+    """bare_last path: no boundary newline is inserted, so the paragraph is
+    only the 1-unit image element."""
+    node = DocsImageNode(
+        src="https://drive.example.com/x",
+        mermaid_source="graph TD\n A-->B",
+        width_pt=468.0,
+        height_pt=234.0,
+    )
+    requests = DocsRequestBuilder()._make_insert_requests(
+        [node], insert_at_index=10, bare_last=True
+    )
+
+    assert len(requests) == 2
+    assert "insertInlineImage" in requests[0]
+    style_request = requests[1]["updateParagraphStyle"]
+    assert style_request["range"] == {"startIndex": 10, "endIndex": 11}
+    assert style_request["paragraphStyle"] == {"alignment": "CENTER"}
+    assert style_request["fields"] == "alignment"
+
+
+def test_mermaid_image_insert_adds_center_paragraph_style_request_when_before_newline() -> None:
+    """before_newline path: the paragraph itself starts one UTF-16 unit later
+    than insert_at_index (mirroring the plain-paragraph branch's own +1 shift),
+    so the CENTER range must be shifted by the leading newline too."""
+    node = DocsImageNode(
+        src="https://drive.example.com/x",
+        mermaid_source="graph TD\n A-->B",
+        width_pt=468.0,
+        height_pt=234.0,
+    )
+    requests = DocsRequestBuilder()._make_insert_requests(
+        [node], insert_at_index=10, before_newline=True
+    )
+
+    style_request = requests[-1]["updateParagraphStyle"]
+    assert style_request["range"] == {"startIndex": 11, "endIndex": 13}
+    assert style_request["paragraphStyle"] == {"alignment": "CENTER"}
+    assert style_request["fields"] == "alignment"

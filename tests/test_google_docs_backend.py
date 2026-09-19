@@ -8,6 +8,7 @@ tests/conftest.py (also used by tests/test_push_preview.py).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 from typing import Callable, List
@@ -21,6 +22,8 @@ from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.push_preview import HighRiskParagraph, PushPlan
+
+from .conftest import minimal_png
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsClient.batch_update — writeControl.requiredRevisionId
@@ -1146,6 +1149,147 @@ class TestMixedImageResolutionOutcomes:
         ]
         assert insert_uris == ["https://drive.example.com/file-1"]
         fake_client.upload_temp_image.assert_called_once()
+
+
+class TestStaleMermaidSizeWarning:
+    """Task 1.1.3c (Story 1.1.3's 5th acceptance criterion / pre-mortem.md
+    Failure #5): re-pushing a doc whose pulled mermaid image size differs
+    from what this feature would now compute must surface a push warning,
+    even though the diff engine still safely no-ops the actual resize
+    (Story 1.3.3's `_content_key() == (alt,)` fold-to-unchanged behavior;
+    this warning is additive, not a change to that no-op)."""
+
+    @staticmethod
+    def _minimal_png(width: int, height: int) -> bytes:
+        return minimal_png(width, height)
+
+    @staticmethod
+    def _doc_with_pulled_mermaid_image(alt: str, width_pt: float, height_pt: float) -> dict:
+        return {
+            "revisionId": "ALm37abc",
+            "body": {
+                "content": [
+                    {
+                        "startIndex": 1,
+                        "endIndex": 2,
+                        "paragraph": {
+                            "elements": [
+                                {"inlineObjectElement": {"inlineObjectId": "kix.obj1"}},
+                            ]
+                        },
+                    },
+                    {
+                        "startIndex": 2,
+                        "endIndex": 3,
+                        "paragraph": {"elements": [{"textRun": {"content": "\n"}}]},
+                    },
+                ]
+            },
+            "inlineObjects": {
+                "kix.obj1": {
+                    "inlineObjectProperties": {
+                        "embeddedObject": {
+                            "contentUri": "https://docs.google.com/old-content-uri",
+                            "description": alt,
+                            "size": {
+                                "width": {"magnitude": width_pt, "unit": "PT"},
+                                "height": {"magnitude": height_pt, "unit": "PT"},
+                            },
+                        }
+                    }
+                }
+            },
+        }
+
+    def test_stale_mermaid_size_warnings_ignores_pulled_node_with_partial_size(self) -> None:
+        """Regression for a real bug caught in sdd:6-verify Layer 1 review: the
+        original inline dict comprehension only checked `width_pt is not None`,
+        so a pulled node with width_pt set but height_pt None (a partial `size`
+        from the Docs API -- both fields are independently Optional) raised
+        `TypeError` on `abs(old_h - resolved.height_pt)`. Calling the extracted
+        pure function directly (not through the full _build_push_plan
+        round-trip) is exactly the isolated-unit-test coverage the architecture
+        review asked for."""
+        from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
+
+        pulled = DocsImageNode(alt="mermaid diagram abc123", width_pt=100.0, height_pt=None)
+        resolved = DocsImageNode(
+            alt="mermaid diagram abc123",
+            mermaid_source="graph TD; A-->B;",
+            width_pt=468.0,
+            height_pt=234.0,
+        )
+
+        warnings = GoogleDocsBackend._stale_mermaid_size_warnings([resolved], [pulled])
+
+        assert warnings == []
+
+    def test_stale_mermaid_size_warning_fires_on_size_mismatch(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+
+        diagram = "graph TD; A-->B;"
+        alt = f"mermaid diagram {hashlib.sha256(diagram.encode('utf-8')).hexdigest()[:12]}"
+
+        monkeypatch.setattr(
+            image_source, "render_mermaid_png", lambda *a, **k: self._minimal_png(2400, 1200)
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = self._doc_with_pulled_mermaid_image(
+            alt, 100.0, 50.0
+        )
+        fake_client.list_comments.return_value = []
+        fake_client.upload_temp_image.return_value = {
+            "file_id": "file-1",
+            "uri": "https://drive.example.com/file-1",
+        }
+
+        local = tmp_path / "doc.md"
+        local.write_text(f"```mermaid\n{diagram}\n```\n", encoding="utf-8")
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert any("stale" in w and alt in w for w in plan.image_warnings)
+        # Additive only -- Story 1.3.3's no-op fold means this push does not
+        # actually resize the already-pushed diagram.
+        assert not any("insertInlineImage" in r for r in plan.requests)
+
+    def test_stale_mermaid_size_warning_does_not_fire_when_sizes_match(
+        self,
+        tmp_path,
+        monkeypatch,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.backends.google_docs import image_source
+
+        diagram = "graph TD; A-->B;"
+        alt = f"mermaid diagram {hashlib.sha256(diagram.encode('utf-8')).hexdigest()[:12]}"
+
+        monkeypatch.setattr(
+            image_source, "render_mermaid_png", lambda *a, **k: self._minimal_png(2400, 1200)
+        )
+
+        backend, fake_client = make_backend()
+        fake_client.get_document.return_value = self._doc_with_pulled_mermaid_image(
+            alt, 468.0, 234.0
+        )
+        fake_client.list_comments.return_value = []
+        fake_client.upload_temp_image.return_value = {
+            "file_id": "file-1",
+            "uri": "https://drive.example.com/file-1",
+        }
+
+        local = tmp_path / "doc.md"
+        local.write_text(f"```mermaid\n{diagram}\n```\n", encoding="utf-8")
+
+        plan = backend._build_push_plan(str(local), "doc-1")
+
+        assert not any("stale" in w for w in plan.image_warnings)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

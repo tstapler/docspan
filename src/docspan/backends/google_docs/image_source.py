@@ -10,17 +10,32 @@ resolution failure into a push warning instead of a crash.
 from __future__ import annotations
 
 import hashlib
+import struct
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
-from docspan.backends.google_docs.mermaid_renderer import MermaidRenderError, render_mermaid_png
+from docspan.backends.google_docs.mermaid_renderer import (
+    RENDER_SCALE,
+    MermaidRenderError,
+    render_mermaid_png,
+)
 
 # Practical ceiling before a raw Drive/Docs API 400 -- see validation.md's
 # "oversized image" edge case.
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
+
+# Letter page, 1in margins each side: 6.5in x 72pt/in content width. A
+# deliberate simplification -- doesn't read a doc's actual documentStyle
+# margins (see requirements.md's "Page content width isn't universal"
+# rabbit hole).
+CONTENT_WIDTH_PT = 468.0
+
+# 96 CSS px/in (the standard browser reference pixel mmdc's Chromium/
+# Puppeteer renderer uses) / 72pt/in.
+_PT_PER_CSS_PX = 0.75
 
 # Magic-byte sniffing instead of `imghdr` (removed in Python 3.13) or a new
 # Pillow dependency -- covers the formats insertInlineImage actually supports.
@@ -31,6 +46,44 @@ _MAGIC_BYTES: Dict[bytes, str] = {
     b"GIF89a": "image/gif",
     b"BM": "image/bmp",
 }
+
+
+def _png_pixel_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    """Read (width_px, height_px) from a PNG's IHDR chunk, or None if malformed.
+
+    PNG guarantees IHDR is the first chunk: 8-byte signature, 4-byte chunk
+    length, 4-byte "IHDR" tag, then width/height as big-endian uint32s at
+    bytes 16-19/20-23 -- avoids a new Pillow dependency (see
+    project_plans/mermaid-diagram-sizing/decisions/ADR-001-png-dimension-reading.md),
+    consistent with this module's existing magic-byte MIME sniffing instead
+    of a full image-parsing library.
+    """
+    if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    if width == 0 or height == 0:
+        return None
+    return width, height
+
+
+def _mermaid_image_size_pt(png_bytes: bytes) -> Optional[Tuple[float, float]]:
+    """Compute (width_pt, height_pt) for a mermaid PNG, filling CONTENT_WIDTH_PT.
+
+    Divides out RENDER_SCALE (mmdc's pure supersampling factor) before any
+    px-to-pt conversion, then derives height from width via one shared scale
+    factor rather than independently rounding each axis -- so an unchanged
+    diagram's rendered PNG always yields the identical (width_pt, height_pt)
+    pair docs_request_builder.py's diff-identity key relies on (see
+    research/pitfalls.md #2-3).
+    """
+    dims = _png_pixel_dimensions(png_bytes)
+    if dims is None:
+        return None
+    native_width_px, native_height_px = dims
+    logical_width_pt = (native_width_px / RENDER_SCALE) * _PT_PER_CSS_PX
+    logical_height_pt = (native_height_px / RENDER_SCALE) * _PT_PER_CSS_PX
+    scale = CONTENT_WIDTH_PT / logical_width_pt
+    return round(logical_width_pt * scale, 2), round(logical_height_pt * scale, 2)
 
 
 @dataclass(frozen=True)
@@ -304,5 +357,13 @@ def resolve_document_images(
     out: List[Optional[DocsImageNode]] = []
     for i, node in enumerate(nodes):
         result = resolved.get(str(i))
-        out.append(replace(node, src=result.uri) if result else None)
+        if result is None:
+            out.append(None)
+            continue
+        updates: Dict[str, object] = {"src": result.uri}
+        if node.mermaid_source and node.width_pt is None and result.rendered_bytes is not None:
+            size = _mermaid_image_size_pt(result.rendered_bytes)
+            if size is not None:
+                updates["width_pt"], updates["height_pt"] = size
+        out.append(replace(node, **updates))
     return out, warnings, temp_drive_file_ids, mermaid_entries

@@ -6,6 +6,7 @@ same fixture is reused multiple times per test.
 """
 from __future__ import annotations
 
+import struct
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -15,6 +16,22 @@ from googleapiclient.errors import HttpError
 from docspan.backends.google_docs.backend import GoogleDocsBackend
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.config import GoogleDocsConfig
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def minimal_png(width: int = 2400, height: int = 1200) -> bytes:
+    """A structurally valid minimal PNG: real IHDR, no real pixel data.
+
+    Only the signature + IHDR chunk are real; mermaid sizing code only ever
+    reads those 24 bytes (see image_source._png_pixel_dimensions), so no
+    IDAT/IEND chunks are needed. Single source of truth for a fake-but-valid
+    mermaid PNG across test_gdocs_mermaid.py and test_google_docs_backend.py
+    -- previously duplicated in both, which risked drifting out of sync if
+    the IHDR layout this encodes ever needed to change.
+    """
+    ihdr_body = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return _PNG_MAGIC + struct.pack(">I", len(ihdr_body)) + b"IHDR" + ihdr_body
 
 
 @pytest.fixture
