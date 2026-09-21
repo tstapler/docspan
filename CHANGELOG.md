@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/tstapler/docspan/compare/docspan-v0.7.0...docspan-v0.8.0) (2026-09-19)
+
+
+### Features
+
+* **google-docs:** new-tab mapping + auto-size/center mermaid diagrams ([#128](https://github.com/tstapler/docspan/issues/128)) ([799294a](https://github.com/tstapler/docspan/commit/799294a659daaab2fc665d70a01caa911c206434))
+
 ## [0.7.0](https://github.com/tstapler/docspan/compare/docspan-v0.6.1...docspan-v0.7.0) (2026-09-18)
 
 
