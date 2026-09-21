@@ -121,6 +121,12 @@ def _cfg_file(tmp_path) -> str:  # type: ignore[no-untyped-def]
     return str(p)
 
 
+def _state_with(local_path: str, entry: MappingState) -> SyncState:
+    state = SyncState()
+    state.update(local_path, entry)
+    return state
+
+
 def _write_state(tmp_path, local_path: str, entry: MappingState) -> None:
     state = SyncState()
     state.update(local_path, entry)
@@ -967,10 +973,50 @@ class TestPull:
     def test_dry_run_prints_preview_and_exits_zero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
         cfg = _cfg_file(tmp_path)
-        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))):
+        with patch("docspan.cli.main.load_config", return_value=_config(_mapping(local=str(local)))), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()):
             result = runner.invoke(app, ["pull", "--dry-run", "--config", cfg])
         assert result.exit_code == 0
         assert "dry-run" in result.output
+
+    def test_dry_run_reports_up_to_date_without_writing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """--dry-run must actually check the remote (issue #131) — a mapping
+        with no local/remote drift is reported up to date, and the local
+        file is never touched."""
+        local = tmp_path / "doc.md"
+        local.write_text("hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local))
+        state_entry = MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2026-01-01T00:00:00Z",
+            local_hash=sha256_of_content("hello\n"), remote_version="v1", base_hash="base",
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend(remote_version="v1")), \
+             patch("docspan.cli.main._load_state", return_value=_state_with(str(local), state_entry)):
+            result = runner.invoke(app, ["pull", "--dry-run", "--config", cfg])
+        assert result.exit_code == 0
+        assert "up to date" in result.output
+        assert local.read_text(encoding="utf-8") == "hello\n"
+
+    def test_dry_run_reports_would_merge_without_writing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Both sides changed: --dry-run reports a real conflict count from
+        an actual three-way merge, but never writes it to the local file."""
+        local = tmp_path / "doc.md"
+        local.write_text("local change\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local))
+        state_entry = MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2026-01-01T00:00:00Z",
+            local_hash=sha256_of_content("base\n"), remote_version="v1", base_hash="base",
+        )
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend(remote_version="v2")), \
+             patch("docspan.cli.main._load_state", return_value=_state_with(str(local), state_entry)):
+            result = runner.invoke(app, ["pull", "--dry-run", "--config", cfg])
+        assert result.exit_code == 0
+        assert "would merge" in result.output
+        assert local.read_text(encoding="utf-8") == "local change\n"
 
     def test_push_only_mapping_is_skipped(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         local = tmp_path / "doc.md"
@@ -1105,6 +1151,70 @@ class TestPull:
         assert result.exit_code == 1
         assert "⚠" in result.output
         assert "✓" not in result.output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sync
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSync:
+    def test_up_to_date_mapping_gets_pushed(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """No remote drift to pull -> sync still pushes (there may be local
+        edits push hasn't seen yet)."""
+        local = tmp_path / "doc.md"
+        local.write_text("hello\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local))
+        state_entry = MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2026-01-01T00:00:00Z",
+            local_hash=sha256_of_content("hello\n"), remote_version="v1", base_hash="base",
+        )
+        backend = FakeBackend(remote_version="v1")
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main._load_state", return_value=_state_with(str(local), state_entry)), \
+             patch("docspan.cli.main.save_config"):
+            result = runner.invoke(app, ["sync", "--config", cfg])
+        assert result.exit_code == 0
+        assert "up to date" in result.output
+        assert len(backend.push_calls) == 1
+
+    def test_merge_conflicts_block_the_push(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """A pull that leaves conflicts must not be followed by a push over
+        them — that's the whole point of `sync` over a bare `pull && push`."""
+        local = tmp_path / "doc.md"
+        local.write_text("local change\n", encoding="utf-8")
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local))
+        state_entry = MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2026-01-01T00:00:00Z",
+            local_hash=sha256_of_content("base\n"), remote_version="v1", base_hash="base",
+        )
+        backend = FakeBackend(remote_version="v2")
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main._load_state", return_value=_state_with(str(local), state_entry)), \
+             patch(
+                 "docspan.cli.main.orchestrate_pull",
+                 return_value=PullOutcome(local_path=str(local), action="merged", has_conflicts=True, conflict_count=1),
+             ), \
+             patch("docspan.cli.main.save_config"):
+            result = runner.invoke(app, ["sync", "--config", cfg])
+        assert result.exit_code == 1
+        assert "Merge conflicts" in result.output
+        assert backend.push_calls == []
+
+    def test_pull_only_mapping_never_pushed(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        cfg = _cfg_file(tmp_path)
+        mapping = _mapping(local=str(local), direction="pull")
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.save_config"):
+            result = runner.invoke(app, ["sync", "--config", cfg])
+        assert result.exit_code == 0
+        assert backend.push_calls == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

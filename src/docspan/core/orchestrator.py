@@ -264,6 +264,20 @@ class PullOutcome:
     orphaned_sections: list[str] = field(default_factory=list)
 
 
+@dataclass
+class PullPreview:
+    """Non-destructive classification of what a real pull would do.
+
+    Mirrors `PullOutcome.action` ("up-to-date" | "local-only" | "would-first-sync"
+    | "would-fast-forward" | "would-merge" | "error") without writing to
+    `mapping.local`, the state file, or the base store.
+    """
+    local_path: str
+    action: str
+    conflict_count: int = 0
+    message: Optional[str] = None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # State recording
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,6 +480,107 @@ def orchestrate_pull(
     return _merge_pull(
         mapping, backend, state, state_dir, state_path,
         local_content, remote_version, entry.base_hash,
+    )
+
+
+def preview_pull(mapping: "Mapping", backend: Backend, state: SyncState, state_dir: str) -> PullPreview:
+    """Classify what `orchestrate_pull` would do, without writing anything.
+
+    Fetches the remote version (the one network call a real pull also makes)
+    and, when both sides changed, downloads "theirs" to a throwaway temp file
+    and runs the same three-way merge as `_merge_pull` purely to count
+    conflicts — the merge result itself is discarded, never written to
+    `mapping.local`.
+    """
+    assert mapping.remote_id is not None, "preview_pull requires a mapping with a created remote doc/page"
+
+    try:
+        remote_version = backend.get_remote_version(mapping.remote_id)
+    except Exception as exc:
+        return PullPreview(local_path=mapping.local, action="error", message=str(exc))
+
+    if mapping.sectioned:
+        return _preview_pull_sectioned(mapping, state, remote_version)
+
+    entry = state.get(mapping.local)
+
+    local_exists = os.path.exists(mapping.local)
+    if local_exists:
+        with open(mapping.local, encoding="utf-8") as fh:
+            local_content = fh.read()
+        current_local_hash = sha256_of_content(local_content)
+    else:
+        local_content = ""
+        current_local_hash = ""
+
+    if entry is None:
+        return PullPreview(local_path=mapping.local, action="would-first-sync")
+
+    remote_changed = remote_version != entry.remote_version
+    local_changed = local_exists and current_local_hash != entry.local_hash
+
+    if not remote_changed and not local_changed:
+        return PullPreview(local_path=mapping.local, action="up-to-date")
+
+    if remote_changed and not local_changed:
+        return PullPreview(local_path=mapping.local, action="would-fast-forward")
+
+    if local_changed and not remote_changed:
+        return PullPreview(local_path=mapping.local, action="local-only")
+
+    # Both sides changed — run the real three-way merge to count conflicts,
+    # but discard the result instead of writing it anywhere.
+    return _preview_pull_merge(mapping, backend, state_dir, local_content, entry.base_hash)
+
+
+def _preview_pull_sectioned(mapping: "Mapping", state: SyncState, remote_version: str) -> PullPreview:
+    """`preview_pull`'s sectioned-mapping branch.
+
+    A Google Doc has one remote_version for the whole document; without
+    doing a real fetch-and-split we can't say which section changed or count
+    conflicts per section (see `_orchestrate_pull_sectioned`), so this
+    reports only the doc-level up-to-date/would-change split.
+    """
+    section_paths = [os.path.join(mapping.local, f) for f in _section_files(mapping.local)]
+    known_entries = [e for p in section_paths if (e := state.get(p)) is not None]
+    if not known_entries:
+        return PullPreview(local_path=mapping.local, action="would-first-sync")
+    if any(e.remote_version != remote_version for e in known_entries):
+        return PullPreview(
+            local_path=mapping.local,
+            action="would-merge",
+            message="sectioned mapping — run without --dry-run for a per-section conflict count",
+        )
+    return PullPreview(local_path=mapping.local, action="up-to-date")
+
+
+def _preview_pull_merge(
+    mapping: "Mapping", backend: Backend, state_dir: str, local_content: str, base_hash: str,
+) -> PullPreview:
+    """`preview_pull`'s both-sides-changed branch: real merge, discarded result."""
+    assert mapping.remote_id is not None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
+            tmp_path = tmp.name
+        tmp_result = backend.pull(
+            mapping.remote_id, tmp_path, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+        )
+        if tmp_result.status not in ("ok", "warning"):
+            os.unlink(tmp_path)
+            return PullPreview(local_path=mapping.local, action="error", message=tmp_result.message)
+        with open(tmp_path, encoding="utf-8") as fh:
+            theirs_content = fh.read()
+        os.unlink(tmp_path)
+    except Exception as exc:
+        return PullPreview(local_path=mapping.local, action="error", message=str(exc))
+
+    base_content = get_base_content(state_dir, base_hash)
+    merge_result = three_way_merge(base_content, theirs_content, local_content)
+
+    return PullPreview(
+        local_path=mapping.local,
+        action="would-merge",
+        conflict_count=merge_result.conflict_count,
     )
 
 

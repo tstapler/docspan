@@ -56,7 +56,7 @@ Pull remote documents into local markdown files.
 | Option | Description |
 |---|---|
 | `--config`, `-c` TEXT | Path to `markgate.yaml` |
-| `--dry-run` | Preview what would be pulled without writing locally |
+| `--dry-run` | Fetches the remote and classifies what a real pull would do — up to date, local-only, would fast-forward, would first-sync, or would merge (with a real conflict count) — without writing anything |
 
 **Behavior:**
 
@@ -75,6 +75,44 @@ Pull remote documents into local markdown files.
 ```bash
 docspan pull
 docspan pull docs/design-doc.md
+docspan pull --dry-run
+```
+
+---
+
+## `docspan sync`
+
+```
+docspan sync [FILES]... [OPTIONS]
+```
+
+Pull then push each mapping — the safe default order.
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `FILES` | Optional list of local file paths to sync. Defaults to all mappings. |
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--config`, `-c` TEXT | Path to `markgate.yaml` |
+| `--force` | Proceed with a push even if it flags a comment-risk paragraph |
+
+**Behavior:**
+
+- For each mapping: runs a real `pull`, then, unless the pull left unresolved merge conflicts, runs a real `push`.
+- A mapping whose pull produced conflicts is reported and **not** pushed — resolve with `docspan conflicts resolve` and re-run.
+- `direction = "pull"` mappings are only pulled; `direction = "push"` mappings are only pushed.
+- Exits non-zero if anything still needs `docspan conflicts resolve`, or if any push/pull failed.
+
+**Example:**
+
+```bash
+docspan sync
+docspan sync docs/design-doc.md
 ```
 
 ---
