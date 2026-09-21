@@ -10,6 +10,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
+    ParagraphStyle,
     TableCell,
     TextSpan,
     _trim_spans_to_cell_text,
@@ -221,7 +222,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 text = _text_of(spans).strip()
                 if text:
                     nodes.append(DocsParagraphNode(
-                        style="NORMAL_TEXT", text=text, is_list_item=True,
+                        style=ParagraphStyle.NORMAL_TEXT, text=text, is_list_item=True,
                         nesting_level=nesting_level, start_index=0, end_index=0,
                         spans=spans if _has_styling(spans) else [],
                     ))
@@ -232,7 +233,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 text = _text_of(spans).strip()
                 if text:
                     nodes.append(DocsParagraphNode(
-                        style="NORMAL_TEXT", text=text, is_list_item=True,
+                        style=ParagraphStyle.NORMAL_TEXT, text=text, is_list_item=True,
                         nesting_level=nesting_level, start_index=0, end_index=0,
                         spans=spans if _has_styling(spans) else [],
                     ))
@@ -246,7 +247,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
         text = _text_of(spans).strip()
         if text:
             nodes.append(DocsParagraphNode(
-                style="NORMAL_TEXT", text=text, is_list_item=True,
+                style=ParagraphStyle.NORMAL_TEXT, text=text, is_list_item=True,
                 nesting_level=nesting_level, start_index=0, end_index=0,
                 spans=spans if _has_styling(spans) else [],
             ))
@@ -296,7 +297,7 @@ def _nodes_from_code_block(
         lang = info.strip()
         if lang:
             nodes.append(DocsParagraphNode(
-                style="NORMAL_TEXT", text=f"{FENCE_MARKER}{lang}",
+                style=ParagraphStyle.NORMAL_TEXT, text=f"{FENCE_MARKER}{lang}",
                 start_index=0, end_index=0, spans=[],
             ))
     raw = token.get("raw", "").strip("\n")
@@ -307,7 +308,7 @@ def _nodes_from_code_block(
     # losing the block or leaving an unterminated marker behind.
     for line in raw.split("\n"):
         nodes.append(DocsParagraphNode(
-            style="NORMAL_TEXT", text=line, is_list_item=is_list_item,
+            style=ParagraphStyle.NORMAL_TEXT, text=line, is_list_item=is_list_item,
             nesting_level=nesting_level, start_index=0, end_index=0,
             # A blank line inside a block carries no span to style.
             # projection.project() drops it from *both* sides, so the
@@ -369,7 +370,7 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
         if ctype == "paragraph":
             spans = _spans_from_inline(child.get("children", []))
             nodes.append(_tagged(DocsParagraphNode(
-                style="NORMAL_TEXT", text=_text_of(spans).strip(),
+                style=ParagraphStyle.NORMAL_TEXT, text=_text_of(spans).strip(),
                 start_index=0, end_index=0,
                 spans=spans if _has_styling(spans) else [],
             )))
@@ -400,7 +401,7 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
             # lets projection.py's blockquote carve-out (Story 2.5) keep it
             # instead of dropping it as an ordinary blank paragraph.
             nodes.append(_tagged(DocsParagraphNode(
-                style="NORMAL_TEXT", text="", start_index=0, end_index=0, spans=[],
+                style=ParagraphStyle.NORMAL_TEXT, text="", start_index=0, end_index=0, spans=[],
             )))
         # nested tables inside a block quote are rare; fall back to skipping
         # rather than mis-rendering them.
@@ -468,9 +469,10 @@ class HeadingTokenConverter(MarkdownTokenConverter):
 
     def convert(self, token: dict) -> List[Node]:
         level = token.get("attrs", {}).get("level", token.get("level", 1))
+        level = max(1, min(level, 6))  # mistune only emits 1-6 (`#` to `######`); clamp defensively
         spans = _spans_from_inline(token.get("children", []))
         return [DocsParagraphNode(
-            style=f"HEADING_{level}", text=_text_of(spans).strip(),
+            style=ParagraphStyle(f"HEADING_{level}"), text=_text_of(spans).strip(),
             start_index=0, end_index=0,
             spans=spans if _has_styling(spans) else [],
         )]
@@ -489,7 +491,7 @@ class ParagraphTokenConverter(MarkdownTokenConverter):
             )]
         spans = _spans_from_inline(token.get("children", []))
         return [DocsParagraphNode(
-            style="NORMAL_TEXT", text=_text_of(spans).strip(),
+            style=ParagraphStyle.NORMAL_TEXT, text=_text_of(spans).strip(),
             start_index=0, end_index=0,
             spans=spans if _has_styling(spans) else [],
         )]

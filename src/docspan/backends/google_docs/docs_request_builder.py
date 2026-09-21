@@ -17,6 +17,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
     DocsTableNode,
+    ParagraphStyle,
     TableCell,
     TextSpan,
 )
@@ -2722,7 +2723,7 @@ class DocsRequestBuilder:
         """
         requests: List[dict] = []
         paragraph_range = {"startIndex": node.start_index, "endIndex": node.end_index}
-        if node.style != "NORMAL_TEXT":
+        if node.style != ParagraphStyle.NORMAL_TEXT:
             requests.append({
                 "updateParagraphStyle": {
                     "range": dict(paragraph_range),
@@ -2886,6 +2887,15 @@ class DocsRequestBuilder:
             if blockquote_fields:
                 paragraph_style.update(blockquote_style)
                 style_fields.extend(blockquote_fields)
+            elif node.style == ParagraphStyle.NORMAL_TEXT and not node.is_list_item:
+                # ponytail: issue #131 — a body paragraph inserted with no
+                # spaceBelow renders back-to-back with the next one (Docs'
+                # own default for a freshly inserted paragraph is 0pt).
+                # 10pt matches a blank Google Doc's own "Normal text" style.
+                # List items and blockquotes are excluded: consecutive
+                # bullets/quote lines are expected to sit tight.
+                paragraph_style["spaceBelow"] = {"magnitude": 10, "unit": "PT"}
+                style_fields.append("spaceBelow")
             requests.append({
                 "updateParagraphStyle": {
                     "range": paragraph_range,
