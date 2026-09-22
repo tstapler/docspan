@@ -320,18 +320,17 @@ class GoogleDocsBackend(Backend):
             # Projecting the target is NOT a no-op any more. This comment used to say
             # "MarkdownToParagraphParser cannot emit an empty-text node, so there is
             # nothing on this side to drop" — splitting fenced code blocks per line
-            # falsified that: a blank line inside a block, an empty fence and a
-            # blank-only fence all produce `text=""`.
+            # falsified that: a blockquote's blank code line still produces
+            # `text=""` (protected from Rule 1 by its own `is_blockquote` carve-out
+            # instead), and a document pushed before issue #127's fix may still hold
+            # that shape for an older top-level/list-item fence too.
             #
-            # So this drops author content — not the #17 trade, which *preserves* a
-            # blank paragraph the Doc already has. A blank code line exists only in the
-            # markdown and is never written.
-            #
-            # Reported rather than fixed, deliberately. Writing it needs projection to
-            # tell a blank *code* line (content) from a stray empty *prose* paragraph
-            # (not content), and the node model cannot express that distinction — a
-            # design change, not a patch. Until then the author is told, which is the
-            # difference between a known limitation and silent data loss.
+            # A *current* top-level/list-item blank code line no longer reaches here
+            # as `text==""`: MarkdownToParagraphParser tags it with
+            # BLANK_CODE_LINE_MARKER (see that constant's docstring), which makes the
+            # paragraph non-empty so Rule 1 never touches it and it gets written like
+            # any other line — closing the gap this comment used to describe (a blank
+            # code line existing only in markdown and never being written).
             target_nodes, target_residue = project(target_nodes)
 
             # Doc-only recovery aid (Part D): rebuilt fresh every push from the

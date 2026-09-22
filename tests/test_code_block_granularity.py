@@ -40,7 +40,11 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsParagraphNode,
     DocsStructureParser,
 )
-from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.markdown_to_paragraph_parser import (
+    BLANK_CODE_LINE_MARKER,
+    MarkdownToParagraphParser,
+)
+from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.projection import project
 
 markdown = MarkdownToParagraphParser()
@@ -330,6 +334,112 @@ class TestFenceInABlockQuote:
         blank = nodes[2]
         assert blank.spans == []
         assert blank.is_blockquote is True
+
+
+class TestBlankLineInsideFence:
+    """Issue #127: a blank line inside a top-level or list-item fence used to
+    become `text="", spans=[]` — the exact shape `projection.project()`'s
+    Rule 1 treats as an ordinary empty markdown paragraph and drops from
+    both sides of the diff, so push silently never wrote it. Fixed by
+    tagging the blank with `BLANK_CODE_LINE_MARKER`, a non-empty placeholder
+    that survives `project()` unprojected. See `TestFenceInABlockQuote`'s
+    `test_a_blank_line_in_a_quoted_fence_still_renders_as_an_empty_tagged_node`
+    for the blockquote case, which already worked via a different carve-out
+    and deliberately keeps the old shape.
+    """
+
+    def test_a_blank_line_in_a_top_level_fence_is_not_dropped_as_residue(self) -> None:
+        md = "```go\nimport (\n\t\"fmt\"\n)\n\nfunc main() {}\n```\n"
+        target, target_residue = project(markdown.parse(md))
+
+        assert target_residue == []
+        blank = next(n for n in target if n.text == BLANK_CODE_LINE_MARKER)
+        assert blank.spans and blank.spans[0].monospace is True
+
+    def test_a_blank_line_in_a_listed_fence_is_not_dropped_as_residue(self) -> None:
+        md = "- Steps:\n\n  ```sh\n  one\n\n  two\n  ```\n"
+        target, target_residue = project(markdown.parse(md))
+
+        assert target_residue == []
+        blank = next(n for n in target if n.text == BLANK_CODE_LINE_MARKER)
+        assert blank.is_list_item is True
+
+    def test_pushing_a_document_that_already_has_the_blank_code_line_emits_no_requests(
+        self,
+    ) -> None:
+        """Push-idempotency: once the marker line has been written to the
+        doc, a second push of the same markdown must not re-touch it."""
+        md = "```sh\none\n\ntwo\n```\n"
+        doc, end = _doc_of_lines("```sh", "one", BLANK_CODE_LINE_MARKER, "two")
+
+        target, target_residue = project(markdown.parse(md))
+        current, current_residue = project(structure.parse(doc))
+
+        assert target_residue == []
+        assert current_residue == []
+        assert builder.build(current, target, end) == []
+
+    def test_a_blank_line_in_a_fence_pulls_back_as_a_real_blank_line(self) -> None:
+        """The other half of the round trip: `nodes_to_markdown` must
+        translate the marker back to an actual blank line, not leak the
+        zero-width-space placeholder into the rendered markdown."""
+        nodes = markdown.parse("```sh\none\n\ntwo\n```\n")
+        md_out = render_nodes_to_markdown(nodes)
+
+        assert "```sh\none\n\ntwo\n```" in md_out
+        assert BLANK_CODE_LINE_MARKER not in md_out
+
+    def test_an_empty_top_level_fence_survives_push_and_pull(self) -> None:
+        """The empty-fence shape (`raw == ""`) is also tagged with the
+        marker now (`emit_blank_line_marker` defaults True), which is a
+        second, previously-untested behaviour change from #127's fix: an
+        empty fence used to become the same dropped `text=""` residue as an
+        interior blank line. Pins that it still round-trips clean rather
+        than rendering an extra blank line inside the fence or losing it.
+        """
+        target, target_residue = project(markdown.parse("```sh\n```\n"))
+
+        assert target_residue == []
+        assert [n.text for n in target] == ["```sh", BLANK_CODE_LINE_MARKER]
+
+        md_out = render_nodes_to_markdown(markdown.parse("```sh\n```\n"))
+        assert "```sh\n```" in md_out
+        assert BLANK_CODE_LINE_MARKER not in md_out
+
+    def test_pushing_a_document_holding_the_legacy_blank_code_line_shape_still_converges(
+        self,
+    ) -> None:
+        """Backward compatibility: a document pushed by pre-#127 docspan can
+        still hold a top-level blank code line as the old `text="",
+        spans=[]` shape (that push never wrote the marker). `_node_key`
+        includes text, so the live doc's node no longer matches the
+        newly-parsed target's `BLANK_CODE_LINE_MARKER` node byte-for-byte —
+        this pins that the diff still converges on a plain one-line
+        replace of just the blank line, not something that also touches
+        the surrounding `one`/`two` code lines.
+        """
+        md = "```sh\none\n\ntwo\n```\n"
+        doc, end = _doc_of_lines("```sh", "one", "", "two")
+
+        target, target_residue = project(markdown.parse(md))
+        current, current_residue = project(structure.parse(doc))
+
+        assert target_residue == []
+        # The live doc's legacy-shape blank line is an ordinary empty
+        # paragraph to Rule 1 (nothing marks it as belonging to a code
+        # block), so it's doc-side residue — left alone, not an error. It's
+        # exactly this drop from `current`'s `kept` list that the assertion
+        # below depends on: `current` now has one fewer node than `target`.
+        assert [r.kind for r in current_residue] == ["empty_paragraph"]
+
+        requests = builder.build(current, target, end)
+        assert requests, "the legacy shape must not be silently accepted as already-equal"
+        touched_texts = {
+            request["insertText"]["text"].strip("\n")
+            for request in requests
+            if "insertText" in request
+        }
+        assert touched_texts == {BLANK_CODE_LINE_MARKER}
 
 
 class TestPushIsIdempotent:

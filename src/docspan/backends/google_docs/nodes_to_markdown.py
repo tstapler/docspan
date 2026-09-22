@@ -34,6 +34,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TableCell,
     TextSpan,
 )
+from docspan.backends.google_docs.markdown_to_paragraph_parser import BLANK_CODE_LINE_MARKER
 from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
@@ -280,10 +281,17 @@ def _is_pure_code_line(node: Node) -> bool:
     Deliberately narrower than "contains some monospace" — a mixed-mark span
     (e.g. monospace+bold) or an isolated inline-code span inside an otherwise
     normal paragraph must never be swept into a fence.
+
+    Excludes `BLANK_CODE_LINE_MARKER` even though it too is a lone monospace
+    span: it stands for a *blank* code line (`_is_blank_code_line`), and the
+    two must stay distinguishable so `_group_code_runs`'s interior-blank
+    lookahead and empty-fence special case still have something to key off.
     """
     if not isinstance(node, DocsParagraphNode):
         return False
     if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    if node.text == BLANK_CODE_LINE_MARKER:
         return False
     spans = node.spans
     return (
@@ -296,22 +304,29 @@ def _is_pure_code_line(node: Node) -> bool:
 
 
 def _is_blank_code_line(node: Node) -> bool:
-    """A blank line inside a fenced block (`_nodes_from_code_block`'s
-    `spans=[]` branch).
+    """A blank line inside a fenced block.
+
+    Two shapes, both produced by `_nodes_from_code_block`: the current
+    `BLANK_CODE_LINE_MARKER`-tagged paragraph (top-level/list-item fences,
+    issue #127), and the older `text="", spans=[]` shape a blockquote's
+    blank code line still uses (already protected from
+    `projection.project()` by the `is_blockquote` carve-out, so it never
+    needed the marker). A document pushed before #127's fix may also still
+    hold the older shape for a top-level/list-item fence.
 
     Only ever absorbed into an already-open code run by `_group_code_runs`
     (it looks ahead for another code line before treating one of these as
     part of the run) — an ordinary blank paragraph between two prose
-    paragraphs has this exact shape too and must not, on its own, start or
+    paragraphs has the legacy shape too and must not, on its own, start or
     extend a fence.
     """
-    return (
-        isinstance(node, DocsParagraphNode)
-        and node.style == "NORMAL_TEXT"
-        and not node.is_list_item
-        and not node.spans
-        and node.text == ""
-    )
+    if not isinstance(node, DocsParagraphNode):
+        return False
+    if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    if node.text == BLANK_CODE_LINE_MARKER:
+        return True
+    return not node.spans and node.text == ""
 
 
 def _is_language_marker(node: Node) -> bool:
@@ -434,20 +449,22 @@ def _group_blockquote_runs(nodes: List[Node]) -> List[Tuple]:
             depth = node.quote_depth
             run: List[Node] = [node]
             j = i + 1
-            while (
-                j < n
-                and isinstance(nodes[j], DocsParagraphNode)
-                and nodes[j].is_blockquote
-            ):
-                run.append(nodes[j])
+            while j < n:
+                candidate = nodes[j]
+                if not (isinstance(candidate, DocsParagraphNode) and candidate.is_blockquote):
+                    break
+                run.append(candidate)
                 j += 1
             groups.append(("blockquote", depth, _group_code_runs(run)))
             i = j
         else:
             j = i
             plain_run: List[Node] = []
-            while j < n and not (isinstance(nodes[j], DocsParagraphNode) and nodes[j].is_blockquote):
-                plain_run.append(nodes[j])
+            while j < n:
+                candidate = nodes[j]
+                if isinstance(candidate, DocsParagraphNode) and candidate.is_blockquote:
+                    break
+                plain_run.append(candidate)
                 j += 1
             groups.extend(_group_code_runs(plain_run))
             i = j
@@ -461,7 +478,11 @@ def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]
     code_lines = []
     for node in code_nodes:
         assert isinstance(node, DocsParagraphNode)
-        code_lines.append(node.text)
+        # A blank code line's real text is always "" regardless of which
+        # shape produced it — BLANK_CODE_LINE_MARKER is a push-side
+        # placeholder, not markdown content, and must never leak into the
+        # rendered line.
+        code_lines.append("" if _is_blank_code_line(node) else node.text)
     delim = _fence_delimiter(lang, code_lines)
     # CommonMark reads the fence's width off the *leading run* of the fence
     # character on the opening line, not a separately-tokenized delimiter —
