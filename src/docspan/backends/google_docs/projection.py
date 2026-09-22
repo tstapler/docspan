@@ -27,6 +27,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     DocsImageNode,
     DocsParagraphNode,
     DocsTableNode,
+    ParagraphStyle,
     _is_all_private_use,
     _utf16_len,
 )
@@ -44,9 +45,9 @@ ResidueKind = Literal[
 # Google Docs' own outline treats TITLE/SUBTITLE as document-level headings, and
 # `#`/`##` is what a markdown reader will do with them, so the mapping loses the
 # distinction rather than the structure.
-_UNWRITABLE_STYLES: Dict[str, str] = {
-    "TITLE": "HEADING_1",
-    "SUBTITLE": "HEADING_2",
+_UNWRITABLE_STYLES: Dict[ParagraphStyle, ParagraphStyle] = {
+    ParagraphStyle.TITLE: ParagraphStyle.HEADING_1,
+    ParagraphStyle.SUBTITLE: ParagraphStyle.HEADING_2,
 }
 
 
@@ -240,7 +241,7 @@ def _describe_empty(node: DocsParagraphNode) -> str:
     """A short human-facing description of a dropped empty paragraph."""
     if node.is_list_item:
         return "empty list item"
-    if node.style != "NORMAL_TEXT":
+    if node.style != ParagraphStyle.NORMAL_TEXT:
         return f"empty {node.style}"
     return "blank paragraph"
 

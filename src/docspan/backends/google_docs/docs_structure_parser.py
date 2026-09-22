@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import List, Optional, Union
 
 from docspan.backends.google_docs.heading_anchors import (
@@ -9,6 +10,38 @@ from docspan.backends.google_docs.heading_anchors import (
     heading_id_to_slug,
     is_anchor,
 )
+
+
+class ParagraphStyle(str, Enum):
+    """Google Docs `paragraphStyle.namedStyleType` — the complete set the API
+    supports. `str` subclass so comparisons and the raw API request payload
+    keep working unchanged; `enum.StrEnum` is unavailable (repo floor is 3.9).
+    """
+    NORMAL_TEXT = "NORMAL_TEXT"
+    TITLE = "TITLE"
+    SUBTITLE = "SUBTITLE"
+    HEADING_1 = "HEADING_1"
+    HEADING_2 = "HEADING_2"
+    HEADING_3 = "HEADING_3"
+    HEADING_4 = "HEADING_4"
+    HEADING_5 = "HEADING_5"
+    HEADING_6 = "HEADING_6"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+def parse_paragraph_style(raw: str) -> ParagraphStyle:
+    """Parse-don't-validate boundary for `namedStyleType` off the raw Docs API JSON.
+
+    An unrecognized value is a live-API/schema-drift scenario, not a bug
+    in a specific paragraph, so it degrades to `NORMAL_TEXT` (the API's own
+    default) rather than raising and failing an entire pull.
+    """
+    try:
+        return ParagraphStyle(raw)
+    except ValueError:
+        return ParagraphStyle.NORMAL_TEXT
 
 # Structural elements whose leading newline the Docs API refuses to delete on
 # its own: "Deleting the newline character before a Table, TableOfContents or
@@ -241,7 +274,7 @@ class TextSpan:
 @dataclass
 class DocsParagraphNode:
     """Represents a single paragraph in a Google Docs document."""
-    style: str  # e.g. "NORMAL_TEXT", "HEADING_1", "HEADING_2", ...
+    style: ParagraphStyle
     text: str   # Concatenated plain text (trailing \n stripped)
     is_list_item: bool = False
     nesting_level: int = 0
@@ -692,7 +725,7 @@ class DocsStructureParser:
         """Parse a structural element that contains a paragraph."""
         paragraph = element["paragraph"]
         paragraph_style = paragraph.get("paragraphStyle", {})
-        style = paragraph_style.get("namedStyleType", "NORMAL_TEXT")
+        style = parse_paragraph_style(paragraph_style.get("namedStyleType", "NORMAL_TEXT"))
 
         start_index = element.get("startIndex", 0)
         end_index = element.get("endIndex", 0)

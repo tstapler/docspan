@@ -1,12 +1,14 @@
 from docspan.core.merge import MergeResult, three_way_merge
 from docspan.core.orchestrator import (
     PullOutcome,
+    PullPreview,
     PushOutcome,
     get_base_content,
     get_state_dir,
     get_state_path,
     orchestrate_pull,
     orchestrate_push,
+    preview_pull,
     record_state,
     save_base_content,
 )
@@ -32,12 +34,14 @@ __all__ = [
     # orchestrator
     "PushOutcome",
     "PullOutcome",
+    "PullPreview",
     "get_state_path",
     "get_state_dir",
     "get_base_content",
     "save_base_content",
     "orchestrate_push",
     "orchestrate_pull",
+    "preview_pull",
     "record_state",
     # paths
     "STATE_FILENAME",

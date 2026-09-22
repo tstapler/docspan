@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from docspan.core.orchestrator import (
     get_base_content,
     orchestrate_pull,
     orchestrate_push,
+    preview_pull,
     save_base_content,
 )
 from docspan.core.state import MappingState, SyncState, sha256_of_content
@@ -946,3 +948,132 @@ class TestAtomicReplaceDirDoubleFailure:
         messages = [record.getMessage() for record in caplog.records]
         assert any("Failed to swap" in m for m in messages)
         assert any("also failed" in m for m in messages)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# preview_pull (issue #130: pull --dry-run must actually classify remote state)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPreviewPull:
+    def test_reports_up_to_date_and_writes_nothing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("hello\n", encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), "hello\n")
+        backend = FakeBackend(remote_content="hello\n")
+
+        preview = preview_pull(_mapping(str(local)), backend, state, str(tmp_path))
+
+        assert preview.action == "up-to-date"
+        assert not backend.pull_calls  # up-to-date never needs the merge fetch
+        assert local.read_text(encoding="utf-8") == "hello\n"
+        assert not os.path.exists(state_path)
+
+    def test_reports_would_fast_forward_when_only_remote_changed(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("hello\n", encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), "hello\n")
+        backend = FakeBackend(remote_version="v2", remote_content="hello v2\n")
+
+        preview = preview_pull(_mapping(str(local)), backend, state, str(tmp_path))
+
+        assert preview.action == "would-fast-forward"
+        assert local.read_text(encoding="utf-8") == "hello\n"
+        assert not os.path.exists(state_path)
+
+    def test_reports_local_only_when_only_local_changed(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        state, state_path = _synced_state(tmp_path, str(local), "hello\n")
+        local.write_text("edited locally\n", encoding="utf-8")
+        backend = FakeBackend(remote_content="hello\n")
+
+        preview = preview_pull(_mapping(str(local)), backend, state, str(tmp_path))
+
+        assert preview.action == "local-only"
+        assert not os.path.exists(state_path)
+
+    def test_reports_would_first_sync_when_no_state_entry(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        preview = preview_pull(_mapping(str(local)), FakeBackend(), SyncState(), str(tmp_path))
+        assert preview.action == "would-first-sync"
+        assert not local.exists()
+
+    def test_reports_error_when_remote_version_fetch_fails(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("hello\n", encoding="utf-8")
+        state, _ = _synced_state(tmp_path, str(local), "hello\n")
+        backend = FakeBackend()
+
+        with patch.object(backend, "get_remote_version", side_effect=RuntimeError("network down")):
+            preview = preview_pull(_mapping(str(local)), backend, state, str(tmp_path))
+
+        assert preview.action == "error"
+        assert "network down" in (preview.message or "")
+
+    def test_sectioned_reports_fast_forward_not_merge_when_only_remote_changed(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression guard for the bug this replaced: comparing the whole
+        document's remote_version (shared by every section) used to
+        misclassify ANY remote change to ANY section as "would-merge (0
+        conflicts)" for every section, even ones nothing touched. The fix
+        classifies each section from its own content hash instead.
+        """
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        section_path = directory / "01-intro.md"
+        section_path.write_text("intro\n", encoding="utf-8")
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        base_hash = save_base_content(str(tmp_path), "intro\n")
+        state.update(
+            str(section_path),
+            MappingState(
+                doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+                base_hash=base_hash, remote_version="v0", local_hash=sha256_of_content("intro\n"),
+            ),
+        )
+        # Doc-level remote_version ("v1") differs from the section's stored
+        # remote_version ("v0") — exactly what used to trigger the bug —
+        # but the section's own content is a clean, conflict-free change.
+        backend = FakeBackend(remote_version="v1", section_files={"01-intro.md": "intro v2\n"})
+
+        preview = preview_pull(mapping, backend, state, str(tmp_path))
+
+        assert preview.action == "would-fast-forward"
+        assert preview.conflict_count == 0
+        assert section_path.read_text(encoding="utf-8") == "intro\n"
+        assert not os.path.exists(state_path)
+
+    def test_sectioned_reports_real_conflict_count_when_both_sides_changed(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        section_path = directory / "01-intro.md"
+        section_path.write_text("local edit\n", encoding="utf-8")
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        base_hash = save_base_content(str(tmp_path), "intro\n")
+        state.update(
+            str(section_path),
+            MappingState(
+                doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+                base_hash=base_hash, remote_version="v1", local_hash=sha256_of_content("intro\n"),
+            ),
+        )
+        backend = FakeBackend(remote_version="v2", section_files={"01-intro.md": "remote edit\n"})
+
+        preview = preview_pull(mapping, backend, state, str(tmp_path))
+
+        assert preview.action == "would-merge"
+        assert preview.conflict_count == 1
+        assert section_path.read_text(encoding="utf-8") == "local edit\n"
+        assert not os.path.exists(state_path)
+
+    def test_sectioned_reports_would_first_sync_when_no_state_entry(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        directory = tmp_path / "big-doc"
+        mapping = _sectioned_mapping(str(directory))
+        backend = FakeBackend(section_files={"01-intro.md": "intro\n"})
+
+        preview = preview_pull(mapping, backend, SyncState(), str(tmp_path))
+
+        assert preview.action == "would-first-sync"
+        assert not (directory / "01-intro.md").exists()

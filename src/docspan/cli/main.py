@@ -17,6 +17,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from docspan.backends import BACKENDS
+from docspan.backends.base import Backend
 from docspan.backends.google_docs.migration import (
     MigrationOutcome,
     MigrationResult,
@@ -35,12 +36,14 @@ from docspan.config import (
 )
 from docspan.core import (
     MappingState,
+    PullPreview,
     SyncState,
     get_base_content,
     get_state_dir,
     get_state_path,
     orchestrate_pull,
     orchestrate_push,
+    preview_pull,
     record_state,
 )
 from docspan.core.paths import BASE_STORE_DIR, ORIG_SUFFIX, STATE_FILENAME
@@ -255,18 +258,7 @@ def push(
     # `files`, so every single-file push wrote such links as a literal,
     # unresolved relative href instead of the target's Google Doc URL.
     mappings = config.mappings
-    mappings_to_push = mappings
-
-    if files:
-        resolved_mappings: list[Mapping] = []
-        for f in files:
-            m = resolve_mapping_for_path(mappings, f)
-            if m is not None and not any(m is existing for existing in resolved_mappings):
-                resolved_mappings.append(m)
-        mappings_to_push = resolved_mappings
-        if not mappings_to_push:
-            err_console.print(f"No mappings found for: {files}")
-            raise typer.Exit(1)
+    mappings_to_push = _resolve_files_or_exit(mappings, files)
 
     if not mappings_to_push:
         err_console.print("No mappings configured. Add entries to markgate.yaml.")
@@ -430,6 +422,28 @@ def push(
 # ─────────────────────────────────────────────────────────────────────────────
 # pull command
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _render_pull_preview(mapping: Mapping, preview: PullPreview) -> None:
+    """Render a `PullPreview` — the real classification `--dry-run` reports."""
+    if preview.action == "up-to-date":
+        console.print(f"[dim]up to date[/dim]  {mapping.local}")
+    elif preview.action == "local-only":
+        console.print(
+            f"[yellow]dry-run[/yellow]  {mapping.local} has local changes not yet pushed and no "
+            "remote changes. A real pull would skip it."
+        )
+    elif preview.action == "would-first-sync":
+        console.print(f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local} (first sync)")
+    elif preview.action == "would-fast-forward":
+        console.print(f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local} (would fast-forward)")
+    elif preview.action == "would-merge":
+        detail = f" ({preview.conflict_count} conflicts)" if preview.conflict_count else " (0 conflicts)"
+        console.print(f"[yellow]dry-run[/yellow]  {mapping.local} would merge{detail}")
+        if preview.message:
+            console.print(f"   [dim]{escape(preview.message)}[/dim]")
+    elif preview.action == "error":
+        err_console.print(f"✗  {mapping.remote_id} → {mapping.local}: {preview.message or 'unknown error'}")
+
 
 def _split_level_display(split_level: str) -> str:
     """Render `"HEADING_2"` as ux.md's short `"h2"` form for status lines."""
@@ -615,18 +629,7 @@ def pull(
 ) -> None:
     """Pull remote docs into local markdown files."""
     config, config_path, prefix = _resolve(config_path, prefix)
-    mappings = config.mappings
-
-    if files:
-        resolved_mappings: list[Mapping] = []
-        for f in files:
-            m = resolve_mapping_for_path(mappings, f)
-            if m is not None and not any(m is existing for existing in resolved_mappings):
-                resolved_mappings.append(m)
-        mappings = resolved_mappings
-        if not mappings:
-            err_console.print(f"No mappings found for: {files}")
-            raise typer.Exit(1)
+    mappings = _resolve_files_or_exit(config.mappings, files)
 
     if not mappings:
         err_console.print("No mappings configured.")
@@ -672,13 +675,20 @@ def pull(
             assert migration_result.new_mapping is not None
             mapping = migration_result.new_mapping
 
+        backend = _get_backend(mapping.backend, config, config_path)
+
         if dry_run:
-            console.print(
-                f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local}"
-            )
+            if mapping.remote_id is None:
+                console.print(
+                    f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local}"
+                )
+                continue
+            preview = preview_pull(mapping, backend, state, state_dir)
+            _render_pull_preview(mapping, preview)
+            if preview.action == "error":
+                had_error = True
             continue
 
-        backend = _get_backend(mapping.backend, config, config_path)
         outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
 
         if outcome.action == "up-to-date":
@@ -723,6 +733,115 @@ def pull(
         raise typer.Exit(1)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# sync command
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sync_pull_step(
+    mapping: Mapping, backend: Backend, state: SyncState, state_dir: str, state_path: str
+) -> Literal["ok", "error", "needs-resolve"]:
+    """`sync`'s pull half: run a real pull and render it, like `pull` does.
+
+    Returns "needs-resolve" when the merge left conflicts a push must not
+    run over, "error" on a pull failure, "ok" otherwise (including
+    no-remote-doc-yet, which is just skipped).
+    """
+    if mapping.remote_id is None:
+        console.print(f"[dim]Skipping {mapping.local} (no remote doc yet)[/dim]")
+        return "ok"
+
+    outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+    if outcome.action == "up-to-date":
+        console.print(f"[dim]up to date[/dim]  {mapping.local}")
+        return "ok"
+    if outcome.action == "local-only":
+        console.print(f"[dim]{mapping.local} has local changes, nothing new to pull[/dim]")
+        return "ok"
+    if outcome.action == "merged":
+        console.print(f"[yellow]merging[/yellow]  {mapping.local}")
+        if outcome.has_conflicts:
+            console.print(
+                f"   [yellow]Merge conflicts ({outcome.conflict_count}) written to "
+                f"{mapping.local}. Resolve with: docspan conflicts resolve {mapping.local}[/yellow]"
+            )
+            return "needs-resolve"
+        console.print("   [green]Merged cleanly.[/green]")
+        return "ok"
+    if outcome.action == "error":
+        err_console.print(
+            f"✗  {mapping.remote_id} → {mapping.local}: "
+            f"{outcome.result.message if outcome.result else 'unknown error'}"
+        )
+        return "error"
+
+    console.print(f"[green]✓[/green]  {mapping.remote_id} → {mapping.local} ({outcome.action})")
+    return "ok"
+
+
+@app.command()
+def sync(
+    files: Optional[list[str]] = typer.Argument(
+        None, help="Local markdown files to sync (default: all mappings)"
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+    force: bool = typer.Option(
+        False, "--force", help="Proceed with a push even if push() flags a comment-risk paragraph"
+    ),
+) -> None:
+    """Pull then push each mapping — the safe default order.
+
+    Stops short of pushing a mapping whose pull left unresolved merge
+    conflicts (run `docspan conflicts resolve` first); everything else —
+    up to date, fast-forwarded, or cleanly merged — gets pushed
+    automatically. Exits non-zero if anything still needs resolving.
+    """
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+    mappings = config.mappings
+    mappings_to_sync = _resolve_files_or_exit(mappings, files)
+
+    if not mappings_to_sync:
+        err_console.print("No mappings configured. Add entries to markgate.yaml.")
+        raise typer.Exit(1)
+
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+
+    had_error = False
+    cross_doc_cache: dict = {}
+    for mapping in mappings_to_sync:
+        backend = _get_backend(mapping.backend, config, config_path)
+
+        if mapping.direction != "push":
+            pull_status = _sync_pull_step(mapping, backend, state, state_dir, state_path)
+            if pull_status == "error":
+                had_error = True
+                continue
+            if pull_status == "needs-resolve":
+                had_error = True
+                continue
+
+        if mapping.direction == "pull":
+            continue
+
+        push_outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+            cross_doc_cache=cross_doc_cache,
+        )
+        result = push_outcome.result
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
+        if result.status in ("error", "blocked", "conflict", "warning"):
+            had_error = True
+
+    if had_error:
+        raise typer.Exit(1)
+
+
 def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Mapping]:
     """Find the mapping that owns `file` (Specification pattern).
 
@@ -742,6 +861,26 @@ def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Map
         elif norm_file == norm_local or norm_file.startswith(norm_local + os.sep):
             return m
     return None
+
+
+def _resolve_files_or_exit(mappings: list[Mapping], files: Optional[list[str]]) -> list[Mapping]:
+    """Narrow `mappings` to the ones owning `files`, or exit(1) if none match.
+
+    Shared by push/pull/sync's `files` argument handling — all three resolve
+    the same way and all three should fail the same way when a given path
+    doesn't own any mapping.
+    """
+    if not files:
+        return mappings
+    resolved: list[Mapping] = []
+    for f in files:
+        m = resolve_mapping_for_path(mappings, f)
+        if m is not None and not any(m is existing for existing in resolved):
+            resolved.append(m)
+    if not resolved:
+        err_console.print(f"No mappings found for: {files}")
+        raise typer.Exit(1)
+    return resolved
 
 
 _H1_PATTERN = re.compile(r"^#[ \t]+(\S.*?)\s*$", re.MULTILINE)

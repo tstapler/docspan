@@ -77,6 +77,29 @@ def test_insert_appended_paragraph() -> None:
     assert any("insertText" in r for r in requests)
 
 
+def test_inserted_body_paragraph_gets_visual_spacing() -> None:
+    """Issue #131: an inserted NORMAL_TEXT paragraph with no spaceBelow
+    renders back-to-back with the next one — a fresh insert must set it."""
+    current: list = []
+    target = [_para("New paragraph")]
+    requests = builder.build(current, target, DOC_END)
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert style_requests
+    style = style_requests[0]["updateParagraphStyle"]
+    assert style["paragraphStyle"]["spaceBelow"] == {"magnitude": 10, "unit": "PT"}
+    assert "spaceBelow" in style["fields"]
+
+
+def test_inserted_list_item_gets_no_visual_spacing() -> None:
+    """Consecutive bullets should sit tight, unlike body paragraphs."""
+    current: list = []
+    target = [_para("Item one", is_list_item=True)]
+    requests = builder.build(current, target, DOC_END)
+    style_requests = [r for r in requests if "updateParagraphStyle" in r]
+    assert style_requests
+    assert "spaceBelow" not in style_requests[0]["updateParagraphStyle"]["paragraphStyle"]
+
+
 def test_mid_document_insert_does_not_merge_into_previous_paragraph() -> None:
     """Regression: inserting a new paragraph between two unchanged paragraphs
     used to target current[i1 - 1].end_index - 1 — the index of the PREVIOUS

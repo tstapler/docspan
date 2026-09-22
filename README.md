@@ -176,6 +176,14 @@ docspan pull [FILES]... [--dry-run] [--config PATH]
 
 Pull remote documents into local markdown files with three-way merge. Writes conflict markers to the file if automatic merge fails. For Google Docs, also writes a `{file}.comments.md` sidecar of the doc's comments (open + resolved, with quoted selections and reply threads) unless `pull_comments: false`.
 
+### `docspan sync`
+
+```
+docspan sync [FILES]... [--force] [--config PATH]
+```
+
+Pull then push each mapping, in that order — the safe default when you don't remember (or don't want to think about) which direction to run first. Stops short of pushing a mapping whose pull left unresolved merge conflicts; everything else (up to date, fast-forwarded, or cleanly merged) gets pushed automatically. Exits non-zero if anything still needs `docspan conflicts resolve`.
+
 ### `docspan status`
 
 ```

@@ -7,6 +7,7 @@ import pytest
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsStructureParser,
     DocsTableNode,
+    ParagraphStyle,
 )
 
 
@@ -102,6 +103,23 @@ def test_normal_text_style() -> None:
     doc = _doc_with_content([_make_para_element("Body", style="NORMAL_TEXT", start=1, end=6)])
     nodes = parser.parse(doc)
     assert nodes[0].style == "NORMAL_TEXT"
+
+
+def test_parsed_style_is_a_paragraph_style_enum_member() -> None:
+    """`.style` is `ParagraphStyle`, not a bare `str` — see type-driven-design."""
+    doc = _doc_with_content([_make_para_element("Title", style="HEADING_2", start=1, end=7)])
+    nodes = parser.parse(doc)
+    assert nodes[0].style is ParagraphStyle.HEADING_2
+
+
+def test_unrecognized_named_style_type_falls_back_to_normal_text() -> None:
+    """A live-API value outside our known set degrades rather than raising —
+    see `parse_paragraph_style`'s docstring."""
+    doc = _doc_with_content(
+        [_make_para_element("Body", style="SOME_FUTURE_STYLE_TYPE", start=1, end=6)]
+    )
+    nodes = parser.parse(doc)
+    assert nodes[0].style is ParagraphStyle.NORMAL_TEXT
 
 
 def test_trailing_newline_stripped() -> None:

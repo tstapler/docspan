@@ -30,7 +30,11 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode, TextSpan
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsParagraphNode,
+    ParagraphStyle,
+    TextSpan,
+)
 
 APPENDIX_HEADING = "Appendix: Diagram Sources"
 APPENDIX_CODE_LANG = "text"
@@ -53,7 +57,7 @@ def build_appendix_nodes(entries: List[Tuple[str, str]]) -> List[DocsParagraphNo
 
     nodes: List[DocsParagraphNode] = [
         DocsParagraphNode(
-            style="HEADING_2",
+            style=ParagraphStyle.HEADING_2,
             text=APPENDIX_HEADING,
             start_index=0,
             end_index=0,
@@ -63,7 +67,7 @@ def build_appendix_nodes(entries: List[Tuple[str, str]]) -> List[DocsParagraphNo
     for sha256_hex, diagram in entries:
         nodes.append(
             DocsParagraphNode(
-                style="HEADING_3",
+                style=ParagraphStyle.HEADING_3,
                 text=_entry_heading(sha256_hex),
                 start_index=0,
                 end_index=0,
@@ -72,7 +76,7 @@ def build_appendix_nodes(entries: List[Tuple[str, str]]) -> List[DocsParagraphNo
         )
         nodes.append(
             DocsParagraphNode(
-                style="NORMAL_TEXT",
+                style=ParagraphStyle.NORMAL_TEXT,
                 text=f"{FENCE_MARKER}{APPENDIX_CODE_LANG}",
                 start_index=0,
                 end_index=0,
@@ -82,7 +86,7 @@ def build_appendix_nodes(entries: List[Tuple[str, str]]) -> List[DocsParagraphNo
         for line in diagram.splitlines():
             nodes.append(
                 DocsParagraphNode(
-                    style="NORMAL_TEXT",
+                    style=ParagraphStyle.NORMAL_TEXT,
                     text=line,
                     start_index=0,
                     end_index=0,
@@ -91,7 +95,7 @@ def build_appendix_nodes(entries: List[Tuple[str, str]]) -> List[DocsParagraphNo
             )
         nodes.append(
             DocsParagraphNode(
-                style="NORMAL_TEXT",
+                style=ParagraphStyle.NORMAL_TEXT,
                 text=FENCE_MARKER,
                 start_index=0,
                 end_index=0,
@@ -106,7 +110,7 @@ def find_appendix_boundary(nodes: List) -> Optional[int]:
     for i, node in enumerate(nodes):
         if (
             isinstance(node, DocsParagraphNode)
-            and node.style == "HEADING_2"
+            and node.style == ParagraphStyle.HEADING_2
             and node.text.strip() == APPENDIX_HEADING
         ):
             return i
@@ -129,7 +133,7 @@ def extract_appendix_entries(nodes: List) -> Dict[str, str]:
         node = nodes[i]
         if not (
             isinstance(node, DocsParagraphNode)
-            and node.style == "HEADING_3"
+            and node.style == ParagraphStyle.HEADING_3
             and node.text.startswith("Diagram ")
         ):
             i += 1
