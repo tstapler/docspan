@@ -254,8 +254,15 @@ def describe_target_residue(residue: List[Residue]) -> str:
     it is *left alone* — nothing is lost. Markdown-side residue is content the
     author wrote that push will **not write**, which is a loss and has to say so.
 
-    Reachable since fenced code blocks became one node per line: a blank line
-    inside a block, an empty fence and a blank-only fence all produce `text=""`.
+    The `empty_paragraph` case here used to be reachable for any top-level or
+    list-item blank code line, an empty fence, or a blank-only fence — all of
+    which produced `text=""` once fenced code blocks became one node per
+    line. Issue #127 closed that for current pushes by tagging those blanks
+    with `BLANK_CODE_LINE_MARKER` instead (see
+    `markdown_to_paragraph_parser.py`), so this message is no longer
+    reachable from a fresh markdown parse; kept for a document whose local
+    markdown still holds output from a pre-#127 docspan and for any future
+    target-side node this rule doesn't yet know how to represent.
     """
     parts: List[str] = []
     blanks = sum(1 for r in residue if r.kind == "empty_paragraph")

@@ -101,15 +101,28 @@ def _table_from_html_block(raw: str) -> DocsTableNode:
 # ```lang fence on render.
 FENCE_MARKER = "```"
 
+# A blank line inside a fenced code block used to become `text="", spans=[]`
+# — the exact shape `projection.project()`'s Rule 1 drops as an empty
+# paragraph, since nothing distinguishes it from an ordinary blank markdown
+# separator (issue #127). A zero-width space makes the paragraph genuinely
+# non-empty, so it survives `project()` unprojected on both sides of the
+# diff and gets written to the doc like any other line — invisible when
+# rendered, and translated back to "" by nodes_to_markdown.py's
+# `_is_blank_code_line`/`_render_code_group` on pull. Not a Private-Use-Area
+# codepoint (`docs_structure_parser._PRIVATE_USE` is E000-F900): it must not
+# collide with `_is_all_private_use`'s "paragraph is entirely PUA" residue
+# rule, which would drop it right back out.
+BLANK_CODE_LINE_MARKER = "​"
+
 
 def _extract_text_from_token(token: dict) -> str:
     """Recursively extract plain text from a mistune AST token."""
     if token.get("type") in ("raw", "text", "codespan"):
-        return token.get("raw", "")
+        return cast(str, token.get("raw", ""))
     children = token.get("children")
     if children:
         return "".join(_extract_text_from_token(c) for c in children)
-    return token.get("raw", "")
+    return cast(str, token.get("raw", ""))
 
 
 def _link_url(token: dict) -> str:
@@ -256,7 +269,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
 
 def _nodes_from_code_block(
     token: dict, *, is_list_item: bool = False, nesting_level: int = 0,
-    emit_language_marker: bool = False,
+    emit_language_marker: bool = False, emit_blank_line_marker: bool = True,
 ) -> List[DocsParagraphNode]:
     """One DocsParagraphNode per line of a fenced code block.
 
@@ -286,6 +299,18 @@ def _nodes_from_code_block(
     `is_blockquote=True`/`quote_depth` like every other node
     `_walk_block_quote` tags, which does not affect `_is_language_marker`'s
     checks.
+
+    `emit_blank_line_marker` (issue #127): a blank line inside a fence used
+    to become `text="", spans=[]` unconditionally, which is exactly the
+    shape `projection.project()`'s Rule 1 treats as an empty paragraph and
+    drops from *both* sides of the diff — so push silently never wrote it.
+    Defaults True so a blank interior line of a top-level or list-item fence
+    is instead tagged with `BLANK_CODE_LINE_MARKER`, a non-empty (and
+    invisible) placeholder that survives `project()` unprojected — see its
+    docstring. `_walk_block_quote` passes False: a blockquote's blank code
+    line already survives `project()` via the `is_blockquote` carve-out
+    (Story 2.5), so it keeps the plain empty shape rather than also picking
+    up the marker for no behavioural gain.
     """
     nodes: List[DocsParagraphNode] = []
     if emit_language_marker:
@@ -307,14 +332,24 @@ def _nodes_from_code_block(
     # `_group_code_runs` uses to render an explicit empty fence rather than
     # losing the block or leaving an unterminated marker behind.
     for line in raw.split("\n"):
-        nodes.append(DocsParagraphNode(
-            style=ParagraphStyle.NORMAL_TEXT, text=line, is_list_item=is_list_item,
-            nesting_level=nesting_level, start_index=0, end_index=0,
-            # A blank line inside a block carries no span to style.
-            # projection.project() drops it from *both* sides, so the
-            # diff never sees it and never tries to delete it.
-            spans=[TextSpan(text=line, monospace=True)] if line else [],
-        ))
+        if line:
+            nodes.append(DocsParagraphNode(
+                style=ParagraphStyle.NORMAL_TEXT, text=line, is_list_item=is_list_item,
+                nesting_level=nesting_level, start_index=0, end_index=0,
+                spans=[TextSpan(text=line, monospace=True)],
+            ))
+        elif emit_blank_line_marker:
+            nodes.append(DocsParagraphNode(
+                style=ParagraphStyle.NORMAL_TEXT, text=BLANK_CODE_LINE_MARKER,
+                is_list_item=is_list_item, nesting_level=nesting_level,
+                start_index=0, end_index=0,
+                spans=[TextSpan(text=BLANK_CODE_LINE_MARKER, monospace=True)],
+            ))
+        else:
+            nodes.append(DocsParagraphNode(
+                style=ParagraphStyle.NORMAL_TEXT, text="", is_list_item=is_list_item,
+                nesting_level=nesting_level, start_index=0, end_index=0, spans=[],
+            ))
     return nodes
 
 
@@ -388,7 +423,9 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
             # it.
             nodes.extend(
                 _tagged(n)
-                for n in _nodes_from_code_block(child, emit_language_marker=True)
+                for n in _nodes_from_code_block(
+                    child, emit_language_marker=True, emit_blank_line_marker=False,
+                )
             )
         elif ctype == "block_quote":
             nodes.extend(_walk_block_quote(child, quote_depth + 1))
@@ -501,7 +538,11 @@ class ListTokenConverter(MarkdownTokenConverter):
     token_type = "list"
 
     def convert(self, token: dict) -> List[Node]:
-        return _walk_list_items(token, nesting_level=0)
+        # _walk_list_items only ever builds DocsParagraphNode, but is typed
+        # List[DocsParagraphNode] rather than List[Node] for its own
+        # internal callers (which accumulate into a DocsParagraphNode-typed
+        # list) — cast narrows that back to this method's Node-union contract.
+        return cast(List[Node], _walk_list_items(token, nesting_level=0))
 
 
 class CodeTokenConverter(MarkdownTokenConverter):
@@ -522,7 +563,7 @@ class CodeTokenConverter(MarkdownTokenConverter):
         # a lang-less fence here stays marker-less.
         if _fence_lang(token) == "mermaid":
             return [_mermaid_image_node(token)]
-        return _nodes_from_code_block(token, emit_language_marker=True)
+        return cast(List[Node], _nodes_from_code_block(token, emit_language_marker=True))
 
 
 class TableTokenConverter(MarkdownTokenConverter):
@@ -536,7 +577,7 @@ class BlockQuoteTokenConverter(MarkdownTokenConverter):
     token_type = "block_quote"
 
     def convert(self, token: dict) -> List[Node]:
-        return _walk_block_quote(token)
+        return cast(List[Node], _walk_block_quote(token))
 
 
 class BlankLineTokenConverter(MarkdownTokenConverter):
@@ -601,7 +642,7 @@ class MarkdownToParagraphParser:
 
         nodes: List[Node] = []
         for token in tokens:
-            converter = _PUSH_REGISTRY.get(token.get("type"))
+            converter = _PUSH_REGISTRY.get(cast(str, token.get("type")))
             if converter is None:
                 # thematic_break, html, etc. are silently skipped
                 continue
