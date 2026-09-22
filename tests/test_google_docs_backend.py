@@ -3858,6 +3858,76 @@ class TestRepairDoesNotCrossPairBlockquoteAndPlainParagraph:
         assert by_target_start[1][:3] == ("equal", 0, 1)
 
 
+def _multi_extraction_fixture():
+    """A "replace" block losing two non-adjacent target indices in one call.
+
+    current[0]/current[1] are standalone "delete" slots ("Dup1"/"Dup2") that
+    each claim one index out of the "replace" range [0, 5); "Mid"/"Keep4" are
+    what's left, both anchored at the replace's current end (4).
+    """
+    from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+    current = [
+        DocsParagraphNode(style="NORMAL_TEXT", text="Dup1"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Dup2"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Rep1"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Rep2"),
+    ]
+    target = [
+        DocsParagraphNode(style="NORMAL_TEXT", text="Keep0"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Dup1"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Mid"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Dup2"),
+        DocsParagraphNode(style="NORMAL_TEXT", text="Keep4"),
+    ]
+    pending = [
+        ("delete", 0, 1, 0, 0),
+        ("delete", 1, 2, 0, 0),
+        ("replace", 2, 4, 0, 5),
+    ]
+    return current, target, pending
+
+
+class TestPreferStructuralPairingTargetSideMultiExtractionOrder:
+    """Issue #119: a `replace` losing 2+ non-adjacent target indices in one
+    `_prefer_structural_pairing_target_side` call produces that many "extra"
+    standalone `insert` opcodes, all anchored at the same current index (see
+    that method's docstring). Locks today's actual relative order between
+    them rather than leaving it merely documented-as-unverified.
+    """
+
+    def test__prefer_structural_pairing_target_side_should_KeepExtraInsertsInTargetOrder_When_ReplaceLosesTwoNonAdjacentIndices(  # noqa: E501
+        self,
+    ) -> None:
+        from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+
+        builder = DocsRequestBuilder()
+        current, target, pending = _multi_extraction_fixture()
+
+        result = builder._prefer_structural_pairing_target_side(pending, current, target)
+
+        extra_inserts = [op for op in result if op[0] == "insert"]
+        assert len(extra_inserts) == 2, f"expected exactly 2 extra inserts: {result}"
+        assert {op[1] for op in extra_inserts} == {4}, (
+            f"extra inserts must share the replace's current end: {result}"
+        )
+        # Today's actual order, straight out of this method: ascending by
+        # target index ("Mid" at index 2 before "Keep4" at index 4).
+        assert [op[3] for op in extra_inserts] == [2, 4], f"extra-insert order regressed: {result}"
+
+        # What `_opcodes()` (caller) does next — sort everything by
+        # (current_start, target_start) — is what actually fixes the two
+        # same-anchor extra inserts' relative order for `build()`'s own
+        # stable tie-break; this method's own output order alone does not
+        # guarantee it. Locking that final order too, so a change to either
+        # this method or that sort key trips a test.
+        final_order = sorted(result, key=lambda op: (op[1], op[3]))
+        final_inserts = [op for op in final_order if op[0] == "insert"]
+        assert [op[3] for op in final_inserts] == [2, 4], (
+            f"final target-order guarantee regressed: {final_order}"
+        )
+
+
 class TestProjectionBlockquoteBlankLineCarveOut:
     """Story 2.5: `project()`'s blank-paragraph-drop rule must not drop an
     empty blockquote line — `MarkdownToParagraphParser` now emits a real,
