@@ -3862,10 +3862,8 @@ def _multi_extraction_fixture():
     """A "replace" block losing two non-adjacent target indices in one call.
 
     current[0]/current[1] are standalone "delete" slots ("Dup1"/"Dup2") that
-    each claim one index out of the "replace" block's target range [0, 5),
-    leaving that range's *other* two indices ("Mid", "Keep4") to become the
-    "extra" inserts issue #119 is about — both anchored at the same current
-    index (the replace's current end, 4).
+    each claim one index out of the "replace" range [0, 5); "Mid"/"Keep4" are
+    what's left, both anchored at the replace's current end (4).
     """
     from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
 
