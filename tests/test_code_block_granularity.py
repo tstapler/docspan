@@ -389,6 +389,58 @@ class TestBlankLineInsideFence:
         assert "```sh\none\n\ntwo\n```" in md_out
         assert BLANK_CODE_LINE_MARKER not in md_out
 
+    def test_an_empty_top_level_fence_survives_push_and_pull(self) -> None:
+        """The empty-fence shape (`raw == ""`) is also tagged with the
+        marker now (`emit_blank_line_marker` defaults True), which is a
+        second, previously-untested behaviour change from #127's fix: an
+        empty fence used to become the same dropped `text=""` residue as an
+        interior blank line. Pins that it still round-trips clean rather
+        than rendering an extra blank line inside the fence or losing it.
+        """
+        target, target_residue = project(markdown.parse("```sh\n```\n"))
+
+        assert target_residue == []
+        assert [n.text for n in target] == ["```sh", BLANK_CODE_LINE_MARKER]
+
+        md_out = render_nodes_to_markdown(markdown.parse("```sh\n```\n"))
+        assert "```sh\n```" in md_out
+        assert BLANK_CODE_LINE_MARKER not in md_out
+
+    def test_pushing_a_document_holding_the_legacy_blank_code_line_shape_still_converges(
+        self,
+    ) -> None:
+        """Backward compatibility: a document pushed by pre-#127 docspan can
+        still hold a top-level blank code line as the old `text="",
+        spans=[]` shape (that push never wrote the marker). `_node_key`
+        includes text, so the live doc's node no longer matches the
+        newly-parsed target's `BLANK_CODE_LINE_MARKER` node byte-for-byte —
+        this pins that the diff still converges on a plain one-line
+        replace of just the blank line, not something that also touches
+        the surrounding `one`/`two` code lines.
+        """
+        md = "```sh\none\n\ntwo\n```\n"
+        doc, end = _doc_of_lines("```sh", "one", "", "two")
+
+        target, target_residue = project(markdown.parse(md))
+        current, current_residue = project(structure.parse(doc))
+
+        assert target_residue == []
+        # The live doc's legacy-shape blank line is an ordinary empty
+        # paragraph to Rule 1 (nothing marks it as belonging to a code
+        # block), so it's doc-side residue — left alone, not an error. It's
+        # exactly this drop from `current`'s `kept` list that the assertion
+        # below depends on: `current` now has one fewer node than `target`.
+        assert [r.kind for r in current_residue] == ["empty_paragraph"]
+
+        requests = builder.build(current, target, end)
+        assert requests, "the legacy shape must not be silently accepted as already-equal"
+        touched_texts = {
+            request["insertText"]["text"].strip("\n")
+            for request in requests
+            if "insertText" in request
+        }
+        assert touched_texts == {BLANK_CODE_LINE_MARKER}
+
 
 class TestPushIsIdempotent:
     def test_an_unchanged_document_with_a_code_block_emits_no_requests(self) -> None:

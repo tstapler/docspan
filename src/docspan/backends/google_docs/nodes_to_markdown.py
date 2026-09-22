@@ -34,6 +34,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     TableCell,
     TextSpan,
 )
+from docspan.backends.google_docs.markdown_to_paragraph_parser import BLANK_CODE_LINE_MARKER
 from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
 
 Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
@@ -48,14 +49,6 @@ FENCE_MARKER = "```"
 # backtick-in-language fallback) — a bare paragraph starting with either
 # fence character must be escaped the same way.
 TILDE_FENCE_MARKER = "~~~"
-
-# The zero-width-space placeholder MarkdownToParagraphParser writes for a
-# blank line inside a top-level or list-item fence (issue #127), so the
-# paragraph is non-empty and survives projection.project() unprojected. Must
-# stay in sync with markdown_to_paragraph_parser.py's BLANK_CODE_LINE_MARKER.
-# `_is_blank_code_line` also still recognises the older `text="", spans=[]`
-# shape a blockquote's blank code line keeps (see that function's docstring).
-BLANK_CODE_LINE_MARKER = "​"
 
 
 def _run_of_char(text: str, target: str) -> int:

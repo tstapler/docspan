@@ -111,7 +111,13 @@ FENCE_MARKER = "```"
 # `_is_blank_code_line`/`_render_code_group` on pull. Not a Private-Use-Area
 # codepoint (`docs_structure_parser._PRIVATE_USE` is E000-F900): it must not
 # collide with `_is_all_private_use`'s "paragraph is entirely PUA" residue
-# rule, which would drop it right back out.
+# rule, which would drop it right back out. A boolean field on
+# DocsParagraphNode (the way is_blockquote/render_prefix mark other special
+# paragraphs) would not survive a pull: DocsStructureParser.parse() rebuilds
+# every node fresh from the live doc's JSON each time, and Docs has nothing
+# there to read such a field back from once the paragraph's real content and
+# styling are empty — only content that Docs itself persists (like this
+# character) round-trips.
 BLANK_CODE_LINE_MARKER = "​"
 
 
