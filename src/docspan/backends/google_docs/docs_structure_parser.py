@@ -14,16 +14,8 @@ from docspan.backends.google_docs.heading_anchors import (
 
 class ParagraphStyle(str, Enum):
     """Google Docs `paragraphStyle.namedStyleType` — the complete set the API
-    itself supports (`NORMAL_TEXT`/`TITLE`/`SUBTITLE`/`HEADING_1..6`), so a
-    match/if-chain over this type can be exhaustive rather than needing a
-    string fallback branch for values that only exist because of a typo.
-
-    A `str` subclass on purpose: `node.style == "NORMAL_TEXT"` and
-    `{"namedStyleType": node.style}` (the literal request payload
-    DocsRequestBuilder sends back to the API) both keep working unchanged.
-    `__str__` is overridden because plain `class X(str, Enum)` prints
-    `"ParagraphStyle.NORMAL_TEXT"` on Python < 3.11 (fixed upstream by
-    `enum.StrEnum`, unavailable here — this repo's floor is 3.9).
+    supports. `str` subclass so comparisons and the raw API request payload
+    keep working unchanged; `enum.StrEnum` is unavailable (repo floor is 3.9).
     """
     NORMAL_TEXT = "NORMAL_TEXT"
     TITLE = "TITLE"

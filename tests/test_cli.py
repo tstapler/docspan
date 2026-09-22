@@ -39,6 +39,14 @@ class FakeBackend(Backend):
     remote_version: str = "v1"
     push_status: str = "ok"
     pull_status: str = "ok"
+    # None (the default) preserves every existing test's behavior — pull()
+    # leaves local_path untouched, exactly as before this field existed.
+    # Set explicitly by tests that need pull() to behave like a real
+    # backend and actually write the remote's content (e.g. a preview_pull
+    # merge test, where reading back an untouched empty temp file would
+    # make the three-way merge it exercises trivially pass regardless of
+    # what "the remote" is supposed to contain).
+    remote_content: Optional[str] = None
     auth_setup_called: bool = False
     push_calls: list = field(default_factory=list)
 
@@ -47,6 +55,9 @@ class FakeBackend(Backend):
         return PushResult(status=self.push_status, doc_id=doc_id, url="https://example.com/doc")  # type: ignore[arg-type]
 
     def pull(self, doc_id: str, local_path: str, **kwargs) -> PullResult:
+        if self.remote_content is not None:
+            with open(local_path, "w", encoding="utf-8") as fh:
+                fh.write(self.remote_content)
         return PullResult(status=self.pull_status, doc_id=doc_id, local_path=local_path)  # type: ignore[arg-type]
 
     def get_remote_version(self, doc_id: str) -> str:
@@ -1001,7 +1012,14 @@ class TestPull:
 
     def test_dry_run_reports_would_merge_without_writing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         """Both sides changed: --dry-run reports a real conflict count from
-        an actual three-way merge, but never writes it to the local file."""
+        an actual three-way merge, but never writes it to the local file.
+
+        `remote_content` is set (and differs from both the empty merge base
+        and the local edit) so the merge FakeBackend.pull feeds into is a
+        genuine three-way merge against real "theirs" content, not a merge
+        against an untouched empty temp file — which would pass regardless
+        of what the classification logic actually computed.
+        """
         local = tmp_path / "doc.md"
         local.write_text("local change\n", encoding="utf-8")
         cfg = _cfg_file(tmp_path)
@@ -1010,12 +1028,14 @@ class TestPull:
             doc_id="doc-123", backend="fake", last_synced_at="2026-01-01T00:00:00Z",
             local_hash=sha256_of_content("base\n"), remote_version="v1", base_hash="base",
         )
+        backend = FakeBackend(remote_version="v2", remote_content="remote change\n")
         with patch("docspan.cli.main.load_config", return_value=_config(mapping)), \
-             patch("docspan.cli.main._get_backend", return_value=FakeBackend(remote_version="v2")), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
              patch("docspan.cli.main._load_state", return_value=_state_with(str(local), state_entry)):
             result = runner.invoke(app, ["pull", "--dry-run", "--config", cfg])
         assert result.exit_code == 0
         assert "would merge" in result.output
+        assert "1 conflicts" in result.output
         assert local.read_text(encoding="utf-8") == "local change\n"
 
     def test_push_only_mapping_is_skipped(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
