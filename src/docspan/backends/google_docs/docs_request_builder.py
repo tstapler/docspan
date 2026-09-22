@@ -56,13 +56,9 @@ _MIN_SIZE_FOR_DUPLICATE_CHECK = 150
 # so a code-rendered candidate always outranks a merely structurally-similar one.
 _CODE_LINE_PREFERENCE_BONUS = 100
 
-# How far a pulled image's stored size may drift from the freshly computed
-# target size before it counts as "changed". insertInlineImage's own API
-# contract only scales an image to fit within the requested bounds while
-# preserving aspect ratio, not to that exact magnitude, so the Docs API is
-# not guaranteed to echo back byte-identical floats for a size this code
-# itself requested — an exact `!=` here would re-resize (and report
-# "changed" in --dry-run) an unchanged diagram on every single push.
+# insertInlineImage only scales "to fit," not to an exact magnitude, so by
+# analogy the Docs API may not echo back byte-identical floats for a size
+# this code itself requested. An exact `!=` would re-resize on every push.
 _IMAGE_SIZE_TOLERANCE_PT = 0.5
 
 
@@ -3123,26 +3119,22 @@ class DocsRequestBuilder:
     def _make_image_resize_requests(
         current_node: DocsImageNode, target_node: DocsImageNode
     ) -> List[dict]:
-        """Resize an already-inserted image in place, keyed by its inlineObjectId.
+        """Resize an already-inserted image via updateInlineObjectProperties.
 
-        `current_node.object_id` is only set on a node parsed from a live
-        document (Docs assigns it on insert; see DocsImageNode's docstring),
-        so a target/push-side node never has one and this is a no-op unless
-        `current_node` is a real pulled node. This is what makes a re-pushed
-        mermaid diagram's size self-correct instead of being silently
-        swallowed forever: `_content_key` matches on `alt` alone, so
-        `_repair` folds a same-diagram, different-size pair to "equal" before
-        this ever runs, and updateInlineObjectProperties resizes the
-        existing embedded object without touching its paragraph or
-        inlineObjectId — unlike a delete-and-reinsert, which recreates the
-        object and risks orphaning a comment anchored to it, this leaves
-        both anchor points untouched.
+        Unlike a delete-and-reinsert, this doesn't recreate the object, so it
+        can't orphan a comment anchored to it. No-op unless `current_node` has
+        a real `object_id` (only set on a node parsed from a live document —
+        see DocsImageNode's docstring), since a target/push-side node never
+        has one.
         """
         if not current_node.object_id:
             return []
-        if target_node.width_pt is None or target_node.height_pt is None:
-            return []
         if not DocsRequestBuilder._image_size_differs(current_node, target_node):
+            return []
+        # _image_size_differs already returns False when either target
+        # dimension is None, so this can't fire here — it exists only to
+        # narrow Optional for the dict literal below.
+        if target_node.width_pt is None or target_node.height_pt is None:
             return []
         return [{
             "updateInlineObjectProperties": {

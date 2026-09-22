@@ -447,6 +447,33 @@ def test_resize_fires_just_past_the_roundtrip_tolerance() -> None:
     assert "updateInlineObjectProperties" in requests[0]
 
 
+def test_resize_fires_when_pulled_node_has_partial_size() -> None:
+    """A pulled node with only one dimension set (a partial `size` from the
+    Docs API -- width_pt/height_pt are independently Optional) can't be
+    verified as matching the target, so it's treated as differing and
+    resized -- a deliberate choice, not the crash the deleted
+    _stale_mermaid_size_warnings once had to guard against for this same
+    partial-size shape."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=100.0,
+        height_pt=None,
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert len(requests) == 1
+    assert "updateInlineObjectProperties" in requests[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # mermaid_renderer.py command construction
 # ─────────────────────────────────────────────────────────────────────────────

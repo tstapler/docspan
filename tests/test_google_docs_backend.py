@@ -1246,6 +1246,12 @@ class TestMermaidRetroactiveResize:
         # In-place resize only -- the diagram is not deleted and reinserted,
         # so any comment anchored to it survives.
         assert not any("insertInlineImage" in r for r in plan.requests)
+        # _restyles is the single predicate diff_summary and the actual write
+        # share -- assert --dry-run's plan.entries agrees a resize is coming,
+        # not just that build() emits the request.
+        assert any(
+            e.kind == "change" and alt in (e.current_text or "") for e in plan.entries
+        )
         assert not any("deleteContentRange" in r for r in plan.requests)
 
     def test_resize_request_does_not_fire_when_sizes_match(
