@@ -56,6 +56,15 @@ _MIN_SIZE_FOR_DUPLICATE_CHECK = 150
 # so a code-rendered candidate always outranks a merely structurally-similar one.
 _CODE_LINE_PREFERENCE_BONUS = 100
 
+# How far a pulled image's stored size may drift from the freshly computed
+# target size before it counts as "changed". insertInlineImage's own API
+# contract only scales an image to fit within the requested bounds while
+# preserving aspect ratio, not to that exact magnitude, so the Docs API is
+# not guaranteed to echo back byte-identical floats for a size this code
+# itself requested — an exact `!=` here would re-resize (and report
+# "changed" in --dry-run) an unchanged diagram on every single push.
+_IMAGE_SIZE_TOLERANCE_PT = 0.5
+
 
 class DiffTooExpensive(Exception):
     """Raised instead of running SequenceMatcher on pathological duplicate-heavy input.
@@ -3063,6 +3072,25 @@ class DocsRequestBuilder:
         return style, ["indentStart", "borderLeft"]
 
     @staticmethod
+    def _image_size_differs(current_node: DocsImageNode, target_node: DocsImageNode) -> bool:
+        """Whether two same-`alt` images differ enough in size to need a resize.
+
+        Tolerance-gated by `_IMAGE_SIZE_TOLERANCE_PT` rather than exact `!=` —
+        see that constant's docstring for why an exact comparison against a
+        Docs-API-echoed value is unsafe. Shared by `_restyles` (so
+        diff_summary/--dry-run reports a change) and
+        `_make_image_resize_requests` (so the actual write agrees).
+        """
+        if target_node.width_pt is None or target_node.height_pt is None:
+            return False
+        if current_node.width_pt is None or current_node.height_pt is None:
+            return True
+        return (
+            abs(current_node.width_pt - target_node.width_pt) > _IMAGE_SIZE_TOLERANCE_PT
+            or abs(current_node.height_pt - target_node.height_pt) > _IMAGE_SIZE_TOLERANCE_PT
+        )
+
+    @staticmethod
     def _restyles(current_node: Node, target_node: Node) -> bool:
         """Whether two same-text nodes differ in a paragraph attribute.
 
@@ -3072,10 +3100,7 @@ class DocsRequestBuilder:
         whether anything is happening.
         """
         if isinstance(current_node, DocsImageNode) and isinstance(target_node, DocsImageNode):
-            return (
-                current_node.width_pt != target_node.width_pt
-                or current_node.height_pt != target_node.height_pt
-            )
+            return DocsRequestBuilder._image_size_differs(current_node, target_node)
         if (
             isinstance(current_node, (DocsTableNode, DocsImageNode))
             or isinstance(target_node, (DocsTableNode, DocsImageNode))
@@ -3109,17 +3134,15 @@ class DocsRequestBuilder:
         `_repair` folds a same-diagram, different-size pair to "equal" before
         this ever runs, and updateInlineObjectProperties resizes the
         existing embedded object without touching its paragraph or
-        inlineObjectId — unlike a delete-and-reinsert, this can't destroy a
-        comment anchored to the image.
+        inlineObjectId — unlike a delete-and-reinsert, which recreates the
+        object and risks orphaning a comment anchored to it, this leaves
+        both anchor points untouched.
         """
         if not current_node.object_id:
             return []
         if target_node.width_pt is None or target_node.height_pt is None:
             return []
-        if (
-            current_node.width_pt == target_node.width_pt
-            and current_node.height_pt == target_node.height_pt
-        ):
+        if not DocsRequestBuilder._image_size_differs(current_node, target_node):
             return []
         return [{
             "updateInlineObjectProperties": {

@@ -399,6 +399,54 @@ def test_repush_of_already_sized_mermaid_image_with_object_id_resizes_in_place()
     }]
 
 
+def test_resize_does_not_fire_within_tolerance_of_a_docs_api_roundtrip() -> None:
+    """The Docs API is not guaranteed to echo back a byte-identical magnitude
+    for a size this code itself requested (insertInlineImage's own contract
+    is "scaled to fit within", not "set to exactly") -- so a sub-tolerance
+    drift between a pulled size and the freshly computed target must not
+    re-resize an otherwise-unchanged diagram on every push."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=468.0,
+        height_pt=233.6,  # 0.4pt under target -- within _IMAGE_SIZE_TOLERANCE_PT
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert requests == []
+
+
+def test_resize_fires_just_past_the_roundtrip_tolerance() -> None:
+    """A step above the tolerance boundary is a real size difference, not
+    API-echo noise, and must still resize."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=468.0,
+        height_pt=233.49,  # 0.51pt under target -- past _IMAGE_SIZE_TOLERANCE_PT
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert len(requests) == 1
+    assert "updateInlineObjectProperties" in requests[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # mermaid_renderer.py command construction
 # ─────────────────────────────────────────────────────────────────────────────
