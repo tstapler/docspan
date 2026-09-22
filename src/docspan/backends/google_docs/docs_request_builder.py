@@ -3071,6 +3071,11 @@ class DocsRequestBuilder:
         definition is what stops the preview and the write from disagreeing about
         whether anything is happening.
         """
+        if isinstance(current_node, DocsImageNode) and isinstance(target_node, DocsImageNode):
+            return (
+                current_node.width_pt != target_node.width_pt
+                or current_node.height_pt != target_node.height_pt
+            )
         if (
             isinstance(current_node, (DocsTableNode, DocsImageNode))
             or isinstance(target_node, (DocsTableNode, DocsImageNode))
@@ -3088,6 +3093,48 @@ class DocsRequestBuilder:
             or current_node.is_blockquote != target_node.is_blockquote
             or current_node.quote_depth != target_node.quote_depth
         )
+
+    @staticmethod
+    def _make_image_resize_requests(
+        current_node: DocsImageNode, target_node: DocsImageNode
+    ) -> List[dict]:
+        """Resize an already-inserted image in place, keyed by its inlineObjectId.
+
+        `current_node.object_id` is only set on a node parsed from a live
+        document (Docs assigns it on insert; see DocsImageNode's docstring),
+        so a target/push-side node never has one and this is a no-op unless
+        `current_node` is a real pulled node. This is what makes a re-pushed
+        mermaid diagram's size self-correct instead of being silently
+        swallowed forever: `_content_key` matches on `alt` alone, so
+        `_repair` folds a same-diagram, different-size pair to "equal" before
+        this ever runs, and updateInlineObjectProperties resizes the
+        existing embedded object without touching its paragraph or
+        inlineObjectId — unlike a delete-and-reinsert, this can't destroy a
+        comment anchored to the image.
+        """
+        if not current_node.object_id:
+            return []
+        if target_node.width_pt is None or target_node.height_pt is None:
+            return []
+        if (
+            current_node.width_pt == target_node.width_pt
+            and current_node.height_pt == target_node.height_pt
+        ):
+            return []
+        return [{
+            "updateInlineObjectProperties": {
+                "objectId": current_node.object_id,
+                "inlineObjectProperties": {
+                    "embeddedObject": {
+                        "size": {
+                            "height": {"magnitude": target_node.height_pt, "unit": "PT"},
+                            "width": {"magnitude": target_node.width_pt, "unit": "PT"},
+                        }
+                    }
+                },
+                "fields": "embeddedObject.size",
+            }
+        }]
 
     def _make_style_update_requests(self, current_node: Node, target_node: Node) -> List[dict]:
         """Restyle a paragraph in place — same text, different paragraph attributes.
@@ -3111,6 +3158,8 @@ class DocsRequestBuilder:
         Changing nesting is a text edit, and it stays a known gap rather than a
         no-op dressed up as a fix.
         """
+        if isinstance(current_node, DocsImageNode) and isinstance(target_node, DocsImageNode):
+            return self._make_image_resize_requests(current_node, target_node)
         if (
             isinstance(current_node, (DocsTableNode, DocsImageNode))
             or isinstance(target_node, (DocsTableNode, DocsImageNode))

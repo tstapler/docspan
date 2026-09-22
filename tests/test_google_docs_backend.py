@@ -1151,13 +1151,14 @@ class TestMixedImageResolutionOutcomes:
         fake_client.upload_temp_image.assert_called_once()
 
 
-class TestStaleMermaidSizeWarning:
-    """Task 1.1.3c (Story 1.1.3's 5th acceptance criterion / pre-mortem.md
-    Failure #5): re-pushing a doc whose pulled mermaid image size differs
-    from what this feature would now compute must surface a push warning,
-    even though the diff engine still safely no-ops the actual resize
-    (Story 1.3.3's `_content_key() == (alt,)` fold-to-unchanged behavior;
-    this warning is additive, not a change to that no-op)."""
+class TestMermaidRetroactiveResize:
+    """Issue #134: re-pushing a doc whose pulled mermaid image size differs
+    from what this feature would now compute must actually resize it, via
+    an `updateInlineObjectProperties` request keyed on the pulled node's
+    `inlineObjectId` -- not silently swallow the size the way the old
+    `_content_key() == (alt,)` fold-to-unchanged behavior used to
+    (superseded known limitation from the original mermaid-diagram-sizing
+    feature)."""
 
     @staticmethod
     def _minimal_png(width: int, height: int) -> bytes:
@@ -1201,49 +1202,7 @@ class TestStaleMermaidSizeWarning:
             },
         }
 
-    def test_stale_mermaid_size_warnings_ignores_pulled_node_with_partial_size(self) -> None:
-        """Regression for a real bug caught in sdd:6-verify Layer 1 review: the
-        original inline dict comprehension only checked `width_pt is not None`,
-        so a pulled node with width_pt set but height_pt None (a partial `size`
-        from the Docs API -- both fields are independently Optional) raised
-        `TypeError` on `abs(old_h - resolved.height_pt)`. Calling the extracted
-        pure function directly (not through the full _build_push_plan
-        round-trip) is exactly the isolated-unit-test coverage the architecture
-        review asked for."""
-        from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
-
-        pulled = DocsImageNode(alt="mermaid diagram abc123", width_pt=100.0, height_pt=None)
-        resolved = DocsImageNode(
-            alt="mermaid diagram abc123",
-            mermaid_source="graph TD; A-->B;",
-            width_pt=468.0,
-            height_pt=234.0,
-        )
-
-        warnings = GoogleDocsBackend._stale_mermaid_size_warnings([resolved], [pulled])
-
-        assert warnings == []
-
-    def test_stale_mermaid_size_warnings_does_not_fire_exactly_at_tolerance_boundary(self) -> None:
-        """_STALE_SIZE_TOLERANCE_PT's check is a strict `>`, not `>=` -- a
-        mismatch of exactly 0.5pt (float rounding noise, not a real stale
-        size) must not warn, while 0.51pt (a step above) must."""
-        from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
-
-        resolved = DocsImageNode(
-            alt="mermaid diagram abc123",
-            mermaid_source="graph TD; A-->B;",
-            width_pt=468.0,
-            height_pt=234.0,
-        )
-
-        at_boundary = DocsImageNode(alt="mermaid diagram abc123", width_pt=467.5, height_pt=234.0)
-        assert GoogleDocsBackend._stale_mermaid_size_warnings([resolved], [at_boundary]) == []
-
-        past_boundary = DocsImageNode(alt="mermaid diagram abc123", width_pt=467.49, height_pt=234.0)
-        assert len(GoogleDocsBackend._stale_mermaid_size_warnings([resolved], [past_boundary])) == 1
-
-    def test_stale_mermaid_size_warning_fires_on_size_mismatch(
+    def test_resize_request_fires_on_size_mismatch(
         self,
         tmp_path,
         monkeypatch,
@@ -1273,12 +1232,23 @@ class TestStaleMermaidSizeWarning:
 
         plan = backend._build_push_plan(str(local), "doc-1")
 
-        assert any("stale" in w and alt in w for w in plan.image_warnings)
-        # Additive only -- Story 1.3.3's no-op fold means this push does not
-        # actually resize the already-pushed diagram.
+        resize_requests = [
+            r["updateInlineObjectProperties"]
+            for r in plan.requests
+            if "updateInlineObjectProperties" in r
+        ]
+        assert len(resize_requests) == 1
+        assert resize_requests[0]["objectId"] == "kix.obj1"
+        assert resize_requests[0]["inlineObjectProperties"]["embeddedObject"]["size"] == {
+            "height": {"magnitude": 234.0, "unit": "PT"},
+            "width": {"magnitude": 468.0, "unit": "PT"},
+        }
+        # In-place resize only -- the diagram is not deleted and reinserted,
+        # so any comment anchored to it survives.
         assert not any("insertInlineImage" in r for r in plan.requests)
+        assert not any("deleteContentRange" in r for r in plan.requests)
 
-    def test_stale_mermaid_size_warning_does_not_fire_when_sizes_match(
+    def test_resize_request_does_not_fire_when_sizes_match(
         self,
         tmp_path,
         monkeypatch,
@@ -1308,7 +1278,7 @@ class TestStaleMermaidSizeWarning:
 
         plan = backend._build_push_plan(str(local), "doc-1")
 
-        assert not any("stale" in w for w in plan.image_warnings)
+        assert not any("updateInlineObjectProperties" in r for r in plan.requests)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
