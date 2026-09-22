@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1](https://github.com/tstapler/docspan/compare/docspan-v0.8.0...docspan-v0.8.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **google-docs:** real pull --dry-run + docspan sync + paragraph spacing ([#132](https://github.com/tstapler/docspan/issues/132)) ([fde5bed](https://github.com/tstapler/docspan/commit/fde5bedd71a016638fe9002b9fdfcbd043c7ab00))
+
 ## [0.8.0](https://github.com/tstapler/docspan/compare/docspan-v0.7.0...docspan-v0.8.0) (2026-09-19)
 
 
