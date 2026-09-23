@@ -56,6 +56,11 @@ _MIN_SIZE_FOR_DUPLICATE_CHECK = 150
 # so a code-rendered candidate always outranks a merely structurally-similar one.
 _CODE_LINE_PREFERENCE_BONUS = 100
 
+# insertInlineImage only scales "to fit," not to an exact magnitude, so by
+# analogy the Docs API may not echo back byte-identical floats for a size
+# this code itself requested. An exact `!=` would re-resize on every push.
+_IMAGE_SIZE_TOLERANCE_PT = 0.5
+
 
 class DiffTooExpensive(Exception):
     """Raised instead of running SequenceMatcher on pathological duplicate-heavy input.
@@ -3063,6 +3068,25 @@ class DocsRequestBuilder:
         return style, ["indentStart", "borderLeft"]
 
     @staticmethod
+    def _image_size_differs(current_node: DocsImageNode, target_node: DocsImageNode) -> bool:
+        """Whether two same-`alt` images differ enough in size to need a resize.
+
+        Tolerance-gated by `_IMAGE_SIZE_TOLERANCE_PT` rather than exact `!=` —
+        see that constant's docstring for why an exact comparison against a
+        Docs-API-echoed value is unsafe. Shared by `_restyles` (so
+        diff_summary/--dry-run reports a change) and
+        `_make_image_resize_requests` (so the actual write agrees).
+        """
+        if target_node.width_pt is None or target_node.height_pt is None:
+            return False
+        if current_node.width_pt is None or current_node.height_pt is None:
+            return True
+        return (
+            abs(current_node.width_pt - target_node.width_pt) > _IMAGE_SIZE_TOLERANCE_PT
+            or abs(current_node.height_pt - target_node.height_pt) > _IMAGE_SIZE_TOLERANCE_PT
+        )
+
+    @staticmethod
     def _restyles(current_node: Node, target_node: Node) -> bool:
         """Whether two same-text nodes differ in a paragraph attribute.
 
@@ -3071,6 +3095,8 @@ class DocsRequestBuilder:
         definition is what stops the preview and the write from disagreeing about
         whether anything is happening.
         """
+        if isinstance(current_node, DocsImageNode) and isinstance(target_node, DocsImageNode):
+            return DocsRequestBuilder._image_size_differs(current_node, target_node)
         if (
             isinstance(current_node, (DocsTableNode, DocsImageNode))
             or isinstance(target_node, (DocsTableNode, DocsImageNode))
@@ -3088,6 +3114,42 @@ class DocsRequestBuilder:
             or current_node.is_blockquote != target_node.is_blockquote
             or current_node.quote_depth != target_node.quote_depth
         )
+
+    @staticmethod
+    def _make_image_resize_requests(
+        current_node: DocsImageNode, target_node: DocsImageNode
+    ) -> List[dict]:
+        """Resize an already-inserted image via updateInlineObjectProperties.
+
+        Unlike a delete-and-reinsert, this doesn't recreate the object, so it
+        can't orphan a comment anchored to it. No-op unless `current_node` has
+        a real `object_id` (only set on a node parsed from a live document —
+        see DocsImageNode's docstring), since a target/push-side node never
+        has one.
+        """
+        if not current_node.object_id:
+            return []
+        if not DocsRequestBuilder._image_size_differs(current_node, target_node):
+            return []
+        # _image_size_differs already returns False when either target
+        # dimension is None, so this can't fire here — it exists only to
+        # narrow Optional for the dict literal below.
+        if target_node.width_pt is None or target_node.height_pt is None:
+            return []
+        return [{
+            "updateInlineObjectProperties": {
+                "objectId": current_node.object_id,
+                "inlineObjectProperties": {
+                    "embeddedObject": {
+                        "size": {
+                            "height": {"magnitude": target_node.height_pt, "unit": "PT"},
+                            "width": {"magnitude": target_node.width_pt, "unit": "PT"},
+                        }
+                    }
+                },
+                "fields": "embeddedObject.size",
+            }
+        }]
 
     def _make_style_update_requests(self, current_node: Node, target_node: Node) -> List[dict]:
         """Restyle a paragraph in place — same text, different paragraph attributes.
@@ -3111,6 +3173,8 @@ class DocsRequestBuilder:
         Changing nesting is a text edit, and it stays a known gap rather than a
         no-op dressed up as a fix.
         """
+        if isinstance(current_node, DocsImageNode) and isinstance(target_node, DocsImageNode):
+            return self._make_image_resize_requests(current_node, target_node)
         if (
             isinstance(current_node, (DocsTableNode, DocsImageNode))
             or isinstance(target_node, (DocsTableNode, DocsImageNode))

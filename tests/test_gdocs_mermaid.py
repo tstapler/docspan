@@ -335,14 +335,11 @@ def test_repeated_mermaid_push_has_stable_node_key(tmp_path) -> None:
     assert first_key == ("__image__", first_key[1], 468.0, 234.0)
 
 
-def test_repush_of_already_sized_mermaid_image_is_a_safe_noop() -> None:
-    """Regression (Story 1.3.3): re-pushing a mermaid diagram whose pulled
-    width_pt/height_pt differs from what this feature would now compute for
-    the same diagram (same alt) is a safe no-op -- zero requests, no crash --
-    per the Known Limitation documented in plan.md (the diff engine's
-    _content_key for an image is alt-only, so _repair folds the mismatched
-    sizes back to "equal", and _make_style_update_requests explicitly no-ops
-    for DocsImageNode)."""
+def test_repush_of_already_sized_mermaid_image_with_no_object_id_is_a_safe_noop() -> None:
+    """A pulled node with no `object_id` (e.g. hand-built, or from a pull
+    path that never populated it) has no live inline object to address, so
+    resizing it would be a guess rather than a fix -- zero requests, no
+    crash, per `_make_image_resize_requests`'s own guard."""
     builder = DocsRequestBuilder()
     pulled = DocsImageNode(
         alt="mermaid diagram abc123",
@@ -360,6 +357,121 @@ def test_repush_of_already_sized_mermaid_image_is_a_safe_noop() -> None:
     requests = builder.build([pulled], [target], doc_end_index=100)
 
     assert requests == []
+
+
+def test_repush_of_already_sized_mermaid_image_with_object_id_resizes_in_place() -> None:
+    """Issue #134: a pulled node with a real `object_id` (the normal case --
+    Docs assigns one on insert, and DocsStructureParser reads it back on
+    pull) must actually resize when the previously-pushed size differs from
+    what this feature now computes for the same diagram (same alt) -- via
+    updateInlineObjectProperties, not a delete-and-reinsert, so no comment
+    anchored to the image is destroyed."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=100.0,
+        height_pt=50.0,
+        mermaid_source=None,
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert requests == [{
+        "updateInlineObjectProperties": {
+            "objectId": "kix.obj1",
+            "inlineObjectProperties": {
+                "embeddedObject": {
+                    "size": {
+                        "height": {"magnitude": 234.0, "unit": "PT"},
+                        "width": {"magnitude": 468.0, "unit": "PT"},
+                    }
+                }
+            },
+            "fields": "embeddedObject.size",
+        }
+    }]
+
+
+def test_resize_does_not_fire_within_tolerance_of_a_docs_api_roundtrip() -> None:
+    """The Docs API is not guaranteed to echo back a byte-identical magnitude
+    for a size this code itself requested (insertInlineImage's own contract
+    is "scaled to fit within", not "set to exactly") -- so a sub-tolerance
+    drift between a pulled size and the freshly computed target must not
+    re-resize an otherwise-unchanged diagram on every push."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=468.0,
+        height_pt=233.6,  # 0.4pt under target -- within _IMAGE_SIZE_TOLERANCE_PT
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert requests == []
+
+
+def test_resize_fires_just_past_the_roundtrip_tolerance() -> None:
+    """A step above the tolerance boundary is a real size difference, not
+    API-echo noise, and must still resize."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=468.0,
+        height_pt=233.49,  # 0.51pt under target -- past _IMAGE_SIZE_TOLERANCE_PT
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert len(requests) == 1
+    assert "updateInlineObjectProperties" in requests[0]
+
+
+def test_resize_fires_when_pulled_node_has_partial_size() -> None:
+    """A pulled node with only one dimension set (a partial `size` from the
+    Docs API -- width_pt/height_pt are independently Optional) can't be
+    verified as matching the target, so it's treated as differing and
+    resized -- a deliberate choice, not the crash the deleted
+    _stale_mermaid_size_warnings once had to guard against for this same
+    partial-size shape."""
+    builder = DocsRequestBuilder()
+    pulled = DocsImageNode(
+        alt="mermaid diagram abc123",
+        object_id="kix.obj1",
+        width_pt=100.0,
+        height_pt=None,
+    )
+    target = DocsImageNode(
+        alt="mermaid diagram abc123",
+        width_pt=468.0,
+        height_pt=234.0,
+        mermaid_source="graph TD\n  A --> B",
+    )
+
+    requests = builder.build([pulled], [target], doc_end_index=100)
+
+    assert len(requests) == 1
+    assert "updateInlineObjectProperties" in requests[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
