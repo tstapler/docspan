@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2](https://github.com/tstapler/docspan/compare/docspan-v0.8.1...docspan-v0.8.2) (2026-09-23)
+
+
+### Bug Fixes
+
+* **google-docs:** resize existing mermaid diagrams in place on re-push ([#138](https://github.com/tstapler/docspan/issues/138)) ([852baad](https://github.com/tstapler/docspan/commit/852baad49ea4562553fa5b6791e171985c1e2edc))
+* **google-docs:** stop dropping blank lines inside pushed fenced code blocks ([#135](https://github.com/tstapler/docspan/issues/135)) ([0666387](https://github.com/tstapler/docspan/commit/0666387ff9350389bf19f6b0946f0adb4d6a6e98))
+
 ## [0.8.1](https://github.com/tstapler/docspan/compare/docspan-v0.8.0...docspan-v0.8.1) (2026-09-22)
 
 
