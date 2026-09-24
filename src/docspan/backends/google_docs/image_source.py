@@ -27,22 +27,23 @@ from docspan.backends.google_docs.mermaid_renderer import (
 # "oversized image" edge case.
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 
-# Letter page, 1in margins each side: 6.5in x 72pt/in content width. A
-# deliberate simplification -- doesn't read a doc's actual documentStyle
-# margins (see requirements.md's "Page content width isn't universal"
-# rabbit hole).
-CONTENT_WIDTH_PT = 468.0
-
 # insertInlineImage isn't clipped to the text column -- Docs renders an
-# inline image wider than CONTENT_WIDTH_PT by overflowing into the page
-# margins, up to the physical page edge. Mermaid diagrams get scaled to
-# this wider target instead of CONTENT_WIDTH_PT: since every diagram is
-# force-scaled to a fixed width regardless of native size (see
-# _mermaid_image_size_pt), stretching that fixed width closer to the full
-# 8.5in Letter page (612pt) rather than the 6.5in text column shrinks
-# everything -- including text -- proportionally less. 0.25in per side is
-# left as a buffer so the image doesn't touch the page edge.
-MERMAID_WIDTH_PT = 612.0 - 2 * 18.0
+# inline image wider than the 6.5in text column by overflowing into the
+# page margins, up to the physical page edge. Mermaid diagrams get scaled
+# to this wider target: since every diagram is force-scaled to a fixed
+# width regardless of native size (see _mermaid_image_size_pt), stretching
+# that fixed width closer to the full page rather than the text column
+# shrinks everything -- including text -- proportionally less. A deliberate
+# simplification like the old fixed content-width constant it replaces --
+# doesn't read a doc's actual documentStyle page size or margins (see
+# requirements.md's "Page content width isn't universal" rabbit hole), so
+# the buffer below is narrower than intended on a page physically smaller
+# than US Letter (e.g. A4). mermaid_renderer.py's _MERMAID_CONFIG font-size
+# bump is calibrated against this width's scale-down ratio -- changing one
+# without the other silently drifts the calibration.
+_LETTER_WIDTH_PT = 612.0  # 8.5in
+_MERMAID_EDGE_BUFFER_PT = 18.0  # 0.25in per side, so the image doesn't touch the page edge
+MERMAID_WIDTH_PT = _LETTER_WIDTH_PT - 2 * _MERMAID_EDGE_BUFFER_PT
 
 # 96 CSS px/in (the standard browser reference pixel mmdc's Chromium/
 # Puppeteer renderer uses) / 72pt/in.

@@ -7,9 +7,11 @@ through the same image_source.py pipeline as any other image.
 """
 
 import hashlib
+import json
 import struct
 
 from docspan.backends.google_docs import mermaid_cache_sidecar
+from docspan.backends.google_docs import mermaid_renderer
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
@@ -582,6 +584,41 @@ def test_render_mermaid_png_cache_key_changes_with_render_scale(tmp_path, monkey
     render_mermaid_png(diagram)
 
     assert calls == [diagram, diagram]  # scale change busts the cache, not a hit
+
+
+def test_render_mermaid_png_cache_key_changes_with_mermaid_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._mmdc_version", lambda: "1.0.0"
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer(calls),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    render_mermaid_png(diagram)
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._MERMAID_CONFIG", '{"themeVariables": {}}'
+    )
+    render_mermaid_png(diagram)
+
+    assert calls == [diagram, diagram]  # config change busts the cache, not a hit
+
+
+def test_mermaid_config_sets_enlarged_font_sizes() -> None:
+    """Pins the actual payload of the PR's font-size fix -- a silent revert
+    of _MERMAID_CONFIG to an empty theme would pass every other test here
+    (cache-key and -c-flag-is-present tests don't inspect its content)."""
+    config = json.loads(mermaid_renderer._MERMAID_CONFIG)
+
+    assert config["themeVariables"]["fontSize"] == "32px"
+    assert config["sequence"] == {
+        "actorFontSize": 32,
+        "noteFontSize": 32,
+        "messageFontSize": 32,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
