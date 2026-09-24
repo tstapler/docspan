@@ -33,6 +33,17 @@ MAX_IMAGE_BYTES = 50 * 1024 * 1024
 # rabbit hole).
 CONTENT_WIDTH_PT = 468.0
 
+# insertInlineImage isn't clipped to the text column -- Docs renders an
+# inline image wider than CONTENT_WIDTH_PT by overflowing into the page
+# margins, up to the physical page edge. Mermaid diagrams get scaled to
+# this wider target instead of CONTENT_WIDTH_PT: since every diagram is
+# force-scaled to a fixed width regardless of native size (see
+# _mermaid_image_size_pt), stretching that fixed width closer to the full
+# 8.5in Letter page (612pt) rather than the 6.5in text column shrinks
+# everything -- including text -- proportionally less. 0.25in per side is
+# left as a buffer so the image doesn't touch the page edge.
+MERMAID_WIDTH_PT = 612.0 - 2 * 18.0
+
 # 96 CSS px/in (the standard browser reference pixel mmdc's Chromium/
 # Puppeteer renderer uses) / 72pt/in.
 _PT_PER_CSS_PX = 0.75
@@ -67,15 +78,15 @@ def _png_pixel_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
 
 
 def _mermaid_image_size_pt(png_bytes: bytes) -> Optional[Tuple[float, float]]:
-    """Compute (width_pt, height_pt) for a mermaid PNG, filling CONTENT_WIDTH_PT.
+    """Compute (width_pt, height_pt) for a mermaid PNG, filling MERMAID_WIDTH_PT.
 
     Under this "always-fill" scaling, RENDER_SCALE and _PT_PER_CSS_PX
     algebraically cancel out of the result -- width always becomes exactly
-    CONTENT_WIDTH_PT, and height only ever depends on the pixel aspect ratio.
+    MERMAID_WIDTH_PT, and height only ever depends on the pixel aspect ratio.
     They're computed anyway (rather than working from the raw pixel ratio
     directly) because plan.md's Unresolved Questions records "always-fill"
     as a reversible bet: switching to cap-only (never upscale a diagram
-    already narrower than CONTENT_WIDTH_PT, e.g. `scale = min(1.0, ...)`)
+    already narrower than MERMAID_WIDTH_PT, e.g. `scale = min(1.0, ...)`)
     needs the real absolute logical_width_pt, which does depend on
     RENDER_SCALE -- so this keeps that one-line rollback available.
 
@@ -91,7 +102,7 @@ def _mermaid_image_size_pt(png_bytes: bytes) -> Optional[Tuple[float, float]]:
     native_width_px, native_height_px = dims
     logical_width_pt = (native_width_px / RENDER_SCALE) * _PT_PER_CSS_PX
     logical_height_pt = (native_height_px / RENDER_SCALE) * _PT_PER_CSS_PX
-    scale = CONTENT_WIDTH_PT / logical_width_pt
+    scale = MERMAID_WIDTH_PT / logical_width_pt
     return round(logical_width_pt * scale, 2), round(logical_height_pt * scale, 2)
 
 
