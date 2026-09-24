@@ -10,8 +10,7 @@ import hashlib
 import json
 import struct
 
-from docspan.backends.google_docs import mermaid_cache_sidecar
-from docspan.backends.google_docs import mermaid_renderer
+from docspan.backends.google_docs import mermaid_cache_sidecar, mermaid_renderer
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
