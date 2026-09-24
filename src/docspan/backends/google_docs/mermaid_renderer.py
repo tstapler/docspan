@@ -32,6 +32,23 @@ RENDER_TIMEOUT_SECONDS = 30
 # both inserted bigger and stays sharp if a reader drags it larger still.
 RENDER_SCALE = 3
 
+# image_source.py always force-scales the rendered PNG to fill a fixed page
+# width (see _mermaid_image_size_pt's "always-fill" docstring), so a wide or
+# node-dense diagram's text shrinks along with everything else -- RENDER_SCALE
+# doesn't help here, since supersampling only adds pixels, it never changes
+# the CSS-pixel layout ratio between text and diagram bounding box. Bumping
+# Mermaid's own font size makes text a bigger fraction of that bounding box
+# *before* the forced scale-down, so what survives the shrink reads larger.
+# Values are Mermaid defaults roughly doubled; sequence-diagram font knobs are
+# set separately from themeVariables.fontSize because Mermaid doesn't derive
+# them from it.
+_MERMAID_CONFIG = json.dumps(
+    {
+        "themeVariables": {"fontSize": "32px"},
+        "sequence": {"actorFontSize": 32, "noteFontSize": 32, "messageFontSize": 32},
+    }
+)
+
 
 class MermaidRenderError(Exception):
     """Raised when mermaid-cli is missing, fails, or produces no output."""
@@ -121,10 +138,12 @@ def _mmdc_version() -> str:
 
 
 def _cache_key(diagram: str) -> str:
-    # RENDER_SCALE and the mmdc version are baked into the key alongside the
-    # diagram text, since both change the rendered bytes for the same source.
+    # RENDER_SCALE, _MERMAID_CONFIG, and the mmdc version are baked into the
+    # key alongside the diagram text, since all three change the rendered
+    # bytes for the same source.
     digest = hashlib.sha256(diagram.encode("utf-8"))
     digest.update(str(RENDER_SCALE).encode("utf-8"))
+    digest.update(_MERMAID_CONFIG.encode("utf-8"))
     digest.update(_mmdc_version().encode("utf-8"))
     return digest.hexdigest()
 
@@ -137,7 +156,9 @@ def _cache_key(diagram: str) -> str:
 _PUPPETEER_CONFIG = json.dumps({"args": ["--no-sandbox", "--disable-setuid-sandbox"]})
 
 
-def _mmdc_command(input_path: str, output_path: str, puppeteer_config_path: str) -> List[str]:
+def _mmdc_command(
+    input_path: str, output_path: str, puppeteer_config_path: str, mermaid_config_path: str
+) -> List[str]:
     """Build the mermaid-cli invocation, preferring a real installed binary.
 
     Falls back to `npx --yes -p @mermaid-js/mermaid-cli mmdc` when `mmdc`
@@ -153,6 +174,7 @@ def _mmdc_command(input_path: str, output_path: str, puppeteer_config_path: str)
         "-o", output_path,
         "-b", "white",
         "-p", puppeteer_config_path,
+        "-c", mermaid_config_path,
         "-s", str(RENDER_SCALE),
     ]
 
@@ -228,10 +250,14 @@ def _render_uncached(diagram: str, *, timeout: Optional[float] = None) -> bytes:
         input_path = tmp / "diagram.mmd"
         output_path = tmp / "diagram.png"
         puppeteer_config_path = tmp / "puppeteer-config.json"
+        mermaid_config_path = tmp / "mermaid-config.json"
         input_path.write_text(diagram, encoding="utf-8")
         puppeteer_config_path.write_text(_PUPPETEER_CONFIG, encoding="utf-8")
+        mermaid_config_path.write_text(_MERMAID_CONFIG, encoding="utf-8")
 
-        command = _mmdc_command(str(input_path), str(output_path), str(puppeteer_config_path))
+        command = _mmdc_command(
+            str(input_path), str(output_path), str(puppeteer_config_path), str(mermaid_config_path)
+        )
         try:
             result = subprocess.run(
                 command,

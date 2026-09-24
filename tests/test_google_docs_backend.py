@@ -1240,8 +1240,8 @@ class TestMermaidRetroactiveResize:
         assert len(resize_requests) == 1
         assert resize_requests[0]["objectId"] == "kix.obj1"
         assert resize_requests[0]["inlineObjectProperties"]["embeddedObject"]["size"] == {
-            "height": {"magnitude": 234.0, "unit": "PT"},
-            "width": {"magnitude": 468.0, "unit": "PT"},
+            "height": {"magnitude": 288.0, "unit": "PT"},
+            "width": {"magnitude": 576.0, "unit": "PT"},
         }
         # In-place resize only -- the diagram is not deleted and reinserted,
         # so any comment anchored to it survives.
@@ -1271,7 +1271,7 @@ class TestMermaidRetroactiveResize:
 
         backend, fake_client = make_backend()
         fake_client.get_document.return_value = self._doc_with_pulled_mermaid_image(
-            alt, 468.0, 234.0
+            alt, 576.0, 288.0
         )
         fake_client.list_comments.return_value = []
         fake_client.upload_temp_image.return_value = {
