@@ -354,6 +354,54 @@ def test_person_mention_inside_table_cell_renders_name() -> None:
     assert [[c.text for c in row] for row in table.rows] == [["Shivam Malpani"]]
 
 
+def test_consecutive_person_mentions_inside_table_cell_get_separated() -> None:
+    """_parse_cell has its own chip-separator wiring, independent of
+    _parse_paragraph — verify two consecutive chips in a cell don't
+    concatenate either (docspan#142)."""
+    doc = _doc_with_content([{
+        "startIndex": 1, "endIndex": 20,
+        "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [{
+                "content": [{
+                    "startIndex": 2, "endIndex": 10,
+                    "paragraph": {"elements": [
+                        {"person": {"personProperties": {"name": "Shivam Malpani"}}},
+                        {"person": {"personProperties": {"name": "Andrew Williams"}}},
+                        {"textRun": {"content": "\n"}},
+                    ]},
+                }],
+            }]},
+        ]},
+    }])
+    nodes = parser.parse(doc)
+    table = nodes[0]
+    assert isinstance(table, DocsTableNode)
+    assert [[c.text for c in row] for row in table.rows] == [["Shivam Malpani Andrew Williams"]]
+
+
+def test_person_mention_directly_followed_by_text_inside_table_cell_gets_a_space() -> None:
+    """A chip glued directly to the following textRun inside a cell must
+    not concatenate either (docspan#142)."""
+    doc = _doc_with_content([{
+        "startIndex": 1, "endIndex": 20,
+        "table": {"rows": 1, "columns": 1, "tableRows": [
+            {"tableCells": [{
+                "content": [{
+                    "startIndex": 2, "endIndex": 10,
+                    "paragraph": {"elements": [
+                        {"person": {"personProperties": {"name": "Shivam Malpani"}}},
+                        {"textRun": {"content": "and team\n"}},
+                    ]},
+                }],
+            }]},
+        ]},
+    }])
+    nodes = parser.parse(doc)
+    table = nodes[0]
+    assert isinstance(table, DocsTableNode)
+    assert [[c.text for c in row] for row in table.rows] == [["Shivam Malpani and team"]]
+
+
 def test_person_mention_with_no_name_or_email_is_skipped_not_raised() -> None:
     """Defensive: an empty personProperties dict must not raise, and simply
     contributes no text (there is nothing to render)."""

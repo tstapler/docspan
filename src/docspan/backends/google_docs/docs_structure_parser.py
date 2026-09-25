@@ -257,7 +257,7 @@ def _person_display_text(person: dict) -> str:
     return ""
 
 
-_CHIP_ADJACENT_PUNCTUATION = frozenset(",.;:!?)]}\"'")
+_CHIP_ADJACENT_PUNCTUATION = frozenset(",.;:!?)]}\"'-–—")
 
 
 def _needs_chip_separator(prev_text: str, next_text: str) -> bool:
