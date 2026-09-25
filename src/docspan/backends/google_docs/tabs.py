@@ -108,10 +108,11 @@ def resolve_document_tab(
     Returns:
         (resolved_doc, resolved_tab_id, warning)
 
-        - resolved_doc: a shallow copy of `doc` with `body`/`lists` set from
-          the resolved tab's `documentTab`, and `tabs` cleared — so existing
-          tabs-unaware code (DocsStructureParser.parse(), _body_content(),
-          etc.) that reads `doc["body"]` operates on the *correct* tab
+        - resolved_doc: a shallow copy of `doc` with `body`/`lists`/
+          `inlineObjects` set from the resolved tab's `documentTab`, and
+          `tabs` cleared — so existing tabs-unaware code
+          (DocsStructureParser.parse(), _body_content(), etc.) that reads
+          `doc["body"]`/`doc["inlineObjects"]` operates on the *correct* tab
           without any further changes. Legacy documents with no `tabs` at
           all are returned unchanged.
         - resolved_tab_id: the tabId actually selected, or None if the
@@ -172,4 +173,5 @@ def resolve_document_tab(
     resolved["tabs"] = []
     resolved["body"] = doc_tab.get("body", {})
     resolved["lists"] = doc_tab.get("lists", {})
+    resolved["inlineObjects"] = doc_tab.get("inlineObjects", {})
     return resolved, resolved_tab_id, warning
