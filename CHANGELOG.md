@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3](https://github.com/tstapler/docspan/compare/docspan-v0.8.2...docspan-v0.8.3) (2026-09-25)
+
+
+### Bug Fixes
+
+* back up local file unconditionally before fast-forward pull overwrite ([#144](https://github.com/tstapler/docspan/issues/144)) ([7e3f556](https://github.com/tstapler/docspan/commit/7e3f5565a25f42fb38feeb2c44d7cb826e197fdb))
+* **google-docs:** carry a tab's inlineObjects through resolve_document_tab ([#146](https://github.com/tstapler/docspan/issues/146)) ([6253c77](https://github.com/tstapler/docspan/commit/6253c772839d7c9505a73227d0e696488e01fc20)), closes [#140](https://github.com/tstapler/docspan/issues/140)
+* **google-docs:** stop crushing mermaid diagram text on push ([#141](https://github.com/tstapler/docspan/issues/141)) ([420178e](https://github.com/tstapler/docspan/commit/420178e5560f46e144eb89a1282eddda7e15e8ec))
+
 ## [0.8.2](https://github.com/tstapler/docspan/compare/docspan-v0.8.1...docspan-v0.8.2) (2026-09-23)
 
 
