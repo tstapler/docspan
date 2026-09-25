@@ -238,6 +238,24 @@ class TestOrchestratePull:
         assert local.read_text(encoding="utf-8") == "new remote\n"
         assert state.get(str(local)).remote_version == "v2"  # type: ignore[union-attr]
 
+    def test_fast_forward_backs_up_local_before_overwrite(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #139: a fast-forward's local_hash comparison only
+        catches edits docspan itself recorded — a local edit made outside a
+        pull/push cycle can still be classified fast-forward, so the pre-overwrite
+        content must be backed up unconditionally, the same guarantee _merge_pull
+        already gives the three-way-merge path."""
+        content = "old\n"
+        local = tmp_path / "doc.md"
+        local.write_text(content, encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), content, remote_version="v1")
+        backend = FakeBackend(remote_version="v2", remote_content="new remote\n")
+
+        outcome = orchestrate_pull(_mapping(str(local)), backend, state, str(tmp_path), state_path)
+
+        assert outcome.action == "fast-forward"
+        orig = local.with_name(local.name + ".orig")
+        assert orig.read_text(encoding="utf-8") == "old\n"
+
     def test_local_only_skips_pull(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         content = "synced\n"
         local = tmp_path / "doc.md"
@@ -507,6 +525,36 @@ class TestOrchestrateSectioned:
         content_b = (directory / "02-body.md").read_text(encoding="utf-8")
         assert "local edit" in content_b
         assert "remote addition" in content_b
+
+    def test_sectioned_fast_forward_backs_up_local_before_overwrite(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #139, sectioned-pull equivalent of
+        test_fast_forward_backs_up_local_before_overwrite: a section's
+        local_hash comparison only catches edits docspan itself recorded, so
+        the pre-overwrite content must be backed up unconditionally before a
+        per-section fast-forward, the same guarantee _merge_pull already
+        gives the three-way-merge path."""
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        local_path = str(directory / "01-intro.md")
+        (directory / "01-intro.md").write_text("unchanged\n", encoding="utf-8")
+        base_hash = save_base_content(state_dir, "unchanged\n")
+        state.update(local_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=base_hash, remote_version="v1",
+            local_hash=sha256_of_content("unchanged\n"),
+        ))
+
+        backend = FakeBackend(section_files={"01-intro.md": "new remote A\n"})
+
+        orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        assert (directory / "01-intro.md").read_text(encoding="utf-8") == "new remote A\n"
+        assert (directory / "01-intro.md.orig").read_text(encoding="utf-8") == "unchanged\n"
 
     def test_orchestrate_pull_sectioned_should_write_orig_backup_before_merge(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         """Mirrors TestOrchestratePull's test_orig_file_created_before_merge
