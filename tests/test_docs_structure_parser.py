@@ -256,6 +256,80 @@ def test_person_mention_inline_with_surrounding_text() -> None:
     assert nodes[0].text == "cc Andrew Williams please"
 
 
+def test_consecutive_person_mentions_get_separated_by_a_space() -> None:
+    """Two @-mentions in a row on the same line (an attendee list) must not
+    concatenate — see docspan#142: "JP PhillipsNick Parker..."."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 30,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": "JP Phillips"}}},
+                {"person": {"personProperties": {"name": "Nick Parker"}}},
+                {"textRun": {"content": "\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "JP Phillips Nick Parker"
+
+
+def test_person_mention_directly_followed_by_text_gets_a_space() -> None:
+    """A chip glued to the following textRun (no author-typed whitespace)
+    must not concatenate — see docspan#142: "...JP Phillipsto continue..."."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 30,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"textRun": {"content": "will schedule more time with ", "textStyle": {}}},
+                {"person": {"personProperties": {"name": "Ryan Copley"}}},
+                {"textRun": {"content": "to continue iterating\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "will schedule more time with Ryan Copley to continue iterating"
+
+
+def test_person_mention_followed_by_punctuation_gets_no_extra_space() -> None:
+    """A chip immediately followed by author-typed punctuation (e.g. a
+    comma in a list) must keep that punctuation tight against the name."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 30,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": "Jerry Wang"}}},
+                {"textRun": {"content": ", Nick Parker\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "Jerry Wang, Nick Parker"
+
+
+def test_person_mention_with_pre_existing_whitespace_gets_no_extra_space() -> None:
+    """When the document already carries whitespace between a chip and the
+    next run, the fix must not add a second space."""
+    doc = _doc_with_content([{
+        "startIndex": 1,
+        "endIndex": 30,
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"person": {"personProperties": {"name": "Tyler Stapler"}}},
+                {"textRun": {"content": " and others\n", "textStyle": {}}},
+            ],
+        },
+    }])
+    nodes = parser.parse(doc)
+    assert nodes[0].text == "Tyler Stapler and others"
+
+
 def test_person_mention_inside_table_cell_renders_name() -> None:
     """The table-cell text extraction loop (_parse_table) has its own
     textRun-only walk, independent of _parse_paragraph — verify it also

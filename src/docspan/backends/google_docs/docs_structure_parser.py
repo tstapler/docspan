@@ -257,6 +257,27 @@ def _person_display_text(person: dict) -> str:
     return ""
 
 
+_CHIP_ADJACENT_PUNCTUATION = frozenset(",.;:!?)]}\"'")
+
+
+def _needs_chip_separator(prev_text: str, next_text: str) -> bool:
+    """Whether a space belongs between two chip-adjacent spans.
+
+    Consecutive Person smart chips (or a chip directly followed by a
+    textRun) can have no whitespace between them in the Docs API JSON even
+    though the chip UI renders visual spacing, so naive concatenation glues
+    names together (docspan#142, e.g. "JP PhillipsNick Parker"). Skip when
+    either side already ends/starts with whitespace, or when the next span
+    opens with punctuation the author typed right after the chip on
+    purpose (e.g. a comma in a list).
+    """
+    if not prev_text or not next_text:
+        return False
+    if prev_text[-1].isspace() or next_text[0].isspace():
+        return False
+    return next_text[0] not in _CHIP_ADJACENT_PUNCTUATION
+
+
 @dataclass
 class TextSpan:
     text: str
@@ -684,6 +705,7 @@ class DocsStructureParser:
         would then place every range in the cell off by the width of the trim.
         """
         spans: List[TextSpan] = []
+        last_is_chip = False
         for cell_element in cell.get("content", []):
             paragraph = cell_element.get("paragraph")
             if paragraph is None:
@@ -694,6 +716,8 @@ class DocsStructureParser:
                     content = text_run.get("content", "")
                     if not content:
                         continue
+                    if last_is_chip and spans and _needs_chip_separator(spans[-1].text, content):
+                        spans.append(TextSpan(text=" "))
                     text_style = text_run.get("textStyle", {})
                     font = text_style.get("weightedFontFamily", {}).get("fontFamily", "")
                     spans.append(TextSpan(
@@ -703,12 +727,16 @@ class DocsStructureParser:
                         link=self._parse_link(text_style.get("link")),
                         monospace="Courier" in font or "mono" in font.lower(),
                     ))
+                    last_is_chip = False
                     continue
                 person = pe.get("person")
                 if person is not None:
                     name = _person_display_text(person)
                     if name:
+                        if spans and _needs_chip_separator(spans[-1].text, name):
+                            spans.append(TextSpan(text=" "))
                         spans.append(TextSpan(text=name))
+                        last_is_chip = True
 
         joined = "".join(span.text for span in spans)
         text = joined.strip()
@@ -733,6 +761,7 @@ class DocsStructureParser:
         # Extract text from all TextRuns, collecting spans
         spans: List[TextSpan] = []
         text_parts: List[str] = []
+        last_is_chip = False
 
         for pe in paragraph.get("elements", []):
             text_run = pe.get("textRun")
@@ -741,8 +770,12 @@ class DocsStructureParser:
                 if person is not None:
                     name = _person_display_text(person)
                     if name:
+                        if text_parts and _needs_chip_separator(text_parts[-1], name):
+                            text_parts.append(" ")
+                            spans.append(TextSpan(text=" "))
                         text_parts.append(name)
                         spans.append(TextSpan(text=name))
+                        last_is_chip = True
                 continue
             run_content = text_run.get("content", "")
             text_style = text_run.get("textStyle", {})
@@ -754,6 +787,9 @@ class DocsStructureParser:
             font_family_lower = font_family.lower()
             monospace = any(marker in font_family_lower for marker in _MONOSPACE_FONT_MARKERS)
 
+            if last_is_chip and text_parts and _needs_chip_separator(text_parts[-1], run_content):
+                text_parts.append(" ")
+                spans.append(TextSpan(text=" "))
             text_parts.append(run_content)
             spans.append(TextSpan(
                 text=run_content,
@@ -762,6 +798,7 @@ class DocsStructureParser:
                 link=link,
                 monospace=monospace,
             ))
+            last_is_chip = False
 
         raw_text = "".join(text_parts)
         # Strip trailing newline (each paragraph ends with \n in the Docs model)
