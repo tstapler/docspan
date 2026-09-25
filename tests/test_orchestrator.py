@@ -238,6 +238,24 @@ class TestOrchestratePull:
         assert local.read_text(encoding="utf-8") == "new remote\n"
         assert state.get(str(local)).remote_version == "v2"  # type: ignore[union-attr]
 
+    def test_fast_forward_backs_up_local_before_overwrite(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #139: a fast-forward's local_hash comparison only
+        catches edits docspan itself recorded — a local edit made outside a
+        pull/push cycle can still be classified fast-forward, so the pre-overwrite
+        content must be backed up unconditionally, the same guarantee _merge_pull
+        already gives the three-way-merge path."""
+        content = "old\n"
+        local = tmp_path / "doc.md"
+        local.write_text(content, encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), content, remote_version="v1")
+        backend = FakeBackend(remote_version="v2", remote_content="new remote\n")
+
+        outcome = orchestrate_pull(_mapping(str(local)), backend, state, str(tmp_path), state_path)
+
+        assert outcome.action == "fast-forward"
+        orig = local.with_name(local.name + ".orig")
+        assert orig.read_text(encoding="utf-8") == "old\n"
+
     def test_local_only_skips_pull(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         content = "synced\n"
         local = tmp_path / "doc.md"
@@ -502,6 +520,10 @@ class TestOrchestrateSectioned:
         content_a = (directory / "01-intro.md").read_text(encoding="utf-8")
         assert content_a == "new remote A\n"
         assert "<<<<<<<" not in content_a
+
+        # Regression test for #139: the pre-overwrite content must be backed up
+        # unconditionally, since local_hash only catches edits docspan itself recorded.
+        assert (directory / "01-intro.md.orig").read_text(encoding="utf-8") == "unchanged\n"
 
         # Section B was actually merged: both edits present.
         content_b = (directory / "02-body.md").read_text(encoding="utf-8")

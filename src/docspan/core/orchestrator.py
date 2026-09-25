@@ -712,6 +712,13 @@ def _fast_forward_pull(
     remote_version: str,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
+    # Classified "fast-forward" means the last-recorded local_hash matches
+    # the file on disk — but that recorded hash can predate local edits made
+    # outside a docspan pull/push cycle (plain editing between syncs), so the
+    # overwrite below isn't actually guaranteed lossless. Back up unconditionally,
+    # the same guarantee _merge_pull already gives the three-way-merge path.
+    if os.path.exists(mapping.local):
+        shutil.copyfile(mapping.local, mapping.local + ORIG_SUFFIX)
     result = backend.pull(
         mapping.remote_id, mapping.local, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
     )
@@ -858,6 +865,12 @@ def _merge_section_files(
             continue
 
         if remote_changed and not local_changed:
+            # Same guarantee as the non-sectioned _fast_forward_pull: local_changed
+            # reflects the last-recorded hash, which can predate edits made outside
+            # a docspan pull/push cycle, so back up unconditionally before overwriting.
+            if local_exists:
+                with open(staged_section_path + ORIG_SUFFIX, "w", encoding="utf-8") as fh:
+                    fh.write(local_content)
             with open(staged_section_path, "w", encoding="utf-8") as fh:
                 fh.write(theirs_content)
             _record_state(
