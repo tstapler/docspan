@@ -17,6 +17,7 @@ from docspan.backends.google_docs.manifest import (
 )
 from docspan.config import Mapping
 from docspan.core.orchestrator import (
+    _write_orig_backup,
     get_base_content,
     orchestrate_pull,
     orchestrate_push,
@@ -256,6 +257,29 @@ class TestOrchestratePull:
         orig = local.with_name(local.name + ".orig")
         assert orig.read_text(encoding="utf-8") == "old\n"
 
+    def test_consecutive_fast_forwards_do_not_clobber_earlier_orig_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #145: two fast-forward pulls in a row, with no
+        local edit (and no `conflicts resolve`) in between, must not let the
+        second .orig write silently overwrite the first — the first snapshot
+        would otherwise be unrecoverable."""
+        local = tmp_path / "doc.md"
+        local.write_text("original\n", encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), "original\n", remote_version="v1")
+        mapping = _mapping(str(local))
+
+        backend_1 = FakeBackend(remote_version="v2", remote_content="remote v2\n")
+        outcome_1 = orchestrate_pull(mapping, backend_1, state, str(tmp_path), state_path)
+        assert outcome_1.action == "fast-forward"
+        orig = local.with_name(local.name + ".orig")
+        assert orig.read_text(encoding="utf-8") == "original\n"
+
+        backend_2 = FakeBackend(remote_version="v3", remote_content="remote v3\n")
+        outcome_2 = orchestrate_pull(mapping, backend_2, state, str(tmp_path), state_path)
+        assert outcome_2.action == "fast-forward"
+        # Still the first, still-unresolved backup — not clobbered by the second.
+        assert orig.read_text(encoding="utf-8") == "original\n"
+        assert local.read_text(encoding="utf-8") == "remote v3\n"
+
     def test_local_only_skips_pull(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         content = "synced\n"
         local = tmp_path / "doc.md"
@@ -374,6 +398,29 @@ class TestOrchestratePull:
         orig = tmp_path / "doc.md.orig"
         assert orig.exists()
         assert orig.read_text(encoding="utf-8") == local_content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .orig backup helper (#145)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWriteOrigBackup:
+    def test_writes_when_no_existing_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        orig = tmp_path / "doc.md.orig"
+        _write_orig_backup(str(orig), "content\n")
+        assert orig.read_text(encoding="utf-8") == "content\n"
+
+    def test_does_not_clobber_differing_existing_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        orig = tmp_path / "doc.md.orig"
+        orig.write_text("first unresolved backup\n", encoding="utf-8")
+        _write_orig_backup(str(orig), "second, different content\n")
+        assert orig.read_text(encoding="utf-8") == "first unresolved backup\n"
+
+    def test_overwrites_matching_existing_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        orig = tmp_path / "doc.md.orig"
+        orig.write_text("same content\n", encoding="utf-8")
+        _write_orig_backup(str(orig), "same content\n")
+        assert orig.read_text(encoding="utf-8") == "same content\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
