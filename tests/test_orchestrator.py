@@ -17,6 +17,7 @@ from docspan.backends.google_docs.manifest import (
 )
 from docspan.config import Mapping
 from docspan.core.orchestrator import (
+    _write_orig_backup,
     get_base_content,
     orchestrate_pull,
     orchestrate_push,
@@ -256,6 +257,29 @@ class TestOrchestratePull:
         orig = local.with_name(local.name + ".orig")
         assert orig.read_text(encoding="utf-8") == "old\n"
 
+    def test_consecutive_fast_forwards_do_not_clobber_earlier_orig_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #145: two fast-forward pulls in a row, with no
+        local edit (and no `conflicts resolve`) in between, must not let the
+        second .orig write silently overwrite the first — the first snapshot
+        would otherwise be unrecoverable."""
+        local = tmp_path / "doc.md"
+        local.write_text("original\n", encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), "original\n", remote_version="v1")
+        mapping = _mapping(str(local))
+
+        backend_1 = FakeBackend(remote_version="v2", remote_content="remote v2\n")
+        outcome_1 = orchestrate_pull(mapping, backend_1, state, str(tmp_path), state_path)
+        assert outcome_1.action == "fast-forward"
+        orig = local.with_name(local.name + ".orig")
+        assert orig.read_text(encoding="utf-8") == "original\n"
+
+        backend_2 = FakeBackend(remote_version="v3", remote_content="remote v3\n")
+        outcome_2 = orchestrate_pull(mapping, backend_2, state, str(tmp_path), state_path)
+        assert outcome_2.action == "fast-forward"
+        # Still the first, still-unresolved backup — not clobbered by the second.
+        assert orig.read_text(encoding="utf-8") == "original\n"
+        assert local.read_text(encoding="utf-8") == "remote v3\n"
+
     def test_local_only_skips_pull(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         content = "synced\n"
         local = tmp_path / "doc.md"
@@ -374,6 +398,36 @@ class TestOrchestratePull:
         orig = tmp_path / "doc.md.orig"
         assert orig.exists()
         assert orig.read_text(encoding="utf-8") == local_content
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .orig backup helper (#145)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWriteOrigBackup:
+    def test_writes_when_no_existing_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        orig = tmp_path / "doc.md.orig"
+        _write_orig_backup(str(orig), "content\n")
+        assert orig.read_text(encoding="utf-8") == "content\n"
+
+    def test_does_not_clobber_differing_existing_backup(self, tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
+        orig = tmp_path / "doc.md.orig"
+        orig.write_text("first unresolved backup\n", encoding="utf-8")
+        with caplog.at_level("WARNING"):
+            _write_orig_backup(str(orig), "second, different content\n")
+        assert orig.read_text(encoding="utf-8") == "first unresolved backup\n"
+        assert "Not overwriting" in caplog.text
+
+    def test_overwrites_matching_existing_backup(self, tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
+        """Guards against the comparison being inverted (warn-when-equal
+        instead of warn-when-different): asserts no warning fires when the
+        existing backup already matches, which a flipped `!=` would break."""
+        orig = tmp_path / "doc.md.orig"
+        orig.write_text("same content\n", encoding="utf-8")
+        with caplog.at_level("WARNING"):
+            _write_orig_backup(str(orig), "same content\n")
+        assert orig.read_text(encoding="utf-8") == "same content\n"
+        assert caplog.text == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,6 +609,41 @@ class TestOrchestrateSectioned:
 
         assert (directory / "01-intro.md").read_text(encoding="utf-8") == "new remote A\n"
         assert (directory / "01-intro.md.orig").read_text(encoding="utf-8") == "unchanged\n"
+
+    def test_sectioned_consecutive_fast_forwards_do_not_clobber_earlier_orig_backup(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #145, sectioned-pull equivalent of
+        test_consecutive_fast_forwards_do_not_clobber_earlier_orig_backup: the
+        sectioned per-section fast-forward branch has its own .orig write site
+        (distinct from the single-file _fast_forward_pull one) that must go
+        through the same collision guard."""
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        local_path = str(directory / "01-intro.md")
+        (directory / "01-intro.md").write_text("original\n", encoding="utf-8")
+        base_hash = save_base_content(state_dir, "original\n")
+        state.update(local_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=base_hash, remote_version="v1",
+            local_hash=sha256_of_content("original\n"),
+        ))
+
+        backend_1 = FakeBackend(section_files={"01-intro.md": "remote v2\n"})
+        orchestrate_pull(mapping, backend_1, state, state_dir, state_path)
+        orig = directory / "01-intro.md.orig"
+        assert orig.read_text(encoding="utf-8") == "original\n"
+
+        backend_2 = FakeBackend(section_files={"01-intro.md": "remote v3\n"})
+        orchestrate_pull(mapping, backend_2, state, state_dir, state_path)
+        # Still the first, still-unresolved backup — not clobbered by the second.
+        assert orig.read_text(encoding="utf-8") == "original\n"
+        assert (directory / "01-intro.md").read_text(encoding="utf-8") == "remote v3\n"
 
     def test_orchestrate_pull_sectioned_should_write_orig_backup_before_merge(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         """Mirrors TestOrchestratePull's test_orig_file_created_before_merge
@@ -832,6 +921,82 @@ class TestOrchestrateSectioned:
         orig = directory / "02-body.md.orig"
         assert orig.exists()
         assert orig.read_text(encoding="utf-8") == body_content
+
+    def test_orphan_conversion_does_not_clobber_orig_backup_from_earlier_fast_forward(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #145: a section fast-forwarded on one pull, then
+        orphaned (heading removed upstream) on the next pull with no
+        `conflicts resolve` in between, must not let the orphan-conversion
+        branch's .orig write clobber the still-unresolved backup the earlier
+        fast-forward already left behind — the two branches are different
+        call sites sharing the same collision guard."""
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        intro_content = "intro\n"
+        original_body_content = "original body\n"
+        (directory / "01-intro.md").write_text(intro_content, encoding="utf-8")
+        (directory / "02-body.md").write_text(original_body_content, encoding="utf-8")
+        intro_base_hash = save_base_content(state_dir, intro_content)
+        body_base_hash = save_base_content(state_dir, original_body_content)
+        state.update(str(directory / "01-intro.md"), MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=intro_base_hash, remote_version="v1",
+            local_hash=sha256_of_content(intro_content),
+        ))
+        state.update(str(directory / "02-body.md"), MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=body_base_hash, remote_version="v1",
+            local_hash=sha256_of_content(original_body_content),
+        ))
+        manifest_with_both = tmp_path / "manifest_both.yaml"
+        ManifestStore.save(
+            str(manifest_with_both),
+            [
+                SectionManifestEntry(heading_id="h.1", slug="intro", filename="01-intro.md", title="Intro"),
+                SectionManifestEntry(heading_id="h.2", slug="body", filename="02-body.md", title="Body"),
+            ],
+        )
+        ManifestStore.save(str(directory / MANIFEST_FILENAME), [
+            SectionManifestEntry(heading_id="h.1", slug="intro", filename="01-intro.md", title="Intro"),
+            SectionManifestEntry(heading_id="h.2", slug="body", filename="02-body.md", title="Body"),
+        ])
+
+        # Pull 1: section 2 fast-forwards (remote changed, local untouched) —
+        # writes .orig = original_body_content via _merge_section_files's
+        # fast-forward branch.
+        backend_1 = FakeBackend(section_files={
+            "01-intro.md": intro_content,
+            "02-body.md": "remote v2 body\n",
+            MANIFEST_FILENAME: manifest_with_both.read_text(),
+        })
+        orchestrate_pull(mapping, backend_1, state, state_dir, state_path)
+        orig = directory / "02-body.md.orig"
+        assert orig.read_text(encoding="utf-8") == original_body_content
+
+        # Pull 2: heading "h.2" is now gone upstream, orphaning section 2 —
+        # _convert_orphans_to_conflicts tries to back up the *current*
+        # local content ("remote v2 body\n"), which differs from the
+        # unresolved .orig left by pull 1.
+        manifest_intro_only = tmp_path / "manifest_intro_only.yaml"
+        ManifestStore.save(
+            str(manifest_intro_only),
+            [SectionManifestEntry(heading_id="h.1", slug="intro", filename="01-intro.md", title="Intro")],
+        )
+        backend_2 = FakeBackend(section_files={
+            "01-intro.md": intro_content,
+            MANIFEST_FILENAME: manifest_intro_only.read_text(),
+        })
+        outcome_2 = orchestrate_pull(mapping, backend_2, state, state_dir, state_path)
+
+        assert outcome_2.orphaned_sections == ["02-body.md"]
+        # Still pull 1's backup — not clobbered by the orphan-conversion write.
+        assert orig.read_text(encoding="utf-8") == original_body_content
 
     def test_orchestrate_push_should_call_push_sectioned_when_mapping_sectioned_is_true(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         directory = tmp_path / "big-doc"

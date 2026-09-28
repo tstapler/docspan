@@ -80,6 +80,29 @@ def save_base_content(state_dir: str, content: str) -> str:
     return sha
 
 
+def _write_orig_backup(orig_path: str, content: str) -> None:
+    """Write a pre-overwrite snapshot to the fixed `.orig` sidecar path.
+
+    Skips the write and warns instead of clobbering an existing backup that
+    holds different content — a second fast-forward/merge pull with no
+    intervening `conflicts resolve` would otherwise silently destroy the
+    only on-disk snapshot of the older content (#145).
+    """
+    if os.path.exists(orig_path):
+        with open(orig_path, encoding="utf-8") as fh:
+            existing = fh.read()
+        if existing != content:
+            logger.warning(
+                "Not overwriting existing unresolved backup %s with new content; "
+                "run `docspan conflicts resolve` on it before the next pull, or "
+                "it will remain the only recoverable snapshot.",
+                orig_path,
+            )
+            return
+    with open(orig_path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
 def _section_files(directory: str) -> list[str]:
     """List a sectioned mapping's section content files, sorted.
 
@@ -718,7 +741,9 @@ def _fast_forward_pull(
     # overwrite below isn't actually guaranteed lossless. Back up unconditionally,
     # the same guarantee _merge_pull already gives the three-way-merge path.
     if os.path.exists(mapping.local):
-        shutil.copyfile(mapping.local, mapping.local + ORIG_SUFFIX)
+        with open(mapping.local, encoding="utf-8") as fh:
+            pre_pull_content = fh.read()
+        _write_orig_backup(mapping.local + ORIG_SUFFIX, pre_pull_content)
     result = backend.pull(
         mapping.remote_id, mapping.local, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
     )
@@ -744,9 +769,7 @@ def _merge_pull(
     base_hash: str,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
-    orig_path = mapping.local + ORIG_SUFFIX
-    with open(orig_path, "w", encoding="utf-8") as fh:
-        fh.write(local_content)
+    _write_orig_backup(mapping.local + ORIG_SUFFIX, local_content)
 
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
@@ -869,8 +892,7 @@ def _merge_section_files(
             # reflects the last-recorded hash, which can predate edits made outside
             # a docspan pull/push cycle, so back up unconditionally before overwriting.
             if local_exists:
-                with open(staged_section_path + ORIG_SUFFIX, "w", encoding="utf-8") as fh:
-                    fh.write(local_content)
+                _write_orig_backup(staged_section_path + ORIG_SUFFIX, local_content)
             with open(staged_section_path, "w", encoding="utf-8") as fh:
                 fh.write(theirs_content)
             _record_state(
@@ -890,9 +912,7 @@ def _merge_section_files(
         # silently falling back to the merge base.
         any_merge = True
         written_files += 1
-        orig_path = staged_section_path + ORIG_SUFFIX
-        with open(orig_path, "w", encoding="utf-8") as fh:
-            fh.write(local_content)
+        _write_orig_backup(staged_section_path + ORIG_SUFFIX, local_content)
         base_content = get_base_content(state_dir, entry.base_hash)
         merge_result = three_way_merge(base_content, theirs_content, local_content)
         with open(staged_section_path, "w", encoding="utf-8") as fh:
@@ -944,9 +964,7 @@ def _convert_orphans_to_conflicts(
         with open(staged_section_path, encoding="utf-8") as fh:
             local_content = fh.read()
 
-        orig_path = staged_section_path + ORIG_SUFFIX
-        with open(orig_path, "w", encoding="utf-8") as fh:
-            fh.write(local_content)
+        _write_orig_backup(staged_section_path + ORIG_SUFFIX, local_content)
 
         conflict_content = (
             "<<<<<<< ours\n"
