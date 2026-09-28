@@ -83,16 +83,10 @@ def save_base_content(state_dir: str, content: str) -> str:
 def _write_orig_backup(orig_path: str, content: str) -> None:
     """Write a pre-overwrite snapshot to the fixed `.orig` sidecar path.
 
-    Consecutive fast-forward/merge pulls with no intervening `conflicts
-    resolve` all want to write this same path. Clobbering an existing,
-    not-yet-recovered backup would silently lose it with no way back, so
-    prefer keeping the older backup over the newer one when forced to choose:
-    the content this call is asked to back up is (at least until the
-    caller's own `_record_state` runs) still reachable by hash in the
-    base-content store, even with no CLI command that looks it up there
-    directly today — a strictly better position than the existing `.orig`,
-    which has no fallback at all once overwritten. So skip the write and warn
-    instead of clobbering an existing backup that holds different content.
+    Skips the write and warns instead of clobbering an existing backup that
+    holds different content — a second fast-forward/merge pull with no
+    intervening `conflicts resolve` would otherwise silently destroy the
+    only on-disk snapshot of the older content (#145).
     """
     if os.path.exists(orig_path):
         with open(orig_path, encoding="utf-8") as fh:
