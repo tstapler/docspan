@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4](https://github.com/tstapler/docspan/compare/docspan-v0.8.3...docspan-v0.8.4) (2026-09-26)
+
+
+### Bug Fixes
+
+* **google-docs:** separate consecutive person smart-chips with a space ([#147](https://github.com/tstapler/docspan/issues/147)) ([c054b74](https://github.com/tstapler/docspan/commit/c054b74f21661c56f293882987ac9437a981ad7d))
+
 ## [0.8.3](https://github.com/tstapler/docspan/compare/docspan-v0.8.2...docspan-v0.8.3) (2026-09-25)
 
 
