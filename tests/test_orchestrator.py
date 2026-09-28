@@ -410,17 +410,25 @@ class TestWriteOrigBackup:
         _write_orig_backup(str(orig), "content\n")
         assert orig.read_text(encoding="utf-8") == "content\n"
 
-    def test_does_not_clobber_differing_existing_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def test_does_not_clobber_differing_existing_backup(self, tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
         orig = tmp_path / "doc.md.orig"
         orig.write_text("first unresolved backup\n", encoding="utf-8")
-        _write_orig_backup(str(orig), "second, different content\n")
+        with caplog.at_level("WARNING"):
+            _write_orig_backup(str(orig), "second, different content\n")
         assert orig.read_text(encoding="utf-8") == "first unresolved backup\n"
+        assert "Not overwriting" in caplog.text
 
-    def test_overwrites_matching_existing_backup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def test_overwrites_matching_existing_backup(self, tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
+        """Distinguishes the "no-op skip" path from the "real write" path: unlike
+        test_does_not_clobber_differing_existing_backup, this must NOT warn — the
+        write actually happens (indistinguishable from the skip by final file
+        content alone, since old == new here)."""
         orig = tmp_path / "doc.md.orig"
         orig.write_text("same content\n", encoding="utf-8")
-        _write_orig_backup(str(orig), "same content\n")
+        with caplog.at_level("WARNING"):
+            _write_orig_backup(str(orig), "same content\n")
         assert orig.read_text(encoding="utf-8") == "same content\n"
+        assert caplog.text == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -602,6 +610,41 @@ class TestOrchestrateSectioned:
 
         assert (directory / "01-intro.md").read_text(encoding="utf-8") == "new remote A\n"
         assert (directory / "01-intro.md.orig").read_text(encoding="utf-8") == "unchanged\n"
+
+    def test_sectioned_consecutive_fast_forwards_do_not_clobber_earlier_orig_backup(
+        self, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Regression test for #145, sectioned-pull equivalent of
+        test_consecutive_fast_forwards_do_not_clobber_earlier_orig_backup: the
+        sectioned per-section fast-forward branch has its own .orig write site
+        (distinct from the single-file _fast_forward_pull one) that must go
+        through the same collision guard."""
+        directory = tmp_path / "big-doc"
+        directory.mkdir()
+        mapping = _sectioned_mapping(str(directory))
+        state = SyncState()
+        state_path = str(tmp_path / ".markgate-state.json")
+        state_dir = str(tmp_path)
+
+        local_path = str(directory / "01-intro.md")
+        (directory / "01-intro.md").write_text("original\n", encoding="utf-8")
+        base_hash = save_base_content(state_dir, "original\n")
+        state.update(local_path, MappingState(
+            doc_id="doc-123", backend="fake", last_synced_at="2024-01-01T00:00:00+00:00",
+            base_hash=base_hash, remote_version="v1",
+            local_hash=sha256_of_content("original\n"),
+        ))
+
+        backend_1 = FakeBackend(section_files={"01-intro.md": "remote v2\n"})
+        orchestrate_pull(mapping, backend_1, state, state_dir, state_path)
+        orig = directory / "01-intro.md.orig"
+        assert orig.read_text(encoding="utf-8") == "original\n"
+
+        backend_2 = FakeBackend(section_files={"01-intro.md": "remote v3\n"})
+        orchestrate_pull(mapping, backend_2, state, state_dir, state_path)
+        # Still the first, still-unresolved backup — not clobbered by the second.
+        assert orig.read_text(encoding="utf-8") == "original\n"
+        assert (directory / "01-intro.md").read_text(encoding="utf-8") == "remote v3\n"
 
     def test_orchestrate_pull_sectioned_should_write_orig_backup_before_merge(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         """Mirrors TestOrchestratePull's test_orig_file_created_before_merge

@@ -895,8 +895,7 @@ def _merge_section_files(
             # reflects the last-recorded hash, which can predate edits made outside
             # a docspan pull/push cycle, so back up unconditionally before overwriting.
             if local_exists:
-                with open(staged_section_path + ORIG_SUFFIX, "w", encoding="utf-8") as fh:
-                    fh.write(local_content)
+                _write_orig_backup(staged_section_path + ORIG_SUFFIX, local_content)
             with open(staged_section_path, "w", encoding="utf-8") as fh:
                 fh.write(theirs_content)
             _record_state(
