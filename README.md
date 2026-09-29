@@ -176,6 +176,22 @@ docspan pull [FILES]... [--dry-run] [--config PATH]
 
 Pull remote documents into local markdown files with three-way merge. Writes conflict markers to the file if automatic merge fails. For Google Docs, also writes a `{file}.comments.md` sidecar of the doc's comments (open + resolved, with quoted selections and reply threads) unless `pull_comments: false`.
 
+### `docspan migrate-sectioned`
+
+```
+docspan migrate-sectioned FILE [--dry-run] [--split-level LEVEL] [--config PATH]
+```
+
+Migrate a single-file mapping to a sectioned mapping (splitting the doc into per-section local files on a heading boundary, default `HEADING_2`), preserving git history via a git commit. Refuses if the mapping is already sectioned or its backend doesn't support sectioned mode.
+
+### `docspan comments respond`
+
+```
+docspan comments respond FILE [--config PATH]
+```
+
+Post `Reply:`/`Resolve:` directives from a `{file}.comments.md` sidecar back to the remote doc. Edit the sidecar's `Reply:` lines and/or flip `Resolve: no` to `Resolve: yes` under an open comment, then run this to post those replies/resolutions and refresh the sidecar with the result.
+
 ### `docspan sync`
 
 ```
@@ -216,7 +232,7 @@ docspan auth setup google_docs
 
 It detects your current state, lets you pick **Personal (OAuth)** [recommended] or **Service account**, auto-detects a `client_secret.json` (scanning `.`, `.markgate/`, `~/Downloads`) or prompts for the path with validation, runs the browser sign-in, verifies the connection, and offers to persist the choice into `markgate.yaml` so you never repeat it. In a non-TTY/CI environment it prints manual instructions instead of prompting.
 
-Everything is scriptable — any answer can be supplied as a flag: `--oauth` / `--service-account`, `--client-secret PATH`, `--credentials PATH`. If a `docspan push`/`pull` runs without credentials in an interactive terminal, it offers to run setup inline and then continues.
+Everything is scriptable — the OAuth path can be selected non-interactively with `--oauth --client-secret PATH`. If a `docspan push`/`pull` runs without credentials in an interactive terminal, it offers to run setup inline and then continues.
 
 For **Confluence**, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
 
