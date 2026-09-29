@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5](https://github.com/tstapler/docspan/compare/docspan-v0.8.4...docspan-v0.8.5) (2026-09-28)
+
+
+### Bug Fixes
+
+* don't let consecutive fast-forward/merge pulls clobber the .orig backup ([#150](https://github.com/tstapler/docspan/issues/150)) ([c6e16a5](https://github.com/tstapler/docspan/commit/c6e16a55e4799f5f1596d8306511b03467151b62))
+
 ## [0.8.4](https://github.com/tstapler/docspan/compare/docspan-v0.8.3...docspan-v0.8.4) (2026-09-26)
 
 
