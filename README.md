@@ -151,112 +151,23 @@ docspan migrate-xdg --prefix design-docs                               # move le
 
 ## Command Reference
 
-### `docspan map`
+Full reference — every command's arguments, options, and behavior — is generated straight from the CLI's source at [docs/commands.md](docs/commands.md), so it can't go stale here. Build it locally with `pip install docspan[docs] && mkdocs serve`. Quick summary:
 
-```
-docspan map FILE --backend google_docs|confluence [--title TITLE] [--direction push|pull|both]
-docspan map FILE --backend google_docs --new-tab-in EXISTING_FILE [--title TITLE]
-```
-
-Create a new remote Google Doc / Confluence page (or, with `--new-tab-in`, a new tab inside the *existing* multi-tab Google Doc that `EXISTING_FILE` is already mapped to) and map `FILE` to it. `--new-tab-in` requires `--backend google_docs` and is mutually exclusive with `--tab-id`. Pushes `FILE`'s current content immediately after creating the mapping.
-
-### `docspan push`
-
-```
-docspan push [FILES]... [--dry-run] [--config PATH]
-```
-
-Push local markdown files to remote docs. Skips mappings with `direction = "pull"`. Accepts an optional list of local file paths to restrict which mappings are pushed.
-
-### `docspan pull`
-
-```
-docspan pull [FILES]... [--dry-run] [--config PATH]
-```
-
-Pull remote documents into local markdown files with three-way merge. Writes conflict markers to the file if automatic merge fails. For Google Docs, also writes a `{file}.comments.md` sidecar of the doc's comments (open + resolved, with quoted selections and reply threads) unless `pull_comments: false`.
-
-### `docspan migrate-sectioned`
-
-```
-docspan migrate-sectioned FILE [--dry-run] [--split-level LEVEL] [--config PATH]
-```
-
-Migrate a single-file mapping to a sectioned mapping (splitting the doc into per-section local files on a heading boundary, default `HEADING_2`), preserving git history via a git commit. Refuses if the mapping is already sectioned or its backend doesn't support sectioned mode.
-
-### `docspan comments respond`
-
-```
-docspan comments respond FILE [--config PATH]
-```
-
-Post `Reply:`/`Resolve:` directives from a `{file}.comments.md` sidecar back to the remote doc. Edit the sidecar's `Reply:` lines and/or flip `Resolve: no` to `Resolve: yes` under an open comment, then run this to post those replies/resolutions and refresh the sidecar with the result.
-
-### `docspan sync`
-
-```
-docspan sync [FILES]... [--force] [--config PATH]
-```
-
-Pull then push each mapping, in that order — the safe default when you don't remember (or don't want to think about) which direction to run first. Stops short of pushing a mapping whose pull left unresolved merge conflicts; everything else (up to date, fast-forwarded, or cleanly merged) gets pushed automatically. Exits non-zero if anything still needs `docspan conflicts resolve`.
-
-### `docspan status`
-
-```
-docspan status [--config PATH]
-```
-
-Display all configured mappings in a table showing local file, backend, remote ID, and direction.
-
-### `docspan style-guide`
-
-```
-docspan style-guide [--backend google_docs|confluence] [--write FILE]
-```
-
-Print backend authoring guidance (e.g. "one image per line on google_docs"). This ships inside the installed package, so re-running it after a `docspan` upgrade picks up new guidance without hand-copying anything. With `--write FILE`, embed it as a marked, idempotent block in a file in your own repo (a `CLAUDE.md`, a style guide doc, etc.) — re-running updates docspan's managed block in place instead of duplicating it.
-
-### `docspan auth setup`
-
-```
-docspan auth setup BACKEND [--config PATH]
-```
-
-Interactive authentication setup. `BACKEND` is one of `google_docs` or `confluence`.
-
-For **Google Docs**, run it with no flags for a guided flow:
-
-```
-docspan auth setup google_docs
-```
-
-It detects your current state, lets you pick **Personal (OAuth)** [recommended] or **Service account**, auto-detects a `client_secret.json` (scanning `.`, `.markgate/`, `~/Downloads`) or prompts for the path with validation, runs the browser sign-in, verifies the connection, and offers to persist the choice into `markgate.yaml` so you never repeat it. In a non-TTY/CI environment it prints manual instructions instead of prompting.
-
-Everything is scriptable — the OAuth path can be selected non-interactively with `--oauth --client-secret PATH`. If a `docspan push`/`pull` runs without credentials in an interactive terminal, it offers to run setup inline and then continues.
-
-For **Confluence**, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
-
-### `docspan conflicts list`
-
-```
-docspan conflicts list [--config PATH]
-```
-
-Scan all tracked files for unresolved merge conflict markers (`<<<<<<< `). Prints a table of conflicted files and conflict block counts.
-
-### `docspan conflicts resolve`
-
-```
-docspan conflicts resolve FILE --accept remote|local|merged [--config PATH]
-```
-
-Resolve a merge conflict in a tracked file.
-
-| Strategy | Behavior |
+| Command | What it does |
 |---|---|
-| `remote` | Re-fetch the remote version and overwrite the local file |
-| `local` | Restore the pre-merge local content from the `.orig` backup |
-| `merged` | Accept the current file contents as the resolved version (conflict markers must be removed first) |
+| `docspan push [FILES]...` | Push local markdown files to remote docs |
+| `docspan pull [FILES]...` | Pull remote documents into local markdown files, with three-way merge |
+| `docspan sync [FILES]...` | Pull then push each mapping — the safe default order |
+| `docspan status` | Show all configured mappings in a table |
+| `docspan map FILE --backend BACKEND` | Create a new remote doc/page and map it to a local file |
+| `docspan migrate-sectioned FILE` | Split a single-file mapping into a sectioned mapping |
+| `docspan style-guide` | Print (or `--write` into a file) backend authoring guidance |
+| `docspan auth setup BACKEND` | Interactive authentication setup for a backend |
+| `docspan comments respond FILE` | Post `Reply:`/`Resolve:` directives from a `.comments.md` sidecar |
+| `docspan conflicts list` | List files with unresolved merge conflicts |
+| `docspan conflicts resolve FILE --accept STRATEGY` | Resolve a merge conflict (`remote`, `local`, or `merged`) |
+| `docspan config show` / `config add PREFIX MARKGATE` | View/register projects in the central config |
+| `docspan migrate-xdg --prefix PREFIX` | Move legacy in-repo storage to XDG and register the project |
 
 ---
 
