@@ -70,7 +70,7 @@ from docspan.config import (
 )
 from docspan.core.atomic_dir import atomic_replace_dir
 from docspan.core.orchestrator import record_state
-from docspan.core.state import MappingState, SyncState
+from docspan.core.state import MappingState, SyncState, sha256_of_content
 
 if TYPE_CHECKING:
     from docspan.backends.google_docs.backend import GoogleDocsBackend
@@ -86,6 +86,14 @@ _GIT_WRITE_TIMEOUT_S = 60
 
 class MigrationError(Exception):
     """Raised for migration pre-flight/execution failures, matching `ManifestError`'s convention."""
+
+
+class _SectionsDivergedError(MigrationError):
+    """Raised only by `_zip_sections`, so its caller can distinguish this
+    specific failure from other `MigrationError`s and check whether a real
+    `docspan pull` would actually change anything before recommending one
+    (issue #153 -- the bare "remote has diverged" message recommended a
+    `pull` even when one was a documented no-op)."""
 
 
 def _run_git(
@@ -254,12 +262,16 @@ def _zip_sections(live: List[Section], local: List[Section]) -> List[Section]:
 
     Per Task 2.3: this is migration's core algorithm, not a second splitting
     pipeline -- `split_nodes()` already ran once on each side (Tasks 2.1/
-    2.2); this only reconciles their outputs. Aborts with a remote-diverged
-    `MigrationError` unless the two section lists have the same length and
-    every pair's `title` matches at its index -- anything else means the
-    live document has changed since the local file was last pulled, and
-    zipping by position would silently mismatch identity to the wrong
-    content.
+    2.2); this only reconciles their outputs. Aborts with a
+    `_SectionsDivergedError` unless the two section lists have the same
+    length and every pair's `title` matches at its index -- anything else
+    means the live document has changed since the local file was last
+    pulled, and zipping by position would silently mismatch identity to the
+    wrong content. The error names the section-count mismatch (if any) and
+    the first differing title/index, rather than a bare "diverged" (issue
+    #153) -- the caller decides what remediation to suggest, since whether
+    a `pull` would actually help depends on sync state this function
+    doesn't have.
 
     On success, each resulting section takes its `heading_id` from the live
     side (real Docs-assigned identity) and everything else (`nodes`, i.e.
@@ -276,7 +288,7 @@ def _zip_sections(live: List[Section], local: List[Section]) -> List[Section]:
         live_section.title != local_section.title
         for live_section, local_section in zip(live, local)
     ):
-        raise MigrationError("remote has diverged — run 'docspan pull' first")
+        raise _SectionsDivergedError(_describe_section_mismatch(live, local))
 
     return [
         dataclasses.replace(
@@ -285,6 +297,55 @@ def _zip_sections(live: List[Section], local: List[Section]) -> List[Section]:
         )
         for index, (live_section, local_section) in enumerate(zip(live, local))
     ]
+
+
+def _describe_section_mismatch(live: List[Section], local: List[Section]) -> str:
+    """Build a specific diagnostic for `_zip_sections`'s abort case.
+
+    Names the section-count mismatch (if any) and the index/titles of the
+    first pair that differ, so the resulting `MigrationError` says what
+    actually mismatched instead of a bare "diverged" (issue #153).
+    """
+    parts = []
+    if len(live) != len(local):
+        parts.append(
+            f"live document has {len(live)} section(s) at this split level, "
+            f"local file has {len(local)}"
+        )
+    for index, (live_section, local_section) in enumerate(zip(live, local)):
+        if live_section.title != local_section.title:
+            parts.append(
+                f"first title mismatch at section {index}: "
+                f"live={live_section.title!r} local={local_section.title!r}"
+            )
+            break
+    return "structural mismatch between live and local sections: " + "; ".join(parts)
+
+
+def _pull_would_be_noop(
+    mapping: Mapping, backend: "GoogleDocsBackend", state: SyncState
+) -> bool:
+    """True if `docspan pull` on `mapping` right now would report "up to
+    date" -- i.e. recommending one as the fix for a `_SectionsDivergedError`
+    (issue #153) would be a no-op that can't actually resolve it.
+
+    Mirrors `orchestrator._classify_pull`'s "up-to-date" branch (remote
+    version and local content hash both unchanged since the last sync)
+    rather than importing it directly, since that function's other three
+    branches (first-sync/fast-forward/merge) have no use here.
+    """
+    entry = state.get(mapping.local)
+    if entry is None or not os.path.exists(mapping.local):
+        return False
+    try:
+        remote_version = backend.get_remote_version(mapping.remote_id)
+    except Exception:
+        return False
+    if remote_version != entry.remote_version:
+        return False
+    with open(mapping.local, encoding="utf-8") as fh:
+        local_content = fh.read()
+    return sha256_of_content(local_content) == entry.local_hash
 
 
 def _deepest_heading_style_present(nodes) -> Optional[str]:
@@ -897,6 +958,20 @@ def migrate_sectioned(
             local_sections = _split_local(mapping.local, split_level)
             zipped = _zip_sections(live_sections, local_sections)
             _guard_against_single_preamble_only(zipped, mapping.local, split_level)
+        except _SectionsDivergedError as exc:
+            if _pull_would_be_noop(mapping, backend, state):
+                message = (
+                    f"{exc} -- this is a structural split mismatch, not stale "
+                    "local content: 'docspan pull' would report up to date "
+                    "and change nothing right now. Check for a parsing "
+                    "difference between the live Doc and the local file at "
+                    f"split level {split_level!r}."
+                )
+            else:
+                message = f"{exc} — run 'docspan pull' first"
+            return MigrationResult(
+                outcome=MigrationOutcome.REFUSED, sections=[], messages=[message]
+            )
         except MigrationError as exc:
             return MigrationResult(
                 outcome=MigrationOutcome.REFUSED, sections=[], messages=[str(exc)]
