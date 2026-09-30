@@ -198,3 +198,17 @@ class TestUnmappedCrossDocLinks:
         resolver = CrossDocLinkResolver([], lambda d, t: [])
         hrefs = builder.unmapped_cross_doc_links(doc, target, resolver=resolver, local_path="source.md")
         assert hrefs == ["census/data.json"]
+
+    def test_unmapped_link_in_table_cell_is_collected(self) -> None:
+        doc = _doc(_paragraph("unrelated", 1))
+        target = [
+            DocsParagraphNode(style="NORMAL_TEXT", text="unrelated"),
+            DocsTableNode(rows=[[
+                TableCell(text="see it", spans=[
+                    TextSpan(text="see it", link="census/data.json"),
+                ]),
+            ]]),
+        ]
+        resolver = CrossDocLinkResolver([], lambda d, t: [])
+        hrefs = builder.unmapped_cross_doc_links(doc, target, resolver=resolver, local_path="source.md")
+        assert hrefs == ["census/data.json"]
