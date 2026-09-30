@@ -2226,6 +2226,53 @@ class DocsRequestBuilder:
                         collect(cell.spans)
         return issues
 
+    def unmapped_cross_doc_links(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
+    ) -> List[str]:
+        """Relative links to a file with no mapping entry, as the raw hrefs (#154).
+
+        Separate from cross_doc_link_issues(): criterion 3 says an unmapped
+        link is written untouched, not reported as a resolution failure, and
+        that stays true here too — this doesn't change what gets written.
+        But "untouched" means the literal relative path becomes the Doc's
+        `url`, and Google Docs renders a schemeless relative path (e.g.
+        `census/data.json`) as `http://census/data.json`, a link that can
+        never resolve. That's worth flagging even though it isn't a failure
+        of resolution, so it's a distinct, non-blocking warning.
+        """
+        if resolver is None or local_path is None:
+            return []
+        styled_paragraph = any(isinstance(n, DocsParagraphNode) and n.spans for n in target)
+        styled_cell = any(cell.styled for n in target if isinstance(n, DocsTableNode)
+                          for row in n.rows for cell in row)
+        if not styled_paragraph and not styled_cell:
+            return []
+        aligned = self._aligned(doc, target, alignment)
+        hrefs: List[str] = []
+
+        def collect(spans: List[TextSpan]) -> None:
+            for span in spans:
+                if (
+                    span.link
+                    and span.link not in hrefs
+                    and cross_doc_links.is_unmapped_cross_doc_link(span.link, local_path, resolver)
+                ):
+                    hrefs.append(span.link)
+
+        for _cnode, tnode in aligned.pairs:
+            collect(tnode.spans)
+        for node in target:
+            if isinstance(node, DocsTableNode):
+                for row in node.rows:
+                    for cell in row:
+                        collect(cell.spans)
+        return hrefs
+
     @staticmethod
     def _spans_overflow(node: DocsParagraphNode, placement: DocsParagraphNode) -> bool:
         """True when ``node``'s spans cannot all fit inside ``placement``'s text.

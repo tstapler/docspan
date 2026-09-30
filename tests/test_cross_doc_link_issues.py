@@ -133,3 +133,68 @@ class TestCrossDocLinkIssues:
         resolver = CrossDocLinkResolver([make_mapping("target.md")], lambda d, t: [])
         issues = builder.cross_doc_link_issues(doc, target, resolver=resolver, local_path="source.md")
         assert len(issues) == 1
+
+
+class TestUnmappedCrossDocLinks:
+    """Tests for DocsRequestBuilder.unmapped_cross_doc_links() (#154).
+
+    A link to a file with no mapping entry is still written untouched
+    (criterion 3, unchanged — see TestCrossDocLinkIssues.test_unmapped_link_is_not_reported),
+    but it's collected here as a distinct, non-blocking warning: Google Docs
+    renders the bare relative path as an unresolvable `http://...` link.
+    """
+
+    def test_unmapped_link_is_collected(self) -> None:
+        doc = _doc(_paragraph("see it", 1))
+        target = [
+            DocsParagraphNode(style="NORMAL_TEXT", text="see it", spans=[
+                TextSpan(text="see it", link="census/data.json"),
+            ]),
+        ]
+        resolver = CrossDocLinkResolver([], lambda d, t: [])
+        hrefs = builder.unmapped_cross_doc_links(doc, target, resolver=resolver, local_path="source.md")
+        assert hrefs == ["census/data.json"]
+
+    def test_mapped_link_is_not_collected(self) -> None:
+        doc = _doc(_paragraph("see it", 1))
+        target = [
+            DocsParagraphNode(style="NORMAL_TEXT", text="see it", spans=[
+                TextSpan(text="see it", link="target.md"),
+            ]),
+        ]
+        resolver = CrossDocLinkResolver([make_mapping("target.md")], lambda d, t: [])
+        assert builder.unmapped_cross_doc_links(doc, target, resolver=resolver, local_path="source.md") == []
+
+    def test_unresolvable_mapped_link_is_not_collected(self) -> None:
+        # An ambiguous/unsupported/fetch-failed/unresolved-anchor link is
+        # cross_doc_link_issues()'s job, not this one's -- the two stay
+        # disjoint the same way cross-doc and same-document anchors do.
+        doc = _doc(_paragraph("see it", 1))
+        target = [
+            DocsParagraphNode(style="NORMAL_TEXT", text="see it", spans=[
+                TextSpan(text="see it", link="target.md#missing"),
+            ]),
+        ]
+        resolver = CrossDocLinkResolver([make_mapping("target.md")], lambda d, t: [])
+        assert builder.unmapped_cross_doc_links(doc, target, resolver=resolver, local_path="source.md") == []
+
+    def test_no_resolver_returns_empty(self) -> None:
+        doc = _doc(_paragraph("see it", 1))
+        target = [
+            DocsParagraphNode(style="NORMAL_TEXT", text="see it", spans=[
+                TextSpan(text="see it", link="census/data.json"),
+            ]),
+        ]
+        assert builder.unmapped_cross_doc_links(doc, target, resolver=None, local_path="source.md") == []
+
+    def test_duplicate_href_is_collected_once(self) -> None:
+        doc = _doc(_paragraph("see one and two", 1))
+        target = [
+            DocsParagraphNode(style="NORMAL_TEXT", text="see one and two", spans=[
+                TextSpan(text="see one", link="census/data.json"),
+                TextSpan(text=" and two", link="census/data.json"),
+            ]),
+        ]
+        resolver = CrossDocLinkResolver([], lambda d, t: [])
+        hrefs = builder.unmapped_cross_doc_links(doc, target, resolver=resolver, local_path="source.md")
+        assert hrefs == ["census/data.json"]
