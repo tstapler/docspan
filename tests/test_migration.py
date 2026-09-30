@@ -423,6 +423,29 @@ def test_split_live_raises_migration_error_for_unknown_tab_id() -> None:  # type
         _split_live(client, "fake-doc-id", "HEADING_1", tab_id="t.missing")
 
 
+def test_split_live_defaults_to_first_tab_when_tab_id_is_none_on_multi_tab_document() -> None:  # type: ignore[no-untyped-def]
+    """No `tab_id` on a multi-tab doc defaults to the first tab (`resolve_document_tab`'s
+    contract) -- the second tab's headings must never leak into the split."""
+    first_tab_content = [
+        _make_para_element("Intro body.", style="NORMAL_TEXT"),
+        _make_para_element("First", style="HEADING_1", heading_id="h.abc123"),
+    ]
+    second_tab_content = [
+        _make_para_element("Unrelated", style="HEADING_1", heading_id="h.unrelated"),
+    ]
+    doc = {
+        "tabs": [
+            _make_tab("t.0", "First", first_tab_content),
+            _make_tab("t.1", "Second", second_tab_content),
+        ]
+    }
+    client = _StubDocsClient(doc)
+
+    sections = _split_live(client, "fake-doc-id", "HEADING_1", tab_id=None)
+
+    assert [s.title for s in sections] == ["", "First"]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Epic 3: stage sections, atomic swap, git commit
 # ─────────────────────────────────────────────────────────────────────────────

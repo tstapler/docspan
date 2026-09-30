@@ -215,22 +215,11 @@ def _check_clean_tree(local_path: str) -> None:
 def _split_live(
     client, doc_id: str, split_level: str, tab_id: Optional[str] = None
 ) -> List[Section]:
-    """Split the *live* Google Doc into `Section`s (identity only, per Task 2.1).
+    """Split the *live* Google Doc into `Section`s, scoped to `tab_id` if given.
 
-    `client.get_document(doc_id)` -> `resolve_document_tab()` ->
-    `DocsStructureParser().parse()` -> `project()` -> `split_nodes(nodes,
-    split_level)` -- the same reusable pipeline `pull_sectioned` already
-    runs (`backend.py`), scoped to `tab_id` (from `Mapping.tab_id`) the same
-    way and likewise discarding the "which tab did we default to" warning,
-    so this performs no new Docs API surface, per plan.md's Pattern
-    Decisions. Only `heading_id`/`title` per section end up mattering to the
-    caller (Task 2.3's zip) -- the section *content* here is discarded in
-    favor of the local file's byte-faithful content.
-
-    Without this scoping, a `tab_id` mapping split the *whole* multi-tab
-    document instead of just the mapped tab, so the zip's section-count/
-    title check against `_split_local`'s single-tab content could never
-    pass (issue #152).
+    Scoping matters: without it, a `tab_id` mapping split the whole
+    multi-tab document instead of just the mapped tab (issue #152). Mirrors
+    `pull_sectioned`'s own `resolve_document_tab()` call in `backend.py`.
 
     Raises `MigrationError` (translated from `TabNotFoundError`) if `tab_id`
     is set but doesn't match any tab in the document.
