@@ -60,6 +60,7 @@ from docspan.backends.google_docs.markdown_to_paragraph_parser import (
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.projection import project
 from docspan.backends.google_docs.section_splitter import Section, split_nodes
+from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.config import (
     _SECTIONED_UNSUPPORTED_BACKENDS,
     Mapping,
@@ -211,18 +212,34 @@ def _check_clean_tree(local_path: str) -> None:
     )
 
 
-def _split_live(client, doc_id: str, split_level: str) -> List[Section]:
+def _split_live(
+    client, doc_id: str, split_level: str, tab_id: Optional[str] = None
+) -> List[Section]:
     """Split the *live* Google Doc into `Section`s (identity only, per Task 2.1).
 
-    `client.get_document(doc_id)` -> `DocsStructureParser().parse()` ->
-    `project()` -> `split_nodes(nodes, split_level)` -- the exact same
-    reusable pipeline `pull_sectioned` already runs (`backend.py`), so this
-    performs no new Docs API surface, per plan.md's Pattern Decisions. Only
-    `heading_id`/`title` per section end up mattering to the caller (Task
-    2.3's zip) -- the section *content* here is discarded in favor of the
-    local file's byte-faithful content.
+    `client.get_document(doc_id)` -> `resolve_document_tab()` ->
+    `DocsStructureParser().parse()` -> `project()` -> `split_nodes(nodes,
+    split_level)` -- the same reusable pipeline `pull_sectioned` already
+    runs (`backend.py`), scoped to `tab_id` (from `Mapping.tab_id`) the same
+    way and likewise discarding the "which tab did we default to" warning,
+    so this performs no new Docs API surface, per plan.md's Pattern
+    Decisions. Only `heading_id`/`title` per section end up mattering to the
+    caller (Task 2.3's zip) -- the section *content* here is discarded in
+    favor of the local file's byte-faithful content.
+
+    Without this scoping, a `tab_id` mapping split the *whole* multi-tab
+    document instead of just the mapped tab, so the zip's section-count/
+    title check against `_split_local`'s single-tab content could never
+    pass (issue #152).
+
+    Raises `MigrationError` (translated from `TabNotFoundError`) if `tab_id`
+    is set but doesn't match any tab in the document.
     """
     doc = client.get_document(doc_id)
+    try:
+        doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
+    except TabNotFoundError as exc:
+        raise MigrationError(str(exc)) from exc
     nodes = DocsStructureParser().parse(doc)
     nodes, _residue = project(nodes)
     return split_nodes(nodes, split_level)
@@ -885,7 +902,9 @@ def migrate_sectioned(
             _check_clean_tree(mapping.local)
 
             client = backend.client
-            live_sections = _split_live(client, mapping.remote_id, split_level)
+            live_sections = _split_live(
+                client, mapping.remote_id, split_level, tab_id=mapping.tab_id
+            )
             local_sections = _split_local(mapping.local, split_level)
             zipped = _zip_sections(live_sections, local_sections)
             _guard_against_single_preamble_only(zipped, mapping.local, split_level)

@@ -381,6 +381,48 @@ def test_split_live_and_split_local_zip_end_to_end(tmp_path) -> None:  # type: i
     assert [s.title for s in zipped] == ["", "First", "Second"]
 
 
+def _make_tab(tab_id: str, title: str, content: list[dict]) -> dict:
+    return {
+        "tabProperties": {"tabId": tab_id, "title": title},
+        "documentTab": {"body": {"content": content}, "lists": {}, "inlineObjects": {}},
+        "childTabs": [],
+    }
+
+
+def test_split_live_scopes_to_tab_id_on_multi_tab_document() -> None:  # type: ignore[no-untyped-def]
+    """Issue #152: a `tab_id` mapping must split only its own tab, not the whole doc."""
+    mapped_tab_content = [
+        _make_para_element("Intro body.", style="NORMAL_TEXT"),
+        _make_para_element("First", style="HEADING_1", heading_id="h.abc123"),
+        _make_para_element("Body one.", style="NORMAL_TEXT"),
+    ]
+    other_tab_content = [
+        _make_para_element("Unrelated", style="HEADING_1", heading_id="h.unrelated"),
+        _make_para_element("Unrelated body.", style="NORMAL_TEXT"),
+        _make_para_element("Another heading", style="HEADING_1", heading_id="h.unrelated2"),
+    ]
+    doc = {
+        "tabs": [
+            _make_tab("t.0", "Mapped", mapped_tab_content),
+            _make_tab("t.1", "Other", other_tab_content),
+        ]
+    }
+    client = _StubDocsClient(doc)
+
+    sections = _split_live(client, "fake-doc-id", "HEADING_1", tab_id="t.0")
+
+    assert [s.title for s in sections] == ["", "First"]
+    assert sections[1].heading_id == "h.abc123"
+
+
+def test_split_live_raises_migration_error_for_unknown_tab_id() -> None:  # type: ignore[no-untyped-def]
+    doc = {"tabs": [_make_tab("t.0", "Mapped", [])]}
+    client = _StubDocsClient(doc)
+
+    with pytest.raises(MigrationError, match="not found"):
+        _split_live(client, "fake-doc-id", "HEADING_1", tab_id="t.missing")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Epic 3: stage sections, atomic swap, git commit
 # ─────────────────────────────────────────────────────────────────────────────
