@@ -421,10 +421,23 @@ def test_migrate_sectioned_scopes_to_mapped_tab_on_multi_tab_document(tmp_path) 
 def test_migrate_sectioned_diverged_message_suggests_pull_when_pull_would_help(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """Issue #153: when the live doc really has moved on since the last
     sync, the refusal message should still point at `docspan pull`."""
+    from docspan.core.state import MappingState, sha256_of_content
+
     repo_root, local_file, config_path, mapping = _repo_with_handbook(tmp_path)
 
     config = load_config(str(config_path))
-    state = SyncState()  # no prior sync recorded -- state.get() returns None
+    state = SyncState()
+    state.update(
+        str(local_file),
+        MappingState(
+            doc_id="doc123",
+            backend="google_docs",
+            last_synced_at="2026-01-01T00:00:00Z",
+            base_hash=sha256_of_content(_CONTENT),
+            remote_version="v0",  # stub's get_remote_version() returns "v1" -- remote has moved on
+            local_hash=sha256_of_content(local_file.read_text(encoding="utf-8")),
+        ),
+    )
     state_path = get_state_path(str(config_path), None)
     state_dir = get_state_dir(str(config_path), None)
 

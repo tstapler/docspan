@@ -42,11 +42,12 @@ import pathlib
 import shutil
 import subprocess
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from rich.markup import escape
 from rich.table import Table
 
+from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
 from docspan.backends.google_docs.manifest import (
     MANIFEST_FILENAME,
@@ -58,7 +59,7 @@ from docspan.backends.google_docs.markdown_to_paragraph_parser import (
     MarkdownToParagraphParser,
 )
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
-from docspan.backends.google_docs.projection import project
+from docspan.backends.google_docs.projection import Node, project
 from docspan.backends.google_docs.section_splitter import Section, split_nodes
 from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.config import (
@@ -69,7 +70,7 @@ from docspan.config import (
     save_config,
 )
 from docspan.core.atomic_dir import atomic_replace_dir
-from docspan.core.orchestrator import record_state
+from docspan.core.orchestrator import _classify_pull, record_state
 from docspan.core.state import MappingState, SyncState, sha256_of_content
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ class _SectionsDivergedError(MigrationError):
 
 def _run_git(
     *args: str, cwd: str, timeout: Optional[float] = None
-) -> subprocess.CompletedProcess:
+) -> "subprocess.CompletedProcess[str]":
     """Run a `git` subcommand and return its `CompletedProcess`.
 
     Mirrors `mermaid_renderer.py`'s subprocess pattern (list-argv,
@@ -221,7 +222,7 @@ def _check_clean_tree(local_path: str) -> None:
 
 
 def _split_live(
-    client, doc_id: str, split_level: str, tab_id: Optional[str] = None
+    client: GoogleDocsClient, doc_id: str, split_level: str, tab_id: Optional[str] = None
 ) -> List[Section]:
     """Split the *live* Google Doc into `Section`s, scoped to `tab_id` if given.
 
@@ -263,15 +264,11 @@ def _zip_sections(live: List[Section], local: List[Section]) -> List[Section]:
     Per Task 2.3: this is migration's core algorithm, not a second splitting
     pipeline -- `split_nodes()` already ran once on each side (Tasks 2.1/
     2.2); this only reconciles their outputs. Aborts with a
-    `_SectionsDivergedError` unless the two section lists have the same
-    length and every pair's `title` matches at its index -- anything else
-    means the live document has changed since the local file was last
-    pulled, and zipping by position would silently mismatch identity to the
-    wrong content. The error names the section-count mismatch (if any) and
-    the first differing title/index, rather than a bare "diverged" (issue
-    #153) -- the caller decides what remediation to suggest, since whether
-    a `pull` would actually help depends on sync state this function
-    doesn't have.
+    `_SectionsDivergedError` (see `_describe_section_mismatch`) unless the
+    two section lists have the same length and every pair's `title` matches
+    at its index -- anything else means the live document has changed since
+    the local file was last pulled, and zipping by position would silently
+    mismatch identity to the wrong content.
 
     On success, each resulting section takes its `heading_id` from the live
     side (real Docs-assigned identity) and everything else (`nodes`, i.e.
@@ -306,7 +303,7 @@ def _describe_section_mismatch(live: List[Section], local: List[Section]) -> str
     first pair that differ, so the resulting `MigrationError` says what
     actually mismatched instead of a bare "diverged" (issue #153).
     """
-    parts = []
+    parts: List[str] = []
     if len(live) != len(local):
         parts.append(
             f"live document has {len(live)} section(s) at this split level, "
@@ -323,32 +320,27 @@ def _describe_section_mismatch(live: List[Section], local: List[Section]) -> str
 
 
 def _pull_would_be_noop(
-    mapping: Mapping, backend: "GoogleDocsBackend", state: SyncState
+    mapping: Mapping, remote_id: str, backend: "GoogleDocsBackend", state: SyncState
 ) -> bool:
-    """True if `docspan pull` on `mapping` right now would report "up to
-    date" -- i.e. recommending one as the fix for a `_SectionsDivergedError`
-    (issue #153) would be a no-op that can't actually resolve it.
+    """True if `docspan pull` on `mapping` right now would be a no-op.
 
-    Mirrors `orchestrator._classify_pull`'s "up-to-date" branch (remote
-    version and local content hash both unchanged since the last sync)
-    rather than importing it directly, since that function's other three
-    branches (first-sync/fast-forward/merge) have no use here.
+    Calls `orchestrator._classify_pull` directly rather than
+    re-deriving its "up-to-date" branch, so the two can't silently drift.
     """
     entry = state.get(mapping.local)
-    if entry is None or not os.path.exists(mapping.local):
+    local_exists = os.path.exists(mapping.local)
+    if entry is None or not local_exists:
         return False
     try:
-        remote_version = backend.get_remote_version(mapping.remote_id)
+        remote_version = backend.get_remote_version(remote_id)
     except Exception:
         return False
-    if remote_version != entry.remote_version:
-        return False
     with open(mapping.local, encoding="utf-8") as fh:
-        local_content = fh.read()
-    return sha256_of_content(local_content) == entry.local_hash
+        current_local_hash = sha256_of_content(fh.read())
+    return _classify_pull(entry, local_exists, current_local_hash, remote_version) == "up-to-date"
 
 
-def _deepest_heading_style_present(nodes) -> Optional[str]:
+def _deepest_heading_style_present(nodes: Sequence[Node]) -> Optional[str]:
     """Return the deepest `HEADING_N` style found in `nodes`, or `None`.
 
     Mirrors `split_nodes`'s own rank-computation exactly (`is_heading_style`
@@ -360,7 +352,7 @@ def _deepest_heading_style_present(nodes) -> Optional[str]:
     ranks = set()
     for node in nodes:
         style = getattr(node, "style", None)
-        if not is_heading_style(style):
+        if style is None or not is_heading_style(style):
             continue
         try:
             ranks.add(int(style.split("_", 1)[1]))
@@ -947,21 +939,26 @@ def migrate_sectioned(
     commit_landed = False
     created_paths: List[pathlib.Path] = []
 
+    assert mapping.remote_id is not None, (
+        "migrate_sectioned requires a mapping with a created remote doc"
+    )
+    remote_id = mapping.remote_id
+
     try:
         try:
             _check_clean_tree(mapping.local)
 
             client = backend.client
             live_sections = _split_live(
-                client, mapping.remote_id, split_level, tab_id=mapping.tab_id
+                client, remote_id, split_level, tab_id=mapping.tab_id
             )
             local_sections = _split_local(mapping.local, split_level)
             zipped = _zip_sections(live_sections, local_sections)
             _guard_against_single_preamble_only(zipped, mapping.local, split_level)
         except _SectionsDivergedError as exc:
-            if _pull_would_be_noop(mapping, backend, state):
+            if _pull_would_be_noop(mapping, remote_id, backend, state):
                 message = (
-                    f"{exc} -- this is a structural split mismatch, not stale "
+                    f"{exc} — this is a structural split mismatch, not stale "
                     "local content: 'docspan pull' would report up to date "
                     "and change nothing right now. Check for a parsing "
                     "difference between the live Doc and the local file at "
@@ -1015,7 +1012,7 @@ def migrate_sectioned(
 
             remote_version: str
             try:
-                remote_version = backend.get_remote_version(mapping.remote_id)
+                remote_version = backend.get_remote_version(remote_id)
             except Exception:
                 remote_version = ""
 
