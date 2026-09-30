@@ -588,6 +588,7 @@ class GoogleDocsBackend(Backend):
             unplaced_cells: list[str] = []
             dead_anchors: list[str] = []
             cross_doc_issues: list[str] = []
+            unmapped_links: list[str] = []
             # Residue from the second, post-pass-1 parse `align()` does inside
             # `_align_for_styling` — distinct from plan.residue (the *first*
             # parse's residue) and reported the same way for the same reason:
@@ -676,6 +677,17 @@ class GoogleDocsBackend(Backend):
                     pass2_doc, plan.target_nodes, alignment,
                     resolver=resolver, local_path=local_path,
                 )
+                # Relative links to a file with no mapping entry (#154):
+                # criterion 3 (cross_doc_issues above) leaves these untouched
+                # rather than treating them as a resolution failure, but the
+                # literal relative path still lands in the Doc as a `url`
+                # link with no scheme, which Google Docs renders as
+                # `http://<first-path-segment>/...` — a link that can never
+                # resolve. Reported as its own non-blocking warning.
+                unmapped_links = builder.unmapped_cross_doc_links(
+                    pass2_doc, plan.target_nodes, alignment,
+                    resolver=resolver, local_path=local_path,
+                )
                 # Styled table cells pass 2 could not place. Same trade as
                 # `unstyled` above and the same reason it has to be said out loud:
                 # the cell got no styling rather than styling aimed at whatever sat
@@ -696,7 +708,8 @@ class GoogleDocsBackend(Backend):
                     )
 
             if (not plan.requests and not style_requests and not second and not unstyled
-                    and not dead_anchors and not unplaced_cells and not cross_doc_issues):
+                    and not dead_anchors and not unplaced_cells and not cross_doc_issues
+                    and not unmapped_links):
                 # Nothing was applied by either pass. That is now a true
                 # statement about the document rather than an inference from an
                 # empty request list: projection.project() removes the one class
@@ -762,6 +775,9 @@ class GoogleDocsBackend(Backend):
                     else None,
                     self._render_cross_doc_issues(cross_doc_issues)
                     if cross_doc_issues
+                    else None,
+                    self._render_unmapped_cross_doc_links(unmapped_links)
+                    if unmapped_links
                     else None,
                     describe_target_residue(plan.target_residue) or None,
                     # Doc-side residue (e.g. an ambiguous code-block prefix) is only
@@ -1221,6 +1237,29 @@ class GoogleDocsBackend(Backend):
             f"not resolve what they point at:",
         ]
         lines += [f"    • {issue}" for issue in shown]
+        if more:
+            lines.append(f"    • … and {more} more")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_unmapped_cross_doc_links(hrefs: list[str]) -> str:
+        """Report relative links written as-is because they match no mapping (#154).
+
+        Distinct from _render_cross_doc_issues: those name a mapped file that
+        couldn't be resolved to a URL, whereas these match no mapping at all
+        (a file outside this project's scope, or simply not one docspan
+        pushes to a Doc). Each is still written untouched, per criterion 3 —
+        this only warns that Google Docs will render the bare relative path
+        as an unresolvable `http://<first-path-segment>/...` link.
+        """
+        shown = hrefs[:5]
+        more = len(hrefs) - len(shown)
+        lines = [
+            f"⚠ {len(hrefs)} relative link(s) point to a file with no mapping entry — "
+            f"written as-is, but Google Docs will render them as a broken "
+            f"http://... link:",
+        ]
+        lines += [f"    • {href}" for href in shown]
         if more:
             lines.append(f"    • … and {more} more")
         return "\n".join(lines)
