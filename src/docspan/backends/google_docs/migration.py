@@ -60,6 +60,7 @@ from docspan.backends.google_docs.markdown_to_paragraph_parser import (
 from docspan.backends.google_docs.nodes_to_markdown import render_nodes_to_markdown
 from docspan.backends.google_docs.projection import project
 from docspan.backends.google_docs.section_splitter import Section, split_nodes
+from docspan.backends.google_docs.tabs import TabNotFoundError, resolve_document_tab
 from docspan.config import (
     _SECTIONED_UNSUPPORTED_BACKENDS,
     Mapping,
@@ -211,18 +212,23 @@ def _check_clean_tree(local_path: str) -> None:
     )
 
 
-def _split_live(client, doc_id: str, split_level: str) -> List[Section]:
-    """Split the *live* Google Doc into `Section`s (identity only, per Task 2.1).
+def _split_live(
+    client, doc_id: str, split_level: str, tab_id: Optional[str] = None
+) -> List[Section]:
+    """Split the *live* Google Doc into `Section`s, scoped to `tab_id` if given.
 
-    `client.get_document(doc_id)` -> `DocsStructureParser().parse()` ->
-    `project()` -> `split_nodes(nodes, split_level)` -- the exact same
-    reusable pipeline `pull_sectioned` already runs (`backend.py`), so this
-    performs no new Docs API surface, per plan.md's Pattern Decisions. Only
-    `heading_id`/`title` per section end up mattering to the caller (Task
-    2.3's zip) -- the section *content* here is discarded in favor of the
-    local file's byte-faithful content.
+    Scoping matters: without it, a `tab_id` mapping split the whole
+    multi-tab document instead of just the mapped tab (issue #152). Mirrors
+    `pull_sectioned`'s own `resolve_document_tab()` call in `backend.py`.
+
+    Raises `MigrationError` (translated from `TabNotFoundError`) if `tab_id`
+    is set but doesn't match any tab in the document.
     """
     doc = client.get_document(doc_id)
+    try:
+        doc, _resolved_tab_id, _warning = resolve_document_tab(doc, tab_id)
+    except TabNotFoundError as exc:
+        raise MigrationError(str(exc)) from exc
     nodes = DocsStructureParser().parse(doc)
     nodes, _residue = project(nodes)
     return split_nodes(nodes, split_level)
@@ -885,7 +891,9 @@ def migrate_sectioned(
             _check_clean_tree(mapping.local)
 
             client = backend.client
-            live_sections = _split_live(client, mapping.remote_id, split_level)
+            live_sections = _split_live(
+                client, mapping.remote_id, split_level, tab_id=mapping.tab_id
+            )
             local_sections = _split_local(mapping.local, split_level)
             zipped = _zip_sections(live_sections, local_sections)
             _guard_against_single_preamble_only(zipped, mapping.local, split_level)

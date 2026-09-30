@@ -355,6 +355,69 @@ def test_dry_run_returns_preview_and_writes_nothing(tmp_path) -> None:  # type: 
     assert not list(repo_root.glob(".docspan-migration-*.lock"))
 
 
+def _multi_tab_doc_for_content(mapped_tab_id: str) -> dict:
+    """A multi-tab Docs-API doc: `mapped_tab_id` matches `_CONTENT`, the other
+    tab holds unrelated headings that must never leak into the split
+    (issue #152 regression coverage)."""
+    return {
+        "tabs": [
+            {
+                "tabProperties": {"tabId": mapped_tab_id, "title": "Mapped"},
+                "documentTab": {"body": _doc_for_content()["body"], "lists": {}, "inlineObjects": {}},
+                "childTabs": [],
+            },
+            {
+                "tabProperties": {"tabId": "t.other", "title": "Other"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            _make_para_element("Unrelated", style="HEADING_1", heading_id="h.unrelated"),
+                            _make_para_element("Unrelated body.", style="NORMAL_TEXT"),
+                        ]
+                    },
+                    "lists": {},
+                    "inlineObjects": {},
+                },
+                "childTabs": [],
+            },
+        ]
+    }
+
+
+def test_migrate_sectioned_scopes_to_mapped_tab_on_multi_tab_document(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Issue #152 regression: `migrate_sectioned` must thread `Mapping.tab_id`
+    through to the live split, not just parse the whole multi-tab document."""
+    _init_repo(tmp_path)
+    local_file = tmp_path / "handbook.md"
+    local_file.write_text(_CONTENT, encoding="utf-8")
+    _git("add", "handbook.md", cwd=str(tmp_path))
+    _git("commit", "-m", "initial", cwd=str(tmp_path))
+
+    config_path = tmp_path / "markgate.yaml"
+    mapping = Mapping(
+        local=str(local_file), backend="google_docs", remote_id="doc123", tab_id="t.mapped"
+    )
+    save_config(MarkgateConfig(mappings=[mapping]), str(config_path))
+
+    config = load_config(str(config_path))
+    state = SyncState()
+    state_path = get_state_path(str(config_path), None)
+    state_dir = get_state_dir(str(config_path), None)
+    backend = _StubMigrationBackend(doc=_multi_tab_doc_for_content("t.mapped"))
+
+    result = migrate_sectioned(
+        mapping, backend, config, str(config_path), state, state_dir, state_path,
+        "HEADING_1", dry_run=True,
+    )
+
+    assert result.outcome == MigrationOutcome.DRY_RUN
+    assert [row.filename for row in result.sections[0].rows] == [
+        "00-preamble.md",
+        "01-first.md",
+        "02-second.md",
+    ]
+
+
 def test_should_CommitSuccessfully_when_MigratingFiftyPlusSections(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """pre-mortem P1 #1: `_run_git`'s per-call-site timeout (Task 1.1) was
     calibrated for tiny plumbing calls, but `_commit_swap` (Task 3.2) runs
