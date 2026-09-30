@@ -202,7 +202,7 @@ def test_zip_sections_assigns_live_heading_id_when_counts_and_titles_match() -> 
     assert zipped[1].slug == "first"
 
 
-def test_zip_sections_raises_remote_diverged_error_on_count_mismatch() -> None:  # type: ignore[no-untyped-def]
+def test_zip_sections_raises_on_count_mismatch_naming_both_counts() -> None:  # type: ignore[no-untyped-def]
     live = [
         _section(PREAMBLE_HEADING_ID, "", PREAMBLE_SLUG),
         _section("h.abc123", "First", "first"),
@@ -213,11 +213,11 @@ def test_zip_sections_raises_remote_diverged_error_on_count_mismatch() -> None: 
         _section("", "First", "first"),
     ]
 
-    with pytest.raises(MigrationError, match="remote has diverged"):
+    with pytest.raises(MigrationError, match="live document has 3 section.*local file has 2"):
         _zip_sections(live, local)
 
 
-def test_zip_sections_raises_remote_diverged_error_on_title_mismatch_at_same_position() -> None:  # type: ignore[no-untyped-def]
+def test_zip_sections_raises_on_title_mismatch_naming_index_and_titles() -> None:  # type: ignore[no-untyped-def]
     live = [
         _section(PREAMBLE_HEADING_ID, "", PREAMBLE_SLUG),
         _section("h.abc123", "First", "first"),
@@ -227,7 +227,10 @@ def test_zip_sections_raises_remote_diverged_error_on_title_mismatch_at_same_pos
         _section("", "Renamed First", "renamed-first"),
     ]
 
-    with pytest.raises(MigrationError, match="remote has diverged"):
+    with pytest.raises(
+        MigrationError,
+        match=r"section 1: live='First' local='Renamed First'",
+    ):
         _zip_sections(live, local)
 
 
