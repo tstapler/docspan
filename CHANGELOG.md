@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 * **google-docs:** fence multi-line code blocks on the default (no tab_id) pull path ([#167](https://github.com/tstapler/docspan/issues/167)) ([c58d048](https://github.com/tstapler/docspan/commit/c58d048e4084e43f6befb6a7bfd748ae90ca99bc))
+* **google-docs:** keep text/spans invariant in paragraph, heading, list and blockquote parsing ([#168](https://github.com/tstapler/docspan/issues/168)) ([1a582fd](https://github.com/tstapler/docspan/commit/1a582fd98f50ebfccb30ab3973c0b403964c7ca6))
 * **google-docs:** warn on relative links with no mapping entry ([#154](https://github.com/tstapler/docspan/issues/154)) ([#165](https://github.com/tstapler/docspan/issues/165)) ([dee2e9f](https://github.com/tstapler/docspan/commit/dee2e9f5ea22d988a0c3d30a50ad0c000eab4e9e))
 
 ## [0.8.6](https://github.com/tstapler/docspan/compare/docspan-v0.8.5...docspan-v0.8.6) (2026-09-30)
