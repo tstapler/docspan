@@ -159,3 +159,15 @@ def test_long_backtick_run_is_linear_time() -> None:
     start = time.perf_counter()
     DocumentConverter.html_to_markdown("<p>" + "`" * 20000 + "x</p>")
     assert time.perf_counter() - start < 2
+
+
+def test_pre_with_backtick_wrapped_lines_is_untouched() -> None:
+    assert DocumentConverter.html_to_markdown("<pre>`a`\n`b`\n`c`</pre>") == "```\n`a`\n`b`\n`c`\n```"
+
+
+def test_many_orphan_markers_scale_linearly() -> None:
+    import time
+
+    start = time.perf_counter()
+    DocumentConverter.html_to_markdown("<p>```py</p>" * 5000)
+    assert time.perf_counter() - start < 2

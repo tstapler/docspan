@@ -76,10 +76,13 @@ def _pure_code_line(line: str) -> str | None:
     return content if content.strip() else None
 
 
+def _fence_of(line: str) -> str:
+    return line[:len(line) - len(line.lstrip('`'))]
+
+
 def _closing_fence(lines: list[str], start: int) -> int | None:
     """Index of the bare fence line closing the fence opened at `start`, if any."""
-    opener = lines[start].rstrip()
-    fence = opener[:len(opener) - len(opener.lstrip('`'))]
+    fence = _fence_of(lines[start])
     for k in range(start + 1, len(lines)):
         if lines[k].rstrip() == fence:
             return k
@@ -96,9 +99,19 @@ def _regroup_code_fences(markdown: str) -> str:
     """
     lines = markdown.split('\n')
     out: list[str] = []
+    unclosed: set[str] = set()  # fence strings known to have no closer; avoids rescans
     i = 0
     while i < len(lines):
         marker = _LANG_MARKER_RE.match(lines[i])
+        # A marker paragraph is followed by a blank line; a fence markdownify
+        # rendered (<pre>) is followed directly by its first content line.
+        rendered = marker and lines[i + 1:i + 2] not in ([], ['']) and _fence_of(lines[i]) not in unclosed
+        if rendered and (end := _closing_fence(lines, i)) is not None:
+            out.extend(lines[i:end + 1])
+            i = end + 1
+            continue
+        if rendered:
+            unclosed.add(_fence_of(lines[i]))
         start = i
         lang = None
         if marker:
@@ -124,9 +137,6 @@ def _regroup_code_fences(markdown: str) -> str:
         if code and (marker or len(code) >= 2):
             out.extend(render_fence(lang or None, code)[:-1])
             i = j
-        elif marker and (end := _closing_fence(lines, i)) is not None:
-            out.extend(lines[i:end + 1])  # fence markdownify already rendered (<pre>)
-            i = end + 1
         elif marker:
             # An orphan marker would reparse as a live fence swallowing what follows.
             out.append(_escape_leading_fence(lines[i]))
