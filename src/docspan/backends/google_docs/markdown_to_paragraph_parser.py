@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 from docspan.backends.google_docs.docs_structure_parser import (
     DocsImageNode,
@@ -13,7 +13,7 @@ from docspan.backends.google_docs.docs_structure_parser import (
     ParagraphStyle,
     TableCell,
     TextSpan,
-    _trim_spans_to_cell_text,
+    _trim_spans_to_text,
 )
 from docspan.backends.google_docs.registry import MarkdownTokenConverter, MarkdownTokenRegistry
 
@@ -221,6 +221,13 @@ def _text_of(spans: List[TextSpan]) -> str:
     return "".join(s.text for s in spans)
 
 
+def _stripped(spans: List[TextSpan]) -> Tuple[str, List[TextSpan]]:
+    """Stripped text plus spans trimmed to match it, so text == join(spans)."""
+    joined = _text_of(spans)
+    text = joined.strip()
+    return text, _trim_spans_to_text(spans, joined, text)
+
+
 def _has_styling(spans: List[TextSpan]) -> bool:
     return any(s.bold or s.italic or s.link or s.monospace for s in spans)
 
@@ -238,7 +245,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
             elif child.get("type") == "block_text":
                 spans.extend(_spans_from_inline(child.get("children", [])))
             elif child.get("type") == "list":
-                text = _text_of(spans).strip()
+                text, spans = _stripped(spans)
                 if text:
                     nodes.append(DocsParagraphNode(
                         style=ParagraphStyle.NORMAL_TEXT, text=text, is_list_item=True,
@@ -249,7 +256,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 nodes.extend(_walk_list_items(child, nesting_level + 1))
                 continue
             elif child.get("type") == "block_code":
-                text = _text_of(spans).strip()
+                text, spans = _stripped(spans)
                 if text:
                     nodes.append(DocsParagraphNode(
                         style=ParagraphStyle.NORMAL_TEXT, text=text, is_list_item=True,
@@ -263,7 +270,7 @@ def _walk_list_items(token: dict, nesting_level: int = 0) -> List[DocsParagraphN
                 continue
             else:
                 spans.extend(_spans_from_inline([child]))
-        text = _text_of(spans).strip()
+        text, spans = _stripped(spans)
         if text:
             nodes.append(DocsParagraphNode(
                 style=ParagraphStyle.NORMAL_TEXT, text=text, is_list_item=True,
@@ -409,9 +416,9 @@ def _walk_block_quote(token: dict, quote_depth: int = 1) -> List[DocsParagraphNo
     for child in token.get("children", []):
         ctype = child.get("type")
         if ctype == "paragraph":
-            spans = _spans_from_inline(child.get("children", []))
+            text, spans = _stripped(_spans_from_inline(child.get("children", [])))
             nodes.append(_tagged(DocsParagraphNode(
-                style=ParagraphStyle.NORMAL_TEXT, text=_text_of(spans).strip(),
+                style=ParagraphStyle.NORMAL_TEXT, text=text,
                 start_index=0, end_index=0,
                 spans=spans if _has_styling(spans) else [],
             )))
@@ -465,7 +472,7 @@ def _cell_from_token(token: dict) -> TableCell:
         return TableCell(text="", spans=[])
     # Re-derive the spans against the stripped text so they still concatenate to
     # it; pass 2 walks span widths to place ranges inside the cell.
-    spans = _trim_spans_to_cell_text(spans, _text_of(spans), text)
+    spans = _trim_spans_to_text(spans, _text_of(spans), text)
     return TableCell(text=text, spans=spans if _has_styling(spans) else [])
 
 
@@ -513,9 +520,9 @@ class HeadingTokenConverter(MarkdownTokenConverter):
     def convert(self, token: dict) -> List[Node]:
         level = token.get("attrs", {}).get("level", token.get("level", 1))
         level = max(1, min(level, 6))  # mistune only emits 1-6 (`#` to `######`); clamp defensively
-        spans = _spans_from_inline(token.get("children", []))
+        text, spans = _stripped(_spans_from_inline(token.get("children", [])))
         return [DocsParagraphNode(
-            style=ParagraphStyle(f"HEADING_{level}"), text=_text_of(spans).strip(),
+            style=ParagraphStyle(f"HEADING_{level}"), text=text,
             start_index=0, end_index=0,
             spans=spans if _has_styling(spans) else [],
         )]
@@ -532,9 +539,9 @@ class ParagraphTokenConverter(MarkdownTokenConverter):
                 alt=_extract_text_from_token(image_tok),
                 start_index=0, end_index=0,
             )]
-        spans = _spans_from_inline(token.get("children", []))
+        text, spans = _stripped(_spans_from_inline(token.get("children", [])))
         return [DocsParagraphNode(
-            style=ParagraphStyle.NORMAL_TEXT, text=_text_of(spans).strip(),
+            style=ParagraphStyle.NORMAL_TEXT, text=text,
             start_index=0, end_index=0,
             spans=spans if _has_styling(spans) else [],
         )]
