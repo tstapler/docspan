@@ -67,3 +67,62 @@ def test_empty_link_is_removed_but_image_with_empty_alt_is_kept() -> None:
     stripping everything but a bare `!` and losing the image entirely."""
     html = '<p><a href=""></a><img alt="" src="https://example.com/x.png"></p>'
     assert DocumentConverter.html_to_markdown(html) == "![](https://example.com/x.png)"
+
+
+# --- default-path code fences (follow-up to #45) ---
+
+import pytest
+
+from docspan.backends.google_docs.docs_structure_parser import _MONOSPACE_FONT_MARKERS
+
+_MONO = "font-family:'Courier New'"
+
+
+def _mono_p(text: str, extra: str = "") -> str:
+    return f'<p><span style="{_MONO};{extra}">{text}</span></p>'
+
+
+def test_multiline_monospace_paragraphs_become_fenced_block() -> None:
+    html = _mono_p("def f():") + _mono_p("    return 1") + "<p>after</p>"
+    assert DocumentConverter.html_to_markdown(html) == "```\ndef f():\n    return 1\n```\n\nafter"
+
+
+def test_inline_monospace_in_prose_is_not_fenced() -> None:
+    html = f'<p>Run <span style="{_MONO}">foo</span> now</p><p>and <span style="{_MONO}">bar</span> too</p>'
+    assert DocumentConverter.html_to_markdown(html) == "Run `foo` now\n\nand `bar` too"
+
+
+def test_bold_monospace_span_is_excluded_from_fence() -> None:
+    html = _mono_p("one") + _mono_p("two", "font-weight:700")
+    assert DocumentConverter.html_to_markdown(html) == "`one`\n\n**`two`**"
+
+
+@pytest.mark.parametrize("font", _MONOSPACE_FONT_MARKERS)
+def test_every_tab_id_monospace_font_is_detected(font: str) -> None:
+    html = f'<p><span style="font-family:\'{font}\'">x</span></p>'
+    assert DocumentConverter.html_to_markdown(html) == "`x`"
+
+
+def test_language_marker_paragraph_sets_fence_language() -> None:
+    html = "<p>```python</p>" + _mono_p("x = 1")
+    assert DocumentConverter.html_to_markdown(html) == "```python\nx = 1\n```"
+
+
+def test_run_without_marker_gets_bare_fence() -> None:
+    html = _mono_p("a") + _mono_p("b")
+    assert DocumentConverter.html_to_markdown(html).startswith("```\n")
+
+
+def test_indentation_and_underscores_survive_fencing() -> None:
+    html = _mono_p("if a_b:") + _mono_p("&nbsp;&nbsp;    x = 1")
+    assert DocumentConverter.html_to_markdown(html) == "```\nif a_b:\n      x = 1\n```"
+
+
+def test_backticks_in_code_widen_the_fence() -> None:
+    html = _mono_p("```") + _mono_p("x")
+    assert DocumentConverter.html_to_markdown(html) == "````\n```\nx\n````"
+
+
+def test_code_blocks_separated_by_prose_stay_separate() -> None:
+    html = _mono_p("a") + _mono_p("b") + "<p>between</p>" + _mono_p("c") + _mono_p("d")
+    assert DocumentConverter.html_to_markdown(html) == "```\na\nb\n```\n\nbetween\n\n```\nc\nd\n```"

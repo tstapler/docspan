@@ -483,6 +483,15 @@ def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]
         # placeholder, not markdown content, and must never leak into the
         # rendered line.
         code_lines.append("" if _is_blank_code_line(node) else node.text)
+    return render_fence(lang, code_lines)
+
+
+def render_fence(lang: Optional[str], code_lines: List[str]) -> List[str]:
+    """Render code_lines as one fenced block (open, lines, close, trailing blank).
+
+    Shared by the tab_id node path and the default HTML-export path
+    (converter.py) so both escape fence delimiters identically.
+    """
     delim = _fence_delimiter(lang, code_lines)
     # CommonMark reads the fence's width off the *leading run* of the fence
     # character on the opening line, not a separately-tokenized delimiter —
