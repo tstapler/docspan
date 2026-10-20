@@ -196,7 +196,7 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _trim_spans_to_cell_text(
+def _trim_spans_to_text(
     spans: List["TextSpan"], joined: str, text: str
 ) -> List["TextSpan"]:
     """Trim `spans` at both ends so they concatenate to exactly `text`.
@@ -712,7 +712,7 @@ class DocsStructureParser:
 
         joined = "".join(span.text for span in spans)
         text = joined.strip()
-        spans = _trim_spans_to_cell_text(spans, joined, text)
+        spans = _trim_spans_to_text(spans, joined, text)
         # An unstyled cell carries no spans, matching DocsParagraphNode: it keeps
         # the diff key and the renderer on the plain-text path.
         if not any(s.bold or s.italic or s.link or s.monospace for s in spans):
