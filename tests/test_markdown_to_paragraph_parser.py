@@ -321,6 +321,7 @@ def test_heading_spans_match_text_when_code_span_has_edge_whitespace() -> None:
 def test_list_item_spans_match_text_when_code_span_has_edge_whitespace() -> None:
     _assert_spans_match_text(parser.parse("- `  item  `"))
     _assert_spans_match_text(parser.parse("- `  item  `\n  - nested"))
+    _assert_spans_match_text(parser.parse("- `  item  `\n  ```\n  code\n  ```\n"))
 
 
 def test_blockquote_spans_match_text_when_code_span_has_edge_whitespace() -> None:
