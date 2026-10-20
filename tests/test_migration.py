@@ -202,7 +202,7 @@ def test_zip_sections_assigns_live_heading_id_when_counts_and_titles_match() -> 
     assert zipped[1].slug == "first"
 
 
-def test_zip_sections_raises_remote_diverged_error_on_count_mismatch() -> None:  # type: ignore[no-untyped-def]
+def test_zip_sections_raises_on_count_mismatch_naming_both_counts() -> None:  # type: ignore[no-untyped-def]
     live = [
         _section(PREAMBLE_HEADING_ID, "", PREAMBLE_SLUG),
         _section("h.abc123", "First", "first"),
@@ -213,11 +213,11 @@ def test_zip_sections_raises_remote_diverged_error_on_count_mismatch() -> None: 
         _section("", "First", "first"),
     ]
 
-    with pytest.raises(MigrationError, match="remote has diverged"):
+    with pytest.raises(MigrationError, match="live document has 3 section.*local file has 2"):
         _zip_sections(live, local)
 
 
-def test_zip_sections_raises_remote_diverged_error_on_title_mismatch_at_same_position() -> None:  # type: ignore[no-untyped-def]
+def test_zip_sections_raises_on_title_mismatch_naming_index_and_titles() -> None:  # type: ignore[no-untyped-def]
     live = [
         _section(PREAMBLE_HEADING_ID, "", PREAMBLE_SLUG),
         _section("h.abc123", "First", "first"),
@@ -227,7 +227,10 @@ def test_zip_sections_raises_remote_diverged_error_on_title_mismatch_at_same_pos
         _section("", "Renamed First", "renamed-first"),
     ]
 
-    with pytest.raises(MigrationError, match="remote has diverged"):
+    with pytest.raises(
+        MigrationError,
+        match=r"section 1: live='First' local='Renamed First'",
+    ):
         _zip_sections(live, local)
 
 
@@ -379,6 +382,71 @@ def test_split_live_and_split_local_zip_end_to_end(tmp_path) -> None:  # type: i
         "h.def456",
     ]
     assert [s.title for s in zipped] == ["", "First", "Second"]
+
+
+def _make_tab(tab_id: str, title: str, content: list[dict]) -> dict:
+    return {
+        "tabProperties": {"tabId": tab_id, "title": title},
+        "documentTab": {"body": {"content": content}, "lists": {}, "inlineObjects": {}},
+        "childTabs": [],
+    }
+
+
+def test_split_live_scopes_to_tab_id_on_multi_tab_document() -> None:  # type: ignore[no-untyped-def]
+    """Issue #152: a `tab_id` mapping must split only its own tab, not the whole doc."""
+    mapped_tab_content = [
+        _make_para_element("Intro body.", style="NORMAL_TEXT"),
+        _make_para_element("First", style="HEADING_1", heading_id="h.abc123"),
+        _make_para_element("Body one.", style="NORMAL_TEXT"),
+    ]
+    other_tab_content = [
+        _make_para_element("Unrelated", style="HEADING_1", heading_id="h.unrelated"),
+        _make_para_element("Unrelated body.", style="NORMAL_TEXT"),
+        _make_para_element("Another heading", style="HEADING_1", heading_id="h.unrelated2"),
+    ]
+    doc = {
+        "tabs": [
+            _make_tab("t.0", "Mapped", mapped_tab_content),
+            _make_tab("t.1", "Other", other_tab_content),
+        ]
+    }
+    client = _StubDocsClient(doc)
+
+    sections = _split_live(client, "fake-doc-id", "HEADING_1", tab_id="t.0")
+
+    assert [s.title for s in sections] == ["", "First"]
+    assert sections[1].heading_id == "h.abc123"
+
+
+def test_split_live_raises_migration_error_for_unknown_tab_id() -> None:  # type: ignore[no-untyped-def]
+    doc = {"tabs": [_make_tab("t.0", "Mapped", [])]}
+    client = _StubDocsClient(doc)
+
+    with pytest.raises(MigrationError, match="not found"):
+        _split_live(client, "fake-doc-id", "HEADING_1", tab_id="t.missing")
+
+
+def test_split_live_defaults_to_first_tab_when_tab_id_is_none_on_multi_tab_document() -> None:  # type: ignore[no-untyped-def]
+    """No `tab_id` on a multi-tab doc defaults to the first tab (`resolve_document_tab`'s
+    contract) -- the second tab's headings must never leak into the split."""
+    first_tab_content = [
+        _make_para_element("Intro body.", style="NORMAL_TEXT"),
+        _make_para_element("First", style="HEADING_1", heading_id="h.abc123"),
+    ]
+    second_tab_content = [
+        _make_para_element("Unrelated", style="HEADING_1", heading_id="h.unrelated"),
+    ]
+    doc = {
+        "tabs": [
+            _make_tab("t.0", "First", first_tab_content),
+            _make_tab("t.1", "Second", second_tab_content),
+        ]
+    }
+    client = _StubDocsClient(doc)
+
+    sections = _split_live(client, "fake-doc-id", "HEADING_1", tab_id=None)
+
+    assert [s.title for s in sections] == ["", "First"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

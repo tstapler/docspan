@@ -7,9 +7,10 @@ through the same image_source.py pipeline as any other image.
 """
 
 import hashlib
+import json
 import struct
 
-from docspan.backends.google_docs import mermaid_cache_sidecar
+from docspan.backends.google_docs import mermaid_cache_sidecar, mermaid_renderer
 from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode, DocsParagraphNode
 from docspan.backends.google_docs.image_source import (
@@ -177,12 +178,12 @@ def test_png_pixel_dimensions_returns_none_for_zero_width_or_height() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# mermaid image sizing (px -> pt, filled to CONTENT_WIDTH_PT)
+# mermaid image sizing (px -> pt, filled to MERMAID_WIDTH_PT)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_mermaid_image_size_pt_scales_2400x1200_at_render_scale_3_to_468x234() -> None:
-    assert _mermaid_image_size_pt(_minimal_png(2400, 1200)) == (468.0, 234.0)
+def test_mermaid_image_size_pt_scales_2400x1200_at_render_scale_3_to_576x288() -> None:
+    assert _mermaid_image_size_pt(_minimal_png(2400, 1200)) == (576.0, 288.0)
 
 
 def test_mermaid_image_size_pt_is_independent_of_render_scale_value(monkeypatch) -> None:
@@ -192,7 +193,7 @@ def test_mermaid_image_size_pt_is_independent_of_render_scale_value(monkeypatch)
     monkeypatch.setattr("docspan.backends.google_docs.image_source.RENDER_SCALE", 6)
     at_scale_6 = _mermaid_image_size_pt(_minimal_png(4800, 2400))
 
-    assert at_scale_3 == at_scale_6 == (468.0, 234.0)
+    assert at_scale_3 == at_scale_6 == (576.0, 288.0)
 
 
 def test_mermaid_image_size_pt_returns_none_for_malformed_png() -> None:
@@ -202,7 +203,7 @@ def test_mermaid_image_size_pt_returns_none_for_malformed_png() -> None:
 
 
 def test_mermaid_image_size_pt_upscales_small_diagram_preserving_aspect_ratio() -> None:
-    assert _mermaid_image_size_pt(_minimal_png(800, 400)) == (468.0, 234.0)
+    assert _mermaid_image_size_pt(_minimal_png(800, 400)) == (576.0, 288.0)
 
 
 def test_mermaid_image_size_pt_is_deterministic_across_repeated_calls() -> None:
@@ -211,7 +212,7 @@ def test_mermaid_image_size_pt_is_deterministic_across_repeated_calls() -> None:
     first = _mermaid_image_size_pt(png_bytes)
     second = _mermaid_image_size_pt(png_bytes)
 
-    assert first == second == (468.0, 234.0)
+    assert first == second == (576.0, 288.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,8 +231,8 @@ def test_resolve_document_images_sets_width_and_height_for_mermaid_image(tmp_pat
     )
 
     assert warnings == []
-    assert out[0].width_pt == 468.0
-    assert out[0].height_pt == 234.0
+    assert out[0].width_pt == 576.0
+    assert out[0].height_pt == 288.0
 
 
 def test_resolve_document_images_leaves_width_and_height_none_for_non_mermaid_image(
@@ -303,8 +304,8 @@ def test_mermaid_image_gets_sized_and_centered_on_push(tmp_path) -> None:
     image_requests = [r["insertInlineImage"] for r in requests if "insertInlineImage" in r]
     assert len(image_requests) == 1
     assert image_requests[0]["objectSize"] == {
-        "height": {"magnitude": 234.0, "unit": "PT"},
-        "width": {"magnitude": 468.0, "unit": "PT"},
+        "height": {"magnitude": 288.0, "unit": "PT"},
+        "width": {"magnitude": 576.0, "unit": "PT"},
     }
 
     style_requests = [
@@ -332,7 +333,7 @@ def test_repeated_mermaid_push_has_stable_node_key(tmp_path) -> None:
     second_key = builder._node_key(_resolve_once())
 
     assert first_key == second_key
-    assert first_key == ("__image__", first_key[1], 468.0, 234.0)
+    assert first_key == ("__image__", first_key[1], 576.0, 288.0)
 
 
 def test_repush_of_already_sized_mermaid_image_with_no_object_id_is_a_safe_noop() -> None:
@@ -481,16 +482,18 @@ def test_resize_fires_when_pulled_node_has_partial_size() -> None:
 
 def test_mmdc_command_falls_back_to_npx_when_binary_missing(monkeypatch) -> None:
     monkeypatch.setattr("shutil.which", lambda name: None)
-    command = _mmdc_command("in.mmd", "out.png", "puppeteer.json")
+    command = _mmdc_command("in.mmd", "out.png", "puppeteer.json", "mermaid.json")
     assert command[:4] == ["npx", "--yes", "-p", "@mermaid-js/mermaid-cli"]
     assert "in.mmd" in command
     assert "out.png" in command
+    assert "mermaid.json" in command
 
 
 def test_mmdc_command_uses_real_binary_when_present(monkeypatch) -> None:
     monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/mmdc")
-    command = _mmdc_command("in.mmd", "out.png", "puppeteer.json")
+    command = _mmdc_command("in.mmd", "out.png", "puppeteer.json", "mermaid.json")
     assert command[0] == "/usr/local/bin/mmdc"
+    assert "-c" in command and command[command.index("-c") + 1] == "mermaid.json"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -580,6 +583,41 @@ def test_render_mermaid_png_cache_key_changes_with_render_scale(tmp_path, monkey
     render_mermaid_png(diagram)
 
     assert calls == [diagram, diagram]  # scale change busts the cache, not a hit
+
+
+def test_render_mermaid_png_cache_key_changes_with_mermaid_config(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._mmdc_version", lambda: "1.0.0"
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._render_uncached",
+        _counting_uncached_renderer(calls),
+    )
+    diagram = "graph TD\n  A --> B"
+
+    render_mermaid_png(diagram)
+    monkeypatch.setattr(
+        "docspan.backends.google_docs.mermaid_renderer._MERMAID_CONFIG", '{"themeVariables": {}}'
+    )
+    render_mermaid_png(diagram)
+
+    assert calls == [diagram, diagram]  # config change busts the cache, not a hit
+
+
+def test_mermaid_config_sets_enlarged_font_sizes() -> None:
+    """Pins the actual payload of the PR's font-size fix -- a silent revert
+    of _MERMAID_CONFIG to an empty theme would pass every other test here
+    (cache-key and -c-flag-is-present tests don't inspect its content)."""
+    config = json.loads(mermaid_renderer._MERMAID_CONFIG)
+
+    assert config["themeVariables"]["fontSize"] == "32px"
+    assert config["sequence"] == {
+        "actorFontSize": 32,
+        "noteFontSize": 32,
+        "messageFontSize": 32,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

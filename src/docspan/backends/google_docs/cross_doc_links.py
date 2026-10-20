@@ -255,6 +255,27 @@ class CrossDocLinkResolver:
         return TargetHeadings(slug_to_id=slug_to_id, known_ids=set(slug_to_id.values()))
 
 
+def is_unmapped_cross_doc_link(
+    href: Optional[str],
+    source_local_path: Optional[str],
+    resolver: Optional[CrossDocLinkResolver],
+) -> bool:
+    """True when `href` is a cross-doc candidate that resolves to no mapping entry.
+
+    Split out from `link_payload` because criterion 3 says such a link is
+    written untouched, not reported as a resolution failure — but "untouched"
+    means the bare relative path (e.g. `census/data.json`) lands in the Doc
+    as a `url` link with no scheme, and Google Docs renders a schemeless
+    relative path as `http://<first-path-segment>/...`, a link that can never
+    resolve (#154). That's not the same thing `cross_doc_link_issues()`
+    reports — it's a distinct, non-blocking warning surfaced separately by
+    `DocsRequestBuilder.unmapped_cross_doc_links()`.
+    """
+    if resolver is None or source_local_path is None or not href:
+        return False
+    return resolver.resolve(source_local_path, href).kind == "unmapped"
+
+
 def link_payload(
     href: Optional[str],
     source_local_path: Optional[str],

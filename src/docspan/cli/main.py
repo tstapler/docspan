@@ -248,7 +248,14 @@ def push(
         ),
     ),
 ) -> None:
-    """Push local markdown to remote docs."""
+    """Push local markdown files to remote docs.
+
+    Skips mappings with `direction = "pull"` (prints a dim "Skipping"
+    message). With --dry-run, prints what would be pushed without making
+    any remote changes. On success, prints a green checkmark and the
+    remote URL; on error, a red X and the error message, exiting with
+    code 1.
+    """
     config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
     # `mappings` (all of config.mappings) is passed to orchestrate_push()
     # below for cross-doc link resolution — it must stay the full set even
@@ -561,7 +568,14 @@ def migrate_sectioned_cmd(
         "HEADING_2", "--split-level", help="Heading level to split on, e.g. HEADING_1, HEADING_2"
     ),
 ) -> None:
-    """Migrate a single-file mapping to a sectioned mapping, preserving git history."""
+    """Migrate a single-file mapping to a sectioned mapping, preserving git history.
+
+    Splits the doc into one local file per section on a heading
+    boundary. Refuses if the mapping is already sectioned, or if its
+    backend doesn't support sectioned mode. On success, replaces the
+    single-file mapping with a directory of per-section files and
+    commits the change.
+    """
     config, config_path, prefix = _resolve(config_path, prefix)
     mapping = resolve_mapping_for_path(config.mappings, mapping_path)
     if mapping is None:
@@ -627,7 +641,17 @@ def pull(
         "HEADING_2", "--split-level", help="Heading level to split on when --to-sectioned is used"
     ),
 ) -> None:
-    """Pull remote docs into local markdown files."""
+    """Pull remote documents into local markdown files.
+
+    Skips mappings with `direction = "push"`. Detects whether local or
+    remote has changed since last sync; outcomes are: `up-to-date` (no
+    changes), `local-only` (local has unpushed changes — pull is skipped
+    with a warning), `fast-forward`/`first-sync` (remote changed, or no
+    sync state yet — writes remote content locally), `merged` cleanly or
+    with conflict markers written to the file, or `error`. With
+    --dry-run, fetches the remote and classifies what a real pull would
+    do (including a real conflict count) without writing anything.
+    """
     config, config_path, prefix = _resolve(config_path, prefix)
     mappings = _resolve_files_or_exit(config.mappings, files)
 
@@ -930,7 +954,17 @@ def map_(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
 ) -> None:
-    """Create a new remote Google Doc / Confluence page and map it to a local file."""
+    """Create a new remote Google Doc / Confluence page and map it to a local file.
+
+    Fails if `FILE` is already mapped, or if the backend is unknown. A
+    freshly created doc/page is always empty, so if `FILE` already
+    exists locally, its content is pushed immediately after the mapping
+    is created — regardless of --direction — so a pull-only mapping
+    doesn't get overwritten by the empty remote doc on its first pull.
+    If saving markgate.yaml hits a conflict (someone else edited it
+    concurrently), the remote doc/page was still created — the error
+    prints its id/url so it can be added by hand.
+    """
     if direction not in ("push", "pull", "both"):
         err_console.print("--direction must be one of: push, pull, both")
         raise typer.Exit(1)
@@ -1047,7 +1081,10 @@ def status(
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
 ) -> None:
-    """Show current mapping status."""
+    """Display all configured mappings in a table.
+
+    Columns: local file, backend, remote ID, direction.
+    """
     config, config_path, prefix = _resolve(config_path, prefix)
 
     if not config.mappings:
@@ -1212,7 +1249,12 @@ def migrate_xdg(
     prefix: str = typer.Option(..., "--prefix", "-p", help="Prefix to migrate this project's storage into"),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
-    """Move legacy in-repo storage (.markgate-state.json, .markgate-base/) to XDG and register the project."""
+    """Move legacy in-repo storage (.markgate-state.json, .markgate-base/) to XDG and register the project.
+
+    Refuses to overwrite an existing file at the XDG destination.
+    Registers `prefix -> markgate.yaml` in the central config, setting
+    it as `default_prefix` if none is set yet.
+    """
     import shutil
 
     from docspan.core.xdg import state_dir_for_prefix
@@ -1256,7 +1298,20 @@ def auth_setup(
         None, "--client-secret", help="Path to an OAuth client secret JSON (google_docs, with --oauth)."
     ),
 ) -> None:
-    """Interactive authentication setup for a backend."""
+    """Interactive authentication setup for a backend.
+
+    For google_docs with no flags: a guided flow that detects the
+    current state, lets you pick Personal (OAuth) or Service account,
+    auto-detects a client_secret.json (scanning `.`, `.markgate/`,
+    `~/Downloads`) or prompts for the path, runs the browser sign-in,
+    verifies the connection, and offers to persist the choice into
+    markgate.yaml. In a non-TTY/CI environment it prints manual
+    instructions instead of prompting. --oauth --client-secret PATH
+    selects the OAuth path non-interactively.
+
+    For confluence: prompts interactively for base URL, username, and
+    API token, then prints a YAML snippet to add to markgate.yaml.
+    """
     config = load_config(config_path)
     cls = BACKENDS.get(backend)
     if not cls:
@@ -1287,7 +1342,11 @@ def auth_setup(
 def conflicts_list(
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
-    """List files with unresolved merge conflicts."""
+    """Scan all tracked files for unresolved merge conflict markers.
+
+    Prints a table of conflicted files and their conflict-block counts,
+    or "No unresolved conflicts." when none are found.
+    """
     state_path = get_state_path(config_path)
     state = _load_state(state_path)
 
@@ -1319,7 +1378,14 @@ def conflicts_resolve(
     accept: str = typer.Option(..., "--accept", help="Resolution strategy: remote | local | merged"),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
 ) -> None:
-    """Resolve a merge conflict in a tracked file."""
+    """Resolve a merge conflict in a tracked file.
+
+    --accept remote re-fetches the remote version and overwrites the
+    local file. --accept local restores the pre-merge local content
+    from the `.orig` backup file. --accept merged accepts the current
+    file contents as resolved (conflict markers must be removed first).
+    All three update the sync state.
+    """
     if accept not in ("remote", "local", "merged"):
         err_console.print("--accept must be one of: remote, local, merged")
         raise typer.Exit(1)
@@ -1440,6 +1506,12 @@ def _resolve_merged(
 
 def main() -> None:
     app()
+
+
+# A plain click.Command view of `app`, for mkdocs-click to render the CLI
+# reference in docs/commands.md straight from these commands' signatures
+# and docstrings — see that file's `::: mkdocs-click` blocks.
+click_app = typer.main.get_command(app)
 
 
 if __name__ == "__main__":

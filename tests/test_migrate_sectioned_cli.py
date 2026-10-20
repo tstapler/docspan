@@ -355,6 +355,154 @@ def test_dry_run_returns_preview_and_writes_nothing(tmp_path) -> None:  # type: 
     assert not list(repo_root.glob(".docspan-migration-*.lock"))
 
 
+def _multi_tab_doc_for_content(mapped_tab_id: str) -> dict:
+    """A multi-tab Docs-API doc: `mapped_tab_id` matches `_CONTENT`, the other
+    tab holds unrelated headings that must never leak into the split
+    (issue #152 regression coverage)."""
+    return {
+        "tabs": [
+            {
+                "tabProperties": {"tabId": mapped_tab_id, "title": "Mapped"},
+                "documentTab": {"body": _doc_for_content()["body"], "lists": {}, "inlineObjects": {}},
+                "childTabs": [],
+            },
+            {
+                "tabProperties": {"tabId": "t.other", "title": "Other"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            _make_para_element("Unrelated", style="HEADING_1", heading_id="h.unrelated"),
+                            _make_para_element("Unrelated body.", style="NORMAL_TEXT"),
+                        ]
+                    },
+                    "lists": {},
+                    "inlineObjects": {},
+                },
+                "childTabs": [],
+            },
+        ]
+    }
+
+
+def test_migrate_sectioned_scopes_to_mapped_tab_on_multi_tab_document(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Issue #152 regression: `migrate_sectioned` must thread `Mapping.tab_id`
+    through to the live split, not just parse the whole multi-tab document."""
+    _init_repo(tmp_path)
+    local_file = tmp_path / "handbook.md"
+    local_file.write_text(_CONTENT, encoding="utf-8")
+    _git("add", "handbook.md", cwd=str(tmp_path))
+    _git("commit", "-m", "initial", cwd=str(tmp_path))
+
+    config_path = tmp_path / "markgate.yaml"
+    mapping = Mapping(
+        local=str(local_file), backend="google_docs", remote_id="doc123", tab_id="t.mapped"
+    )
+    save_config(MarkgateConfig(mappings=[mapping]), str(config_path))
+
+    config = load_config(str(config_path))
+    state = SyncState()
+    state_path = get_state_path(str(config_path), None)
+    state_dir = get_state_dir(str(config_path), None)
+    backend = _StubMigrationBackend(doc=_multi_tab_doc_for_content("t.mapped"))
+
+    result = migrate_sectioned(
+        mapping, backend, config, str(config_path), state, state_dir, state_path,
+        "HEADING_1", dry_run=True,
+    )
+
+    assert result.outcome == MigrationOutcome.DRY_RUN
+    assert [row.filename for row in result.sections[0].rows] == [
+        "00-preamble.md",
+        "01-first.md",
+        "02-second.md",
+    ]
+
+
+def test_migrate_sectioned_diverged_message_suggests_pull_when_pull_would_help(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Issue #153: when the live doc really has moved on since the last
+    sync, the refusal message should still point at `docspan pull`."""
+    from docspan.core.state import MappingState, sha256_of_content
+
+    repo_root, local_file, config_path, mapping = _repo_with_handbook(tmp_path)
+
+    config = load_config(str(config_path))
+    state = SyncState()
+    state.update(
+        str(local_file),
+        MappingState(
+            doc_id="doc123",
+            backend="google_docs",
+            last_synced_at="2026-01-01T00:00:00Z",
+            base_hash=sha256_of_content(_CONTENT),
+            remote_version="v0",  # stub's get_remote_version() returns "v1" -- remote has moved on
+            local_hash=sha256_of_content(local_file.read_text(encoding="utf-8")),
+        ),
+    )
+    state_path = get_state_path(str(config_path), None)
+    state_dir = get_state_dir(str(config_path), None)
+
+    doc = _doc_for_content()
+    doc["body"]["content"][3] = _make_para_element(
+        "Second (renamed)", style="HEADING_1", heading_id="h.def456"
+    )
+    backend = _StubMigrationBackend(doc=doc)
+
+    result = migrate_sectioned(
+        mapping, backend, config, str(config_path), state, state_dir, state_path,
+        "HEADING_1", dry_run=True,
+    )
+
+    assert result.outcome == MigrationOutcome.REFUSED
+    message = result.messages[0]
+    assert "section 2: live='Second (renamed)' local='Second'" in message
+    assert "run 'docspan pull' first" in message
+
+
+def test_migrate_sectioned_diverged_message_skips_pull_suggestion_when_pull_would_be_noop(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Issue #153: when the recorded sync state shows nothing has changed
+    remotely or locally since the last sync, a real `docspan pull` would be
+    a no-op -- the refusal must say so instead of recommending it."""
+    from docspan.core.state import MappingState, sha256_of_content
+
+    repo_root, local_file, config_path, mapping = _repo_with_handbook(tmp_path)
+
+    config = load_config(str(config_path))
+    state = SyncState()
+    state.update(
+        str(local_file),
+        MappingState(
+            doc_id="doc123",
+            backend="google_docs",
+            last_synced_at="2026-01-01T00:00:00Z",
+            base_hash=sha256_of_content(_CONTENT),
+            remote_version="v1",
+            local_hash=sha256_of_content(local_file.read_text(encoding="utf-8")),
+        ),
+    )
+    state_path = get_state_path(str(config_path), None)
+    state_dir = get_state_dir(str(config_path), None)
+
+    # Same remote_version ("v1", the stub default) and same local file
+    # content as when state was recorded, but the live Doc's heading text
+    # differs from the local file's at the same position -- simulating a
+    # parsing difference rather than genuine remote drift.
+    doc = _doc_for_content()
+    doc["body"]["content"][3] = _make_para_element(
+        "Second ", style="HEADING_1", heading_id="h.def456"
+    )
+    backend = _StubMigrationBackend(doc=doc)
+
+    result = migrate_sectioned(
+        mapping, backend, config, str(config_path), state, state_dir, state_path,
+        "HEADING_1", dry_run=True,
+    )
+
+    assert result.outcome == MigrationOutcome.REFUSED
+    message = result.messages[0]
+    assert "run 'docspan pull' first" not in message
+    assert "'docspan pull' would report up to date and change nothing" in message
+
+
 def test_should_CommitSuccessfully_when_MigratingFiftyPlusSections(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """pre-mortem P1 #1: `_run_git`'s per-call-site timeout (Task 1.1) was
     calibrated for tiny plumbing calls, but `_commit_swap` (Task 3.2) runs

@@ -38,3 +38,4 @@ markdown_extensions:
   - admonition
   - tables
   - attr_list
+  - mkdocs-click

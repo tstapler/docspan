@@ -13,12 +13,19 @@ from docspan.backends.google_docs.tabs import (
 )
 
 
-def _tab(tab_id: str, title: str, body_text: str, child_tabs: list | None = None) -> dict:
+def _tab(
+    tab_id: str,
+    title: str,
+    body_text: str,
+    child_tabs: list | None = None,
+    inline_objects: dict | None = None,
+) -> dict:
     return {
         "tabProperties": {"tabId": tab_id, "title": title},
         "documentTab": {
             "body": {"content": [{"paragraph": {"elements": [{"textRun": {"content": body_text}}]}}]},
             "lists": {},
+            "inlineObjects": inline_objects or {},
         },
         "childTabs": child_tabs or [],
     }
@@ -89,6 +96,30 @@ def test_unknown_tab_id_raises_tab_not_found_error_listing_available_tabs() -> N
     message = str(exc_info.value)
     assert "t.nonexistent" in message
     assert "t.first" in message and "t.second" in message
+
+
+def test_resolved_doc_carries_the_chosen_tabs_inline_objects() -> None:
+    doc = {
+        "revisionId": "r1",
+        "body": {"content": []},
+        "inlineObjects": {"kix.wrong": {"embeddedObject": {"imageProperties": {"contentUri": "wrong-tab"}}}},
+        "tabs": [
+            _tab("t.first", "Overview", "first tab content"),
+            _tab(
+                "t.second",
+                "Details",
+                "second tab content",
+                inline_objects={
+                    "kix.right": {"embeddedObject": {"imageProperties": {"contentUri": "right-tab"}}}
+                },
+            ),
+        ],
+    }
+    resolved, resolved_tab_id, _warning = resolve_document_tab(doc, "t.second")
+    assert resolved_tab_id == "t.second"
+    assert resolved["inlineObjects"] == {
+        "kix.right": {"embeddedObject": {"imageProperties": {"contentUri": "right-tab"}}}
+    }
 
 
 def test_nested_child_tabs_are_flattened_and_selectable() -> None:

@@ -144,6 +144,37 @@ class TestCrossDocLinkResolutionThroughPush:
         links = _link_requests(fake_client)
         assert {"url": "../not-mapped.md"} in links, links
 
+    def test_link_to_unmapped_file_is_flagged_but_still_written(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:
+        # #154: writing the link untouched (asserted above) is correct per
+        # criterion 3, but the bare relative path renders in Google Docs as
+        # an unresolvable `http://<first-path-segment>/...` link, so push()
+        # should warn about it rather than silently claim "ok".
+        backend, fake_client = make_backend()
+        source_local = self._local(
+            tmp_path, "source.md", "see [data](census/data.json)\n"
+        )
+        source_doc = _doc(
+            _paragraph("see data", 1, runs=[
+                {"textRun": {"content": "see data\n", "textStyle": {}}}
+            ]),
+            revision_id="rev-1",
+        )
+        fake_client.get_document.side_effect = lambda doc_id, **_: {
+            "doc-1": source_doc,
+        }[doc_id]
+        mappings = [
+            Mapping(local=source_local, backend="google_docs", remote_id="doc-1"),
+        ]
+
+        result = backend.push(source_local, "doc-1", mappings=mappings)
+
+        assert result.status == "warning", result.message
+        assert "census/data.json" in result.message
+        links = _link_requests(fake_client)
+        assert {"url": "census/data.json"} in links, links
+
     def test_fragment_matching_no_heading_in_target_is_reported_not_silently_written(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:
