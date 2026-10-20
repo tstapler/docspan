@@ -14,6 +14,7 @@ from markdownify import MarkdownConverter, chomp
 from docspan.backends.google_docs.docs_structure_parser import _MONOSPACE_FONT_MARKERS
 from docspan.backends.google_docs.nodes_to_markdown import (
     FENCE_MARKER,
+    _escape_leading_fence,
     _wrap_inline_code,
     render_fence,
 )
@@ -100,7 +101,7 @@ def _regroup_code_fences(markdown: str) -> str:
         while j < len(lines):
             text = _pure_code_line(lines[j])
             if text is not None:
-                code.append(text.replace(_INDENT, ' '))
+                code.append(text.replace(_INDENT, ' ') if text.strip(_INDENT + ' ') else '')
                 j += 1
             elif code and lines[j] == '' and j + 1 < len(lines) and _pure_code_line(lines[j + 1]) is not None:
                 j += 1
@@ -110,7 +111,8 @@ def _regroup_code_fences(markdown: str) -> str:
             out.extend(render_fence(lang or None, code)[:-1])
             i = j
         else:
-            out.append(lines[i])
+            # An orphan marker would reparse as a live fence swallowing what follows.
+            out.append(_escape_leading_fence(lines[i]) if marker else lines[i])
             i += 1
     return '\n'.join(out)
 

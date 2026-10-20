@@ -126,3 +126,14 @@ def test_backticks_in_code_widen_the_fence() -> None:
 def test_code_blocks_separated_by_prose_stay_separate() -> None:
     html = _mono_p("a") + _mono_p("b") + "<p>between</p>" + _mono_p("c") + _mono_p("d")
     assert DocumentConverter.html_to_markdown(html) == "```\na\nb\n```\n\nbetween\n\n```\nc\nd\n```"
+
+
+def test_blank_code_line_is_empty_not_a_space() -> None:
+    html = _mono_p("a") + _mono_p("&nbsp;") + _mono_p("b")
+    assert DocumentConverter.html_to_markdown(html) == "```\na\n\nb\n```"
+
+
+def test_orphan_language_marker_does_not_open_a_live_fence() -> None:
+    out = DocumentConverter.html_to_markdown("<p>```py</p><p>hello</p>")
+    assert not any(line.startswith("```") for line in out.split("\n"))
+    assert "hello" in out
