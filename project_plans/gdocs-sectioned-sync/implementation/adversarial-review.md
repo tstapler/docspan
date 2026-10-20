@@ -1,0 +1,28 @@
+# Adversarial Review: gdocs-sectioned-sync (iteration 2)
+**Date**: 2026-08-13
+**Verdict**: CONCERNS
+
+## Blockers
+(none)
+
+## Concerns
+- [x] Task 3.1.3 (`implementation/plan.md:202`) — **Resolved.** Plan.md now specifies only "pass a section file's own path (never the bare sectioned directory)" as `markdown_path`, dropping the previously-offered directory option that resolved one level too high against `build_source`'s `.parent` behavior. Also added a fixture requirement (Story 7.1/7.2) for colliding same-named images across two sections, surfaced as a `warning`/`error` per the Observability Plan.
+- [x] Citation in Task 5.2.1 — **Resolved.** plan.md now cites `MappingState` at `core/state.py:12` and `SyncState.get`/`update` at `core/state.py:40-43`, not `orchestrator.py:81-143`.
+- [ ] **Accepted limitation, not fixed.** No dedicated task for a manifest-vs-on-disk consistency pre-diff check (e.g., manifest lists a filename absent from disk, or a stray `.md` file not in the manifest) before push-time diffing begins. Coverage is implicit via Task 2.2.1 (pull-side matching) and Story 3.2 (add/delete/reorder detection derived from directory listing vs. manifest); this is judged sufficient for v1 given the appetite, and is not named as a separate pre-diff validation step.
+- [ ] **Accepted limitation, not fixed.** Concurrent pull/push race handling has no explicit task or acceptance criterion (e.g., two processes racing on the same sectioned directory, or a push racing a manifest write). Single-file docspan mappings have the same unaddressed race today; sectioned mode does not regress this, and dedicated locking is out of scope for v1.
+- [ ] Partial-API-failure coverage for the reorder fallback (copy-to-new-position + delete-old-range-after-insert) remains thin. Task 6.1.2's "keep the full reassembled request list within a single `batchUpdate` call wherever possible" implicitly gives the fallback's two operations atomicity (Docs batchUpdate applies all sub-requests as one transaction), but the plan never states this connection explicitly for Story 3.2/ADR-002's fallback path — a reader has to infer it. Recommend a one-line cross-reference in Task 3.2.3 or ADR-002 Consequences.
+
+## Minors
+- Preamble sentinel-key format (Task 2.1.2, `plan.md:187`) is still only "e.g. a fixed sentinel key" — no concrete value chosen. Left as-is.
+- YAML library choice for `manifest.py` (Task 1.2.1) is still unspecified; `config.py` uses `import yaml` (PyYAML) while `pyproject.toml` also lists `ruamel.yaml>=0.18.0` as a dependency — the plan doesn't say which one `ManifestStore` should use. Left as-is.
+- Comment-bucketing misassignment edge case (near-duplicate quoted text appearing in two sections) is not more deeply treated than iteration 1; Task 4.1.1's "first match wins in manifest order" is a defined-but-not-obviously-correct tiebreak for that case. Left as-is.
+
+## Prior-blocker resolution status
+
+1. **Resolved.** Step 0.5 (`plan.md:21`) and Task 3.1.3 (`plan.md:202`) now correctly describe `_build_push_plan`'s real signature/behavior, verified independently against `backend.py:172-299`: `_build_push_plan(local_path, doc_id, tab_id=None)` reads `pathlib.Path(local_path).read_text()` at line 195 and calls `resolve_document_images(image_nodes, local_path, ...)` at line 208 — matching the plan's citations. Task 3.1.3 adds a concrete `content: Optional[str] = None` parameter to skip the read when pre-assembled content is supplied, leaving single-file `push()`/`preview_push()` unaffected (`content=None`). The "unchanged" claim is now correctly scoped to only the diff/request-emission tail (`_build_push_plan`'s post-front-half code, confirmed unchanged in the read source at `backend.py:232-299`), not the whole function. One residual inaccuracy in the same task's image-path guidance is flagged above as a concern (not a blocker — the correct alternative is also given in the same sentence).
+
+2. **Resolved.** Task 1.1.2 (`plan.md:172`) now specifies a concrete `@model_validator(mode="after")` on `Mapping` enforcing `sectioned == (split_level is not None)`, raising `ValueError` for both the `sectioned=True, split_level=None` and `sectioned=False, split_level=<set>` cases, and Story 1.1's Given/When/Then acceptance criteria (`plan.md:167-170`) reflect both invalid combinations plus the two valid ones. `config.py`'s current `Mapping` class (confirmed at `src/docspan/config.py:78-88`) has no existing validator, matching the plan's note that this introduces the pattern.
+
+3. **Resolved.** New Story 7.5 (`plan.md:268-272`) and Task 7.5.1 deliver a `sectioned` × `tab_id` test matrix, explicitly citing ADR-003. It covers the three combinations that matter: both set (correct tab + same split as unscoped), `sectioned` true with `tab_id` unset (regression vs. Story 7.1), and `tab_id` set with `sectioned` false (regression check that sectioned code doesn't affect the existing tab-scoped path). The fourth combination (neither set) is already exercised by pre-existing tests, so its omission here is reasonable.
+
+4. **Resolved.** A "Go/no-go gate" section (`plan.md:210-214`) now sits explicitly between Task 3.2.2 and Task 3.2.3, naming three tiers: a real move primitive, ADR-002's documented copy-then-delete-after-insert fallback, and (if even that is infeasible) accepting `heading_id` churn as a documented limitation — matching what ADR-002's Decision/Consequences sections actually say (verified by reading `decisions/ADR-002-reorder-as-in-place-move.md`). Story 7.3's acceptance criteria (`plan.md:261`) are rewritten to hold under either outcome ("go" preserves both `heading_id`s; "no-go" asserts the documented churn explicitly), so they don't need rewriting once the spike resolves.

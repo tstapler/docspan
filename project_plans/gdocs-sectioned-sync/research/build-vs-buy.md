@@ -1,0 +1,64 @@
+# Build vs. Buy: Sectioned Sync (Agent 6)
+
+Scope: split a pulled Google Doc into a directory of per-section markdown files (stable identity, add/delete/reorder detection on push), reusing `DocsStructureParser` / `nodes_to_markdown.py` and the existing three-way-merge push path in `src/docspan/backends/google_docs/backend.py`. No new deps/services. Confluence backend untouched.
+
+## 1. Existing OSS library for "split doc into files with stable section identity + reassembly"
+
+Searched the space of doc-splitting tools that operate on this exact problem shape (one logical document ↔ many files with stable per-unit IDs):
+
+- **Sphinx / MyST includes** (`.. include::`, `{literalinclude}`): these are author-driven, static file references baked into a source tree ahead of time — no automatic split-by-heading-level, no round-trip reassembly, no identity tracking across edits. Wrong problem (multi-file authoring, not doc↔directory sync).
+- **Pandoc**: `pandoc --split-level`-style filters split HTML into files, but each run is stateless — no manifest, no reorder detection, and pandoc understands nothing about `DocsStructureParser`'s node model (`DocsParagraphNode`, `DocsTableNode`, `DocsImageNode`, `TextSpan`). Adopting it means bypassing docspan's structural parser entirely, which directly conflicts with the "reuse the existing pipeline" constraint.
+- **Static-site generators' content-collection loaders** (Hugo page bundles, Jekyll collections, Astro content collections, `mkdocs` nav trees): these load a *pre-existing* directory of files into a site; they don't solve the inverse (split one doc, track identity, reassemble). They also assume front-matter-based slugs as identity, which is a convention docspan would still have to invent and maintain itself — no code reuse, just a naming convention borrowed from elsewhere.
+- **markdown-it plugins with front-matter section IDs** (e.g. `markdown-it-container`, front-matter chunkers): JS ecosystem, would violate "no new external dependencies" and is off-stack (docspan is a `uv`/pytest Python project). Also front-matter-as-identity is a convention, not a library — nothing here is a package to depend on.
+
+**Verdict: Not recommended.** No OSS library exists for "split a single document into files with stable section identity across edits, then reassemble," because that identity/reassembly problem is inherently coupled to the calling app's own document model — here, `DocsStructureParser`'s node types and `nodes_to_markdown.py`'s rendering. Every candidate either solves a materially different problem (static multi-file authoring, not sync) or would require abandoning the existing structural parser, which the requirements explicitly forbid. This should be built directly on top of `DocsStructureParser` output.
+
+## 2. Google Docs API native "sections" primitive: Named Ranges
+
+Google Docs API v1 does support `NamedRange` / `namedRanges` (confirmed against current docs, [Work with named ranges](https://developers.google.com/workspace/docs/api/how-tos/named-ranges), April 2026 revision of the API model docs). Key facts:
+
+- A `NamedRange` is a `namedRangeId` + a name + a list of `Range`s covering the current text extent; `CreateNamedRangeRequest`/`DeleteNamedRangeRequest` manage them; indexes auto-update as content is inserted/removed elsewhere in the doc.
+- **Named ranges are visible to every collaborator with doc access** — they are not a private/hidden mechanism.
+- **A single named range can split into multiple `Range`s** when content is inserted at its boundary or a collaborator edits inside it — the how-to guide's own sample code has to re-gather and re-sort ranges by `startIndex` for this reason.
+- Names are **not required to be unique** — multiple named ranges can share a name, distinguished only by `namedRangeId`.
+- There is **no Docs UI surface** for viewing/editing named ranges — they're API-only, invisible to a human editing the doc directly, and easy for a collaborator to accidentally invalidate (e.g. by cutting/pasting across a range boundary) with no visible warning.
+
+Assessment against the manifest requirement (stable identity + order across pull/edit/push cycles, human-inspectable, git-diffable, no new external service):
+
+- **Pros**: identity would live in the doc itself (no manifest file to keep in sync); range extents self-heal on non-boundary edits.
+- **Cons**: (a) splitting behavior on boundary edits means "one section = one named range" can silently become "one section = N discontiguous named ranges," complicating both split-on-pull and reorder-detection-on-push; (b) invisibility in the Docs UI means a user has no way to see or fix a corrupted mapping without going through docspan itself, and no way to see it at all if they never install docspan; (c) non-unique names mean a lookup-by-name is not authoritative without also tracking `namedRangeId`, which brings back a manifest anyway (docspan needs to persist that ID mapping somewhere — a `NamedRange` alone doesn't tell docspan which local file it corresponds to); (d) requires calling `batchUpdate` with `CreateNamedRangeRequest`/`DeleteNamedRangeRequest` on every section add/delete, which is additional API surface `docs_request_builder.py` does not currently touch and would need new coverage/tests for; (e) a git-tracked manifest file is diffable and reviewable in a PR, a hidden API-only doc property is not.
+
+**Verdict: Not recommended as primary mechanism, but worth noting as future/complementary.** A flat, git-tracked manifest (e.g. YAML mapping local section-file → stable section ID → last-known heading text/position) is simpler, fully visible, needs no new `batchUpdate` request types, and doesn't inherit named ranges' split-on-edit fragility. Named ranges could be revisited later as a *redundant* anchor if manifest drift becomes a real problem in practice, but adding them now increases surface area (new request types, new failure modes) for a benefit (self-healing indexes) the manifest approach doesn't need, since section boundaries are already re-derived from heading structure on every pull.
+
+Note: docspan already has a working, lighter-weight analog for exactly this "stable identity anchor" need — `paragraphStyle.headingId`, captured today as `DocsParagraphNode.heading_id` (`src/docspan/backends/google_docs/docs_structure_parser.py:188`) and used to resolve `#slug` anchor links (`src/docspan/backends/google_docs/heading_anchors.py`). This is a native, per-heading Docs identity already round-tripped through the existing parser — a stronger starting point than introducing named ranges (see §4).
+
+## 3. LLM-hand-rolled reorder/add/delete detection vs. an existing library
+
+The manifest/identity-tracking logic (detect that section B moved from position 3 to position 1, section C was deleted, section D is new) is a sequence-alignment problem — and docspan already has a heavily-used, well-tested solution to *this exact class of problem* in production:
+
+- `src/docspan/backends/google_docs/docs_request_builder.py` builds its entire push diff on `difflib.SequenceMatcher` (`autojunk=False`), keyed first on a structural `_node_key` and then a `_content_key`, run up to three times per push (see the file's own comments at lines 32, 81–113, 226, 374, 1647). This is the mechanism that already detects insert/delete/replace/equal at node granularity for full-document push.
+- `src/docspan/core/merge.py` wraps the `merge3` package for the three-way text merge that push already invokes.
+- The Confluence backend independently uses `difflib.SequenceMatcher` for text-similarity comparison (`src/docspan/backends/confluence/adf/comparator.py:301,365`).
+
+Given that, section-level add/delete/reorder detection is naturally expressed as one more `difflib.SequenceMatcher` pass — keyed on section IDs from the manifest (analogous to today's `_node_key`) — rather than a hand-rolled LCS/patience-sort implementation. `difflib` is stdlib, already a first-class dependency of this exact subsystem, and the team has already invested in understanding and documenting its worst-case behavior (the guarded `SequenceMatcher` wrapper at `docs_request_builder.py:81` exists specifically because of a pathological-input issue found in production, per its own comments referencing issues #54/#68).
+
+**Verdict: Recommended — reuse `difflib.SequenceMatcher`, don't hand-roll and don't add a new sequence-alignment dependency.** Model section identity as a key sequence and run it through the same guarded `SequenceMatcher` helper already factored out in `docs_request_builder.py`, rather than introducing e.g. a diff/alignment PyPI package (which would violate the no-new-dependency constraint) or writing new LCS code from scratch (which would duplicate a class of bug the codebase has already paid down once).
+
+## 4. Fork-or-adapt: existing docspan code paths close enough to reuse
+
+- **Heading identity (`heading_id` / `heading_anchors.py`)**: as noted in §2, this is the closest existing precedent for "stable ID surviving edits, derived from Docs' own paragraph metadata," already flowing through `DocsStructureParser`. Sectioned mode's manifest can key sections by the same `heading_id` when present, falling back to a synthesized ID (e.g. derived from heading text + position) for headings Docs hasn't assigned an ID to yet — no new Docs-side primitive needed.
+- **Image/attachment sidecar pattern (`image_source.py`, `resolve_document_images`)**: images already exist as separate files referenced *from* the markdown rather than embedded in it, resolved back to Docs content at push time via `build_source`/`resolve_images`. This is the existing "one logical document, N related files on disk" precedent in the google_docs backend, and the closest structural analog to "one logical document, N section files on disk" — same shape of problem (external files + a reference mechanism + resolution at push time), just at a different granularity (image blob vs. markdown section).
+- **`pull_comments` sidecar config flag on `GoogleDocsConfig`** (`src/docspan/config.py:63`): shows the established opt-in-sidecar-output convention (`{file}.comments.md`) already in this codebase — sectioned mode's config knob (heading-level threshold, opt-in flag) should follow this same shape rather than inventing new config conventions.
+- **Confluence backend's multi-file organization** (`services/confluence/crawler.py`, `SpaceCrawler`/`CrawledPage`): this crawls a *space* into multiple *pages*, each an independent Confluence-native document — a fundamentally different granularity (page-to-page, not doc-to-section) and it's explicitly out of scope per the "must not touch the Confluence backend" constraint. Not close enough to adapt; would also drag in ADF-specific plumbing (`adf/`) with no relevance to Google Docs' node model.
+- **Push diff pipeline itself (`docs_request_builder.py`)**: not something to fork, but the primary thing to *extend* — section-level reorder detection is a new SequenceMatcher pass keyed on section IDs feeding into the same request-building machinery that already turns node-level diffs into Docs `batchUpdate` requests.
+
+**Verdict: Recommended — adapt, don't fork.** Combine the `heading_id` identity precedent (§2/§4) with the image-sidecar file-reference pattern (§4) and the existing `SequenceMatcher`-based diff machinery (§3): a manifest keyed by `heading_id` (falling back to a synthesized key), files referenced from it the way image sources are referenced today, and reorder/add/delete detected with the same guarded `SequenceMatcher` helper already used for full-document push. This requires no new external dependency, no new SaaS/API surface, and touches only the `google_docs` backend.
+
+## Summary table
+
+| Option | Verdict |
+|---|---|
+| 1. OSS doc-splitting library (Sphinx/MyST, Pandoc, SSG loaders, markdown-it plugins) | Not recommended — no library solves split+stable-identity+reassemble; all would bypass `DocsStructureParser` |
+| 2. Google Docs API Named Ranges as identity anchor | Not recommended as primary mechanism — visible-but-fragile (silent splitting on edit, non-unique names, no UI, new `batchUpdate` request types); a git-tracked manifest is simpler and equally sufficient given headings are re-derived on every pull |
+| 3. `difflib.SequenceMatcher` for reorder/add/delete detection | Recommended — already the load-bearing diff mechanism in `docs_request_builder.py`; reuse the existing guarded wrapper rather than hand-rolling LCS or adding a new alignment library |
+| 4. Fork/adapt existing docspan code | Recommended — combine `heading_id` (heading_anchors.py) as identity source, the image-sidecar file-reference pattern (image_source.py) for section-file references, and the existing SequenceMatcher-based push diff for reorder detection; Confluence's crawler is not a fit and is out of scope regardless |

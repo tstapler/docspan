@@ -1,0 +1,119 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "docspan"
+dynamic = ["version"]
+description = "Push and pull markdown to Google Docs and Confluence from a single CLI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Tyler Stapler", email = "tystapler@gmail.com"}
+]
+keywords = ["markdown", "google-docs", "confluence", "sync", "docs-as-code", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = [
+    # Core
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "PyYAML>=6.0",
+    "ruamel.yaml>=0.18.0",
+    "pydantic>=2.0.0",
+    # Google Docs backend
+    "google-auth>=2.23.0",
+    "google-auth-oauthlib>=1.1.0",
+    "google-auth-httplib2>=0.1.1",
+    "google-api-python-client>=2.108.0",
+    "markdownify>=0.11.6",
+    # Confluence backend
+    "requests>=2.25.0",
+    "httpx>=0.24.0",
+    # Utilities
+    "python-dateutil>=2.8.2",
+    # Merge
+    "merge3>=0.0.16",
+    "mistune>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "types-PyYAML>=6.0.0",
+    "types-requests>=2.25.0",
+]
+docs = [
+    "mkdocs>=1.5.0,<2.0",
+    "mkdocs-material>=9.5.0,<10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tstapler/docspan"
+Repository = "https://github.com/tstapler/docspan"
+Issues = "https://github.com/tstapler/docspan/issues"
+Changelog = "https://github.com/tstapler/docspan/releases"
+
+[project.scripts]
+docspan = "docspan.cli.main:app"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docspan"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501", "E402"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+# google-api-python-client ships no py.typed marker / stub package.
+[[tool.mypy.overrides]]
+module = "googleapiclient.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+
+# Resolve against the public index explicitly, overriding whatever index the
+# machine is configured with. uv's precedence is CLI > env > this file > the
+# user's ~/.config/uv/uv.toml > system config, so a contributor whose machine
+# points uv at a private or corporate mirror still gets a lockfile with
+# pypi.org URLs.
+#
+# Without this, any `uv run`/`uv lock` on such a machine silently rewrites every
+# URL in uv.lock to that mirror. Committing the result leaks the internal
+# hostname into this public repo and breaks CI, which cannot reach it — and the
+# diff is thousands of near-identical lines nobody reads. In CI there is no user
+# config, so this is a no-op there. `ci.yml` greps uv.lock as the backstop.
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true

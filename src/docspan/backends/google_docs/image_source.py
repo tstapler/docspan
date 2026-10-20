@@ -1,0 +1,384 @@
+"""Resolve markdown image references to fetchable URIs for insertInlineImage.
+
+`ImageSource` is a closed union (`LocalPathSource | InMemorySource |
+UrlSource | MermaidSource`). `MermaidSource` carries raw diagram text
+rather than pre-rendered bytes so rendering happens lazily in
+`_resolve_one`, behind the same try/except that turns every other
+resolution failure into a push warning instead of a crash.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import struct
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
+from docspan.backends.google_docs import mermaid_cache_sidecar
+from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
+from docspan.backends.google_docs.mermaid_renderer import (
+    RENDER_SCALE,
+    MermaidRenderError,
+    render_mermaid_png,
+)
+
+# Practical ceiling before a raw Drive/Docs API 400 -- see validation.md's
+# "oversized image" edge case.
+MAX_IMAGE_BYTES = 50 * 1024 * 1024
+
+# Letter page, 1in margins each side: 6.5in x 72pt/in content width. A
+# deliberate simplification -- doesn't read a doc's actual documentStyle
+# margins (see requirements.md's "Page content width isn't universal"
+# rabbit hole).
+CONTENT_WIDTH_PT = 468.0
+
+# 96 CSS px/in (the standard browser reference pixel mmdc's Chromium/
+# Puppeteer renderer uses) / 72pt/in.
+_PT_PER_CSS_PX = 0.75
+
+# Magic-byte sniffing instead of `imghdr` (removed in Python 3.13) or a new
+# Pillow dependency -- covers the formats insertInlineImage actually supports.
+_MAGIC_BYTES: Dict[bytes, str] = {
+    b"\x89PNG\r\n\x1a\n": "image/png",
+    b"\xff\xd8\xff": "image/jpeg",
+    b"GIF87a": "image/gif",
+    b"GIF89a": "image/gif",
+    b"BM": "image/bmp",
+}
+
+
+def _png_pixel_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    """Read (width_px, height_px) from a PNG's IHDR chunk, or None if malformed.
+
+    PNG guarantees IHDR is the first chunk: 8-byte signature, 4-byte chunk
+    length, 4-byte "IHDR" tag, then width/height as big-endian uint32s at
+    bytes 16-19/20-23 -- avoids a new Pillow dependency (see
+    project_plans/mermaid-diagram-sizing/decisions/ADR-001-png-dimension-reading.md),
+    consistent with this module's existing magic-byte MIME sniffing instead
+    of a full image-parsing library.
+    """
+    if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    if width == 0 or height == 0:
+        return None
+    return width, height
+
+
+def _mermaid_image_size_pt(png_bytes: bytes) -> Optional[Tuple[float, float]]:
+    """Compute (width_pt, height_pt) for a mermaid PNG, filling CONTENT_WIDTH_PT.
+
+    Under this "always-fill" scaling, RENDER_SCALE and _PT_PER_CSS_PX
+    algebraically cancel out of the result -- width always becomes exactly
+    CONTENT_WIDTH_PT, and height only ever depends on the pixel aspect ratio.
+    They're computed anyway (rather than working from the raw pixel ratio
+    directly) because plan.md's Unresolved Questions records "always-fill"
+    as a reversible bet: switching to cap-only (never upscale a diagram
+    already narrower than CONTENT_WIDTH_PT, e.g. `scale = min(1.0, ...)`)
+    needs the real absolute logical_width_pt, which does depend on
+    RENDER_SCALE -- so this keeps that one-line rollback available.
+
+    Height is derived from width via one shared scale factor rather than
+    independently rounding each axis -- so an unchanged diagram's rendered
+    PNG always yields the identical (width_pt, height_pt) pair
+    docs_request_builder.py's diff-identity key relies on (see
+    research/pitfalls.md #2-3).
+    """
+    dims = _png_pixel_dimensions(png_bytes)
+    if dims is None:
+        return None
+    native_width_px, native_height_px = dims
+    logical_width_pt = (native_width_px / RENDER_SCALE) * _PT_PER_CSS_PX
+    logical_height_pt = (native_height_px / RENDER_SCALE) * _PT_PER_CSS_PX
+    scale = CONTENT_WIDTH_PT / logical_width_pt
+    return round(logical_width_pt * scale, 2), round(logical_height_pt * scale, 2)
+
+
+@dataclass(frozen=True)
+class LocalPathSource:
+    """An image at an already-resolved filesystem path."""
+
+    path: str
+
+
+@dataclass(frozen=True)
+class InMemorySource:
+    """Raw image bytes with no backing file (e.g. a rendered mermaid diagram)."""
+
+    data: bytes
+    filename: str
+    mime_type: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class UrlSource:
+    """An image already at a fetchable http(s):// URL -- bypasses Drive upload."""
+
+    url: str
+
+
+@dataclass(frozen=True)
+class MermaidSource:
+    """Raw mermaid diagram text, rendered to PNG bytes at resolve time."""
+
+    diagram: str
+
+
+ImageSource = Union[LocalPathSource, InMemorySource, UrlSource, MermaidSource]
+
+Uploader = Callable[[bytes, str, str], Dict[str, str]]
+
+Renderer = Callable[[str], bytes]
+
+
+@dataclass
+class ResolvedImage:
+    """A resolved image, ready to feed an insertInlineImage request."""
+
+    uri: str
+    temp_drive_file_id: Optional[str] = None
+    # Set only when this resolution rendered a ```mermaid fence -- the raw
+    # PNG bytes, so resolve_document_images() can record them in the
+    # cross-machine mermaid-cache sidecar (mermaid_cache_sidecar.py) without
+    # re-rendering. None for every other image source kind.
+    rendered_bytes: Optional[bytes] = None
+
+
+@dataclass
+class ImageResolutionError:
+    """A source that couldn't be resolved -- surfaced as push residue, never a crash."""
+
+    key: str
+    reason: str
+
+
+class _ResolutionFailure(Exception):
+    pass
+
+
+def build_source(markdown_path: str, image_ref: str) -> ImageSource:
+    """Turn a raw markdown image ref into an `ImageSource`, relative to the markdown file.
+
+    Absolute paths and `../` traversal outside the markdown file's directory
+    are resolved and passed through rather than rejected: shared asset
+    directories are a supported use case, and `markdown_path`'s directory is
+    trusted input by the time it reaches here (not derived from network
+    input). This is a deliberate scope decision, not an accidental
+    side-effect of path-joining -- see validation.md's path-traversal edge
+    case.
+    """
+    if image_ref.startswith(("http://", "https://")):
+        return UrlSource(url=image_ref)
+    ref_path = Path(image_ref)
+    if ref_path.is_absolute():
+        resolved = ref_path
+    else:
+        resolved = Path(markdown_path).resolve().parent / ref_path
+    return LocalPathSource(path=str(resolved))
+
+
+def resolve_images(
+    sources: Dict[str, ImageSource], uploader: Uploader, renderer: Optional[Renderer] = None
+) -> Tuple[Dict[str, ResolvedImage], List[ImageResolutionError]]:
+    """Resolve each image source to a URI usable in an insertInlineImage request.
+
+    `uploader` matches `GoogleDocsClient.upload_temp_image`'s call shape
+    (`(data, filename, mime_type) -> {"file_id", "uri"}`) -- injected rather
+    than constructing a client here, so this module is testable without
+    mocking Drive API client construction. `renderer` (diagram text -> PNG
+    bytes) defaults to `render_mermaid_png`; tests inject a stub to avoid
+    shelling out to mermaid-cli.
+
+    Returns `(resolved, errors)`: resolved sources feed the request builder;
+    errors become push residue warnings (never an exception), keyed the same
+    way as `sources` so callers can map failures back to their node.
+    """
+    resolved: Dict[str, ResolvedImage] = {}
+    errors: List[ImageResolutionError] = []
+    for key, source in sources.items():
+        try:
+            resolved[key] = _resolve_one(source, uploader, renderer or render_mermaid_png)
+        except _ResolutionFailure as exc:
+            errors.append(ImageResolutionError(key=key, reason=str(exc)))
+        except Exception as exc:
+            # `uploader` (Drive API) can raise anything, not just
+            # _ResolutionFailure -- letting that propagate would discard
+            # every already-resolved image in this same batch instead of
+            # just reporting this one key as a warning.
+            errors.append(ImageResolutionError(key=key, reason=f"upload failed: {exc}"))
+    return resolved, errors
+
+
+def _render_mermaid(source: MermaidSource, renderer: Renderer) -> Tuple[bytes, str]:
+    try:
+        data = renderer(source.diagram)
+    except MermaidRenderError as exc:
+        raise _ResolutionFailure(f"mermaid render failed: {exc}") from exc
+    return data, "diagram.png"
+
+
+def _resolve_one(source: ImageSource, uploader: Uploader, renderer: Renderer) -> ResolvedImage:
+    if isinstance(source, UrlSource):
+        return ResolvedImage(uri=source.url)
+
+    if isinstance(source, LocalPathSource):
+        data, filename = _read_local(source.path)
+        mime_type = _sniff_mime_type(data)
+    elif isinstance(source, InMemorySource):
+        data, filename = source.data, source.filename
+        mime_type = source.mime_type or _sniff_mime_type(data)
+    elif isinstance(source, MermaidSource):
+        data, filename = _render_mermaid(source, renderer)
+        mime_type = _sniff_mime_type(data)
+    else:
+        raise _ResolutionFailure(f"unsupported image source type: {type(source).__name__}")
+
+    if len(data) > MAX_IMAGE_BYTES:
+        raise _ResolutionFailure(
+            f"image exceeds {MAX_IMAGE_BYTES // (1024 * 1024)}MB limit "
+            f"({len(data)} bytes): {filename}"
+        )
+    if mime_type is None:
+        raise _ResolutionFailure(f"not a recognized image format: {filename}")
+    if mime_type == "image/svg+xml":
+        raise _ResolutionFailure(
+            f"SVG is not supported by Google Docs' insertInlineImage: {filename}"
+        )
+
+    result = uploader(data, filename, mime_type)
+    return ResolvedImage(
+        uri=result["uri"],
+        temp_drive_file_id=result["file_id"],
+        rendered_bytes=data if isinstance(source, MermaidSource) else None,
+    )
+
+
+def _read_local(path: str) -> Tuple[bytes, str]:
+    p = Path(path)
+    if not p.is_file():
+        raise _ResolutionFailure(f"image file not found: {path}")
+    try:
+        size = p.stat().st_size
+    except OSError as exc:
+        raise _ResolutionFailure(f"could not read image file {path}: {exc}") from exc
+    if size > MAX_IMAGE_BYTES:
+        # Reject on the cheap stat() size before reading the whole file into
+        # memory -- an oversized file has no other reason to be read at all.
+        raise _ResolutionFailure(
+            f"image exceeds {MAX_IMAGE_BYTES // (1024 * 1024)}MB limit "
+            f"({size} bytes): {p.name}"
+        )
+    try:
+        data = p.read_bytes()
+    except OSError as exc:
+        raise _ResolutionFailure(f"could not read image file {path}: {exc}") from exc
+    return data, p.name
+
+
+def _sniff_mime_type(data: bytes) -> Optional[str]:
+    for magic, mime in _MAGIC_BYTES.items():
+        if data.startswith(magic):
+            return mime
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    stripped = data.lstrip()[:256]
+    if stripped.startswith(b"<?xml") or stripped.startswith(b"<svg"):
+        return "image/svg+xml"
+    return None
+
+
+def _describe_source(source: ImageSource) -> str:
+    """Short, single-line label for a warning -- never the raw dataclass repr.
+
+    `MermaidSource.diagram` is the full (often multi-line) fence text; its
+    default dataclass repr would dump that whole text, escaped onto one line,
+    into a push warning. Callers just need enough to find which image failed.
+    """
+    if isinstance(source, MermaidSource):
+        first_line = next((ln.strip() for ln in source.diagram.splitlines() if ln.strip()), "")
+        return f"mermaid diagram ({first_line})" if first_line else "mermaid diagram"
+    if isinstance(source, LocalPathSource):
+        return source.path
+    if isinstance(source, UrlSource):
+        return source.url
+    return repr(source)
+
+
+def resolve_document_images(
+    nodes: List[DocsImageNode],
+    markdown_path: str,
+    uploader: Uploader,
+    renderer: Optional[Renderer] = None,
+) -> Tuple[List[Optional[DocsImageNode]], List[str], List[str], List[Tuple[str, str]]]:
+    """Resolve every `DocsImageNode.src` in `nodes` to a fetchable URI, in place-equivalent form.
+
+    Convenience wrapper over `resolve_images()` for the `backend.py` push
+    pre-pass: builds an `ImageSource` per node -- a `MermaidSource` when
+    `node.mermaid_source` is set (a ```mermaid fence), otherwise from its raw
+    markdown `src` via `build_source` -- resolves them all, and returns
+    `(nodes, warnings, temp_drive_file_ids, mermaid_entries)`.
+
+    The returned `nodes` list is positional -- same length and order as the
+    input, one slot per input node -- so a caller splicing these back into a
+    larger node list (backend.py's target_nodes) can zip them against the
+    original `DocsImageNode` positions without having to guess which ones
+    failed. A resolved slot holds the node with `src` rewritten to the
+    resolved URI; an unresolved slot is `None` (its failure is reported via
+    `warnings`, matching the `_render_unstyled`/`_render_dead_anchors`
+    residue-warning pattern in `backend.py`) and the caller drops it.
+    `temp_drive_file_ids` lets the caller delete on success or retry on
+    failure (criterion 5/7/8). `mermaid_entries` is
+    `[(sha256_of_png_bytes, diagram_source), ...]`, in document order, for
+    `mermaid_appendix.build_appendix_nodes` -- the same key domain the
+    committed sidecar below already uses.
+    """
+    sources: Dict[str, ImageSource] = {
+        str(i): MermaidSource(diagram=node.mermaid_source)
+        if node.mermaid_source
+        else build_source(markdown_path, node.src)
+        for i, node in enumerate(nodes)
+    }
+    resolved, errors = resolve_images(sources, uploader, renderer)
+
+    warnings = [f"image {_describe_source(sources[e.key])}: {e.reason}" for e in errors]
+    temp_drive_file_ids = [
+        r.temp_drive_file_id for r in resolved.values() if r.temp_drive_file_id
+    ]
+
+    # Persist mermaid renders to the committed sidecar (mermaid_cache_sidecar.py)
+    # so a pull on a different machine, which never had the local XDG render
+    # cache populated, can still restore the ```mermaid fence instead of
+    # falling back to a bare image link. Collected into one dict and written
+    # once via record_many() rather than once per node -- record() alone
+    # would do a full sidecar read-modify-write per diagram, O(N) file I/O
+    # for an N-diagram doc.
+    mermaid_entries: List[Tuple[str, str]] = []
+    sidecar_entries: Dict[str, str] = {}
+    for i, node in enumerate(nodes):
+        result = resolved.get(str(i))
+        if node.mermaid_source and result is not None and result.rendered_bytes is not None:
+            sha256_hex = hashlib.sha256(result.rendered_bytes).hexdigest()
+            sidecar_entries[sha256_hex] = node.mermaid_source
+            mermaid_entries.append((sha256_hex, node.mermaid_source))
+    mermaid_cache_sidecar.record_many(markdown_path, sidecar_entries)
+
+    out: List[Optional[DocsImageNode]] = []
+    for i, node in enumerate(nodes):
+        result = resolved.get(str(i))
+        if result is None:
+            out.append(None)
+            continue
+        size: Optional[Tuple[float, float]] = None
+        if (
+            node.mermaid_source
+            and node.width_pt is None
+            and node.height_pt is None
+            and result.rendered_bytes is not None
+        ):
+            size = _mermaid_image_size_pt(result.rendered_bytes)
+        if size is not None:
+            out.append(replace(node, src=result.uri, width_pt=size[0], height_pt=size[1]))
+        else:
+            out.append(replace(node, src=result.uri))
+    return out, warnings, temp_drive_file_ids, mermaid_entries

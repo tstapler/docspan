@@ -1,0 +1,40 @@
+site_name: docspan
+site_description: Push and pull markdown to Google Docs and Confluence from a single CLI
+site_url: https://tstapler.github.io/docspan
+repo_url: https://github.com/tstapler/docspan
+repo_name: tstapler/docspan
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+    - search.suggest
+
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Configuration: configuration.md
+  - Commands: commands.md
+  - Backends:
+    - Google Docs: backends/google-docs.md
+    - Confluence: backends/confluence.md
+  - Contributing: contributing.md
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - admonition
+  - tables
+  - attr_list

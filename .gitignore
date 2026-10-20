@@ -1,1 +1,75 @@
-# Project gitignore
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Google API credentials
+credentials.json
+token.json
+*_credentials.json
+account_a_credentials.json
+account_b_credentials.json
+
+# Configuration files with sensitive data
+config.yaml
+markgate.yaml
+
+# State files
+.sync_state.json
+conflicts.log
+.markgate-state.json
+.markgate-base/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# MkDocs build output
+site/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
+
+# Session scaffolding — regenerated per backlog-session spawn/attach, never a
+# repo deliverable (see commits 8f80a5b, bd693ca on other branches)
+.backlog-context.md
+.claude/commands/backlog/
+
+# Scratch artifacts — debug dumps, snapshots, never a repo deliverable
+.scratch/

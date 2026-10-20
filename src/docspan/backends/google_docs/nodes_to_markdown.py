@@ -1,0 +1,698 @@
+"""Render DocsParagraphNode/DocsTableNode lists back into Markdown.
+
+Used by GoogleDocsBackend.pull() only for the tab-scoped path (an explicit
+Mapping.tab_id): Drive's HTML export (files.export) has no supported way to
+target a single tab, so a tab-specific pull instead re-uses the structural
+API path push() already relies on — DocsStructureParser.parse() — and needs
+a nodes-to-markdown direction to go with MarkdownToParagraphParser's
+markdown-to-nodes direction. Default (no tab_id) pulls keep using the
+existing, more mature Drive HTML export -> DocumentConverter path unchanged.
+
+This is a best-effort renderer, not a byte-for-byte inverse of
+MarkdownToParagraphParser — round-tripping through Markdown is inherently
+lossy (e.g. Docs' native nested-list structure vs. flat nesting_level here).
+
+The default (no-tab_id) pull path through converter.py's
+_GoogleDocsMarkdownConverter has the same per-line-inline-code symptom via a
+completely separate CSS-font-family-based mechanism and is NOT touched here
+— see issue #45's "Scope gap found late": that HTML-export pipeline has no
+render_prefix/span-shape equivalent to key fence detection off, would need
+its own detection heuristic, and was out of scope for this fix. This was
+confirmed rather than silently assumed: a live scope-confirmation request
+went unanswered, so the gap was filed as a separate, explicit follow-up
+(docspan backlog item a500ef94-2e02-499e-a628-5f843198c49e) instead of being
+folded into or dropped from this fix.
+"""
+from __future__ import annotations
+
+from typing import List, Optional, Tuple, Union
+
+from docspan.backends.google_docs.docs_structure_parser import (
+    DocsImageNode,
+    DocsParagraphNode,
+    DocsTableNode,
+    TableCell,
+    TextSpan,
+)
+from docspan.backends.google_docs.markdown_to_paragraph_parser import BLANK_CODE_LINE_MARKER
+from docspan.backends.google_docs.registry import MarkdownNodeRenderer, MarkdownRenderRegistry
+
+Node = Union[DocsParagraphNode, DocsTableNode, DocsImageNode]
+
+# The literal marker MarkdownToParagraphParser writes ahead of a fenced
+# block's lines to carry the language (mistune's token.attrs.info) through
+# the node-list representation, which has no field for it. Must stay in
+# sync with markdown_to_paragraph_parser.py's FENCE_MARKER.
+FENCE_MARKER = "```"
+
+# A rendered code fence can also open with tildes (see _fence_delimiter's
+# backtick-in-language fallback) — a bare paragraph starting with either
+# fence character must be escaped the same way.
+TILDE_FENCE_MARKER = "~~~"
+
+
+def _run_of_char(text: str, target: str) -> int:
+    """The longest run of consecutive occurrences of `target` in text."""
+    max_run = run = 0
+    for ch in text:
+        if ch == target:
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    return max_run
+
+
+def _run_of_backticks(text: str) -> int:
+    """The longest run of consecutive backticks in text."""
+    return _run_of_char(text, "`")
+
+
+def _wrap_inline_code(text: str) -> str:
+    """Wrap text as a CommonMark code span, escaping any backticks inside it.
+
+    CommonMark's rule: the delimiter must be a run of backticks longer than
+    the longest run inside the content, and if the content starts or ends
+    with a backtick (or starts and ends with a space around non-space
+    content), a single space is added inside the delimiters so the content
+    doesn't fuse with them.
+
+    Empty text is left unwrapped: a 1-backtick fence around no content is
+    two adjacent backticks, which CommonMark parses as literal text, not an
+    empty code span — wrapping would silently produce that ambiguous output.
+    """
+    if not text:
+        return text
+    delim = "`" * (_run_of_backticks(text) + 1)
+    needs_pad = text.startswith("`") or text.endswith("`")
+    if not needs_pad and text[:1] == " " and text[-1:] == " " and text.strip():
+        needs_pad = True
+    if needs_pad:
+        return f"{delim} {text} {delim}"
+    return f"{delim}{text}{delim}"
+
+
+def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
+    """The shortest fence (at least 3) longer than any run of its own
+    character appearing in the content, so the fence can never be confused
+    with a run of that character inside the code itself.
+
+    CommonMark forbids a backtick fence's info string from containing any
+    backtick at all — widening the fence doesn't help, since the rule isn't
+    about run length there. So a language containing a backtick forces a
+    tilde fence instead, which has no such restriction on its info string.
+    """
+    if lang and "`" in lang:
+        max_run = max((_run_of_char(line, "~") for line in code_lines), default=0)
+        return "~" * max(3, max_run + 1)
+    max_run = max((_run_of_backticks(line) for line in [lang or "", *code_lines]), default=0)
+    return "`" * max(3, max_run + 1)
+
+
+def _render_spans(spans: List[TextSpan]) -> str:
+    parts = []
+    for span in spans:
+        text = span.text
+        if span.monospace:
+            text = _wrap_inline_code(text)
+        if span.bold:
+            text = f"**{text}**"
+        if span.italic:
+            text = f"*{text}*"
+        if span.link:
+            text = f"[{text}]({span.link})"
+        parts.append(text)
+    return "".join(parts)
+
+
+def _cell_markdown_text(cell: TableCell) -> str:
+    """The cell's content rendered through the same markdown-span rules as a paragraph."""
+    return _render_spans(cell.spans) if cell.spans else cell.text
+
+
+def _render_cell(cell: TableCell) -> str:
+    """A cell's markdown — with its marks, and with `|` escaped.
+
+    An unescaped `|` ends the cell, so a link whose URL or label contains one would
+    split the row into extra columns. Not preserved: a `|` inside a *URL* keeps the
+    row intact but comes back percent-encoded (`%7C`) on the next parse, so such a
+    link is rewritten once and then stable.
+
+    Used only for single-paragraph cells: `_render_table` routes any table holding a
+    multi-paragraph cell (`\\n` in `cell.text`) to `_render_table_html` instead, since
+    pipe-table syntax has no cell-internal line break. See that function's docstring
+    for why raw HTML, not `<br>` or a diff-key change, is the fix — and issue #61.
+    """
+    return _cell_markdown_text(cell).replace("|", "\\|")
+
+
+_BLANK_PARAGRAPH_MARKER = "​"
+
+
+def _escape_html(text: str) -> str:
+    """Entity-escape `&`, `<`, `>` — plus any *real* occurrence of the guard marker.
+
+    Escaping the marker here means the raw U+200B byte only ever appears in the
+    rendered HTML where `_guard_blank_paragraph_lines` deliberately put it — a real
+    cell whose text happens to contain a stray U+200B (copy-pasted from another
+    editor is a real source of these) round-trips as itself instead of being
+    mistaken for the guard and silently dropped to "" on decode.
+    """
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace(_BLANK_PARAGRAPH_MARKER, "&#8203;")
+    )
+
+
+def _guard_blank_paragraph_lines(paragraphs: List[str]) -> str:
+    """Join already-escaped paragraph fragments, guarding interior blank ones.
+
+    CommonMark ends an HTML block (type 6, e.g. `<table>`) at the first blank line —
+    even one produced by an empty paragraph *inside* a cell's own text (an author
+    leaving a blank line between two paragraphs). Left alone, that blank line would
+    fracture mistune's single opaque `block_html` token into two, losing the rest of
+    the table (see #61). A leading/trailing empty paragraph is safe as-is: it shares
+    its physical line with the `<th>`/`</th>` tag text, so it's never actually blank.
+    """
+    guarded = list(paragraphs)
+    for i in range(1, len(guarded) - 1):
+        if guarded[i] == "":
+            guarded[i] = _BLANK_PARAGRAPH_MARKER
+    return "\n".join(guarded)
+
+
+def _split_paragraph_spans(spans: List[TextSpan]) -> List[List[TextSpan]]:
+    """Split a cell's spans at each embedded "\\n" into one span-list per paragraph.
+
+    A cell's paragraph break lives inside whichever `TextSpan` happens to contain
+    it (e.g. a bold run spanning "line one\\nline two") — span boundaries are
+    styling boundaries, not paragraph boundaries. Rendering markdown syntax (e.g.
+    `**`) across a paragraph break corrupts it: each side gets an unmatched marker
+    once the fragment is later parsed on its own. Each paragraph must be rendered
+    independently instead, exactly as `_spans_from_markdown_text` on the decode
+    side expects.
+    """
+    paragraphs: List[List[TextSpan]] = [[]]
+    for span in spans:
+        parts = span.text.split("\n")
+        for i, part in enumerate(parts):
+            if i > 0:
+                paragraphs.append([])
+            if part:
+                paragraphs[-1].append(TextSpan(
+                    text=part, bold=span.bold, italic=span.italic,
+                    link=span.link, monospace=span.monospace,
+                ))
+    return paragraphs
+
+
+def _cell_html_paragraphs(cell: TableCell) -> List[str]:
+    """Each of a cell's paragraphs, independently markdown-rendered and escaped."""
+    if cell.spans:
+        return [_escape_html(_render_spans(p)) for p in _split_paragraph_spans(cell.spans)]
+    return [_escape_html(p) for p in cell.text.split("\n")]
+
+
+def _render_table_html(node: DocsTableNode) -> str:
+    """Render a table holding a multi-paragraph cell as a raw HTML `<table>` block.
+
+    Markdown's pipe-table syntax has no cell-internal paragraph break — every
+    encoding into that syntax (a bare newline, `<br>`, `<br>` decoded back on parse)
+    either breaks the row or silently destroys the table on the next unmodified push
+    (see #51, #61). Raw HTML sidesteps the problem instead of encoding around it:
+    mistune tokenizes the whole `<table>...</table>` as one opaque `block_html` raw
+    string, so a literal `\\n` inside a `<td>` is just a character — nothing here
+    reparses it as a row terminator. No `\\n`-encoding is needed at all, except for
+    the blank-paragraph edge case `_guard_blank_paragraph_lines` handles.
+
+    `_table_from_html_block` decodes the entity-escaping back and re-parses each
+    paragraph's markdown independently (bold/links survive, joined across
+    paragraphs by a literal `\\n` `TextSpan`).
+    """
+    header, *body = node.rows
+
+    def render_row(row: List[TableCell], tag: str) -> str:
+        cells = "".join(
+            f"<{tag}>{_guard_blank_paragraph_lines(_cell_html_paragraphs(c))}</{tag}>"
+            for c in row
+        )
+        return f"<tr>{cells}</tr>"
+
+    rows_html = [render_row(header, "th")] + [render_row(r, "td") for r in body]
+    return "<table>\n" + "\n".join(rows_html) + "\n</table>"
+
+
+def _render_table(node: DocsTableNode) -> str:
+    if not node.rows:
+        return ""
+    if any("\n" in c.text for row in node.rows for c in row):
+        return _render_table_html(node)
+    header, *body = node.rows
+    lines = [
+        "| " + " | ".join(_render_cell(c) for c in header) + " |",
+        "| " + " | ".join(["---"] * len(header)) + " |",
+    ]
+    lines.extend("| " + " | ".join(_render_cell(c) for c in row) + " |" for row in body)
+    return "\n".join(lines)
+
+
+def _node_text(node: DocsParagraphNode) -> str:
+    return _render_spans(node.spans) if node.spans else node.text
+
+
+def _dispatch_key(node: Node) -> str:
+    """Synthesize a dispatch key — DocsParagraphNode/DocsTableNode carry no `.type` field."""
+    if isinstance(node, DocsTableNode):
+        return "table"
+    if isinstance(node, DocsImageNode):
+        return "image"
+    if node.style.startswith("HEADING_"):
+        return "heading"
+    if node.is_list_item:
+        return "list_item"
+    return "paragraph"
+
+
+def _is_pure_code_line(node: Node) -> bool:
+    """Exactly the shape MarkdownToParagraphParser's `_nodes_from_code_block`
+    writes for a code line: one span, monospace, and no other mark.
+    Deliberately narrower than "contains some monospace" — a mixed-mark span
+    (e.g. monospace+bold) or an isolated inline-code span inside an otherwise
+    normal paragraph must never be swept into a fence.
+
+    Excludes `BLANK_CODE_LINE_MARKER` even though it too is a lone monospace
+    span: it stands for a *blank* code line (`_is_blank_code_line`), and the
+    two must stay distinguishable so `_group_code_runs`'s interior-blank
+    lookahead and empty-fence special case still have something to key off.
+    """
+    if not isinstance(node, DocsParagraphNode):
+        return False
+    if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    if node.text == BLANK_CODE_LINE_MARKER:
+        return False
+    spans = node.spans
+    return (
+        len(spans) == 1
+        and spans[0].monospace
+        and not spans[0].bold
+        and not spans[0].italic
+        and not spans[0].link
+    )
+
+
+def _is_blank_code_line(node: Node) -> bool:
+    """A blank line inside a fenced block.
+
+    Two shapes, both produced by `_nodes_from_code_block`: the current
+    `BLANK_CODE_LINE_MARKER`-tagged paragraph (top-level/list-item fences,
+    issue #127), and the older `text="", spans=[]` shape a blockquote's
+    blank code line still uses (already protected from
+    `projection.project()` by the `is_blockquote` carve-out, so it never
+    needed the marker). A document pushed before #127's fix may also still
+    hold the older shape for a top-level/list-item fence.
+
+    Only ever absorbed into an already-open code run by `_group_code_runs`
+    (it looks ahead for another code line before treating one of these as
+    part of the run) — an ordinary blank paragraph between two prose
+    paragraphs has the legacy shape too and must not, on its own, start or
+    extend a fence.
+    """
+    if not isinstance(node, DocsParagraphNode):
+        return False
+    if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    if node.text == BLANK_CODE_LINE_MARKER:
+        return True
+    return not node.spans and node.text == ""
+
+
+def _is_language_marker(node: Node) -> bool:
+    """The literal, non-monospace marker line MarkdownToParagraphParser
+    writes ahead of a fence's lines to carry the language
+    (`markdown_to_paragraph_parser.py`'s FENCE_MARKER). Non-monospace is
+    what makes it unambiguously decodable: every real code line is
+    monospace by construction, so this shape never collides with one.
+    """
+    if not isinstance(node, DocsParagraphNode):
+        return False
+    if node.style != "NORMAL_TEXT" or node.is_list_item:
+        return False
+    if not node.text.startswith(FENCE_MARKER):
+        return False
+    if node.spans:
+        if len(node.spans) != 1:
+            return False
+        span = node.spans[0]
+        if span.monospace or span.bold or span.italic or span.link:
+            return False
+    return True
+
+
+def _group_code_runs(nodes: List[Node]) -> List[Tuple]:
+    """Partition nodes into ("node", node) passthroughs and
+    ("code", lang, code_nodes) runs of consecutive pure code lines
+    (optionally preceded by a language marker, and allowing interior blank
+    lines that are followed by more code before the run ends).
+
+    Only ever recovers a *top-level* fence: `_is_pure_code_line` and its
+    siblings all require `not node.is_list_item`, since that's the only call
+    site `_nodes_from_code_block` marks with a language marker
+    (`emit_language_marker=True`) — a list item's or blockquote's own code
+    lines render one at a time via the normal per-node dispatch below instead
+    of being regrouped into a fence.
+    """
+    groups: List[Tuple] = []
+    i, n = 0, len(nodes)
+    while i < n:
+        node = nodes[i]
+        lang: Optional[str] = None
+        start = i
+        if _is_language_marker(node) and i + 1 < n:
+            # _is_language_marker already requires DocsParagraphNode; assert
+            # narrows the Node union for mypy without re-checking at runtime.
+            assert isinstance(node, DocsParagraphNode)
+            if _is_pure_code_line(nodes[i + 1]):
+                lang = node.text[len(FENCE_MARKER):]
+                start = i + 1
+            elif _is_blank_code_line(nodes[i + 1]) and (
+                i + 2 >= n or not _is_pure_code_line(nodes[i + 2])
+            ):
+                # A marker immediately followed by exactly one blank-shaped
+                # line, with no code line beyond it, is
+                # MarkdownToParagraphParser's shape for an explicitly empty
+                # fenced block (see `_nodes_from_code_block`) — not an
+                # orphaned marker.
+                groups.append(("code", node.text[len(FENCE_MARKER):], []))
+                i += 2
+                continue
+
+        if start < n and _is_pure_code_line(nodes[start]):
+            run: List[Node] = []
+            j = start
+            while j < n:
+                if _is_pure_code_line(nodes[j]):
+                    run.append(nodes[j])
+                    j += 1
+                    continue
+                if _is_blank_code_line(nodes[j]):
+                    k = j
+                    while k < n and _is_blank_code_line(nodes[k]):
+                        k += 1
+                    if k < n and _is_pure_code_line(nodes[k]):
+                        run.extend(nodes[j:k])
+                        j = k
+                        continue
+                break
+            groups.append(("code", lang, run))
+            i = j
+        else:
+            groups.append(("node", node))
+            i += 1
+    return groups
+
+
+def _group_blockquote_runs(nodes: List[Node]) -> List[Tuple]:
+    """Partition nodes into ("node", node)/("code", lang, [...]) passthroughs
+    (via `_group_code_runs`, applied to each contiguous non-quote stretch —
+    see below) and ("blockquote", depth, inner_groups) runs of contiguous
+    native-blockquote paragraphs, keyed on `node.is_blockquote`/
+    `node.quote_depth` — the marker Story 3.1's `_detect_blockquote_depth`
+    sets during structure parsing, not any textual `>` prefix (there is none
+    to key off; Epic 2 dropped it from the pushed text).
+
+    A run's reported `depth` is its first node's `quote_depth`, used only as
+    the common case's shorthand — a run is contiguous `is_blockquote=True`
+    nodes, which may still mix depths (e.g. `"> outer\\n> > inner\\n"`, no
+    blank line between the two): CommonMark reads adjacent `>`-prefixed lines
+    with no blank between them as one nested quote structure, not two
+    sibling blockquotes, so a depth change alone must not end a run or
+    `render_nodes_to_markdown` would insert a blank line where the source had
+    none. `BlockquoteNodeRenderer` reads each line's own node for its actual
+    depth rather than trusting the run-level shorthand uniformly.
+
+    This is now the sole outer grouping stage `render_nodes_to_markdown`
+    calls (replacing a bare `_group_code_runs(nodes)`), so a non-quote
+    stretch must still get top-level fence detection: `_group_code_runs` is
+    applied to it exactly as it would have been before this story existed.
+    A quote run's own inner node list is separately passed through
+    `_group_code_runs` too, composing the two stages the way
+    `BlockquoteNodeRenderer` expects to recurse into `_render_code_group`.
+    """
+    groups: List[Tuple] = []
+    i, n = 0, len(nodes)
+    while i < n:
+        node = nodes[i]
+        if isinstance(node, DocsParagraphNode) and node.is_blockquote:
+            depth = node.quote_depth
+            run: List[Node] = [node]
+            j = i + 1
+            while j < n:
+                candidate = nodes[j]
+                if not (isinstance(candidate, DocsParagraphNode) and candidate.is_blockquote):
+                    break
+                run.append(candidate)
+                j += 1
+            groups.append(("blockquote", depth, _group_code_runs(run)))
+            i = j
+        else:
+            j = i
+            plain_run: List[Node] = []
+            while j < n:
+                candidate = nodes[j]
+                if isinstance(candidate, DocsParagraphNode) and candidate.is_blockquote:
+                    break
+                plain_run.append(candidate)
+                j += 1
+            groups.extend(_group_code_runs(plain_run))
+            i = j
+    return groups
+
+
+def _render_code_group(lang: Optional[str], code_nodes: List[Node]) -> List[str]:
+    # code_nodes are only ever populated via _is_pure_code_line/
+    # _is_blank_code_line, both of which require DocsParagraphNode; assert
+    # narrows the Node union for mypy without re-checking at runtime.
+    code_lines = []
+    for node in code_nodes:
+        assert isinstance(node, DocsParagraphNode)
+        # A blank code line's real text is always "" regardless of which
+        # shape produced it — BLANK_CODE_LINE_MARKER is a push-side
+        # placeholder, not markdown content, and must never leak into the
+        # rendered line.
+        code_lines.append("" if _is_blank_code_line(node) else node.text)
+    delim = _fence_delimiter(lang, code_lines)
+    # CommonMark reads the fence's width off the *leading run* of the fence
+    # character on the opening line, not a separately-tokenized delimiter —
+    # if the info string starts with that same character (e.g. a tilde
+    # fence whose language itself starts with "~"), it silently extends the
+    # opening fence past `delim`, so the closing line we write is too short
+    # to close the block. A single space breaks the adjacency; CommonMark
+    # trims it from the info string on reparse, so it's otherwise a no-op.
+    sep = " " if lang and lang[:1] == delim[:1] else ""
+    lines = [f"{delim}{sep}{lang or ''}"]
+    lines.extend(code_lines)
+    lines.append(delim)
+    lines.append("")
+    return lines
+
+
+def _escape_leading_fence(text: str) -> str:
+    """Escape a plain paragraph line that would otherwise open a live
+    CommonMark code fence when reparsed.
+
+    Only the bare-paragraph render path needs this: headings prefix "# ",
+    list items prefix "- ", and block quotes prefix "> ", all of which
+    already keep a fence-shaped line from starting the line. Without it, a
+    marker node left behind by `_group_code_runs` (because it wasn't
+    immediately followed by a matching code run) or ordinary user prose that
+    happens to start with ``` or ~~~ renders as literal fence-shaped text
+    that, on the next parse, opens an unterminated fence and swallows every
+    following line as code until EOF instead of staying inert.
+    """
+    if text.startswith(FENCE_MARKER) or text.startswith(TILDE_FENCE_MARKER):
+        return "\\" + text
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pull-direction renderers — one class per synthesized dispatch key,
+# registered in _build_pull_registry(). To add a new node kind, register a
+# renderer there; render_nodes_to_markdown()'s dispatch loop needs no changes.
+# Code lines are handled separately, before dispatch even runs — see
+# _group_code_runs/_render_code_group above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TableNodeRenderer(MarkdownNodeRenderer):
+    node_key = "table"
+
+    def render(self, node: DocsTableNode) -> str:
+        return _render_table(node)
+
+
+class HeadingNodeRenderer(MarkdownNodeRenderer):
+    node_key = "heading"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        try:
+            level = int(node.style.split("_", 1)[1])
+        except ValueError:
+            level = 1
+        level = max(1, min(level, 6))
+        return f"{'#' * level} {_node_text(node)}"
+
+
+class ListItemNodeRenderer(MarkdownNodeRenderer):
+    node_key = "list_item"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        indent = "  " * node.nesting_level
+        text = _node_text(node)
+        if node.is_native_checkbox:
+            # The Docs API does not expose a native checkbox's
+            # checked/unchecked bit anywhere DocsStructureParser can read
+            # it (see push_preview.py's NATIVE CHECKBOX GLYPH warning) —
+            # DocsParagraphNode carries no checked-state field at all.
+            # Rendering unchecked is the only honest option here; this is
+            # a one-way, lossy render (never fed back through
+            # MarkdownToParagraphParser as this exact text), not a claim
+            # about the glyph's real state.
+            return f"{indent}- [ ] {text}"
+        if node.is_ordered_list:
+            # Push has no ordered-list concept at all (MarkdownToParagraphParser
+            # always emits BULLET_DISC_CIRCLE_SQUARE regardless of source
+            # syntax), so this numbering is a one-way, lossy render — a
+            # round-trip through push will turn it back into a plain bullet.
+            # That's a pre-existing, unconditional asymmetry on both pull
+            # paths, not something this rendering introduces.
+            return f"{indent}{node.ordered_number or 1}. {text}"
+        return f"{indent}- {text}"
+
+
+class ParagraphNodeRenderer(MarkdownNodeRenderer):
+    node_key = "paragraph"
+
+    def render(self, node: DocsParagraphNode) -> str:
+        # Escaping here (rather than in _node_text) keeps the escape scoped
+        # to the bare-paragraph path — headings/list items/block quotes all
+        # already prefix the line with something that keeps a fence-shaped
+        # line from opening a live fence on reparse.
+        return _escape_leading_fence(_node_text(node))
+
+
+class ImageNodeRenderer(MarkdownNodeRenderer):
+    node_key = "image"
+
+    def render(self, node: DocsImageNode) -> str:
+        return f"![{node.alt}]({node.src})"
+
+
+def _render_group_lines(node: Node) -> str:
+    """Render one non-code, non-blockquote group's node via the pull registry."""
+    key = _dispatch_key(node)
+    renderer = _PULL_REGISTRY.get(key)
+    if renderer is None:
+        raise ValueError(f"no renderer registered for dispatch key {key!r}")
+    return renderer.render(node)
+
+
+class BlockquoteNodeRenderer(MarkdownNodeRenderer):
+    """Renders a `("blockquote", depth, inner_groups)` tuple from
+    `_group_blockquote_runs` — `node` here is `(depth, inner_groups)`, not a
+    DocsParagraphNode; the pull registry's `render(self, node: Any)` contract
+    is generic enough to carry that (see registry.py's module docstring on
+    synthesized dispatch keys).
+
+    Unlike top-level `render_nodes_to_markdown`, no blank line is inserted
+    between a run's inner lines: CommonMark reads a blank `> ` line as
+    closing one paragraph and opening another *inside the same blockquote*,
+    which is not what a multi-line source quote (`"> first line\\n> second
+    line\\n"`) means — every inner line gets exactly one `"> " * depth`
+    prefix and the lines are joined directly.
+
+    Each line's prefix comes from *that line's own* node depth, not a single
+    depth shared by the whole run: a run may mix depths (see
+    `_group_blockquote_runs`'s docstring on `"> outer\\n> > inner\\n"`), and
+    the `depth` this renderer is called with is only ever the run's first
+    node's depth, kept as a fallback for a group (e.g. a fenced code run)
+    that doesn't carry its own node to read a depth from.
+    """
+
+    node_key = "blockquote"
+
+    def render(self, node: Tuple[int, List[Tuple]]) -> str:
+        depth, inner_groups = node
+        lines: List[Tuple[int, str]] = []
+        for group in inner_groups:
+            if group[0] == "code":
+                _, lang, code_nodes = group
+                line_depth = (
+                    code_nodes[0].quote_depth
+                    if code_nodes and isinstance(code_nodes[0], DocsParagraphNode)
+                    else depth
+                )
+                code_lines = _render_code_group(lang, code_nodes)
+                # _render_code_group always appends a trailing "" for the
+                # top-level blank-line-between-blocks convention, which does
+                # not apply inside a quote run — see class docstring.
+                if code_lines and code_lines[-1] == "":
+                    code_lines.pop()
+                lines.extend((line_depth, line) for line in code_lines)
+            else:
+                inner_node = group[1]
+                line_depth = (
+                    inner_node.quote_depth
+                    if isinstance(inner_node, DocsParagraphNode)
+                    else depth
+                )
+                lines.append((line_depth, _render_group_lines(inner_node)))
+        # An empty line gets the bare ">"-per-level marker with no trailing
+        # space, matching what a human (or MarkdownToParagraphParser on the
+        # way in) writes for an empty quoted line -- "> " for an empty line
+        # would carry a trailing space no source line has, breaking the
+        # byte-identical round trip (Story 3.3's push_pull_roundtrip test).
+        rendered = []
+        for line_depth, line in lines:
+            prefix = "> " * line_depth
+            rendered.append(f"{prefix}{line}" if line else prefix.rstrip())
+        return "\n".join(rendered)
+
+
+def _build_pull_registry() -> MarkdownRenderRegistry:
+    registry = MarkdownRenderRegistry()
+    registry.register("table", TableNodeRenderer())
+    registry.register("heading", HeadingNodeRenderer())
+    registry.register("list_item", ListItemNodeRenderer())
+    registry.register("paragraph", ParagraphNodeRenderer())
+    registry.register("image", ImageNodeRenderer())
+    registry.register("blockquote", BlockquoteNodeRenderer())
+    return registry
+
+
+_PULL_REGISTRY = _build_pull_registry()
+
+
+def render_nodes_to_markdown(nodes: List[Node]) -> str:
+    """Render a parsed node list (document order) back into Markdown text."""
+    lines: List[str] = []
+    for group in _group_blockquote_runs(nodes):
+        if group[0] == "code":
+            _, lang, code_nodes = group
+            lines.extend(_render_code_group(lang, code_nodes))
+            continue
+
+        if group[0] == "blockquote":
+            _, depth, inner_groups = group
+            renderer = _PULL_REGISTRY.get("blockquote")
+            assert renderer is not None  # registered in _build_pull_registry
+            lines.append(renderer.render((depth, inner_groups)))
+            lines.append("")
+            continue
+
+        node = group[1]
+        lines.append(_render_group_lines(node))
+        lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"

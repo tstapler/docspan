@@ -1,0 +1,886 @@
+"""
+Google Drive Client Module
+
+Provides clients for interacting with Google Drive API:
+- GoogleDocsClient: For Google Docs operations (Account A)
+- VaultDriveClient: For Markdown files in Obsidian vault (Account B)
+"""
+
+import io
+import logging
+import random
+import socket
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, cast
+
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+logger = logging.getLogger(__name__)
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+TIMEOUT = 60  # seconds
+
+
+class GoogleSheetsClient:
+    """Client for reading mappings from Google Sheets"""
+
+    def __init__(self, credentials):
+        """
+        Initialize Google Sheets client
+
+        Args:
+            credentials: Google OAuth2 credentials
+        """
+        self.credentials = credentials
+        self.sheets_service = build('sheets', 'v4', credentials=credentials)
+
+    def get_mappings(self, sheet_id: str, sheet_range: str) -> List[Dict[str, str]]:
+        """
+        Read mappings from Google Sheet and normalize
+
+        Args:
+            sheet_id: Spreadsheet ID
+            sheet_range: Range to read (e.g., 'Sheet1!A:B')
+
+        Returns:
+            list: [{ 'doc_id': ..., 'vault_path': ... }, ...]
+        """
+        result = self.sheets_service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=sheet_range
+        ).execute()
+        values = result.get('values', [])
+
+        if not values or len(values) < 2:
+            logger.warning("Sheet has no data rows for mappings")
+            return []
+
+        headers = [h.strip().lower() for h in values[0]]
+        try:
+            doc_idx = headers.index('doc_id')
+            vault_idx = headers.index('vault_path')
+        except ValueError:
+            raise ValueError("Sheet header must include 'doc_id' and 'vault_path'")
+
+        mappings: List[Dict[str, str]] = []
+        for row in values[1:]:
+            # Guard missing columns
+            doc_id = row[doc_idx].strip() if len(row) > doc_idx and row[doc_idx] else ''
+            vault_path = row[vault_idx].strip() if len(row) > vault_idx and row[vault_idx] else ''
+
+            if not doc_id or not vault_path:
+                continue
+
+            mappings.append({
+                'doc_id': doc_id,
+                'vault_path': vault_path
+            })
+
+        logger.info(f"Loaded {len(mappings)} mapping(s) from Google Sheet")
+        return mappings
+
+
+class GoogleDocsClient:
+    """Client for Google Docs operations (Account A)"""
+
+    def __init__(self, credentials):
+        """
+        Initialize Google Docs client
+
+        Args:
+            credentials: Google OAuth2 credentials
+        """
+        self.credentials = credentials
+        # Set timeout for HTTP requests
+        self.drive_service = build('drive', 'v3', credentials=credentials)
+        self.docs_service = build('docs', 'v1', credentials=credentials)
+
+        # Set default socket timeout
+        socket.setdefaulttimeout(TIMEOUT)
+
+    def _with_backoff(self, fn, max_retries: int = 5, max_backoff: int = 64):
+        """Execute fn() with truncated exponential backoff on HTTP 429 errors."""
+        for n in range(max_retries):
+            try:
+                return fn()
+            except HttpError as e:
+                if e.resp.status == 429:
+                    wait = min(2 ** n + random.random(), max_backoff)
+                    time.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError("Max retries exceeded after rate limit backoff")
+
+    def get_document(self, doc_id: str, include_tabs_content: bool = True) -> dict:
+        """
+        Get full Google Docs document JSON (including body structure).
+
+        Args:
+            doc_id: Google Doc ID
+            include_tabs_content: When True (default), passes
+                `includeTabsContent=True` so multi-tab docs populate
+                `document.tabs` (each tab's own body/lists). Per the Docs API,
+                when this is omitted/False, `document.tabs` is left empty and
+                the legacy `document.body`/`document.lists` fields are
+                populated from the *first tab only* — silently ignoring any
+                other tab. Defaulting to True here is what makes tab
+                selection (Mapping.tab_id) possible at all; single-tab docs
+                are unaffected (their one tab's content still lands in
+                `document.tabs[0]`, handled by the existing tabs-aware
+                parsing code).
+
+        Returns:
+            dict: Full document resource including body.content (legacy docs)
+                or tabs[].documentTab.body.content (multi-tab docs).
+        """
+        return self._with_backoff(
+            lambda: self.docs_service.documents()
+            .get(documentId=doc_id, includeTabsContent=include_tabs_content)
+            .execute()
+        )
+
+    def create_document(self, title: str) -> dict:
+        """
+        Create a new, empty Google Doc.
+
+        Returns:
+            dict: the created document resource (at minimum `documentId`, `title`).
+        """
+        return cast(
+            dict,
+            self._with_backoff(
+                lambda: self.docs_service.documents().create(body={"title": title}).execute()
+            ),
+        )
+
+    def add_document_tab(self, doc_id: str, title: str) -> Dict[str, str]:
+        """Create a new root-level tab in `doc_id` titled `title`.
+
+        Uses the `addDocumentTab` batchUpdate request (Docs API v1;
+        AddDocumentTabRequest.tabProperties, all fields optional). Returns
+        the created tab's `tabProperties` (at least `tabId`/`title`) so the
+        caller can echo back what Google actually stored rather than
+        assuming it matches the request verbatim.
+        """
+        response = self.batch_update(
+            doc_id,
+            [{"addDocumentTab": {"tabProperties": {"title": title}}}],
+        )
+        return cast(
+            Dict[str, str], response["replies"][0]["addDocumentTab"]["tabProperties"]
+        )
+
+    def batch_update(
+        self,
+        doc_id: str,
+        requests: list,
+        required_revision_id: Optional[str] = None,
+    ) -> dict:
+        """
+        Submit a list of batchUpdate requests to a Google Doc.
+
+        Applies exponential backoff on HTTP 429 (rate limit) errors.
+
+        Args:
+            doc_id: Google Doc ID
+            requests: List of request dicts (e.g. insertText, deleteContentRange)
+            required_revision_id: If provided, sets `writeControl.requiredRevisionId`
+                so the batch fails atomically (HTTP 400) if the doc changed since
+                this revision was fetched. When None, behavior is unchanged.
+
+        Returns:
+            dict: batchUpdate response
+        """
+        body: Dict[str, object] = {"requests": requests}
+        if required_revision_id is not None:
+            body["writeControl"] = {"requiredRevisionId": required_revision_id}
+
+        return self._with_backoff(
+            lambda: self.docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body=body,
+            ).execute()
+        )
+
+    def upload_temp_image(self, data: bytes, filename: str, mime_type: str) -> Dict[str, str]:
+        """Upload image bytes to Drive as a temp file, shared publicly for Docs to fetch.
+
+        `insertInlineImage`'s `uri` must be fetchable by Google's own servers
+        at insert time — a `drive.file`-scoped private upload isn't reachable
+        from there, hence the explicit `role="reader", type="anyone"` share
+        (the `drive` scope, already in PUSH_SCOPES, is what makes this call
+        itself permitted).
+
+        Returns:
+            dict: {"file_id": ..., "uri": ...} — `file_id` for later
+            `delete_temp_upload`, `uri` for the `insertInlineImage` request.
+        """
+        media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type, resumable=False)
+        file = self._with_backoff(
+            lambda: self.drive_service.files().create(
+                body={"name": filename},
+                media_body=media,
+                fields="id",
+            ).execute()
+        )
+        file_id = file["id"]
+        try:
+            self._with_backoff(
+                lambda: self.drive_service.permissions().create(
+                    fileId=file_id,
+                    body={
+                        "role": "reader",
+                        "type": "anyone",
+                        "allowFileDiscovery": False,
+                    },
+                ).execute()
+            )
+        except Exception:
+            # files().create() already succeeded; without this the caller
+            # never learns file_id and that Drive file is orphaned forever.
+            self.delete_temp_upload(file_id)
+            raise
+        return {
+            "file_id": file_id,
+            "uri": f"https://drive.google.com/uc?export=view&id={file_id}",
+        }
+
+    def delete_temp_upload(self, file_id: str) -> None:
+        """Delete a temp Drive upload made by `upload_temp_image`.
+
+        Tolerates the file already being gone (a retried cleanup after a
+        partial failure) rather than raising on a 404.
+        """
+        try:
+            self._with_backoff(
+                lambda: self.drive_service.files().delete(fileId=file_id).execute()
+            )
+        except HttpError as e:
+            if e.resp.status != 404:
+                raise
+
+    def list_comments(self, doc_id: str) -> List[dict]:
+        """
+        Return open (not resolved) comments on a Drive file, read-only.
+
+        Never mutates, resolves, or re-anchors a comment — used purely as a
+        read-only source for CommentCrossReference/CommentCountBackstop
+        (see ADR-002). Wrapped in the same _with_backoff helper as
+        get_document/batch_update.
+
+        Args:
+            doc_id: Google Doc / Drive file ID
+
+        Returns:
+            list[dict]: comment resources (id, content, quotedFileContent,
+            resolved, author.displayName) with resolved=True comments
+            excluded.
+        """
+        response = self._with_backoff(
+            lambda: self.drive_service.comments().list(
+                fileId=doc_id,
+                fields="comments(id,content,quotedFileContent,resolved,author(displayName))",
+                includeDeleted=False,
+            ).execute()
+        )
+        comments = response.get("comments", [])
+        return [c for c in comments if not c.get("resolved")]
+
+    def get_doc_content(self, doc_id: str) -> str:
+        """
+        Get Google Doc content as HTML with retry mechanism
+
+        Args:
+            doc_id: Google Doc ID
+
+        Returns:
+            str: Document content in HTML format
+        """
+        last_error = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Export as HTML
+                request = self.drive_service.files().export_media(
+                    fileId=doc_id,
+                    mimeType='text/html'
+                )
+                content = request.execute()
+                logger.info(f"Retrieved content from Google Doc: {doc_id}")
+                return content.decode('utf-8')
+
+            except socket.timeout as e:
+                last_error = e
+                logger.warning(f"Timeout retrieving doc {doc_id} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                    continue
+
+            except HttpError as e:
+                # Don't retry on 404 or permission errors
+                if e.resp.status in [404, 403]:
+                    logger.error(f"Error retrieving doc {doc_id}: {e}")
+                    raise
+                # Retry on other HTTP errors
+                last_error = e
+                logger.warning(f"HTTP error retrieving doc {doc_id} (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Error retrieving doc {doc_id} (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+
+        # All retries failed
+        logger.error(f"Failed to retrieve doc {doc_id} after {MAX_RETRIES} attempts")
+        raise last_error
+
+    def get_comments(self, doc_id: str) -> List[dict]:
+        """
+        List all (non-deleted) comments on a Google Doc via the Drive API.
+
+        Returns the raw comment dicts (content, author, resolved, quotedFileContent, replies,
+        createdTime). Requires a drive/drive.readonly scope. Paginates fully.
+        """
+        fields = (
+            "nextPageToken,comments(id,content,resolved,createdTime,modifiedTime,"
+            "author(displayName),quotedFileContent(value),"
+            "replies(content,createdTime,author(displayName)))"
+        )
+        comments: List[dict] = []
+        page_token: Optional[str] = None
+        while True:
+            token = page_token
+
+            def _list():
+                return self.drive_service.comments().list(
+                    fileId=doc_id,
+                    fields=fields,
+                    pageSize=100,
+                    pageToken=token,
+                    includeDeleted=False,
+                ).execute()
+
+            resp = self._with_backoff(_list)
+            comments.extend(resp.get("comments", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return comments
+
+    def create_reply(self, doc_id: str, comment_id: str, content: str = "", resolve: bool = False) -> dict:
+        """
+        Post a reply to a Drive comment, optionally resolving it in the same call.
+
+        Args:
+            doc_id: Google Doc / Drive file ID
+            comment_id: id of the comment to reply to (see get_comments()'s "id" field)
+            content: reply text; may be empty when resolve=True with no message
+            resolve: when True, sets the reply's action to "resolve", which also
+                marks the parent comment resolved
+
+        Returns:
+            dict: the created reply resource (id, content, action)
+        """
+        body: dict = {}
+        if content:
+            body["content"] = content
+        if resolve:
+            body["action"] = "resolve"
+        return self._with_backoff(
+            lambda: self.drive_service.replies().create(
+                fileId=doc_id,
+                commentId=comment_id,
+                body=body,
+                fields="id,content,action",
+            ).execute()
+        )
+
+    def get_doc_plain_text(self, doc_id: str) -> str:
+        """
+        Get Google Doc content as plain text
+
+        Args:
+            doc_id: Google Doc ID
+
+        Returns:
+            str: Document content in plain text
+        """
+        try:
+            request = self.drive_service.files().export_media(
+                fileId=doc_id,
+                mimeType='text/plain'
+            )
+            content = request.execute()
+            logger.info(f"Retrieved plain text from Google Doc: {doc_id}")
+            return content.decode('utf-8')
+        except HttpError as e:
+            logger.error(f"Error retrieving doc {doc_id}: {e}")
+            raise
+
+    def fetch_markdown_export(self, doc_id: str) -> str:
+        """Get Google Doc content via Drive's markdown export.
+
+        A different renderer than `get_doc_content()`'s HTML export or
+        `documents.get()`: it is the only read path that exposes a native
+        checkbox's checked/unchecked state (as GFM `- [x]`/`- [ ]`) — see
+        checkbox_state.py. Uses `_with_backoff` (unlike `get_doc_content`'s
+        own bespoke retry loop) since this is a single idempotent read with
+        no special timeout handling to preserve; a transport failure
+        propagates so the caller can degrade gracefully (see
+        GoogleDocsBackend.pull()).
+        """
+        content: bytes = self._with_backoff(
+            lambda: self.drive_service.files()
+            .export_media(fileId=doc_id, mimeType="text/markdown")
+            .execute()
+        )
+        return content.decode("utf-8")
+
+    def update_doc_content(self, doc_id: str, content: str) -> bool:
+        """
+        Update Google Doc content from plain text
+
+        Args:
+            doc_id: Google Doc ID
+            content: New content as plain text
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # Get current document to find the end index
+            doc = self.docs_service.documents().get(documentId=doc_id).execute()
+            doc_content = doc.get('body').get('content')
+            end_index = doc_content[-1].get('endIndex') - 1
+
+            # Delete all content first
+            requests = [
+                {
+                    'deleteContentRange': {
+                        'range': {
+                            'startIndex': 1,
+                            'endIndex': end_index
+                        }
+                    }
+                },
+                {
+                    'insertText': {
+                        'location': {
+                            'index': 1
+                        },
+                        'text': content
+                    }
+                }
+            ]
+
+            self.docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={'requests': requests}
+            ).execute()
+
+            logger.info(f"Updated Google Doc: {doc_id}")
+            return True
+        except HttpError as e:
+            logger.error(f"Error updating doc {doc_id}: {e}")
+            raise
+
+    def get_modified_time(self, doc_id: str) -> datetime:
+        """
+        Get last modified time of Google Doc
+
+        Args:
+            doc_id: Google Doc ID
+
+        Returns:
+            datetime: Last modified timestamp
+        """
+        try:
+            file = self.drive_service.files().get(
+                fileId=doc_id,
+                fields='modifiedTime'
+            ).execute()
+            modified_time_str = file.get('modifiedTime')
+            modified_time = datetime.fromisoformat(modified_time_str.replace('Z', '+00:00'))
+            logger.debug(f"Doc {doc_id} modified at: {modified_time}")
+            return modified_time
+        except HttpError as e:
+            if e.resp.status == 404:
+                logger.error(
+                    f"Google Doc not found: {doc_id}\n"
+                    f"  → Please share this document with: "
+                    f"obsidian-sync-account-aw@obsidian-sync-vault.iam.gserviceaccount.com\n"
+                    f"  → Document URL: https://docs.google.com/document/d/{doc_id}/edit"
+                )
+            else:
+                logger.error(f"Error getting modified time for doc {doc_id}: {e}")
+            raise
+
+    def get_doc_info(self, doc_id: str) -> Dict:
+        """
+        Get Google Doc metadata
+
+        Args:
+            doc_id: Google Doc ID
+
+        Returns:
+            dict: Document metadata
+        """
+        try:
+            file = self.drive_service.files().get(
+                fileId=doc_id,
+                fields='id,name,modifiedTime,mimeType'
+            ).execute()
+            return file
+        except HttpError as e:
+            logger.error(f"Error getting info for doc {doc_id}: {e}")
+            raise
+
+
+class VaultDriveClient:
+    """Client for Obsidian vault operations in Google Drive (Account B)"""
+
+    def __init__(self, credentials, vault_folder_id: str):
+        """
+        Initialize Vault Drive client
+
+        Args:
+            credentials: Google OAuth2 credentials
+            vault_folder_id: Google Drive folder ID containing the vault
+        """
+        self.credentials = credentials
+        self.drive_service = build('drive', 'v3', credentials=credentials)
+        self.vault_folder_id = vault_folder_id
+
+    def _get_file_id_by_name(self, filename: str) -> Optional[str]:
+        """
+        Search for file by name in entire vault (recursively)
+
+        Args:
+            filename: File name to search for (e.g., "SignalPlus Log.md")
+
+        Returns:
+            str: File ID or None if not found
+        """
+        # Search in entire vault folder and subfolders
+        # Use 'in parents' to search within vault and its descendants
+        query = f"name='{filename}' and '{self.vault_folder_id}' in parents and trashed=false"
+
+        try:
+            # First try: search directly in vault root
+            results = self.drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name, parents)',
+                supportsAllDrives=True
+            ).execute()
+            files = results.get('files', [])
+
+            if files:
+                logger.info(f"Found file '{filename}' with ID: {files[0]['id']}")
+                return files[0]['id']
+
+            # Second try: recursive search in all subfolders
+            query = f"name='{filename}' and trashed=false"
+            results = self.drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name, parents)',
+                supportsAllDrives=True
+            ).execute()
+            files = results.get('files', [])
+
+            # Filter files that are within vault folder tree
+            for file in files:
+                if self._is_file_in_vault(file):
+                    logger.info(f"Found file '{filename}' in subfolder with ID: {file['id']}")
+                    return file['id']
+
+            logger.warning(f"File not found in vault: {filename}")
+            return None
+
+        except HttpError as e:
+            logger.error(f"Error searching for file {filename}: {e}")
+            return None
+
+    def _is_file_in_vault(self, file: Dict) -> bool:
+        """
+        Check if file is within vault folder tree
+
+        Args:
+            file: File metadata dict with 'parents' field
+
+        Returns:
+            bool: True if file is in vault tree
+        """
+        if 'parents' not in file:
+            return False
+
+        parents = file['parents']
+        current_id = parents[0] if parents else None
+
+        # Traverse up to check if we reach vault folder
+        max_depth = 20  # Prevent infinite loop
+        depth = 0
+
+        while current_id and depth < max_depth:
+            if current_id == self.vault_folder_id:
+                return True
+
+            try:
+                parent = self.drive_service.files().get(
+                    fileId=current_id,
+                    fields='parents'
+                ).execute()
+
+                if 'parents' in parent and parent['parents']:
+                    current_id = parent['parents'][0]
+                else:
+                    break
+
+            except HttpError:
+                break
+
+            depth += 1
+
+        return False
+
+    def _get_file_id_by_path(self, relative_path: str) -> Optional[str]:
+        """
+        Get file ID by relative path within vault
+
+        This method first tries to find by filename only (flexible),
+        then falls back to exact path matching (strict)
+
+        Args:
+            relative_path: Path relative to vault root (e.g., "01. Inbox/note.md")
+
+        Returns:
+            str: File ID or None if not found
+        """
+        # Extract filename from path
+        filename = relative_path.split('/')[-1]
+
+        # Try flexible search by filename first
+        file_id = self._get_file_id_by_name(filename)
+        if file_id:
+            return file_id
+
+        # Fallback to exact path matching
+        parts = relative_path.split('/')
+        current_folder_id = self.vault_folder_id
+
+        # Traverse folders
+        for i, part in enumerate(parts[:-1]):
+            query = f"name='{part}' and '{current_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            try:
+                results = self.drive_service.files().list(
+                    q=query,
+                    spaces='drive',
+                    fields='files(id, name)'
+                ).execute()
+                folders = results.get('files', [])
+                if not folders:
+                    logger.warning(f"Folder not found: {part} in path {relative_path}")
+                    return None
+                current_folder_id = folders[0]['id']
+            except HttpError as e:
+                logger.error(f"Error finding folder {part}: {e}")
+                return None
+
+        # Find file in specific folder
+        query = f"name='{filename}' and '{current_folder_id}' in parents and trashed=false"
+        try:
+            results = self.drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
+            files = results.get('files', [])
+            if not files:
+                logger.warning(f"File not found: {filename} in path {relative_path}")
+                return None
+            return files[0]['id']
+        except HttpError as e:
+            logger.error(f"Error finding file {filename}: {e}")
+            return None
+
+    def read_file(self, relative_path: str) -> Optional[str]:
+        """
+        Read markdown file content from vault
+
+        Args:
+            relative_path: Path relative to vault root
+
+        Returns:
+            str: File content or None if not found
+        """
+        file_id = self._get_file_id_by_path(relative_path)
+        if not file_id:
+            return None
+
+        try:
+            request = self.drive_service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+
+            content = fh.getvalue().decode('utf-8')
+            logger.info(f"Read file from vault: {relative_path}")
+            return content
+        except HttpError as e:
+            logger.error(f"Error reading file {relative_path}: {e}")
+            raise
+
+    def write_file(self, relative_path: str, content: str) -> bool:
+        """
+        Write or update markdown file in vault
+
+        Args:
+            relative_path: Path relative to vault root
+            content: File content
+
+        Returns:
+            bool: True if successful
+        """
+        file_id = self._get_file_id_by_path(relative_path)
+
+        try:
+            media = MediaIoBaseUpload(
+                io.BytesIO(content.encode('utf-8')),
+                mimetype='text/markdown',
+                resumable=True
+            )
+
+            if file_id:
+                # Update existing file
+                self.drive_service.files().update(
+                    fileId=file_id,
+                    media_body=media,
+                    supportsAllDrives=True
+                ).execute()
+                logger.info(f"Updated file in vault: {relative_path}")
+            else:
+                # Create new file
+                parts = relative_path.split('/')
+                filename = parts[-1]
+
+                # Ensure parent folders exist
+                parent_id = self._ensure_folders_exist('/'.join(parts[:-1]))
+
+                file_metadata = {
+                    'name': filename,
+                    'parents': [parent_id],
+                    'mimeType': 'text/markdown'
+                }
+
+                self.drive_service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id',
+                    supportsAllDrives=True
+                ).execute()
+                logger.info(f"Created new file in vault: {relative_path}")
+
+            return True
+        except HttpError as e:
+            logger.error(f"Error writing file {relative_path}: {e}")
+            raise
+
+    def _ensure_folders_exist(self, folder_path: str) -> str:
+        """
+        Ensure folder path exists, create if necessary
+
+        Args:
+            folder_path: Folder path relative to vault root
+
+        Returns:
+            str: Final folder ID
+        """
+        if not folder_path:
+            return self.vault_folder_id
+
+        parts = folder_path.split('/')
+        current_folder_id = self.vault_folder_id
+
+        for part in parts:
+            if not part:
+                continue
+
+            # Check if folder exists
+            query = f"name='{part}' and '{current_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            results = self.drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
+            folders = results.get('files', [])
+
+            if folders:
+                current_folder_id = folders[0]['id']
+            else:
+                # Create folder
+                file_metadata = {
+                    'name': part,
+                    'parents': [current_folder_id],
+                    'mimeType': 'application/vnd.google-apps.folder'
+                }
+                folder = self.drive_service.files().create(
+                    body=file_metadata,
+                    fields='id',
+                    supportsAllDrives=True
+                ).execute()
+                current_folder_id = folder.get('id')
+                logger.info(f"Created folder: {part}")
+
+        return current_folder_id
+
+    def get_modified_time(self, relative_path: str) -> Optional[datetime]:
+        """
+        Get last modified time of file
+
+        Args:
+            relative_path: Path relative to vault root
+
+        Returns:
+            datetime: Last modified timestamp or None if not found
+        """
+        file_id = self._get_file_id_by_path(relative_path)
+        if not file_id:
+            return None
+
+        try:
+            file = self.drive_service.files().get(
+                fileId=file_id,
+                fields='modifiedTime'
+            ).execute()
+            modified_time_str = file.get('modifiedTime')
+            modified_time = datetime.fromisoformat(modified_time_str.replace('Z', '+00:00'))
+            logger.debug(f"File {relative_path} modified at: {modified_time}")
+            return modified_time
+        except HttpError as e:
+            logger.error(f"Error getting modified time for {relative_path}: {e}")
+            raise
+
+    def file_exists(self, relative_path: str) -> bool:
+        """
+        Check if file exists in vault
+
+        Args:
+            relative_path: Path relative to vault root
+
+        Returns:
+            bool: True if file exists
+        """
+        return self._get_file_id_by_path(relative_path) is not None

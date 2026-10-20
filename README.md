@@ -1,0 +1,331 @@
+# docspan
+
+[![PyPI](https://img.shields.io/pypi/v/docspan)](https://pypi.org/project/docspan/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+Push and pull markdown to Google Docs and Confluence from a single CLI. docspan provides bidirectional sync with three-way merge conflict detection, structural diff push that preserves comments on unchanged paragraphs, and a simple YAML-based configuration file.
+
+The config file is named `markgate.yaml` for backward compatibility. `docspan.yaml` is also recognized — if present in the working directory (and no `markgate.yaml` is there), docspan reads and writes it instead, so a project can rename its config file at its own pace.
+
+---
+
+## Supported Backends
+
+| Backend | Push | Pull |
+|---|---|---|
+| Google Docs | yes | yes |
+| Confluence | yes | yes |
+
+---
+
+## Install
+
+```bash
+pip install docspan
+```
+
+**Optional: mermaid diagram rendering (Google Docs backend only).** Pushing a
+` ```mermaid ` fence to Google Docs renders it to a PNG via the official
+[mermaid-cli](https://github.com/mermaid-js/mermaid-cli) (`mmdc`), which
+wraps Puppeteer/headless Chrome — there is no pure-Python renderer, so this
+is a Node.js dependency, not a `uv`/`pip` one, and isn't declared in
+`pyproject.toml`. Install it globally so docspan finds a real binary instead
+of falling back to `npx` (which re-fetches on every render):
+
+```bash
+npm install -g @mermaid-js/mermaid-cli   # tested against 11.x; older 10.x should also work
+```
+
+If Puppeteer's headless Chrome cache gets corrupted (a truncated download,
+an interrupted npm install), renders fail with an error like `Could not
+find chrome-headless-shell`; re-fetch it with:
+
+```bash
+npx puppeteer browsers install chrome-headless-shell
+```
+
+Without `mmdc` installed and without network access for `npx` to fetch it
+on demand, a mermaid render failure is reported as a push warning, not a
+crash — see [Limitations](docs/backends/google-docs.md#limitations).
+
+---
+
+## Quick start
+
+**1. Create `markgate.yaml`:**
+
+```yaml
+backends:
+  google_docs:
+    credentials_path: /path/to/service-account.json
+
+mappings:
+  - local: docs/design-doc.md
+    backend: google_docs
+    remote_id: YOUR_GOOGLE_DOC_ID
+    direction: both
+```
+
+**2. Set up authentication:**
+
+```bash
+docspan auth setup google_docs
+# or
+docspan auth setup confluence
+```
+
+**3. Push and pull:**
+
+```bash
+docspan push                     # push all mappings
+docspan pull                     # pull all mappings
+docspan status                   # show mapping table
+```
+
+**4. Resolve conflicts (if any):**
+
+```bash
+docspan conflicts list
+docspan conflicts resolve docs/design-doc.md --accept remote
+```
+
+---
+
+## Configuration (`markgate.yaml`)
+
+```yaml
+backends:
+  google_docs:
+    credentials_path: /path/to/service-account.json  # or use env ACCOUNT_A_CREDENTIALS_PATH
+  confluence:
+    base_url: https://yourorg.atlassian.net
+    username: you@example.com
+    api_token: your-api-token  # or env CONFLUENCE_API_TOKEN
+
+mappings:
+  - local: docs/notes.md
+    backend: google_docs
+    remote_id: YOUR_GOOGLE_DOC_ID
+    direction: both  # push | pull | both
+  - local: docs/page.md
+    backend: confluence
+    remote_id: YOUR_CONFLUENCE_PAGE_ID
+    direction: both
+```
+
+**Note**: `markgate.yaml` is gitignored by default because it may contain API tokens. Commit a `markgate.yaml.example` template alongside it.
+
+---
+
+## Central config & XDG storage
+
+By default docspan stores its config, sync state, and credentials under the [XDG base directories](https://specifications.freedesktop.org/basedir-spec/latest/), and a **central config** lets you register multiple projects by *prefix* and run docspan from anywhere.
+
+```
+$XDG_CONFIG_HOME/docspan/config.yaml     # central config (project registry)
+$XDG_CONFIG_HOME/docspan/<prefix>/…      # cached OAuth token
+$XDG_STATE_HOME/docspan/<prefix>/…       # sync state + base store, per project
+```
+
+Central config (`~/.config/docspan/config.yaml`):
+
+```yaml
+default_prefix: design-docs
+projects:
+  design-docs:
+    markgate: ~/Documents/design-docs/markgate.yaml
+```
+
+Register and use projects:
+
+```bash
+docspan config add design-docs ~/Documents/design-docs/markgate.yaml   # register (prefix → markgate.yaml)
+docspan config show                                                    # list projects + active resolution
+docspan push --prefix design-docs                                      # or DOCSPAN_PREFIX, or default_prefix, or cwd match
+docspan migrate-xdg --prefix design-docs                               # move legacy in-repo state to XDG + register
+```
+
+**Prefix resolution order:** `--config PATH` (legacy — storage stays beside the file) → `--prefix` → `DOCSPAN_PREFIX` → cwd inside a registered project → `default_prefix`. If nothing matches, docspan falls back to a local `./markgate.yaml` with beside-the-file storage (fully backward-compatible).
+
+---
+
+## Command Reference
+
+### `docspan map`
+
+```
+docspan map FILE --backend google_docs|confluence [--title TITLE] [--direction push|pull|both]
+docspan map FILE --backend google_docs --new-tab-in EXISTING_FILE [--title TITLE]
+```
+
+Create a new remote Google Doc / Confluence page (or, with `--new-tab-in`, a new tab inside the *existing* multi-tab Google Doc that `EXISTING_FILE` is already mapped to) and map `FILE` to it. `--new-tab-in` requires `--backend google_docs` and is mutually exclusive with `--tab-id`. Pushes `FILE`'s current content immediately after creating the mapping.
+
+### `docspan push`
+
+```
+docspan push [FILES]... [--dry-run] [--config PATH]
+```
+
+Push local markdown files to remote docs. Skips mappings with `direction = "pull"`. Accepts an optional list of local file paths to restrict which mappings are pushed.
+
+### `docspan pull`
+
+```
+docspan pull [FILES]... [--dry-run] [--config PATH]
+```
+
+Pull remote documents into local markdown files with three-way merge. Writes conflict markers to the file if automatic merge fails. For Google Docs, also writes a `{file}.comments.md` sidecar of the doc's comments (open + resolved, with quoted selections and reply threads) unless `pull_comments: false`.
+
+### `docspan sync`
+
+```
+docspan sync [FILES]... [--force] [--config PATH]
+```
+
+Pull then push each mapping, in that order — the safe default when you don't remember (or don't want to think about) which direction to run first. Stops short of pushing a mapping whose pull left unresolved merge conflicts; everything else (up to date, fast-forwarded, or cleanly merged) gets pushed automatically. Exits non-zero if anything still needs `docspan conflicts resolve`.
+
+### `docspan status`
+
+```
+docspan status [--config PATH]
+```
+
+Display all configured mappings in a table showing local file, backend, remote ID, and direction.
+
+### `docspan style-guide`
+
+```
+docspan style-guide [--backend google_docs|confluence] [--write FILE]
+```
+
+Print backend authoring guidance (e.g. "one image per line on google_docs"). This ships inside the installed package, so re-running it after a `docspan` upgrade picks up new guidance without hand-copying anything. With `--write FILE`, embed it as a marked, idempotent block in a file in your own repo (a `CLAUDE.md`, a style guide doc, etc.) — re-running updates docspan's managed block in place instead of duplicating it.
+
+### `docspan auth setup`
+
+```
+docspan auth setup BACKEND [--config PATH]
+```
+
+Interactive authentication setup. `BACKEND` is one of `google_docs` or `confluence`.
+
+For **Google Docs**, run it with no flags for a guided flow:
+
+```
+docspan auth setup google_docs
+```
+
+It detects your current state, lets you pick **Personal (OAuth)** [recommended] or **Service account**, auto-detects a `client_secret.json` (scanning `.`, `.markgate/`, `~/Downloads`) or prompts for the path with validation, runs the browser sign-in, verifies the connection, and offers to persist the choice into `markgate.yaml` so you never repeat it. In a non-TTY/CI environment it prints manual instructions instead of prompting.
+
+Everything is scriptable — any answer can be supplied as a flag: `--oauth` / `--service-account`, `--client-secret PATH`, `--credentials PATH`. If a `docspan push`/`pull` runs without credentials in an interactive terminal, it offers to run setup inline and then continues.
+
+For **Confluence**, prompts for base URL, username, and API token, then prints a YAML snippet to add to `markgate.yaml`.
+
+### `docspan conflicts list`
+
+```
+docspan conflicts list [--config PATH]
+```
+
+Scan all tracked files for unresolved merge conflict markers (`<<<<<<< `). Prints a table of conflicted files and conflict block counts.
+
+### `docspan conflicts resolve`
+
+```
+docspan conflicts resolve FILE --accept remote|local|merged [--config PATH]
+```
+
+Resolve a merge conflict in a tracked file.
+
+| Strategy | Behavior |
+|---|---|
+| `remote` | Re-fetch the remote version and overwrite the local file |
+| `local` | Restore the pre-merge local content from the `.orig` backup |
+| `merged` | Accept the current file contents as the resolved version (conflict markers must be removed first) |
+
+---
+
+## Configuration Reference
+
+### `backends.google_docs`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `credentials_path` | string | null | Path to a Google **service account** JSON key |
+| `oauth_client_secret_path` | string | null | Path to an **OAuth client secret** JSON (Desktop app) for per-user auth |
+| `token_path` | string | `$XDG_CONFIG_HOME/docspan/google_token.json` | Where the cached OAuth user token is stored/refreshed (out of the repo) |
+| `pull_comments` | bool | `true` | On pull, write a `{file}.comments.md` sidecar of the doc's comments |
+
+Auth resolution order: `credentials_path` → `ACCOUNT_A_CREDENTIALS[_PATH]` env → per-user OAuth (`oauth_client_secret_path`, or an already-cached `token_path`).
+
+**Environment variable alternatives (service account):**
+- `ACCOUNT_A_CREDENTIALS_PATH` — path to service account JSON
+- `ACCOUNT_A_CREDENTIALS` — inline service account JSON string
+
+### `backends.confluence`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `base_url` | string | null | Confluence base URL, e.g. `https://yourorg.atlassian.net` |
+| `username` | string | null | Atlassian account email |
+| `api_token` | string | null | API token from id.atlassian.com |
+
+**Environment variable alternatives:**
+- `CONFLUENCE_BASE_URL`
+- `ATLASSIAN_USER_NAME`
+- `CONFLUENCE_API_TOKEN`
+
+### `mappings[]`
+
+| Field | Type | Default | Required | Description |
+|---|---|---|---|---|
+| `local` | string | — | yes | Relative path to local markdown file |
+| `backend` | string | — | yes | `"google_docs"` or `"confluence"` |
+| `remote_id` | string | — | yes | Google Doc ID or Confluence page ID |
+| `direction` | enum | `"both"` | no | `"push"`, `"pull"`, or `"both"` |
+| `tab_id` | string | `null` | no | Google Docs tab id (e.g. `"t.moqlkhpwn82e"`) to target on a multi-tab doc. Ignored by the Confluence backend. If unset and the doc has more than one tab, push/pull still succeed but report a `"warning"` naming the tabs found, instead of silently syncing whichever tab is first. |
+| `pageless` | bool | `null` | no | Reconciles the Google Doc's pageless/pages toggle on every push. `true` sets `PAGELESS`, `false` sets `PAGES`, `null` (default) leaves the doc's current mode untouched. Ignored by the Confluence backend. |
+
+---
+
+## State Files
+
+docspan generates these files in your project directory after first sync:
+
+| File | Description |
+|---|---|
+| `.markgate-state.json` | Sync state tracking (content hashes, remote versions) |
+| `.markgate-base/` | Content-addressed store of merge bases |
+| `{file}.orig` | Backup of local file before merge; deleted after conflict resolution |
+| `{file}.comments.md` | Comment sidecar (Google Docs + Confluence); written during pull if comments exist |
+| `{file}.mermaid-cache.yaml` | Google Docs: maps each pushed `​```mermaid` fence's rendered-PNG hash back to its source, so a *different* machine pulling the doc can still restore the fence instead of a bare image link. Written during push if the file has any mermaid fences. |
+
+**Commit `.markgate-state.json`, `.markgate-base/`, and `{file}.mermaid-cache.yaml` — do not gitignore them.** `.markgate-state.json`/`.markgate-base/` need to be shared for three-way merge to work across machines/teammates; `{file}.mermaid-cache.yaml` is what makes mermaid-fence recovery work across machines at all (Google Docs has no API-writable place to store a diagram's source, only the rendered image — see `mermaid_cache_sidecar.py`'s module docstring for why). `{file}.orig` and `{file}.comments.md` are transient/informational and safe to gitignore if you prefer.
+
+---
+
+## Known Limitations
+
+> [!NOTE]
+> **Known limitations in v0.1.0**
+>
+> - Google Docs: comments on edited paragraphs are lost on push (paragraph-level structural diff; comments on unchanged paragraphs are preserved). `docspan push --dry-run` and a default fail-closed `--force`-gated block now warn before this happens, naming every at-risk comment (id, author, quoted snippet) per flagged paragraph — it is still not prevented. Re-anchoring or recreating the comment was investigated and rejected: neither `comments().update` nor `comments().create` can produce a comment Google Docs' own UI renders as anchored to arbitrary text (see [ADR-003](project_plans/wedding-planning-workflow/decisions/ADR-003-no-comment-anchor-migration.md)), so no migration ships.
+> - Google Docs: images push and pull (`![alt](./local.png)` uploads to Drive; `https://` URLs are referenced directly). SVG, missing, and oversized (>50MB) images are reported as warnings rather than blocking the push. An image mixed into a paragraph alongside running text is not supported — only a standalone `![alt](src)` on its own line
+> - Google Docs: a pulled image's markdown link is Google's `contentUri` for that embedded object, which Google's API docs say may change over time even when the image itself hasn't. docspan's push diff keys image identity on `alt`/size rather than this URI, so a rotated URI alone will not cause a paragraph to be needlessly deleted and reinserted (and its comments lost) on the next push — but the URI written into your markdown file can itself go stale between pulls, and a stale-but-unchanged URI line can still show up as a one-sided edit in `docspan conflicts resolve`'s three-way diff even though nothing meaningful changed
+> - Push: no image support for Confluence — local images cannot be pushed
+> - Push: no table support — markdown tables are not rendered in Google Docs
+> - Confluence: requires an Atlassian API token; no OAuth flow
+> - Confluence: the comment sidecar (`{file}.comments.md`) is informational only; comments cannot be pushed back
+> - Checklist state (`- [ ]`/`- [x]`) round-trips as literal text — Google Docs' native checkbox glyph is intentionally not used because its checked/unchecked state cannot be read back via the API (see ADR-001)
+> - `push --dry-run` now shows a real structural diff and flags paragraphs with open comments at risk; `push` blocks by default on a flagged paragraph unless `--force` is passed
+> - If a push succeeds but a post-push check finds the open-comment count dropped, docspan reports this as a `⚠` warning — never a plain green success — so it's never mistaken for a clean push
+> - Google Docs: multi-tab docs need `tab_id` set explicitly per mapping — `docspan map FILE --backend google_docs --new-tab-in EXISTING_FILE` creates a brand-new tab and fills in `tab_id` automatically; for an already-existing tab, find its id in the doc's URL (`...#tab=t.XXXXXXXXXX` after clicking the tab) or from the warning message docspan prints when `tab_id` is left unset. Without it, pull/push default to the doc's first tab (`pull`'s default path additionally can't target a tab at all — it uses Drive's HTML export, which only ever returns the first tab; set `tab_id` to instead pull via the structural API, which can target any tab)
+> - Google Docs OAuth requires each user to create their own GCP project (`docspan auth setup google_docs` → Personal/OAuth) and stays in Google's "Testing" publishing status — capped at 100 test users, with Google's "app isn't verified" warning shown on first sign-in. This avoids the annual CASA security assessment required to verify apps requesting Drive/Docs' restricted read-write scopes (a real recurring cost), at the price of a few extra manual setup minutes per user instead of a single embedded, zero-config client. Revisit if/when adoption outgrows a per-user-project model — options are paying for verification, or narrowing to the unrestricted `drive.file` scope via Google's Picker API (bigger rework: requires the user to explicitly select their doc through a picker rather than referencing it by ID in config)
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE) for details.
+
+For contribution guidelines, see [CONTRIBUTING.md](https://github.com/tstapler/docspan/blob/main/CONTRIBUTING.md).
+For the full change history, see [CHANGELOG.md](https://github.com/tstapler/docspan/blob/main/CHANGELOG.md).

@@ -1,0 +1,452 @@
+"""Push-preview and comment/glyph risk-flagging for the Google Docs backend.
+
+See project_plans/wedding-planning-workflow/implementation/plan.md Epic 1.2
+and ADR-002 for the design rationale: a read-only substring cross-reference
+against Drive's `quotedFileContent.value` (CommentCrossReference), plus a
+live native-checkbox-glyph check (GlyphShapeCheck), both folded into
+`find_high_risk_paragraphs()` and enforced inside `GoogleDocsBackend.push()`
+itself — never by a separately-fetched CLI-layer preview.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Optional, Tuple
+
+from docspan.backends.google_docs.docs_request_builder import DiffEntry, Node
+from docspan.backends.google_docs.projection import Residue
+
+
+@dataclass
+class AtRiskComment:
+    """One open Drive comment matched onto a HighRiskParagraph.
+
+    `id` is the Drive comment id — surfaced so a user can cross-reference the
+    `.comments.md` sidecar or the Drive UI directly, since a paragraph can
+    carry more than one open comment.
+    """
+    id: Optional[str]
+    quoted_text: Optional[str]
+    author: Optional[str]
+
+
+@dataclass
+class HighRiskParagraph:
+    """A `remove`/`change` DiffEntry that is high-risk for one or both reasons.
+
+    A single paragraph can carry both reasons at once (e.g. a native-glyph
+    paragraph that also has an open comment). `comments` is only populated
+    when "comment" is among `reasons`, and holds every matching comment —
+    a paragraph can be the target of more than one open comment at once.
+    """
+    paragraph_text: str
+    reasons: List[Literal["comment", "native_glyph", "style_upgrade"]]
+    comments: List[AtRiskComment] = field(default_factory=list)
+
+
+def find_high_risk_paragraphs(
+    entries: List[DiffEntry], comments: List[dict]
+) -> List[HighRiskParagraph]:
+    """Flag any `remove`/`change` DiffEntry that is high-risk to write over.
+
+    Two independent, read-only checks, both against already-computed data
+    (no second diff pass, no second document fetch):
+
+    - CommentCrossReference ("comment"): the entry's current_text contains
+      an open comment's `quotedFileContent.value` as a substring (ADR-002 —
+      deliberately an approximation, not a semantic anchor decode).
+    - GlyphShapeCheck ("native_glyph"): the entry's current_is_native_checkbox
+      is True, i.e. DocsStructureParser resolved this paragraph as a native
+      BULLET_CHECKBOX glyph on push()'s own live fetch (ADR-001).
+    - StyleUpgradeCheck ("style_upgrade"): the entry's current_text starts
+      with a legacy literal "> " blockquote prefix and, once that prefix is
+      stripped, is identical to target_text — i.e. the author didn't change
+      this paragraph's text at all; docspan's own blockquote-rendering rules
+      changed (literal "> " text -> native borderLeft/indentStart styling),
+      so the paragraph is rewritten as a one-time migration. The `startswith`
+      guard (rather than a bare stripped-equality check) matters: without it,
+      any entry with current_text == target_text and no prefix at all would
+      trivially "match" too.
+
+    A paragraph can carry more than one reason at once; it gets a single
+    HighRiskParagraph combining all of them, not one entry per reason.
+    """
+    high_risk: List[HighRiskParagraph] = []
+
+    for entry in entries:
+        if entry.kind not in ("remove", "change"):
+            continue
+
+        reasons: List[Literal["comment", "native_glyph", "style_upgrade"]] = []
+        at_risk_comments: List[AtRiskComment] = []
+
+        current_text = entry.current_text or ""
+        for comment in comments:
+            quoted = (comment.get("quotedFileContent") or {}).get("value")
+            if not quoted:
+                continue
+            if quoted in current_text:
+                at_risk_comments.append(
+                    AtRiskComment(
+                        id=comment.get("id"),
+                        quoted_text=quoted,
+                        author=(comment.get("author") or {}).get("displayName"),
+                    )
+                )
+        if at_risk_comments:
+            reasons.append("comment")
+
+        if entry.current_is_native_checkbox:
+            reasons.append("native_glyph")
+
+        target_text = entry.target_text or ""
+        if current_text.startswith("> ") and current_text[2:] == target_text:
+            reasons.append("style_upgrade")
+
+        if reasons:
+            high_risk.append(
+                HighRiskParagraph(
+                    paragraph_text=entry.current_text or "",
+                    reasons=reasons,
+                    comments=at_risk_comments,
+                )
+            )
+
+    return high_risk
+
+
+def render_available_anchors(slugs: List[str]) -> str:
+    """The "did you mean" tail for an unresolvable-anchor warning.
+
+    Naming the bad anchor and stopping tells the author they are wrong without
+    telling them what is right — and the slug of a heading is not something they
+    can reliably derive by eye (an em dash leaves *two* hyphens). Shared by the
+    dry-run and the push so the two reports cannot drift apart.
+    """
+    if not slugs:
+        return "  the document has no headings to anchor to."
+    shown = slugs[:10]
+    more = len(slugs) - len(shown)
+    lines = ["  available heading anchors:"]
+    lines += [f"    • #{slug}" for slug in shown]
+    if more:
+        lines.append(f"    • … and {more} more")
+    return "\n".join(lines)
+
+
+def render_high_risk(high_risk: List[HighRiskParagraph]) -> str:
+    """Render the ⚠ warning block(s) for a list of HighRiskParagraph.
+
+    Shared by PushPreview.render() (--dry-run) and push()'s blocked-path
+    message, so the warning text is identical in both places. Renders a
+    distinct block per reason present on each paragraph — a paragraph with
+    both "comment" and "native_glyph" gets both blocks, never merged into
+    one message that could obscure either reason.
+
+    "style_upgrade" paragraphs are the exception to "one block per
+    paragraph": when 5 or more are present in the same call, they collapse
+    into a single summarized count line instead of one block each, since
+    every legacy blockquote in a file migrates together on its first push
+    after this feature ships (a single cause, not N independent risks worth
+    reading individually).
+    """
+    style_upgrade_count = sum(1 for hr in high_risk if "style_upgrade" in hr.reasons)
+    summarize_style_upgrade = style_upgrade_count >= 5
+    style_upgrade_summary_emitted = False
+
+    blocks: List[str] = []
+    for hr in high_risk:
+        if "comment" in hr.reasons:
+            n = len(hr.comments)
+            plural = "an open comment" if n == 1 else f"{n} open comments"
+            lines = [
+                f'⚠ COMMENT AT RISK: paragraph "{hr.paragraph_text}" has {plural}\n'
+                "  and would be changed:"
+            ]
+            for c in hr.comments:
+                author = c.author or "unknown"
+                comment_id = c.id or "unknown id"
+                lines.append(f'    • [{comment_id}] {author}: "{c.quoted_text}"')
+            lines.append(
+                "  Resolve manually in Google Docs, or re-run with --force to proceed anyway."
+            )
+            blocks.append("\n".join(lines))
+        if "native_glyph" in hr.reasons:
+            blocks.append(
+                f'⚠ NATIVE CHECKBOX GLYPH: paragraph "{hr.paragraph_text}" is a native Google Docs\n'
+                "  checkbox (checked/unchecked state not readable via the API) — editing it here\n"
+                "  would delete the paragraph's existing text and reinsert literal [x]/[ ] text in\n"
+                "  its place; the checkbox glyph itself is untouched by that edit. Toggle this line\n"
+                "  by hand in Google Docs UI instead, or re-run with --force to proceed anyway."
+            )
+        if "style_upgrade" in hr.reasons:
+            if summarize_style_upgrade:
+                if not style_upgrade_summary_emitted:
+                    blocks.append(
+                        f"⚠ {style_upgrade_count} paragraphs rewritten to add native blockquote "
+                        "styling (one-time upgrade)\n"
+                        "  — any comments anchored to them would be lost. See "
+                        "docs/backends/google-docs.md\n"
+                        "  for details."
+                    )
+                    style_upgrade_summary_emitted = True
+            else:
+                blocks.append(
+                    f'⚠ paragraph "{hr.paragraph_text}" rewritten to add native blockquote styling\n'
+                    "  (one-time upgrade) — any comment anchored to it would be lost. See\n"
+                    "  docs/backends/google-docs.md for details."
+                )
+    return "\n".join(blocks)
+
+
+def find_churn_pairs(entries: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
+    """Pair up `remove`/`add` DiffEntry that are really one delete-and-reinsert
+    of byte-identical text (a destroyed-and-recreated paragraph, not a real
+    removal). Matched by `DiffEntry.edit_group`, not list adjacency — adjacent
+    entries can come from different opcodes (see
+    `test_find_churn_pairs_ignores_adjacent_entries_from_different_edit_groups`),
+    which is the same `_node_key` collision class as `docs_request_builder.py:112-150`.
+    Table rows (`style == "TABLE"`) are excluded as a weaker text signal.
+    """
+    groups: Dict[int, List[DiffEntry]] = {}
+    for entry in entries:
+        if entry.kind in ("remove", "add"):
+            groups.setdefault(entry.edit_group, []).append(entry)
+
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    for group in groups.values():
+        pairs.extend(_match_churn_run(group))
+    return pairs
+
+
+def _match_churn_run(run: List[DiffEntry]) -> List[Tuple[DiffEntry, DiffEntry]]:
+    removes = [e for e in run if e.kind == "remove" and e.style != "TABLE"]
+    adds = [e for e in run if e.kind == "add" and e.style != "TABLE"]
+
+    pairs: List[Tuple[DiffEntry, DiffEntry]] = []
+    claimed: set = set()
+    for r in removes:
+        for i, a in enumerate(adds):
+            if i in claimed:
+                continue
+            if r.current_text is not None and r.current_text == a.target_text:
+                pairs.append((r, a))
+                claimed.add(i)
+                break
+    return pairs
+
+
+def render_churn_note(
+    pairs: List[Tuple[DiffEntry, DiffEntry]],
+    high_risk: Optional[List[HighRiskParagraph]] = None,
+) -> str:
+    """Render the ⓘ note for churn pairs — text is unchanged, but the
+    paragraph itself (and anything anchored to it) was destroyed and recreated.
+
+    `high_risk` (optional, defaults to None/empty) is the SAME
+    find_high_risk_paragraphs()-derived list PushPreview already carries —
+    consulted here only to check whether a pair's removed paragraph is
+    already known to be a "style_upgrade" case, never as a second,
+    independent detection path (Story 4.2: the two mechanisms must never
+    disagree about which paragraphs are style upgrades). A pair whose
+    removed text matches a style_upgrade-tagged HighRiskParagraph gets
+    specific wording naming the cause; every other pair keeps the generic
+    "no text change" wording unchanged.
+    """
+    style_upgrade_texts = {
+        hr.paragraph_text for hr in (high_risk or []) if "style_upgrade" in hr.reasons
+    }
+    style_upgrade_pairs = [
+        pair for pair in pairs if (pair[0].current_text or "") in style_upgrade_texts
+    ]
+    other_pairs = [pair for pair in pairs if pair not in style_upgrade_pairs]
+
+    notes: List[str] = []
+    if style_upgrade_pairs:
+        n = len(style_upgrade_pairs)
+        plural = "paragraph" if n == 1 else "paragraphs"
+        notes.append(
+            f"⚠ {n} {plural} rewritten to add native blockquote styling (one-time upgrade) "
+            "— comment on it is lost."
+        )
+    if other_pairs:
+        n = len(other_pairs)
+        notes.append(
+            f"ⓘ {n} paragraph(s) are rewritten with no text change (delete-and-reinsert) — "
+            "the wording is identical, but the paragraph is destroyed and recreated, so "
+            "any comment anchored to it is still lost."
+        )
+    return "\n".join(notes)
+
+
+def _is_checklist_marker(text: Optional[str]) -> bool:
+    """True if text (once stripped) starts with a literal `[ ]`/`[x]`/`[X]` marker."""
+    if not text:
+        return False
+    return text.strip()[:3].lower() in ("[x]", "[ ]")
+
+
+@dataclass
+class PushPlan:
+    """The internal, single-fetch snapshot a real push is gated against.
+
+    Built by GoogleDocsBackend._build_push_plan() from exactly one
+    get_document() call and exactly one list_comments() call. push() and
+    preview_push() each call _build_push_plan() independently — they never
+    share a plan computed by the other (see plan.md Story 1.2.3).
+    """
+    current_nodes: List[Node]
+    target_nodes: List[Node]
+    requests: List[dict]
+    doc: dict
+    entries: List[DiffEntry]
+    unchanged_count: int
+    comments: List[dict]
+    high_risk: List[HighRiskParagraph]
+    # Set when the doc has multiple tabs and no tab_id was configured — the
+    # plan silently defaulted to the first tab (tabs.resolve_document_tab).
+    tab_warning: Optional[str] = None
+    # The tabId every request must carry, as resolved by
+    # tabs.resolve_document_tab — None for a legacy (non-tabbed) doc. `doc`
+    # above is already narrowed to this tab, so pass 2 needs this to build
+    # requests against it without re-resolving.
+    resolved_tab_id: Optional[str] = None
+    # State projection.project() removed from the current side because markdown
+    # cannot represent it (today: empty paragraphs). Never part of the diff —
+    # carried so a push can report what it deliberately left alone.
+    residue: List[Residue] = field(default_factory=list)
+    # State projection.project() removed from the *markdown* side because the diff
+    # cannot carry it (today: a blank line inside a fenced code block). Unlike
+    # `residue` this is author content that will NOT be written, so push reports it.
+    target_residue: List[Residue] = field(default_factory=list)
+    # The full get_document() response, before tabs.resolve_document_tab narrows
+    # `doc` to one tab. Kept because a cross-tab anchor can only be resolved
+    # against every tab's headings, and narrowing throws the others away.
+    # _build_push_plan always sets it; only a plan built by hand leaves it empty,
+    # which costs cross-tab resolution and nothing else.
+    whole_doc: dict = field(default_factory=dict)
+    # Drive file ids for images this plan already uploaded (image_source.py's
+    # resolve_document_images), so push() can delete them on success or
+    # surface them as PushResult.retryable_temp_drive_file_ids on failure.
+    temp_drive_file_ids: List[str] = field(default_factory=list)
+    # Per-image resolution failures (missing file, oversized, unsupported
+    # format) -- reported the same way target_residue is, never a crash.
+    image_warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PushPreview:
+    """The in-memory, human-renderable --dry-run summary.
+
+    Read-only and cosmetic only — never consulted by a real push() to decide
+    whether to write. Staleness here is acceptable because it never gates a
+    write.
+
+    `error` is set (with all other fields at their empty defaults) when
+    GoogleDocsBackend.preview_push() caught a failure (expired auth, network
+    error, malformed doc) while building the plan — mirroring push()'s
+    try/except HttpError/except Exception -> PushResult(status="error", ...)
+    convention, so a --dry-run failure renders as one clean line instead of
+    a raw traceback.
+    """
+    entries: List[DiffEntry]
+    unchanged_count: int
+    high_risk: List[HighRiskParagraph]
+    request_count: int
+    error: Optional[str] = None
+    tab_warning: Optional[str] = None
+    # Internal anchors (`[A1](#a1-foo)`) that name no heading in either the
+    # markdown or the document, so push() will write the text without a link and
+    # is expected to report them. Surfaced here so --dry-run does not read clean
+    # for a file the real push will warn about — but the two can differ: this
+    # list under-reports, never over-reports. See unresolved_anchors' docstring
+    # for the three causes only pass 2 can see.
+    unresolved_anchors: List[str] = field(default_factory=list)
+    # Every anchor the markdown *does* offer, for the "did you mean" tail. The
+    # exception this replaced listed these; dropping it left the user told their
+    # anchor is wrong and not what would be right.
+    available_anchors: List[str] = field(default_factory=list)
+    # Author content the diff cannot carry, so push will not write it. Surfaced on
+    # the dry-run too, or the first the author hears of it is after the write.
+    target_residue_note: str = ""
+
+    def render(self) -> str:
+        if self.error is not None:
+            return f"✗ dry-run failed: {self.error}"
+
+        churn_pairs = find_churn_pairs(self.entries)
+        churned_removes = {id(pair[0]) for pair in churn_pairs}
+        churned_adds = {id(pair[1]) for pair in churn_pairs}
+
+        additions = sum(
+            1 for e in self.entries if e.kind == "add" and id(e) not in churned_adds
+        )
+        removals = sum(
+            1 for e in self.entries if e.kind == "remove" and id(e) not in churned_removes
+        )
+        changes = sum(1 for e in self.entries if e.kind == "change")
+
+        lines = [
+            f"Preview: {changes} change(s), {additions} addition(s), "
+            f"{removals} removal(s), {len(churn_pairs)} rewritten (no text change), "
+            f"{self.unchanged_count} unchanged"
+        ]
+
+        for entry in self.entries:
+            if entry.kind == "add":
+                if id(entry) in churned_adds:
+                    continue
+                lines.append(f"  + {entry.target_text}")
+            elif entry.kind == "remove":
+                if id(entry) in churned_removes:
+                    lines.append(f"  ~ rewritten (no text change): {entry.current_text}")
+                else:
+                    lines.append(f"  - {entry.current_text}")
+            elif entry.kind == "change":
+                lines.append(f"  ~ {entry.current_text} → {entry.target_text}")
+
+        if churn_pairs:
+            lines.append(render_churn_note(churn_pairs, self.high_risk))
+
+        non_churn_entries = [
+            e
+            for e in self.entries
+            if id(e) not in churned_adds and id(e) not in churned_removes
+        ]
+        checklist_flags = [
+            _is_checklist_marker(e.current_text) or _is_checklist_marker(e.target_text)
+            for e in non_churn_entries
+        ] + [
+            _is_checklist_marker(remove.current_text) or _is_checklist_marker(add.target_text)
+            for remove, add in churn_pairs
+        ]
+        n_checklist = sum(checklist_flags)
+        n_other = len(non_churn_entries) + len(churn_pairs) - n_checklist
+        if n_checklist > 0 and n_other > 0:
+            lines.append(
+                f"ⓘ This push mixes {n_checklist} checklist toggle(s) with {n_other} "
+                "other edit(s) — consider pushing checklist-only changes separately "
+                "(see workflow runbook)."
+            )
+
+        if self.high_risk:
+            lines.append(render_high_risk(self.high_risk))
+
+        if self.unresolved_anchors:
+            shown = self.unresolved_anchors[:5]
+            more = len(self.unresolved_anchors) - len(shown)
+            lines.append(
+                f"⚠ {len(self.unresolved_anchors)} internal anchor(s) have no link — "
+                "nothing in the document matches what they name:"
+            )
+            lines += [f"    • {anchor}" for anchor in shown]
+            if more:
+                lines.append(f"    • … and {more} more")
+            lines.append(render_available_anchors(self.available_anchors))
+
+        if self.target_residue_note:
+            lines.append(self.target_residue_note)
+
+        if self.tab_warning:
+            lines.append(f"⚠ {self.tab_warning}")
+
+        return "\n".join(lines)

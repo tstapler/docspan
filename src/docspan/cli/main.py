@@ -1,0 +1,1446 @@
+"""docspan CLI — push, pull, auth, status, conflicts."""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.table import Table
+
+from docspan.backends import BACKENDS
+from docspan.backends.base import Backend
+from docspan.backends.google_docs.migration import (
+    MigrationOutcome,
+    MigrationResult,
+    migrate_sectioned,
+)
+from docspan.config import (
+    _SECTIONED_UNSUPPORTED_BACKENDS,
+    ConfigConflictError,
+    Mapping,
+    MarkgateConfig,
+    config_mtime,
+    load_central_config,
+    load_config,
+    resolve_active_project,
+    save_config,
+)
+from docspan.core import (
+    MappingState,
+    PullPreview,
+    SyncState,
+    get_base_content,
+    get_state_dir,
+    get_state_path,
+    orchestrate_pull,
+    orchestrate_push,
+    preview_pull,
+    record_state,
+)
+from docspan.core.paths import BASE_STORE_DIR, ORIG_SUFFIX, STATE_FILENAME
+
+app = typer.Typer(
+    name="docspan",
+    help="Push and pull markdown to Google Docs and Confluence.",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+auth_app = typer.Typer(help="Manage authentication for backends.")
+conflicts_app = typer.Typer(help="Manage merge conflicts.")
+config_app = typer.Typer(help="Manage the central docspan config (project registry).")
+comments_app = typer.Typer(help="Respond to and resolve comments pulled into .comments.md sidecars.")
+app.add_typer(auth_app, name="auth")
+app.add_typer(conflicts_app, name="conflicts")
+app.add_typer(config_app, name="config")
+app.add_typer(comments_app, name="comments")
+
+console = Console()
+err_console = Console(stderr=True, style="bold red")
+
+# Status -> (icon, style) lookup for rendering PushResult/PullResult in the
+# CLI. PushResult.status has 6 literal values (ok, conflict, error, skipped,
+# blocked, warning); PullResult has a subset. Any status not explicitly
+# mapped falls back to _DEFAULT_STATUS_DISPLAY (✗, red) — this preserves the
+# old if/else behavior, where "ok"/"skipped" rendered green-check, "warning"
+# rendered yellow-warn, and everything else (conflict/error/blocked, or any
+# future status) rendered red-cross.
+STATUS_DISPLAY: dict[str, tuple[str, str]] = {
+    "ok": ("✓", "green"),
+    "skipped": ("✓", "green"),
+    "warning": ("⚠", "yellow"),
+}
+_DEFAULT_STATUS_DISPLAY: tuple[str, str] = ("✗", "red")
+
+
+def _status_display(status: str) -> tuple[str, str]:
+    """Look up the (icon, style) pair for a push/pull result status."""
+    return STATUS_DISPLAY.get(status, _DEFAULT_STATUS_DISPLAY)
+
+
+def _count_style_upgrades(high_risk: object) -> int:
+    """Count HighRiskParagraph entries whose reasons include "style_upgrade".
+
+    Used to build STYLE_UPGRADE_COUNT (Story 4.3). Takes a bare list rather
+    than the push_preview module's HighRiskParagraph type so this file
+    doesn't need a backend-specific import for a single duck-typed field
+    read; any falsy/missing `high_risk` (e.g. a backend without
+    preview_push()) counts as 0.
+    """
+    if not high_risk:
+        return 0
+    return sum(1 for hr in high_risk if "style_upgrade" in getattr(hr, "reasons", ()))
+
+# The live wedding planning doc — Story 1.2.5's ScratchVerificationMarker
+# confirmation prompt is a targeted tripwire for this one doc_id specifically,
+# never for wedding-scratch.md or any other mapping. See
+# project_plans/wedding-planning-workflow/implementation/plan.md's Domain
+# Glossary entry for ScratchDoc.
+LIVE_WEDDING_DOC_ID = "1T0Omd6G2KU6QZ3Te-8C65uIVuq3dG46I_D_FS5RBbDE"
+SCRATCH_VERIFIED_MARKER = "scratch-verified.marker"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _can_prompt() -> bool:
+    """True only when we can safely prompt the user (real TTY, not CI)."""
+    import sys
+    return sys.stdin.isatty() and sys.stdout.isatty() and not os.getenv("CI")
+
+
+def _get_backend(backend_name: str, config: MarkgateConfig, config_path: Optional[str] = None):
+    cls = BACKENDS.get(backend_name)
+    if not cls:
+        err_console.print(
+            f"Unknown backend '{backend_name}'. Available: {list(BACKENDS.keys())}"
+        )
+        raise typer.Exit(1)
+    backend = cls.from_config(config)
+    try:
+        backend.validate_config()
+    except ValueError as exc:
+        # Auto-prompt the user to set up credentials inline (interactive only).
+        if _can_prompt() and typer.confirm(f"{exc}\n\nRun setup now?", default=True):
+            backend.auth_setup(config_path=config_path)
+            backend = cls.from_config(load_config(config_path))
+            try:
+                backend.validate_config()
+            except ValueError as exc2:
+                err_console.print(f"Still not configured: {exc2}")
+                raise typer.Exit(1)
+        else:
+            err_console.print(f"Configuration error: {exc}")
+            raise typer.Exit(1)
+    return backend
+
+
+def _load_state(state_path: str) -> SyncState:
+    try:
+        return SyncState.load(state_path)
+    except FileNotFoundError:
+        return SyncState()
+
+
+@dataclass
+class _GroupOptions:
+    """``--config`` / ``--prefix`` as given before the subcommand name.
+
+    Both options are accepted in either position, because `docspan --config X
+    status` reads like it should work and used to fail with "No such option"
+    (#20). Typer parses group-level and subcommand-level options with separate
+    parsers, so the group-level values are stashed here for _resolve() to fall
+    back on.
+
+    Module-level state is safe here only because _group_callback() runs on every
+    invocation and overwrites both fields, so a value cannot leak from one
+    invocation into the next — which matters for tests using CliRunner in one
+    process. Nothing else may write to it.
+    """
+
+    config_path: Optional[str] = None
+    prefix: Optional[str] = None
+
+
+_GROUP = _GroupOptions()
+
+
+@app.callback()
+def _group_callback(
+    config_path: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Path to markgate.yaml (also accepted after the command)"
+    ),
+    prefix: Optional[str] = typer.Option(
+        None,
+        "--prefix",
+        "-p",
+        help="Central-config project prefix (also accepted after the command)",
+    ),
+) -> None:
+    # No docstring: Typer would use it as the group's help text and replace the
+    # `help=` given to typer.Typer() above.
+    _GROUP.config_path = config_path
+    _GROUP.prefix = prefix
+
+
+def _resolve(config_path: Optional[str], prefix: Optional[str]):
+    """Resolve the active markgate config + storage prefix from flags / central config.
+
+    Returns (config, markgate_path, prefix). Storage helpers take (markgate_path, prefix):
+    a prefix routes state under XDG; no prefix keeps legacy beside-the-file storage.
+
+    A value given after the subcommand wins over the same option given before
+    it, so the more specific position is the one that takes effect.
+    """
+    config_path = config_path or _GROUP.config_path
+    prefix = prefix or _GROUP.prefix
+    markgate_path, resolved_prefix = resolve_active_project(prefix=prefix, config_path=config_path)
+    config = load_config(markgate_path)
+    return config, markgate_path, resolved_prefix
+
+
+def _resolve_with_mtime(
+    config_path: Optional[str], prefix: Optional[str]
+) -> tuple[MarkgateConfig, Optional[str], Optional[str], Optional[float]]:
+    """Like _resolve(), but also captures the config's mtime at load time.
+
+    The mtime must be sampled here — immediately after load_config() — not
+    later, right before save_config(). A caller that re-reads the mtime just
+    before writing (e.g. after a slow backend.create() network call) defeats
+    the whole point of the concurrency check: any edit that lands during that
+    window becomes the new "expected" baseline instead of being detected.
+    """
+    config, markgate_path, resolved_prefix = _resolve(config_path, prefix)
+    return config, markgate_path, resolved_prefix, config_mtime(markgate_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# push command
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command()
+def push(
+    files: Optional[list[str]] = typer.Argument(
+        None, help="Local markdown files to push (default: all mappings)"
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without writing"),
+    force: bool = typer.Option(
+        False, "--force", help="Proceed with a push even if push() flags a comment-risk paragraph"
+    ),
+    fail_on_comment_loss: bool = typer.Option(
+        False,
+        "--fail-on-comment-loss",
+        help=(
+            "Exit non-zero if any paragraph was (or would be) rewritten to add native "
+            "blockquote styling, losing an anchored comment. Reporting only — never "
+            "blocks the write itself; see STYLE_UPGRADE_COUNT in the output."
+        ),
+    ),
+) -> None:
+    """Push local markdown to remote docs."""
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+    # `mappings` (all of config.mappings) is passed to orchestrate_push()
+    # below for cross-doc link resolution — it must stay the full set even
+    # when `files` narrows which mappings actually get pushed this run.
+    # Narrowing it here used to make a relative link's target mapping
+    # invisible to the resolver whenever the target wasn't also named in
+    # `files`, so every single-file push wrote such links as a literal,
+    # unresolved relative href instead of the target's Google Doc URL.
+    mappings = config.mappings
+    mappings_to_push = _resolve_files_or_exit(mappings, files)
+
+    if not mappings_to_push:
+        err_console.print("No mappings configured. Add entries to markgate.yaml.")
+        raise typer.Exit(1)
+
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+
+    had_error = False
+    # Count of HighRiskParagraph entries whose reasons include "style_upgrade"
+    # across every mapping pushed this run — reported via STYLE_UPGRADE_COUNT
+    # (Story 4.3). Purely a reporting aggregate: it is never consulted to
+    # decide whether to skip a write (that stays push()'s job, per the
+    # Story 1.2.3/1.2.4 note below) — only --fail-on-comment-loss's post-hoc
+    # exit-code check reads it.
+    style_upgrade_count = 0
+    # Shared across every mapping's push() call below (criterion 11): each
+    # mapping gets its own backend instance via _get_backend(), so without a
+    # cache threaded in from here a push --all run with N documents linking
+    # to the same target would fetch that target N times, once per pushing
+    # backend instance, instead of once for the whole run.
+    cross_doc_cache: dict = {}
+    for mapping in mappings_to_push:
+        if mapping.direction == "pull":
+            console.print(f"[dim]Skipping {mapping.local} (pull-only)[/dim]")
+            continue
+
+        # Story 1.2.3/1.2.4: the CLI is NOT the enforcement point — it never
+        # calls preview_push() to decide whether to skip a real push. Its
+        # only two jobs here are (1) render preview_push()'s cosmetic output
+        # for --dry-run, and (2) thread --force through to push(), which
+        # makes and enforces the block/proceed decision itself.
+        backend = _get_backend(mapping.backend, config, config_path)
+
+        if dry_run:
+            if hasattr(backend, "preview_push"):
+                preview = backend.preview_push(
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                )
+                # escape(): preview text carries literal "[ ]"/"[x]" checklist
+                # markers, which Rich's console markup would otherwise parse
+                # as (and silently swallow) style tags.
+                console.print(escape(preview.render()))
+                style_upgrade_count += _count_style_upgrades(getattr(preview, "high_risk", None))
+                if getattr(preview, "error", None):
+                    had_error = True
+            else:
+                console.print(
+                    f"[yellow]dry-run[/yellow]  {mapping.local} → [{mapping.backend}] {mapping.remote_id}"
+                )
+            continue
+
+        if mapping.remote_id is None:
+            if not _can_prompt():
+                err_console.print(
+                    f"'{mapping.local}' has no remote_id and this session cannot prompt "
+                    "(non-interactive/CI). Run 'docspan map' to create the remote doc first."
+                )
+                had_error = True
+                continue
+            if not typer.confirm(
+                f"'{mapping.local}' has no remote doc yet. Create one on [{mapping.backend}] now?",
+                default=True,
+            ):
+                console.print("Push cancelled.")
+                had_error = True
+                continue
+            try:
+                create_result = backend.create(os.path.splitext(os.path.basename(mapping.local))[0])
+            except ValueError as exc:
+                err_console.print(
+                    f"{exc}\n"
+                    f"Run 'docspan map {mapping.local} --backend {mapping.backend} --space <key>' "
+                    "to create the remote doc/page with the required options."
+                )
+                had_error = True
+                continue
+            mapping.remote_id = create_result.doc_id
+            try:
+                save_config(config, config_path, expected_mtime=loaded_mtime)
+            except ConfigConflictError as exc:
+                err_console.print(
+                    f"{exc}\n\n"
+                    f"⚠ A new {mapping.backend} doc/page was created but NOT recorded in markgate.yaml:\n"
+                    f"  remote_id: {create_result.doc_id}\n"
+                    f"  url: {create_result.url or '(none)'}\n"
+                    "Add it manually (or resolve the conflict and re-run)."
+                )
+                had_error = True
+                continue
+            loaded_mtime = config_mtime(config_path)
+            console.print(f"[green]✓[/green]  Created {mapping.backend} doc → {mapping.local}")
+
+        # Story 1.2.5: ScratchVerificationMarker — a one-time confirmation
+        # tripwire before the very first push against the live wedding doc
+        # specifically. Never fires for --dry-run (handled above) or for any
+        # other mapping's remote_id.
+        if mapping.remote_id == LIVE_WEDDING_DOC_ID:
+            marker_path = os.path.join(state_dir, SCRATCH_VERIFIED_MARKER)
+            if not os.path.exists(marker_path):
+                proceed = typer.confirm(
+                    "⚠ Scratch-doc verification not recorded — proceed against live doc?",
+                    default=False,
+                )
+                if not proceed:
+                    console.print("Push cancelled.")
+                    had_error = True
+                    continue
+                os.makedirs(state_dir, exist_ok=True)
+                with open(marker_path, "w", encoding="utf-8") as fh:
+                    fh.write("verified\n")
+
+        # Best-effort, reporting-only: a pre-push preview_push() call solely
+        # to count style_upgrade paragraphs for STYLE_UPGRADE_COUNT (Story
+        # 4.3). Must run BEFORE orchestrate_push(), which is the only call
+        # that decides whether to write and what happens if it fails — a
+        # preview fetched after the write would see the doc already
+        # upgraded and undercount. Never gates the push: any exception here
+        # is swallowed and simply contributes 0.
+        if hasattr(backend, "preview_push"):
+            try:
+                pre_preview = backend.preview_push(
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                )
+                style_upgrade_count += _count_style_upgrades(getattr(pre_preview, "high_risk", None))
+            except Exception:
+                pass
+
+        outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+            cross_doc_cache=cross_doc_cache,
+        )
+        result = outcome.result
+
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            # escape(): a "blocked"/"warning" message can carry literal
+            # "[ ]"/"[x]" checklist markers (render_high_risk()), which Rich
+            # markup would otherwise parse as style tags and swallow.
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
+        if result.status == "ok" and not outcome.state_saved:
+            console.print("   [yellow]Warning: could not save sync state[/yellow]")
+        if result.status in ("error", "blocked", "conflict", "warning"):
+            had_error = True
+
+    # Emitted on every run (dry-run or real), always, even when 0 — see
+    # docs/backends/google-docs.md. No color/glyphs: this line is meant to be
+    # machine-parsed (e.g. from CI). --fail-on-comment-loss is a purely
+    # post-hoc check here (never gates the write itself, which stays push()'s
+    # job per the Story 1.2.3/1.2.4 note above).
+    console.print(f"STYLE_UPGRADE_COUNT={style_upgrade_count}")
+    if fail_on_comment_loss and style_upgrade_count > 0:
+        had_error = True
+
+    if had_error:
+        raise typer.Exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pull command
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_pull_preview(mapping: Mapping, preview: PullPreview) -> None:
+    """Render a `PullPreview` — the real classification `--dry-run` reports."""
+    if preview.action == "up-to-date":
+        console.print(f"[dim]up to date[/dim]  {mapping.local}")
+    elif preview.action == "local-only":
+        console.print(
+            f"[yellow]dry-run[/yellow]  {mapping.local} has local changes not yet pushed and no "
+            "remote changes. A real pull would skip it."
+        )
+    elif preview.action == "would-first-sync":
+        console.print(f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local} (first sync)")
+    elif preview.action == "would-fast-forward":
+        console.print(f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local} (would fast-forward)")
+    elif preview.action == "would-merge":
+        detail = f" ({preview.conflict_count} conflicts)" if preview.conflict_count else " (0 conflicts)"
+        console.print(f"[yellow]dry-run[/yellow]  {mapping.local} would merge{detail}")
+        if preview.message:
+            console.print(f"   [dim]{escape(preview.message)}[/dim]")
+    elif preview.action == "error":
+        err_console.print(f"✗  {mapping.remote_id} → {mapping.local}: {preview.message or 'unknown error'}")
+
+
+def _split_level_display(split_level: str) -> str:
+    """Render `"HEADING_2"` as ux.md's short `"h2"` form for status lines."""
+    if split_level.startswith("HEADING_"):
+        return "h" + split_level[len("HEADING_") :]
+    return split_level
+
+
+def _render_migration_result(
+    mapping: Mapping,
+    new_local_dir: str,
+    result: MigrationResult,
+    *,
+    dry_run: bool,
+    split_level: str,
+) -> None:
+    """Render a `MigrationResult` per ux.md's output templates (Task 5.2/5.4).
+
+    Shared by `migrate-sectioned` and `pull --to-sectioned` so the two
+    surfaces stay pixel-consistent (ux.md's cross-surface consistency
+    criterion) -- neither caller prints its own success/failure text.
+    """
+    level_display = _split_level_display(split_level)
+
+    if result.outcome == MigrationOutcome.REFUSED:
+        for message in result.messages:
+            err_console.print(f"✗  {mapping.local}: {escape(message)}")
+        return
+
+    if result.outcome == MigrationOutcome.DRY_RUN:
+        preview = result.sections[0] if result.sections else None
+        n = len(preview.rows) if preview else 0
+        console.print(
+            f"[yellow]dry-run[/yellow]  {mapping.local} → {new_local_dir}/ "
+            f"(would split into {n} sections at split_level={level_display})"
+        )
+        if preview and len(preview.rows) == 1 and not preview.rows[0].title:
+            console.print(
+                f"[yellow]⚠[/yellow]  No {level_display} headings found in {mapping.local} — "
+                f'the entire file would become a single "{preview.rows[0].filename}" section. '
+                "This is probably not what you want; pass --split-level to choose a "
+                "different boundary."
+            )
+        if preview:
+            console.print(preview.render())
+        console.print(
+            "Nothing written. Run without --dry-run to apply, or add "
+            "--split-level to change the boundary."
+        )
+        return
+
+    if result.outcome == MigrationOutcome.SUCCESS:
+        preview = result.sections[0] if result.sections else None
+        rows = preview.rows if preview else []
+        console.print(
+            f"[green]✓[/green]  {mapping.local} → {new_local_dir}/ ({len(rows)} sections)"
+        )
+        console.print()
+        for row in rows:
+            heading = f'"{row.title}"' if row.title else "(no heading — preamble)"
+            console.print(f"   {row.filename}    {escape(heading)}    {row.line_count} lines   {row.word_count} words")
+        console.print()
+        console.print(
+            f"   _manifest.yaml written · markgate.yaml updated "
+            f"(sectioned: true, split_level: {level_display})"
+        )
+        console.print(f"   SyncState updated for {len(rows)} sections")
+        console.print("   Section identity will stabilize after your next pull.")
+        if rows:
+            first_path = os.path.join(new_local_dir, rows[0].filename)
+            console.print("   git history preserved — verify with:")
+            console.print(f"     git log --follow -C20% {first_path}")
+            console.print(f"     git blame -C20% -C20% -C20% {first_path}")
+        console.print(f"MIGRATED_SECTIONS={len(rows)}")
+        return
+
+    if result.outcome == MigrationOutcome.FAILED:
+        detail = escape(result.messages[0]) if result.messages else "unknown error"
+        err_console.print(f"✗  Migration failed: {detail}")
+        console.print()
+        console.print("   Rolling back... done.")
+        console.print(f"   {mapping.local} is unchanged and markgate.yaml was not modified.")
+        console.print()
+        console.print(
+            "Nothing was written. Original file and config are exactly as they were before this run."
+        )
+        return
+
+    if result.outcome == MigrationOutcome.ROLLBACK_FAILED:
+        detail = escape(result.messages[0]) if result.messages else "unknown error"
+        rollback_detail = escape(result.messages[1]) if len(result.messages) > 1 else "unknown error"
+        err_console.print(f"✗  Migration failed: {detail}")
+        err_console.print(f"✗  Rollback FAILED: {rollback_detail}")
+        console.print()
+        console.print(
+            "   Your working tree may be in an inconsistent state. Compare against "
+            "your last commit before continuing:"
+        )
+        console.print()
+        console.print("     git status")
+        console.print("     git diff")
+        console.print(f"     git checkout -- {mapping.local} {new_local_dir}/   # discard partial migration")
+        return
+
+
+@app.command("migrate-sectioned")
+def migrate_sectioned_cmd(
+    mapping_path: str = typer.Argument(
+        ..., help="Local markdown file to migrate to a sectioned mapping"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview the split without writing"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+    split_level: str = typer.Option(
+        "HEADING_2", "--split-level", help="Heading level to split on, e.g. HEADING_1, HEADING_2"
+    ),
+) -> None:
+    """Migrate a single-file mapping to a sectioned mapping, preserving git history."""
+    config, config_path, prefix = _resolve(config_path, prefix)
+    mapping = resolve_mapping_for_path(config.mappings, mapping_path)
+    if mapping is None:
+        err_console.print(f"No mapping found for: {mapping_path}")
+        raise typer.Exit(1)
+
+    # UX sugar only — migrate_sectioned() re-checks both of these itself and
+    # is the sole authority; this only lets the CLI fail fast without
+    # touching the backend/state/lock for the two most common refusals.
+    if mapping.sectioned:
+        err_console.print(f"✗  {mapping.local} is already sectioned — nothing to migrate")
+        raise typer.Exit(1)
+    if mapping.backend in _SECTIONED_UNSUPPORTED_BACKENDS:
+        err_console.print(f"✗  backend {mapping.backend!r} does not support sectioned mode")
+        raise typer.Exit(1)
+
+    backend = _get_backend(mapping.backend, config, config_path)
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+    new_local_dir = os.path.splitext(mapping.local)[0]
+
+    if not dry_run:
+        console.print(
+            f"[yellow]migrating[/yellow]  {mapping.local} → {new_local_dir}/ "
+            "(this will create a git commit)"
+        )
+
+    result = migrate_sectioned(
+        mapping,
+        backend,
+        config,
+        config_path,
+        state,
+        state_dir,
+        state_path,
+        split_level,
+        dry_run=dry_run,
+    )
+
+    _render_migration_result(mapping, new_local_dir, result, dry_run=dry_run, split_level=split_level)
+
+    if result.outcome in (
+        MigrationOutcome.REFUSED,
+        MigrationOutcome.FAILED,
+        MigrationOutcome.ROLLBACK_FAILED,
+    ):
+        raise typer.Exit(1)
+
+
+@app.command()
+def pull(
+    files: Optional[list[str]] = typer.Argument(
+        None, help="Local paths to pull into (default: all mappings)"
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    to_sectioned: bool = typer.Option(
+        False, "--to-sectioned", help="Migrate a non-sectioned mapping to sectioned mode before pulling"
+    ),
+    split_level: str = typer.Option(
+        "HEADING_2", "--split-level", help="Heading level to split on when --to-sectioned is used"
+    ),
+) -> None:
+    """Pull remote docs into local markdown files."""
+    config, config_path, prefix = _resolve(config_path, prefix)
+    mappings = _resolve_files_or_exit(config.mappings, files)
+
+    if not mappings:
+        err_console.print("No mappings configured.")
+        raise typer.Exit(1)
+
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+
+    had_error = False
+    for mapping in mappings:
+        if mapping.direction == "push":
+            console.print(f"[dim]Skipping {mapping.local} (push-only)[/dim]")
+            continue
+
+        if to_sectioned and not mapping.sectioned:
+            new_local_dir = os.path.splitext(mapping.local)[0]
+            if not dry_run:
+                console.print(
+                    f"[yellow]migrating[/yellow]  {mapping.local} → {new_local_dir}/ "
+                    "(this will create a git commit)"
+                )
+            migration_backend = _get_backend(mapping.backend, config, config_path)
+            migration_result = migrate_sectioned(
+                mapping,
+                migration_backend,
+                config,
+                config_path,
+                state,
+                state_dir,
+                state_path,
+                split_level,
+                dry_run=dry_run,
+            )
+            _render_migration_result(
+                mapping, new_local_dir, migration_result, dry_run=dry_run, split_level=split_level
+            )
+            if migration_result.outcome == MigrationOutcome.DRY_RUN:
+                continue
+            if migration_result.outcome != MigrationOutcome.SUCCESS:
+                had_error = True
+                continue
+            assert migration_result.new_mapping is not None
+            mapping = migration_result.new_mapping
+
+        backend = _get_backend(mapping.backend, config, config_path)
+
+        if dry_run:
+            if mapping.remote_id is None:
+                console.print(
+                    f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local}"
+                )
+                continue
+            preview = preview_pull(mapping, backend, state, state_dir)
+            _render_pull_preview(mapping, preview)
+            if preview.action == "error":
+                had_error = True
+            continue
+
+        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+        if outcome.action == "up-to-date":
+            console.print(f"[dim]up to date[/dim]  {mapping.local}")
+        elif outcome.action == "local-only":
+            console.print(
+                f"[yellow]warning[/yellow]  {mapping.local} has local changes not yet pushed. "
+                "Pull skipped. Push first or use 'docspan conflicts resolve'."
+            )
+        elif outcome.action == "merged":
+            console.print(f"[yellow]merging[/yellow]  {mapping.local}")
+            if outcome.has_conflicts:
+                console.print(
+                    f"   [yellow]Merge conflicts ({outcome.conflict_count}) written to "
+                    f"{mapping.local}. Resolve with: docspan conflicts resolve {mapping.local}[/yellow]"
+                )
+            else:
+                console.print("   [green]Merged cleanly.[/green]")
+            if outcome.result and outcome.result.status == "warning":
+                had_error = True
+                if outcome.result.message:
+                    console.print(f"   [dim]{escape(outcome.result.message)}[/dim]")
+        elif outcome.action == "error":
+            had_error = True
+            result = outcome.result
+            err_console.print(
+                f"✗  {mapping.remote_id} → {mapping.local}: "
+                f"{result.message if result else 'unknown error'}"
+            )
+        else:
+            # first-sync or fast-forward
+            result = outcome.result
+            if result:
+                icon, style = _status_display(result.status)
+                console.print(f"[{style}]{icon}[/{style}]  {mapping.remote_id} → {mapping.local}")
+                if result.message:
+                    console.print(f"   [dim]{escape(result.message)}[/dim]")
+                if result.status == "warning":
+                    had_error = True
+
+    if had_error:
+        raise typer.Exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sync command
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sync_pull_step(
+    mapping: Mapping, backend: Backend, state: SyncState, state_dir: str, state_path: str
+) -> Literal["ok", "error", "needs-resolve"]:
+    """`sync`'s pull half: run a real pull and render it, like `pull` does.
+
+    Returns "needs-resolve" when the merge left conflicts a push must not
+    run over, "error" on a pull failure, "ok" otherwise (including
+    no-remote-doc-yet, which is just skipped).
+    """
+    if mapping.remote_id is None:
+        console.print(f"[dim]Skipping {mapping.local} (no remote doc yet)[/dim]")
+        return "ok"
+
+    outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+
+    if outcome.action == "up-to-date":
+        console.print(f"[dim]up to date[/dim]  {mapping.local}")
+        return "ok"
+    if outcome.action == "local-only":
+        console.print(f"[dim]{mapping.local} has local changes, nothing new to pull[/dim]")
+        return "ok"
+    if outcome.action == "merged":
+        console.print(f"[yellow]merging[/yellow]  {mapping.local}")
+        if outcome.has_conflicts:
+            console.print(
+                f"   [yellow]Merge conflicts ({outcome.conflict_count}) written to "
+                f"{mapping.local}. Resolve with: docspan conflicts resolve {mapping.local}[/yellow]"
+            )
+            return "needs-resolve"
+        console.print("   [green]Merged cleanly.[/green]")
+        return "ok"
+    if outcome.action == "error":
+        err_console.print(
+            f"✗  {mapping.remote_id} → {mapping.local}: "
+            f"{outcome.result.message if outcome.result else 'unknown error'}"
+        )
+        return "error"
+
+    console.print(f"[green]✓[/green]  {mapping.remote_id} → {mapping.local} ({outcome.action})")
+    return "ok"
+
+
+@app.command()
+def sync(
+    files: Optional[list[str]] = typer.Argument(
+        None, help="Local markdown files to sync (default: all mappings)"
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+    force: bool = typer.Option(
+        False, "--force", help="Proceed with a push even if push() flags a comment-risk paragraph"
+    ),
+) -> None:
+    """Pull then push each mapping — the safe default order.
+
+    Stops short of pushing a mapping whose pull left unresolved merge
+    conflicts (run `docspan conflicts resolve` first); everything else —
+    up to date, fast-forwarded, or cleanly merged — gets pushed
+    automatically. Exits non-zero if anything still needs resolving.
+    """
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+    mappings = config.mappings
+    mappings_to_sync = _resolve_files_or_exit(mappings, files)
+
+    if not mappings_to_sync:
+        err_console.print("No mappings configured. Add entries to markgate.yaml.")
+        raise typer.Exit(1)
+
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+
+    had_error = False
+    cross_doc_cache: dict = {}
+    for mapping in mappings_to_sync:
+        backend = _get_backend(mapping.backend, config, config_path)
+
+        if mapping.direction != "push":
+            pull_status = _sync_pull_step(mapping, backend, state, state_dir, state_path)
+            if pull_status == "error":
+                had_error = True
+                continue
+            if pull_status == "needs-resolve":
+                had_error = True
+                continue
+
+        if mapping.direction == "pull":
+            continue
+
+        push_outcome = orchestrate_push(
+            mapping, backend, state, state_dir, state_path, force=force, mappings=mappings,
+            cross_doc_cache=cross_doc_cache,
+        )
+        result = push_outcome.result
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
+        if result.status in ("error", "blocked", "conflict", "warning"):
+            had_error = True
+
+    if had_error:
+        raise typer.Exit(1)
+
+
+def resolve_mapping_for_path(mappings: list[Mapping], file: str) -> Optional[Mapping]:
+    """Find the mapping that owns `file` (Specification pattern).
+
+    A non-sectioned mapping owns exactly the file at `mapping.local` (the old
+    exact-match check). A sectioned mapping's `local` is a *directory* of
+    section files (`NN-slug.md` + `_manifest.yaml`), so it owns every path
+    underneath that directory — e.g. `docs/big-doc/02-intro.md` resolves to
+    the `docs/big-doc` mapping even though no mapping's `local` ever equals
+    that section path exactly.
+    """
+    norm_file = os.path.normpath(file)
+    for m in mappings:
+        norm_local = os.path.normpath(m.local)
+        if not m.sectioned:
+            if norm_local == norm_file:
+                return m
+        elif norm_file == norm_local or norm_file.startswith(norm_local + os.sep):
+            return m
+    return None
+
+
+def _resolve_files_or_exit(mappings: list[Mapping], files: Optional[list[str]]) -> list[Mapping]:
+    """Narrow `mappings` to the ones owning `files`, or exit(1) if none match.
+
+    Shared by push/pull/sync's `files` argument handling — all three resolve
+    the same way and all three should fail the same way when a given path
+    doesn't own any mapping.
+    """
+    if not files:
+        return mappings
+    resolved: list[Mapping] = []
+    for f in files:
+        m = resolve_mapping_for_path(mappings, f)
+        if m is not None and not any(m is existing for existing in resolved):
+            resolved.append(m)
+    if not resolved:
+        err_console.print(f"No mappings found for: {files}")
+        raise typer.Exit(1)
+    return resolved
+
+
+_H1_PATTERN = re.compile(r"^#[ \t]+(\S.*?)\s*$", re.MULTILINE)
+_FRONTMATTER_PATTERN = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
+_CODE_FENCE_PATTERN = re.compile(r"^(```|~~~)[^\n]*\n.*?\n\1[ \t]*$\n?", re.MULTILINE | re.DOTALL)
+
+
+def _default_title(file: str) -> str:
+    """Default title for a newly mapped doc: the file's first H1, else its basename."""
+    basename = os.path.splitext(os.path.basename(file))[0]
+    try:
+        with open(file, "r", encoding="utf-8") as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError):
+        return basename
+    content = _FRONTMATTER_PATTERN.sub("", content, count=1)
+    content = _CODE_FENCE_PATTERN.sub("", content)
+    match = _H1_PATTERN.search(content)
+    return match.group(1) if match else basename
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# map command
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command("map")
+def map_(
+    file: str = typer.Argument(..., help="Local markdown file to map to a new remote doc/page"),
+    backend: str = typer.Option(
+        ..., "--backend", "-b", help="Backend to create the doc in: google_docs | confluence"
+    ),
+    space: Optional[str] = typer.Option(
+        None, "--space", help="Confluence space key (required for the confluence backend unless set in markgate.yaml)"
+    ),
+    title: Optional[str] = typer.Option(
+        None, "--title", help="Title for the new doc/page (default: the file's first H1 heading, else its basename)"
+    ),
+    direction: str = typer.Option("both", "--direction", help="push | pull | both"),
+    tab_id: Optional[str] = typer.Option(None, "--tab-id", help="Google Docs tab id to target"),
+    new_tab_in: Optional[str] = typer.Option(
+        None,
+        "--new-tab-in",
+        help="Local file of an existing google_docs mapping; create a new tab in that "
+        "doc (titled from --title/the file's H1) instead of a new doc, and map "
+        "this file to it. Requires --backend google_docs.",
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Create a new remote Google Doc / Confluence page and map it to a local file."""
+    if direction not in ("push", "pull", "both"):
+        err_console.print("--direction must be one of: push, pull, both")
+        raise typer.Exit(1)
+
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+
+    if resolve_mapping_for_path(config.mappings, file) is not None:
+        err_console.print(
+            f"'{file}' is already mapped in markgate.yaml. Remove the existing mapping before creating a new one."
+        )
+        raise typer.Exit(1)
+
+    if backend not in BACKENDS:
+        err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
+        raise typer.Exit(1)
+
+    parent_mapping: Optional[Mapping] = None
+    if new_tab_in is not None:
+        if backend != "google_docs":
+            err_console.print("--new-tab-in requires --backend google_docs")
+            raise typer.Exit(1)
+        if tab_id is not None:
+            err_console.print("--new-tab-in and --tab-id are mutually exclusive")
+            raise typer.Exit(1)
+        if space:
+            err_console.print("--space is ignored by --new-tab-in (Confluence-only option)")
+            raise typer.Exit(1)
+        parent_mapping = resolve_mapping_for_path(config.mappings, new_tab_in)
+        if parent_mapping is None:
+            err_console.print(f"'{new_tab_in}' is not mapped in markgate.yaml")
+            raise typer.Exit(1)
+        if parent_mapping.backend != "google_docs":
+            err_console.print(
+                f"'{new_tab_in}' is mapped to backend '{parent_mapping.backend}', not "
+                "google_docs — tabs require google_docs"
+            )
+            raise typer.Exit(1)
+        if parent_mapping.remote_id is None:
+            err_console.print(
+                f"'{new_tab_in}' has no remote_id yet — push it (or re-run 'docspan map "
+                f"{new_tab_in} --backend google_docs') before using it as --new-tab-in"
+            )
+            raise typer.Exit(1)
+
+    doc_title = title or _default_title(file)
+    backend_instance = _get_backend(backend, config, config_path)
+
+    create_kwargs: dict = {}
+    if space:
+        create_kwargs["space"] = space
+
+    try:
+        if parent_mapping is not None:
+            create_result = backend_instance.create_tab(parent_mapping.remote_id, doc_title)
+        else:
+            create_result = backend_instance.create(doc_title, **create_kwargs)
+    except ValueError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(1)
+
+    mapping = Mapping(
+        local=file,
+        backend=backend,
+        remote_id=create_result.doc_id,
+        direction=direction,  # type: ignore[arg-type]
+        tab_id=create_result.tab_id or tab_id,
+    )
+    config.mappings.append(mapping)
+
+    try:
+        save_config(config, config_path, expected_mtime=loaded_mtime)
+    except ConfigConflictError as exc:
+        tab_line = f"  tab_id: {create_result.tab_id}\n" if create_result.tab_id else ""
+        created_kind = "tab" if create_result.tab_id else "doc/page"
+        err_console.print(
+            f"{exc}\n\n"
+            f"⚠ A new {backend} {created_kind} was created but NOT recorded in markgate.yaml:\n"
+            f"  remote_id: {create_result.doc_id}\n"
+            f"{tab_line}"
+            f"  url: {create_result.url or '(none)'}\n"
+            "Add it manually (or resolve the conflict and re-run 'docspan map')."
+        )
+        raise typer.Exit(1)
+
+    action = "tab" if create_result.tab_id else "doc"
+    console.print(f"[green]✓[/green]  Created {backend} {action} '{create_result.title}' → {file}")
+    if create_result.url:
+        console.print(f"   {create_result.url}")
+
+    # A freshly created remote doc/page is always empty. Push local content
+    # into it now regardless of `direction` — otherwise a "pull" mapping's
+    # very next pull has no prior sync state to compare against and will
+    # unconditionally overwrite the local file with that empty remote doc.
+    if os.path.exists(file):
+        state_path = get_state_path(config_path, prefix)
+        state_dir = get_state_dir(config_path, prefix)
+        state = _load_state(state_path)
+        outcome = orchestrate_push(
+            mapping, backend_instance, state, state_dir, state_path, mappings=config.mappings,
+        )
+        result = outcome.result
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# status command
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command()
+def status(
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Show current mapping status."""
+    config, config_path, prefix = _resolve(config_path, prefix)
+
+    if not config.mappings:
+        console.print("[yellow]No mappings configured.[/yellow] Add entries to markgate.yaml.")
+        return
+
+    table = Table(title="docspan mappings")
+    table.add_column("Local file", style="cyan")
+    table.add_column("Backend", style="magenta")
+    table.add_column("Remote ID")
+    table.add_column("Direction")
+
+    for m in config.mappings:
+        table.add_row(m.local, m.backend, m.remote_id, m.direction)
+
+    console.print(table)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# style-guide command — print/embed backend authoring guidance into a repo
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command("style-guide")
+def style_guide_cmd(
+    backend: Optional[str] = typer.Option(
+        None, "--backend", "-b", help="google_docs, confluence, or omit for all backends"
+    ),
+    write: Optional[str] = typer.Option(
+        None, "--write", "-w",
+        help="File to write/update (e.g. a project CLAUDE.md). Updates docspan's "
+        "managed block in place if the file already has one; appends otherwise.",
+    ),
+) -> None:
+    """Print backend authoring guidance (e.g. "one image per line on google_docs").
+
+    Ships inside the installed package, so re-running this after a docspan
+    upgrade picks up new guidance without hand-copying anything. With
+    --write, embed it as a marked, idempotent block in a file in your own
+    repo (a CLAUDE.md, a style-guide doc, etc.) instead of just printing it.
+    """
+    from docspan.style_guide import STYLE_GUIDES, render_style_guide, upsert_managed_block
+
+    if backend is not None and backend not in STYLE_GUIDES:
+        err_console.print(f"Unknown backend '{backend}'. Available: {list(STYLE_GUIDES.keys())}")
+        raise typer.Exit(1)
+
+    content = render_style_guide(backend)
+
+    if write is None:
+        console.print(escape(content))
+        return
+
+    existing = ""
+    if os.path.exists(write):
+        existing = open(write, encoding="utf-8").read()
+    updated = upsert_managed_block(existing, backend)
+    with open(write, "w", encoding="utf-8") as f:
+        f.write(updated)
+    console.print(f"[green]✓[/green] Wrote style guide to {write}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# comments subcommand — respond to / resolve pulled comments
+# ─────────────────────────────────────────────────────────────────────────────
+
+@comments_app.command("respond")
+def comments_respond(
+    file: str = typer.Argument(..., help="Local markdown file whose .comments.md sidecar to process"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Post Reply:/Resolve: directives from a .comments.md sidecar back to the remote doc.
+
+    Edit the sidecar's `Reply:` lines and/or flip `Resolve: no` to `Resolve: yes` under
+    an open comment, then run this to post those replies/resolutions and refresh the
+    sidecar with the result.
+    """
+    config, config_path, prefix = _resolve(config_path, prefix)
+
+    mapping = resolve_mapping_for_path(config.mappings, file)
+    if mapping is None:
+        err_console.print(f"No mapping found for: {file}")
+        raise typer.Exit(1)
+
+    backend = _get_backend(mapping.backend, config, config_path)
+    if not hasattr(backend, "respond_to_comments"):
+        err_console.print(f"Backend '{mapping.backend}' does not support comment replies.")
+        raise typer.Exit(1)
+
+    result = backend.respond_to_comments(mapping.remote_id, mapping.local)
+    if result.posted or result.resolved:
+        console.print(
+            f"[green]✓[/green]  Posted {result.posted} repl{'y' if result.posted == 1 else 'ies'}, "
+            f"resolved {result.resolved}."
+        )
+    else:
+        console.print("No pending Reply:/Resolve: directives found.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# config subcommand — central project registry (XDG)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_central(raw: dict) -> str:
+    import yaml as _yaml
+
+    from docspan.core.xdg import central_config_path
+    path = central_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
+    return str(path)
+
+
+def _read_central_raw() -> dict:
+    import yaml as _yaml
+
+    from docspan.core.xdg import central_config_path
+    path = central_config_path()
+    if path.exists():
+        return _yaml.safe_load(path.read_text()) or {}
+    return {}
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show the central config (registered projects) and the active resolution."""
+    from docspan.core.xdg import central_config_path
+    central = load_central_config()
+    console.print(f"Central config: {central_config_path()}")
+    console.print(f"default_prefix: {central.default_prefix or '(none)'}")
+    if not central.projects:
+        console.print(
+            "No projects registered. Add one:\n"
+            "  docspan config add <prefix> <path-to-markgate.yaml>"
+        )
+        return
+    table = Table(title="docspan projects")
+    table.add_column("Prefix", style="cyan")
+    table.add_column("markgate.yaml")
+    for name, entry in central.projects.items():
+        table.add_row(name, entry.markgate)
+    console.print(table)
+
+
+@config_app.command("add")
+def config_add(
+    prefix: str = typer.Argument(..., help="Project prefix (name)"),
+    markgate: str = typer.Argument(..., help="Path to that project's markgate.yaml"),
+    default: bool = typer.Option(False, "--default", help="Also set as default_prefix"),
+) -> None:
+    """Register a project (prefix → markgate.yaml) in the central config."""
+    raw = _read_central_raw()
+    raw.setdefault("projects", {})[prefix] = {"markgate": markgate}
+    if default or not raw.get("default_prefix"):
+        raw["default_prefix"] = prefix
+    path = _write_central(raw)
+    console.print(f"✓ Registered '{prefix}' → {markgate} in {path}")
+
+
+@app.command("migrate-xdg")
+def migrate_xdg(
+    prefix: str = typer.Option(..., "--prefix", "-p", help="Prefix to migrate this project's storage into"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Move legacy in-repo storage (.markgate-state.json, .markgate-base/) to XDG and register the project."""
+    import shutil
+
+    from docspan.core.xdg import state_dir_for_prefix
+    legacy_dir = get_state_dir(config_path)  # cwd / dirname(config) — legacy location
+    dest = str(state_dir_for_prefix(prefix))
+    os.makedirs(dest, exist_ok=True)
+
+    moved = []
+    for name in (STATE_FILENAME, BASE_STORE_DIR):
+        src = os.path.join(legacy_dir, name)
+        if os.path.exists(src):
+            target = os.path.join(dest, name)
+            if os.path.exists(target):
+                err_console.print(f"Refusing to overwrite existing {target}")
+                raise typer.Exit(1)
+            shutil.move(src, target)
+            moved.append(name)
+
+    from docspan.config import _resolve_config_path
+    markgate_abs = os.path.abspath(os.path.expanduser(str(_resolve_config_path(config_path))))
+    raw = _read_central_raw()
+    raw.setdefault("projects", {})[prefix] = {"markgate": markgate_abs}
+    if not raw.get("default_prefix"):
+        raw["default_prefix"] = prefix
+    _write_central(raw)
+
+    console.print(f"✓ Moved {moved or '(nothing)'} → {dest}")
+    console.print(f"✓ Registered '{prefix}' → {markgate_abs}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# auth subcommand
+# ─────────────────────────────────────────────────────────────────────────────
+
+@auth_app.command("setup")
+def auth_setup(
+    backend: str = typer.Argument(..., help="Backend to authenticate: google_docs | confluence"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    oauth: bool = typer.Option(False, "--oauth", help="Use per-user OAuth (google_docs)."),
+    client_secret: Optional[str] = typer.Option(
+        None, "--client-secret", help="Path to an OAuth client secret JSON (google_docs, with --oauth)."
+    ),
+) -> None:
+    """Interactive authentication setup for a backend."""
+    config = load_config(config_path)
+    cls = BACKENDS.get(backend)
+    if not cls:
+        err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
+        raise typer.Exit(1)
+
+    if oauth or client_secret:
+        from docspan.config import GoogleDocsConfig
+        gd = config.backends.google_docs or GoogleDocsConfig()
+        if client_secret:
+            gd.oauth_client_secret_path = client_secret
+        if not gd.oauth_client_secret_path:
+            err_console.print(
+                "--oauth requires --client-secret PATH (or oauth_client_secret_path in markgate.yaml)."
+            )
+            raise typer.Exit(1)
+        config.backends.google_docs = gd
+
+    b = cls.from_config(config)
+    b.auth_setup(config_path=config_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# conflicts subcommand
+# ─────────────────────────────────────────────────────────────────────────────
+
+@conflicts_app.command("list")
+def conflicts_list(
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """List files with unresolved merge conflicts."""
+    state_path = get_state_path(config_path)
+    state = _load_state(state_path)
+
+    conflicted = []
+    for local_path in state.mappings:
+        if not os.path.exists(local_path):
+            continue
+        with open(local_path, encoding="utf-8") as fh:
+            content = fh.read()
+        count = sum(1 for line in content.splitlines() if line.startswith("<<<<<<< "))
+        if count > 0:
+            conflicted.append((local_path, count))
+
+    if not conflicted:
+        console.print("No unresolved conflicts.")
+        return
+
+    table = Table(title="Files with merge conflicts")
+    table.add_column("File", style="cyan")
+    table.add_column("Conflict blocks", style="red")
+    for local_path, count in conflicted:
+        table.add_row(local_path, str(count))
+    console.print(table)
+
+
+@conflicts_app.command("resolve")
+def conflicts_resolve(
+    file: str = typer.Argument(..., help="Local file path to resolve"),
+    accept: str = typer.Option(..., "--accept", help="Resolution strategy: remote | local | merged"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+) -> None:
+    """Resolve a merge conflict in a tracked file."""
+    if accept not in ("remote", "local", "merged"):
+        err_console.print("--accept must be one of: remote, local, merged")
+        raise typer.Exit(1)
+
+    state_path = get_state_path(config_path)
+    state_dir = get_state_dir(config_path)
+    state = _load_state(state_path)
+
+    entry = state.get(file)
+    if entry is None:
+        err_console.print(f"File '{file}' is not tracked in .markgate-state.json")
+        raise typer.Exit(1)
+
+    config = load_config(config_path)
+    backend = _get_backend(entry.backend, config)
+    # MappingState (.markgate-state.json) has no tab_id field — look the
+    # mapping up in markgate.yaml by local path so a re-fetch of a tab-scoped
+    # mapping targets the right tab instead of silently falling back to the
+    # doc's first tab.
+    mapping = resolve_mapping_for_path(config.mappings, file)
+    tab_id = mapping.tab_id if mapping is not None else None
+    pull_strategy = mapping.pull_strategy if mapping is not None else "auto"
+
+    if accept == "remote":
+        _resolve_remote(
+            file, entry, backend, state, state_path, state_dir, tab_id=tab_id, pull_strategy=pull_strategy,
+        )
+    elif accept == "local":
+        _resolve_local(file, entry, state, state_path, state_dir)
+    elif accept == "merged":
+        _resolve_merged(file, entry, state, state_path, state_dir)
+
+
+def _resolve_remote(
+    file: str,
+    entry: MappingState,
+    backend,
+    state: SyncState,
+    state_path: str,
+    state_dir: str,
+    tab_id: Optional[str] = None,
+    pull_strategy: Literal["auto", "structural"] = "auto",
+) -> None:
+    result = backend.pull(entry.doc_id, file, tab_id=tab_id, pull_strategy=pull_strategy)
+    if result.status != "ok":
+        err_console.print(f"Could not re-fetch remote: {result.message}")
+        raise typer.Exit(1)
+    orig_path = file + ORIG_SUFFIX
+    if os.path.exists(orig_path):
+        os.unlink(orig_path)
+    with open(file, encoding="utf-8") as fh:
+        new_content = fh.read()
+    try:
+        remote_version = backend.get_remote_version(entry.doc_id)
+    except Exception:
+        logger.warning(
+            "Could not fetch remote version for %s after resolve; retaining stale version %s",
+            entry.doc_id, entry.remote_version, exc_info=True,
+        )
+        remote_version = entry.remote_version
+    record_state(state, state_path, state_dir, file, entry.doc_id, entry.backend, new_content, remote_version)
+    console.print(f"[green]Resolved[/green] {file} (accepted remote)")
+
+
+def _resolve_local(
+    file: str,
+    entry: MappingState,
+    state: SyncState,
+    state_path: str,
+    state_dir: str,
+) -> None:
+    orig_path = file + ORIG_SUFFIX
+    if os.path.exists(orig_path):
+        shutil.copy2(orig_path, file)
+        os.unlink(orig_path)
+        console.print(f"[green]Restored[/green] {file} from {orig_path}")
+    else:
+        base_content = get_base_content(state_dir, entry.base_hash)
+        if base_content:
+            with open(file, "w", encoding="utf-8") as fh:
+                fh.write(base_content)
+            console.print("[yellow]Warning:[/yellow] .orig not found; restored from base content")
+        else:
+            err_console.print(f"No .orig file and no base content for '{file}'. Cannot restore.")
+            raise typer.Exit(1)
+    with open(file, encoding="utf-8") as fh:
+        new_content = fh.read()
+    record_state(state, state_path, state_dir, file, entry.doc_id, entry.backend, new_content, entry.remote_version)
+    console.print(f"[green]Resolved[/green] {file} (accepted local)")
+
+
+def _resolve_merged(
+    file: str,
+    entry: MappingState,
+    state: SyncState,
+    state_path: str,
+    state_dir: str,
+) -> None:
+    if not os.path.exists(file):
+        err_console.print(f"File '{file}' does not exist")
+        raise typer.Exit(1)
+    with open(file, encoding="utf-8") as fh:
+        content = fh.read()
+    if "<<<<<<< " in content:
+        err_console.print(
+            f"File '{file}' still contains conflict markers. "
+            "Resolve all conflicts before accepting as merged."
+        )
+        raise typer.Exit(1)
+    record_state(state, state_path, state_dir, file, entry.doc_id, entry.backend, content, entry.remote_version)
+    console.print(f"[green]Resolved[/green] {file} (accepted merged)")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
