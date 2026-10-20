@@ -4,6 +4,8 @@ Document Converter Module
 Handles conversion between Google Docs and Markdown formats
 """
 
+from __future__ import annotations
+
 import logging
 import re
 import sys
