@@ -4,6 +4,8 @@ Document Converter Module
 Handles conversion between Google Docs and Markdown formats
 """
 
+from __future__ import annotations
+
 import logging
 import re
 import sys
@@ -11,7 +13,13 @@ import urllib.parse
 
 from markdownify import MarkdownConverter, chomp
 
-from docspan.backends.google_docs.nodes_to_markdown import _wrap_inline_code
+from docspan.backends.google_docs.docs_structure_parser import _MONOSPACE_FONT_MARKERS
+from docspan.backends.google_docs.nodes_to_markdown import (
+    FENCE_MARKER,
+    _escape_leading_fence,
+    _wrap_inline_code,
+    render_fence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +30,12 @@ sys.setrecursionlimit(10000)
 MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
 
 _FONT_WEIGHT_RE = re.compile(r'font-weight:\s*(\d+)')
-_FONT_FAMILY_RE = re.compile(r'font-family:[^;]*(courier|consolas|monospace|mono)', re.IGNORECASE)
+_FONT_FAMILY_RE = re.compile(r'font-family:([^;]*)', re.IGNORECASE)
+# Stands in for a code line's leading indentation while markdownify runs, since
+# it strips leading whitespace at paragraph start; restored after fence regrouping.
+_INDENT = '\ue000'
+_LANG_MARKER_RE = re.compile(r'^' + re.escape(FENCE_MARKER) + r'([^`\n]*)$')
+_BACKTICK_RUN_RE = re.compile(r'`+')
 _GOOGLE_REDIRECT_RE = re.compile(r'^https?://(?:www\.)?google\.com/url\?')
 
 
@@ -41,6 +54,106 @@ def _unwrap_google_redirect(href: str) -> str:
     return target[0] if target else href
 
 
+def _is_monospace_style(style: str) -> bool:
+    match = _FONT_FAMILY_RE.search(style)
+    return bool(match) and any(m in match.group(1).lower() for m in _MONOSPACE_FONT_MARKERS)
+
+
+def _pure_code_line(line: str) -> str | None:
+    """The code text if the whole markdown line is one inline-code span, else None.
+
+    Text-level mirror of nodes_to_markdown._is_pure_code_line: bold/italic
+    wrappers or surrounding prose leave non-backtick characters at the line
+    edges, so they never match.
+    """
+    # Linear scan: a regex over a long backtick run backtracks cubically.
+    fence_len = len(line) - len(line.lstrip('`'))
+    if fence_len == 0 or len(line) <= 2 * fence_len or len(line) - len(line.rstrip('`')) != fence_len:
+        return None
+    fence, content = line[:fence_len], line[fence_len:-fence_len]
+    if any(len(run) == len(fence) for run in _BACKTICK_RUN_RE.findall(content)):
+        return None
+    if content[:1] == ' ' and content[-1:] == ' ' and content.strip():
+        content = content[1:-1]  # undo _wrap_inline_code's padding
+    return content if content.strip() else None
+
+
+def _fence_of(line: str) -> str:
+    return line[:len(line) - len(line.lstrip('`'))]
+
+
+def _closing_fence(lines: list[str], start: int) -> int | None:
+    """Index of the bare fence line closing the fence opened at `start`, if any."""
+    fence = _fence_of(lines[start])
+    for k in range(start + 1, len(lines)):
+        if lines[k].rstrip() == fence:
+            return k
+    return None
+
+
+def _regroup_code_fences(markdown: str) -> str:
+    """Collapse runs of whole-line inline-code paragraphs into fenced blocks.
+
+    Docs exports each code line as its own monospace paragraph, so a code
+    block arrives as per-line `code` spans separated by blank lines. A run is
+    fenced when it has 2+ lines or follows a ```lang marker paragraph (the
+    push side's language carrier). A lone code line stays inline.
+    """
+    lines = markdown.split('\n')
+    out: list[str] = []
+    unclosed: set[str] = set()  # fence strings known to have no closer; avoids rescans
+    i = 0
+    while i < len(lines):
+        marker = _LANG_MARKER_RE.match(lines[i])
+        # A marker paragraph is followed by a blank line; a fence markdownify
+        # rendered (<pre>) is followed directly by its first content line.
+        rendered = marker and lines[i + 1:i + 2] not in ([], ['']) and _fence_of(lines[i]) not in unclosed
+        if rendered and (end := _closing_fence(lines, i)) is not None:
+            out.extend(lines[i:end + 1])
+            i = end + 1
+            continue
+        if rendered:
+            unclosed.add(_fence_of(lines[i]))
+        start = i
+        lang = None
+        if marker:
+            start = i + 1
+            if start < len(lines) and lines[start] == '':
+                start += 1
+            lang = marker.group(1).strip()
+        code: list[str] = []
+        j = start
+        while j < len(lines):
+            text = _pure_code_line(lines[j])
+            if text is not None:
+                code.append(text.replace(_INDENT, ' ') if text.strip(_INDENT + ' ') else '')
+                j += 1
+            elif code and lines[j] == '' and j + 1 < len(lines) and _pure_code_line(lines[j + 1]) is not None:
+                j += 1
+            else:
+                break
+        while code and code[-1] == '':
+            code.pop()
+        while code and code[0] == '':
+            code.pop(0)
+        if code and (marker or len(code) >= 2):
+            out.extend(render_fence(lang or None, code)[:-1])
+            i = j
+        elif marker:
+            # An orphan marker would reparse as a live fence swallowing what follows.
+            out.append(_escape_leading_fence(lines[i]))
+            i += 1
+        else:
+            text = _pure_code_line(lines[i])
+            blank = text is not None and not text.strip(_INDENT + ' ')
+            if blank:
+                i += 2 if lines[i + 1:i + 2] == [''] else 1  # drop it and its separator
+            else:
+                out.append(lines[i])
+                i += 1
+    return '\n'.join(out)
+
+
 class _GoogleDocsMarkdownConverter(MarkdownConverter):
     """markdownify converter aware of Google Docs' HTML export quirks.
 
@@ -50,6 +163,18 @@ class _GoogleDocsMarkdownConverter(MarkdownConverter):
     no convert_span handler at all, so styled spans silently lose their
     formatting on pull; this subclass restores it.
     """
+
+    def process_text(self, el, parent_tags=None):
+        parent = el.parent
+        if parent is None or parent.name != 'span' or not _is_monospace_style(parent.get('style') or ''):
+            return super().process_text(el, parent_tags)
+        # Code text is literal: no markdown escaping, and the leading
+        # indent of a paragraph-initial span must survive markdownify.
+        text = str(el).replace('\xa0', ' ')
+        if parent.previous_sibling is None:
+            stripped = text.lstrip(' ')
+            text = _INDENT * (len(text) - len(stripped)) + stripped
+        return text
 
     def convert_span(self, el, text, parent_tags):
         if '_noformat' in parent_tags or not text:
@@ -61,7 +186,7 @@ class _GoogleDocsMarkdownConverter(MarkdownConverter):
         weight_match = _FONT_WEIGHT_RE.search(style)
         is_bold = bool(weight_match) and int(weight_match.group(1)) >= 700
         is_italic = 'font-style:italic' in style.replace(' ', '')
-        is_monospace = bool(_FONT_FAMILY_RE.search(style))
+        is_monospace = _is_monospace_style(style)
         if is_monospace:
             text = _wrap_inline_code(text)
         if is_bold:
@@ -131,6 +256,8 @@ class DocumentConverter:
 
             # Remove Google Docs specific artifacts
             markdown = DocumentConverter._clean_google_docs_artifacts(markdown)
+
+            markdown = _regroup_code_fences(markdown).replace(_INDENT, '')
 
             logger.info("Converted HTML to Markdown")
             return markdown
