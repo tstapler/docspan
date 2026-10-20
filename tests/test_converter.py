@@ -137,3 +137,25 @@ def test_orphan_language_marker_does_not_open_a_live_fence() -> None:
     out = DocumentConverter.html_to_markdown("<p>```py</p><p>hello</p>")
     assert not any(line.startswith("```") for line in out.split("\n"))
     assert "hello" in out
+
+
+def test_pre_block_is_left_as_a_fence() -> None:
+    assert DocumentConverter.html_to_markdown("<pre>x\ny</pre><p>z</p>") == "```\nx\ny\n```\n\nz"
+
+
+def test_whitespace_only_monospace_paragraph_is_dropped() -> None:
+    assert DocumentConverter.html_to_markdown(_mono_p("&nbsp;")) == ""
+    assert DocumentConverter.html_to_markdown(_mono_p("&nbsp;") + "<p>x</p>") == "x"
+
+
+def test_trailing_blank_code_line_stays_outside_the_fence() -> None:
+    html = _mono_p("a") + _mono_p("b") + _mono_p("&nbsp;") + "<p>x</p>"
+    assert DocumentConverter.html_to_markdown(html) == "```\na\nb\n```\n\nx"
+
+
+def test_long_backtick_run_is_linear_time() -> None:
+    import time
+
+    start = time.perf_counter()
+    DocumentConverter.html_to_markdown("<p>" + "`" * 20000 + "x</p>")
+    assert time.perf_counter() - start < 2

@@ -33,7 +33,6 @@ _FONT_FAMILY_RE = re.compile(r'font-family:([^;]*)', re.IGNORECASE)
 # it strips leading whitespace at paragraph start; restored after fence regrouping.
 _INDENT = '\ue000'
 _LANG_MARKER_RE = re.compile(r'^' + re.escape(FENCE_MARKER) + r'([^`\n]*)$')
-_CODE_SPAN_RE = re.compile(r'(`+)(.*)\1')
 _BACKTICK_RUN_RE = re.compile(r'`+')
 _GOOGLE_REDIRECT_RE = re.compile(r'^https?://(?:www\.)?google\.com/url\?')
 
@@ -65,15 +64,26 @@ def _pure_code_line(line: str) -> str | None:
     wrappers or surrounding prose leave non-backtick characters at the line
     edges, so they never match.
     """
-    match = _CODE_SPAN_RE.fullmatch(line)
-    if not match:
+    # Linear scan: a regex over a long backtick run backtracks cubically.
+    fence_len = len(line) - len(line.lstrip('`'))
+    if fence_len == 0 or len(line) <= 2 * fence_len or len(line) - len(line.rstrip('`')) != fence_len:
         return None
-    fence, content = match.groups()
+    fence, content = line[:fence_len], line[fence_len:-fence_len]
     if any(len(run) == len(fence) for run in _BACKTICK_RUN_RE.findall(content)):
         return None
     if content[:1] == ' ' and content[-1:] == ' ' and content.strip():
         content = content[1:-1]  # undo _wrap_inline_code's padding
     return content if content.strip() else None
+
+
+def _closing_fence(lines: list[str], start: int) -> int | None:
+    """Index of the bare fence line closing the fence opened at `start`, if any."""
+    opener = lines[start].rstrip()
+    fence = opener[:len(opener) - len(opener.lstrip('`'))]
+    for k in range(start + 1, len(lines)):
+        if lines[k].rstrip() == fence:
+            return k
+    return None
 
 
 def _regroup_code_fences(markdown: str) -> str:
@@ -107,13 +117,28 @@ def _regroup_code_fences(markdown: str) -> str:
                 j += 1
             else:
                 break
+        while code and code[-1] == '':
+            code.pop()
+        while code and code[0] == '':
+            code.pop(0)
         if code and (marker or len(code) >= 2):
             out.extend(render_fence(lang or None, code)[:-1])
             i = j
-        else:
+        elif marker and (end := _closing_fence(lines, i)) is not None:
+            out.extend(lines[i:end + 1])  # fence markdownify already rendered (<pre>)
+            i = end + 1
+        elif marker:
             # An orphan marker would reparse as a live fence swallowing what follows.
-            out.append(_escape_leading_fence(lines[i]) if marker else lines[i])
+            out.append(_escape_leading_fence(lines[i]))
             i += 1
+        else:
+            text = _pure_code_line(lines[i])
+            blank = text is not None and not text.strip(_INDENT + ' ')
+            if blank:
+                i += 2 if lines[i + 1:i + 2] == [''] else 1  # drop it and its separator
+            else:
+                out.append(lines[i])
+                i += 1
     return '\n'.join(out)
 
 
