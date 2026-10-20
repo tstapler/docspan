@@ -1,6 +1,9 @@
 """Unit tests for MarkdownToParagraphParser — mistune AST traversal, no network."""
 
+from docspan.backends.google_docs.docs_request_builder import DocsRequestBuilder
+from docspan.backends.google_docs.docs_structure_parser import DocsStructureParser
 from docspan.backends.google_docs.markdown_to_paragraph_parser import MarkdownToParagraphParser
+from docspan.backends.google_docs.projection import project
 
 parser = MarkdownToParagraphParser()
 
@@ -291,3 +294,70 @@ def test_mixed_document_order_preserved() -> None:
     assert styles[0] == "HEADING_1"
     # Remaining nodes should contain NORMAL_TEXT entries
     assert "NORMAL_TEXT" in styles
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# text/spans invariant: node.text == "".join(span.text) when spans are present
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _assert_spans_match_text(nodes: list) -> None:
+    styled = [n for n in nodes if n.spans]
+    assert styled, "expected at least one styled node"
+    for n in styled:
+        assert n.text == "".join(s.text for s in n.spans)
+
+
+def test_paragraph_spans_match_text_when_code_span_has_edge_whitespace() -> None:
+    nodes = parser.parse("`  indented: yes  `")
+    _assert_spans_match_text(nodes)
+    assert nodes[0].text == "indented: yes"
+    assert nodes[0].spans[0].monospace
+
+
+def test_heading_spans_match_text_when_code_span_has_edge_whitespace() -> None:
+    _assert_spans_match_text(parser.parse("# `  title  `"))
+
+
+def test_list_item_spans_match_text_when_code_span_has_edge_whitespace() -> None:
+    _assert_spans_match_text(parser.parse("- `  item  `"))
+    _assert_spans_match_text(parser.parse("- `  item  `\n  - nested"))
+    _assert_spans_match_text(parser.parse("- `  item  `\n  ```\n  code\n  ```\n"))
+
+
+def test_blockquote_spans_match_text_when_code_span_has_edge_whitespace() -> None:
+    nodes = parser.parse("> `  quoted  `")
+    _assert_spans_match_text(nodes)
+    assert nodes[0].is_blockquote
+
+
+def test_fenced_code_still_preserves_leading_whitespace() -> None:
+    nodes = parser.parse("```\n  indented: yes\n```")
+    assert any(n.text == "  indented: yes" for n in nodes)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Push-side effects of the invariant (_spans_overflow, idempotence)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mono_doc(text: str) -> tuple[dict, int]:
+    mono = {"weightedFontFamily": {"fontFamily": "Courier New", "weight": 400}}
+    end = 1 + len(text) + 1
+    return {"revisionId": "rev-1", "body": {"content": [{
+        "startIndex": 1, "endIndex": end, "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{"textRun": {"content": text + "\n", "textStyle": mono}}],
+        }}]}}, end
+
+
+def test_spans_overflow_is_false_for_a_styled_paragraph_with_edge_whitespace() -> None:
+    doc, end = _mono_doc("indented: yes")
+    (placement,) = DocsStructureParser().parse(doc)
+    (target,) = parser.parse("`  indented: yes  `")
+    assert not DocsRequestBuilder._spans_overflow(target, placement)
+
+
+def test_pushing_a_styled_whitespace_paragraph_is_idempotent() -> None:
+    doc, end = _mono_doc("indented: yes")
+    current, _ = project(DocsStructureParser().parse(doc))
+    target, _ = project(parser.parse("`  indented: yes  `"))
+    assert DocsRequestBuilder().build(current, target, end) == []
