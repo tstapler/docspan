@@ -407,14 +407,12 @@ class PushPreview:
                 else:
                     lines.append(f"  ~ {entry.current_text} → {entry.target_text}")
                 for sc in entry.span_changes:
-                    if sc.old_link != sc.new_link:
+                    if sc.new_link:
                         old = sc.old_link or "(no link)"
-                        new = sc.new_link or "(no link)"
-                        lines.append(f'    ↳ link "{sc.text}": {old} → {new}')
+                        lines.append(f'    ↳ link "{sc.text}": {old} → {sc.new_link}')
                     for name in ("bold", "italic", "monospace"):
-                        if getattr(sc, f"old_{name}") != getattr(sc, f"new_{name}"):
-                            state = "on" if getattr(sc, f"new_{name}") else "off"
-                            lines.append(f'    ↳ {name} "{sc.text}": {state}')
+                        if getattr(sc, f"new_{name}"):
+                            lines.append(f'    ↳ {name} "{sc.text}": on')
 
         if churn_pairs:
             lines.append(render_churn_note(churn_pairs, self.high_risk))

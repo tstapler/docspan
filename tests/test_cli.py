@@ -104,7 +104,9 @@ class FakeBackendWithPreview(FakeBackend):
     preview_error: Optional[str] = None
     preview_high_risk: list = field(default_factory=list)
 
-    def preview_push(self, local_path: str, doc_id: str, tab_id: Optional[str] = None) -> FakePushPreview:
+    def preview_push(
+        self, local_path: str, doc_id: str, tab_id: Optional[str] = None, **kwargs: object
+    ) -> FakePushPreview:
         if self.preview_error is not None:
             return FakePushPreview(text=f"✗ dry-run failed: {self.preview_error}", error=self.preview_error)
         if self.preview_text is not None:

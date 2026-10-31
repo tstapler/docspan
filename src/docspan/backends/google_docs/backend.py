@@ -209,6 +209,7 @@ class GoogleDocsBackend(Backend):
         doc_id: str,
         tab_id: Optional[str] = None,
         content: Optional[str] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
     ) -> PushPlan:
         """Fetch the doc + open comments exactly once and compute the diff/risk plan.
 
@@ -337,7 +338,9 @@ class GoogleDocsBackend(Backend):
             requests = request_builder.build(
                 current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
             )
-            entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
+            entries, unchanged_count = request_builder.diff_summary(
+                current_nodes, target_nodes, resolver, local_path
+            )
 
             comments = self._client.list_comments(doc_id)
             high_risk = find_high_risk_paragraphs(entries, comments)
@@ -371,7 +374,7 @@ class GoogleDocsBackend(Backend):
         )
 
     def preview_push(
-        self, local_path: str, doc_id: str, tab_id: Optional[str] = None
+        self, local_path: str, doc_id: str, tab_id: Optional[str] = None, **kwargs: object
     ) -> PushPreview:
         """Build a read-only, cosmetic preview of what push() would do.
 
@@ -389,7 +392,8 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         try:
-            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
+            resolver = self._build_cross_doc_resolver(kwargs, caller="preview_push")
+            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id, resolver=resolver)
             # Inside the try/except deliberately: the docstring above promises a
             # PushPreview(error=…) rather than a traceback, and evaluating these
             # in the return expression put them outside that promise.
@@ -534,7 +538,9 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         plan: Optional[PushPlan] = None
         try:
-            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id, content=content)
+            plan = self._build_push_plan(
+                local_path, doc_id, tab_id=tab_id, content=content, resolver=resolver
+            )
             # Document-wide, not scoped to plan.doc's resolved tab -- reads
             # from the unresolved whole_doc fetch. Never gated by
             # plan.high_risk/force: it's a metadata toggle, not a content
