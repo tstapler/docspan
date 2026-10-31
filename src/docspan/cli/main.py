@@ -907,6 +907,7 @@ def _resolve_files_or_exit(mappings: list[Mapping], files: Optional[list[str]]) 
     return resolved
 
 
+_TAB_TITLE_MAX_LEN = 50  # Google Docs addDocumentTab rejects longer titles
 _H1_PATTERN = re.compile(r"^#[ \t]+(\S.*?)\s*$", re.MULTILINE)
 _FRONTMATTER_PATTERN = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
 _CODE_FENCE_PATTERN = re.compile(r"^(```|~~~)[^\n]*\n.*?\n\1[ \t]*$\n?", re.MULTILINE | re.DOTALL)
@@ -1010,6 +1011,19 @@ def map_(
             raise typer.Exit(1)
 
     doc_title = title or _default_title(file)
+    if new_tab_in is not None and len(doc_title) > _TAB_TITLE_MAX_LEN:
+        if title is not None:
+            err_console.print(
+                f"Tab title is {len(doc_title)} characters; Google Docs limits tab titles to "
+                f"{_TAB_TITLE_MAX_LEN}. Shorten the value passed to --title."
+            )
+        else:
+            err_console.print(
+                f"Tab title derived from the file is {len(doc_title)} characters; "
+                f"Google Docs limits tab titles to {_TAB_TITLE_MAX_LEN}. "
+                "Use --title to supply a shorter title."
+            )
+        raise typer.Exit(1)
     backend_instance = _get_backend(backend, config, config_path)
 
     create_kwargs: dict = {}
