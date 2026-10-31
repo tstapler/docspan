@@ -707,7 +707,7 @@ def pull(
                     f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local}"
                 )
                 continue
-            preview = preview_pull(mapping, backend, state, state_dir)
+            preview = preview_pull(mapping, backend, state, state_dir, mappings=config.mappings)
             _render_pull_preview(mapping, preview)
             if preview.action == "error":
                 had_error = True

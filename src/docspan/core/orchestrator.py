@@ -539,7 +539,13 @@ def orchestrate_pull(
     )
 
 
-def preview_pull(mapping: "Mapping", backend: Backend, state: SyncState, state_dir: str) -> PullPreview:
+def preview_pull(
+    mapping: "Mapping",
+    backend: Backend,
+    state: SyncState,
+    state_dir: str,
+    mappings: Optional[list] = None,
+) -> PullPreview:
     """Classify what `orchestrate_pull` would do, without writing anything.
 
     Fetches the remote version (the one network call a real pull also makes)
@@ -551,7 +557,7 @@ def preview_pull(mapping: "Mapping", backend: Backend, state: SyncState, state_d
     assert mapping.remote_id is not None, "preview_pull requires a mapping with a created remote doc/page"
 
     if mapping.sectioned:
-        return _preview_pull_sectioned(mapping, backend, state, state_dir)
+        return _preview_pull_sectioned(mapping, backend, state, state_dir, mappings)
 
     try:
         remote_version = backend.get_remote_version(mapping.remote_id)
@@ -583,7 +589,9 @@ def preview_pull(mapping: "Mapping", backend: Backend, state: SyncState, state_d
     # action == "merge" — run the real three-way merge to count conflicts,
     # but discard the result instead of writing it anywhere.
     assert entry is not None
-    return _preview_pull_merge(mapping, backend, state_dir, local_content, entry.base_hash)
+    return _preview_pull_merge(
+        mapping, backend, state_dir, local_content, entry.base_hash, mappings
+    )
 
 
 def _classify_preview_sections(
@@ -640,6 +648,7 @@ def _classify_preview_sections(
 
 def _preview_pull_sectioned(
     mapping: "Mapping", backend: Backend, state: SyncState, state_dir: str,
+    mappings: Optional[list] = None,
 ) -> PullPreview:
     """`preview_pull`'s sectioned-mapping branch.
 
@@ -664,6 +673,7 @@ def _preview_pull_sectioned(
         pull_result = backend.pull_sectioned(
             mapping.remote_id, tmp_dir, split_level=mapping.split_level,
             tab_id=mapping.tab_id, canonical_dir=canonical_dir,
+            **_pull_link_kwargs(mapping, mappings),
         )
         if pull_result.status not in ("ok", "warning"):
             return PullPreview(local_path=mapping.local, action="error", message=pull_result.message)
@@ -683,6 +693,7 @@ def _preview_pull_sectioned(
 
 def _preview_pull_merge(
     mapping: "Mapping", backend: Backend, state_dir: str, local_content: str, base_hash: str,
+    mappings: Optional[list] = None,
 ) -> PullPreview:
     """`preview_pull`'s both-sides-changed branch: real merge, discarded result."""
     assert mapping.remote_id is not None
@@ -691,6 +702,7 @@ def _preview_pull_merge(
     try:
         tmp_result = backend.pull(
             mapping.remote_id, tmp_path, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+            **_pull_link_kwargs(mapping, mappings),
         )
         if tmp_result.status not in ("ok", "warning"):
             return PullPreview(local_path=mapping.local, action="error", message=tmp_result.message)
