@@ -897,8 +897,9 @@ class TestMap:
              patch("docspan.cli.main._get_backend", return_value=FakeBackend()) as get_backend:
             result = self._invoke_new_tab(new_local, parent_local, cfg)
         assert result.exit_code == 1
-        assert "50" in result.output
-        assert "--title" in result.output
+        assert "50" in _unwrapped(result.output)
+        assert "--title" in _unwrapped(result.output)
+        assert "Shorten" not in _unwrapped(result.output)
         get_backend.assert_not_called()
 
     def test_new_tab_in_accepts_title_of_exactly_50_chars(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -918,8 +919,9 @@ class TestMap:
                 new_local, parent_local, cfg, extra_args=["--title", "C" * 51]
             )
         assert result.exit_code == 1
-        assert "50" in result.output
-        assert "Shorten" in result.output
+        assert "50" in _unwrapped(result.output)
+        assert "Shorten" in _unwrapped(result.output)
+        assert "Use --title" not in _unwrapped(result.output)
         get_backend.assert_not_called()
 
     def test_default_title_falls_back_to_basename_when_file_is_not_utf8(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
