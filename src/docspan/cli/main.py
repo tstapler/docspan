@@ -227,6 +227,82 @@ def _resolve_with_mtime(
 # push command
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _needs_creation(mapping: Mapping) -> bool:
+    return mapping.remote_id is None and (mapping.create or mapping.tab_in is not None)
+
+
+def _create_declared_mappings(
+    selected: list[Mapping],
+    config: MarkgateConfig,
+    config_path: str,
+    loaded_mtime: Optional[float],
+    dry_run: bool,
+) -> tuple[set[str], Optional[float]]:
+    """Create the remote doc/tab for every `create`/`tab_in` mapping lacking a remote_id (parents first)."""
+    by_local = {m.local: m for m in config.mappings}
+    wanted: dict[str, Mapping] = {}
+    for m in selected:
+        node: Optional[Mapping] = m
+        while node is not None and _needs_creation(node) and node.local not in wanted:
+            wanted[node.local] = node
+            node = by_local.get(node.tab_in) if node.tab_in else None
+
+    # Parents first: depth along the tab_in chain (cycles are rejected at load).
+    def depth(m: Mapping) -> int:
+        return 0 if m.tab_in is None else 1 + depth(by_local[m.tab_in])
+
+    failed: set[str] = set()
+    ordered = sorted(wanted.values(), key=depth)
+    for i, m in enumerate(ordered):
+        title = m.title or _default_title(m.local)
+        parent = by_local[m.tab_in] if m.tab_in else None
+        if dry_run:
+            where = f"tab in {parent.local}'s doc" if parent else f"{m.backend} doc"
+            console.print(f"[yellow]dry-run[/yellow]  would create {where} → {m.local}  {title!r}")
+            continue
+        if parent is not None and parent.local in failed:
+            err_console.print(f"'{m.local}': parent '{parent.local}' failed to create; skipping.")
+            failed.add(m.local)
+            continue
+        if parent is not None and parent.remote_id is None:
+            err_console.print(
+                f"'{m.local}': parent '{parent.local}' has no remote_id; set `create: true` on it. Skipping."
+            )
+            failed.add(m.local)
+            continue
+        backend = _get_backend(m.backend, config, config_path)
+        try:
+            if parent is not None:
+                created = backend.create_tab(parent.remote_id, title)  # type: ignore[arg-type]
+                m.tab_id = created.tab_id
+            else:
+                created = backend.create(title)
+                m.tab_id = created.first_tab_id
+        except Exception as exc:
+            err_console.print(f"Could not create '{m.local}': {exc}")
+            failed.add(m.local)
+            continue
+        m.remote_id = created.doc_id
+        try:
+            save_config(config, config_path, expected_mtime=loaded_mtime)
+        except Exception as exc:
+            err_console.print(
+                f"{exc}\n\n"
+                f"⚠ A new {m.backend} doc/tab was created but NOT recorded in markgate.yaml:\n"
+                f"  local: {m.local}\n  remote_id: {created.doc_id}\n"
+                f"  tab_id: {m.tab_id or '(none)'}\n  url: {created.url or '(none)'}\n"
+                "Add it manually (or resolve the conflict and re-run)."
+            )
+            # Stop: the config mtime is stale, so further creations couldn't be recorded either.
+            # m.remote_id stays set in memory, but m is in `failed` so callers never push it.
+            failed.add(m.local)
+            failed.update(r.local for r in ordered[i + 1:])
+            break
+        loaded_mtime = config_mtime(config_path)
+        console.print(f"[green]✓[/green]  Created {m.backend} {'tab' if parent else 'doc'} → {m.local}")
+    return failed, loaded_mtime
+
+
 @app.command()
 def push(
     files: Optional[list[str]] = typer.Argument(
@@ -289,10 +365,20 @@ def push(
     # to the same target would fetch that target N times, once per pushing
     # backend instance, instead of once for the whole run.
     cross_doc_cache: dict = {}
+    creating = [m for m in mappings_to_push if m.direction != "pull"]
+    creation_failed, loaded_mtime = _create_declared_mappings(
+        creating, config, config_path, loaded_mtime, dry_run
+    )
+    if creation_failed:
+        had_error = True
     for mapping in mappings_to_push:
         if mapping.direction == "pull":
             console.print(f"[dim]Skipping {mapping.local} (pull-only)[/dim]")
             continue
+        if mapping.local in creation_failed:
+            continue
+        if dry_run and _needs_creation(mapping):
+            continue  # plan already printed by the creation pre-pass
 
         # Story 1.2.3/1.2.4: the CLI is NOT the enforcement point — it never
         # calls preview_push() to decide whether to skip a real push. Its
@@ -700,6 +786,11 @@ def pull(
             assert migration_result.new_mapping is not None
             mapping = migration_result.new_mapping
 
+        if mapping.remote_id is None and not dry_run:
+            console.print(
+                f"[dim]Skipping {mapping.local} (no remote doc yet; run `docspan push` to create it)[/dim]"
+            )
+            continue
         backend = _get_backend(mapping.backend, config, config_path)
 
         if dry_run:
@@ -836,7 +927,18 @@ def sync(
 
     had_error = False
     cross_doc_cache: dict = {}
+    creation_failed, loaded_mtime = _create_declared_mappings(
+        [m for m in mappings_to_sync if m.direction != "pull"], config, config_path, loaded_mtime, False
+    )
     for mapping in mappings_to_sync:
+        if mapping.local in creation_failed:
+            had_error = True
+            continue
+        if mapping.remote_id is None:
+            console.print(
+                f"[dim]Skipping {mapping.local} (no remote doc yet; set `create: true` to create it)[/dim]"
+            )
+            continue
         backend = _get_backend(mapping.backend, config, config_path)
 
         if mapping.direction != "push":
@@ -1071,6 +1173,84 @@ def map_(
         console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
         if result.message:
             console.print(f"   [dim]{escape(result.message)}[/dim]")
+
+
+@app.command("map-dir")
+def map_dir(
+    directory: str = typer.Argument(..., help="Directory of markdown files to map as tabs of one new doc"),
+    backend: str = typer.Option("google_docs", "--backend", "-b", help="Backend (tabs require google_docs)"),
+    title: Optional[str] = typer.Option(
+        None, "--title", help="Title for the new doc (default: README's first H1, else its basename)"
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
+) -> None:
+    """Map every *.md in DIRECTORY as tabs of one new Google Doc (README first, then A-Z).
+
+    Writes declarative mappings (create + tab_in) to markgate.yaml, then runs
+    the same creation and push as `docspan push`, so an interrupted run can be
+    resumed with `docspan push`.
+    """
+    if backend != "google_docs":
+        err_console.print("map-dir requires --backend google_docs (tabs are Google Docs only)")
+        raise typer.Exit(1)
+    if not os.path.isdir(directory):
+        err_console.print(f"'{directory}' is not a directory")
+        raise typer.Exit(1)
+    names = sorted(
+        (
+            n for n in os.listdir(directory)
+            if n.lower().endswith(".md")
+            and os.path.isfile(os.path.join(directory, n))
+            and not os.path.islink(os.path.join(directory, n))
+        ),
+        key=lambda n: (n.lower() != "readme.md", n.lower()),
+    )
+    if not names:
+        err_console.print(f"No *.md files found in '{directory}'")
+        raise typer.Exit(1)
+
+    config, config_path, prefix, loaded_mtime = _resolve_with_mtime(config_path, prefix)
+    paths = [os.path.join(directory, n) for n in names]
+    already = [p for p in paths if resolve_mapping_for_path(config.mappings, p) is not None]
+    if already:
+        err_console.print(f"Already mapped in markgate.yaml: {', '.join(already)}")
+        raise typer.Exit(1)
+
+    first = paths[0]
+    new_mappings = [Mapping(local=first, backend=backend, create=True, title=title)]
+    new_mappings += [
+        Mapping(local=p, backend=backend, create=True, tab_in=first) for p in paths[1:]
+    ]
+    config.mappings.extend(new_mappings)
+    try:
+        save_config(config, config_path, expected_mtime=loaded_mtime)
+    except ConfigConflictError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(1)
+    loaded_mtime = config_mtime(config_path)
+
+    failed, loaded_mtime = _create_declared_mappings(new_mappings, config, config_path, loaded_mtime, False)
+    state_path = get_state_path(config_path, prefix)
+    state_dir = get_state_dir(config_path, prefix)
+    state = _load_state(state_path)
+    had_error = bool(failed)
+    for mapping in new_mappings:
+        if mapping.local in failed:
+            continue
+        backend_instance = _get_backend(backend, config, config_path)
+        outcome = orchestrate_push(
+            mapping, backend_instance, state, state_dir, state_path, mappings=config.mappings,
+        )
+        result = outcome.result
+        icon, style = _status_display(result.status)
+        console.print(f"[{style}]{icon}[/{style}]  {mapping.local} → {result.url or mapping.remote_id}")
+        if result.message:
+            console.print(f"   [dim]{escape(result.message)}[/dim]")
+        if result.status in ("error", "blocked", "conflict", "warning"):
+            had_error = True
+    if had_error:
+        raise typer.Exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

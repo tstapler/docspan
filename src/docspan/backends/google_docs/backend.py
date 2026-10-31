@@ -9,7 +9,7 @@ import pathlib
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
 from googleapiclient.errors import HttpError
 
@@ -505,7 +505,20 @@ class GoogleDocsBackend(Backend):
             mappings, self._fetch_target_headings, cache=cross_doc_cache
         )
 
-    def _execute_push(
+    def _execute_push(self, local_path: str, doc_id: str, **kwargs: Any) -> PushResult:
+        """Run `_execute_push_once`, retrying once on a requiredRevisionId conflict.
+
+        An earlier write to the same Doc (e.g. another tab pushed in this run) can
+        advance its revision after this push's plan was built; the retry rebuilds
+        the plan from a fresh `get_document`. A second conflict is genuinely external.
+        """
+        result = self._execute_push_once(local_path, doc_id, **kwargs)
+        if result.status == "conflict":
+            logger.debug("requiredRevisionId conflict for %s; retrying once", doc_id)
+            result = self._execute_push_once(local_path, doc_id, **kwargs)
+        return result
+
+    def _execute_push_once(
         self,
         local_path: str,
         doc_id: str,
@@ -602,12 +615,12 @@ class GoogleDocsBackend(Backend):
             # original document, and is just as unsafe to drop silently.
             pass2_residue: list = []
             if needs_pass2:
-                # When pass 1 wrote nothing the already-fetched plan.doc is
+                # When pass 1 wrote nothing (content or style) the already-fetched plan.doc is
                 # still current, so pass 2 runs against it and skips a
                 # redundant GET; otherwise the document has moved and must be
                 # re-read. plan.doc is already narrowed to the resolved tab,
                 # which is why PushPlan carries resolved_tab_id.
-                if plan.requests:
+                if first_pass_requests:
                     whole_doc = self._client.get_document(doc_id)
                     pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
                 else:
@@ -843,7 +856,11 @@ class GoogleDocsBackend(Backend):
                 return PushResult(
                     status="conflict",
                     doc_id=doc_id,
-                    message="The doc changed since your last pull — run `docspan pull` again",
+                    message=(
+                        "The doc's revision changed during the push (an external edit, or "
+                        "another push to the same doc) and a retry did not resolve it — "
+                        "re-run the push, or `docspan pull` if the doc was edited elsewhere"
+                    ),
                     retryable_temp_drive_file_ids=retryable,
                 )
             return PushResult(
@@ -1915,10 +1932,17 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         doc = self._client.create_document(title)
         doc_id = doc["documentId"]
+        # documents.create doesn't return tabs; look up the real first-tab id.
+        try:
+            _, first_tab_id, _ = resolve_document_tab(self._client.get_document(doc_id), None)
+        except Exception as exc:
+            logger.warning("Created doc %s but could not resolve its first tab id: %s", doc_id, exc)
+            first_tab_id = None
         return CreateResult(
             doc_id=doc_id,
             title=doc.get("title", title),
             url=f"https://docs.google.com/document/d/{doc_id}/edit",
+            first_tab_id=first_tab_id,
         )
 
     def create_tab(self, doc_id: str, title: str, **kwargs: object) -> CreateResult:
