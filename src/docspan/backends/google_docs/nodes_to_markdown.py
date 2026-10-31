@@ -109,19 +109,41 @@ def _fence_delimiter(lang: Optional[str], code_lines: List[str]) -> str:
     return "`" * max(3, max_run + 1)
 
 
+def _render_span_marks(span: TextSpan) -> str:
+    """A span's text with monospace/bold/italic applied, without any link wrapper."""
+    text = span.text
+    if span.monospace:
+        text = _wrap_inline_code(text)
+    if span.bold:
+        text = f"**{text}**"
+    if span.italic:
+        text = f"*{text}*"
+    return text
+
+
 def _render_spans(spans: List[TextSpan]) -> str:
-    parts = []
+    """Render spans to markdown, merging adjacent spans sharing a URL into one link.
+
+    Google Docs stores a link per text run, so `[Foo `bar` baz](url)` comes back as
+    three runs with the same URL; they must be re-joined into a single link.
+    """
+    parts: List[str] = []
+    group: List[str] = []
+    group_link: Optional[str] = None
+
+    def flush() -> None:
+        if group_link:
+            parts.append(f"[{''.join(group)}]({group_link})")
+        else:
+            parts.extend(group)
+        group.clear()
+
     for span in spans:
-        text = span.text
-        if span.monospace:
-            text = _wrap_inline_code(text)
-        if span.bold:
-            text = f"**{text}**"
-        if span.italic:
-            text = f"*{text}*"
-        if span.link:
-            text = f"[{text}]({span.link})"
-        parts.append(text)
+        if span.link != group_link:
+            flush()
+            group_link = span.link or None
+        group.append(_render_span_marks(span))
+    flush()
     return "".join(parts)
 
 

@@ -597,8 +597,9 @@ class GoogleDocsBackend(Backend):
                 for n in plan.target_nodes
             )
             second: list[dict] = []
+            filled = False
             unstyled: list[DocsParagraphNode] = []
-            unplaced_cells: list[str] = []
+            unplaced_cells: list = []
             dead_anchors: list[str] = []
             cross_doc_issues: list[str] = []
             unmapped_links: list[str] = []
@@ -639,6 +640,23 @@ class GoogleDocsBackend(Backend):
                     pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
                 )
                 pass2_residue = alignment.residue
+                # A table this push created is still empty in pass2_doc, so its
+                # cells' styling cannot be placed. Apply the fills alone, re-read,
+                # and let everything below run against the populated document.
+                fills = builder.build_table_fill_batch(
+                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
+                )
+                if fills:
+                    self._client.batch_update(
+                        doc_id, fills, required_revision_id=pass2_doc["revisionId"]
+                    )
+                    filled = True
+                    whole_doc = self._client.get_document(doc_id)
+                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
+                    alignment = builder.align(
+                        pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
+                    )
+                    pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
                     pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment,
                     resolver=resolver, local_path=local_path,
@@ -709,7 +727,7 @@ class GoogleDocsBackend(Backend):
                 # cells are still empty when the ranges are computed), when a
                 # concurrent edit changed a cell, or when the cell holds an inline
                 # object whose index width the text search cannot see.
-                unplaced_cells = builder.unplaced_table_cells(
+                unplaced_cells = builder.unplaced_table_cell_details(
                     pass2_doc, plan.target_nodes, alignment
                 )
                 if second:
@@ -720,7 +738,7 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if (not plan.requests and not style_requests and not second and not unstyled
+            if (not plan.requests and not style_requests and not second and not filled and not unstyled
                     and not dead_anchors and not unplaced_cells and not cross_doc_issues
                     and not unmapped_links):
                 # Nothing was applied by either pass. That is now a true
@@ -775,7 +793,7 @@ class GoogleDocsBackend(Backend):
                     # blame docspan for a comment a human resolved mid-run, and pay
                     # an extra list_comments call to do it.
                     self._comment_backstop_message(doc_id, len(plan.comments))
-                    if (plan.requests or second)
+                    if (plan.requests or second or filled)
                     else None,
                     self._render_unstyled(unstyled) if unstyled else None,
                     self._render_unplaced_cells(unplaced_cells) if unplaced_cells else None,
@@ -1282,7 +1300,7 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_unplaced_cells(cells: list[str]) -> str:
+    def _render_unplaced_cells(cells: list) -> str:
         """Styled table cells whose styling was not written.
 
         Distinct from _render_unstyled, which is about paragraphs.
@@ -1296,7 +1314,13 @@ class GoogleDocsBackend(Backend):
         Non-convergence is the same known open decision `unresolved_anchor_links`
         documents; misdescribing the remedy is not, so that part is fixed here.
         """
-        preview = [(text[:40] or "(empty)") for text in cells[:5]]
+        def describe(cell) -> str:
+            if isinstance(cell, str):
+                return cell[:40] or "(empty)"
+            label = cell.text[:40] or "(empty)"
+            return f"row {cell.row + 1}, col {cell.col + 1}: {label} ({cell.reason})"
+
+        preview = [describe(cell) for cell in cells[:5]]
         more = len(cells) - len(preview)
         listed = "; ".join(preview) + (f"; +{more} more" if more > 0 else "")
         return (
