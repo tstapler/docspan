@@ -238,13 +238,7 @@ def _create_declared_mappings(
     loaded_mtime: Optional[float],
     dry_run: bool,
 ) -> tuple[set[str], Optional[float]]:
-    """Create the remote doc/tab for every `create`/`tab_in` mapping lacking a remote_id.
-
-    Parents (`tab_in` targets) are created before their tabs, whatever the YAML
-    order. Each creation is written back to the config immediately, so an
-    interrupted run resumes where it stopped. Returns the `local` paths that
-    could not be created and the refreshed config mtime.
-    """
+    """Create the remote doc/tab for every `create`/`tab_in` mapping lacking a remote_id (parents first)."""
     by_local = {m.local: m for m in config.mappings}
     wanted: dict[str, Mapping] = {}
     for m in selected:
@@ -258,15 +252,22 @@ def _create_declared_mappings(
         return 0 if m.tab_in is None else 1 + depth(by_local[m.tab_in])
 
     failed: set[str] = set()
-    for m in sorted(wanted.values(), key=depth):
+    ordered = sorted(wanted.values(), key=depth)
+    for i, m in enumerate(ordered):
         title = m.title or _default_title(m.local)
         parent = by_local[m.tab_in] if m.tab_in else None
         if dry_run:
             where = f"tab in {parent.local}'s doc" if parent else f"{m.backend} doc"
             console.print(f"[yellow]dry-run[/yellow]  would create {where} → {m.local}  {title!r}")
             continue
-        if parent is not None and (parent.remote_id is None or parent.local in failed):
-            err_console.print(f"'{m.local}': parent '{parent.local}' has no remote_id; skipping.")
+        if parent is not None and parent.local in failed:
+            err_console.print(f"'{m.local}': parent '{parent.local}' failed to create; skipping.")
+            failed.add(m.local)
+            continue
+        if parent is not None and parent.remote_id is None:
+            err_console.print(
+                f"'{m.local}': parent '{parent.local}' has no remote_id; set `create: true` on it. Skipping."
+            )
             failed.add(m.local)
             continue
         backend = _get_backend(m.backend, config, config_path)
@@ -284,7 +285,7 @@ def _create_declared_mappings(
         m.remote_id = created.doc_id
         try:
             save_config(config, config_path, expected_mtime=loaded_mtime)
-        except ConfigConflictError as exc:
+        except Exception as exc:
             err_console.print(
                 f"{exc}\n\n"
                 f"⚠ A new {m.backend} doc/tab was created but NOT recorded in markgate.yaml:\n"
@@ -292,8 +293,11 @@ def _create_declared_mappings(
                 f"  tab_id: {m.tab_id or '(none)'}\n  url: {created.url or '(none)'}\n"
                 "Add it manually (or resolve the conflict and re-run)."
             )
+            # Stop: the config mtime is stale, so further creations couldn't be recorded either.
+            # m.remote_id stays set in memory, but m is in `failed` so callers never push it.
             failed.add(m.local)
-            continue
+            failed.update(r.local for r in ordered[i + 1:])
+            break
         loaded_mtime = config_mtime(config_path)
         console.print(f"[green]✓[/green]  Created {m.backend} {'tab' if parent else 'doc'} → {m.local}")
     return failed, loaded_mtime
@@ -781,6 +785,11 @@ def pull(
             assert migration_result.new_mapping is not None
             mapping = migration_result.new_mapping
 
+        if mapping.remote_id is None and not dry_run:
+            console.print(
+                f"[dim]Skipping {mapping.local} (no remote doc yet; run `docspan push` to create it)[/dim]"
+            )
+            continue
         backend = _get_backend(mapping.backend, config, config_path)
 
         if dry_run:
@@ -917,7 +926,18 @@ def sync(
 
     had_error = False
     cross_doc_cache: dict = {}
+    creation_failed, loaded_mtime = _create_declared_mappings(
+        [m for m in mappings_to_sync if m.direction != "pull"], config, config_path, loaded_mtime, False
+    )
     for mapping in mappings_to_sync:
+        if mapping.local in creation_failed:
+            had_error = True
+            continue
+        if mapping.remote_id is None:
+            console.print(
+                f"[dim]Skipping {mapping.local} (no remote doc yet; set `create: true` to create it)[/dim]"
+            )
+            continue
         backend = _get_backend(mapping.backend, config, config_path)
 
         if mapping.direction != "push":
@@ -1177,7 +1197,12 @@ def map_dir(
         err_console.print(f"'{directory}' is not a directory")
         raise typer.Exit(1)
     names = sorted(
-        (n for n in os.listdir(directory) if n.lower().endswith(".md")),
+        (
+            n for n in os.listdir(directory)
+            if n.lower().endswith(".md")
+            and os.path.isfile(os.path.join(directory, n))
+            and not os.path.islink(os.path.join(directory, n))
+        ),
         key=lambda n: (n.lower() != "readme.md", n.lower()),
     )
     if not names:

@@ -476,3 +476,12 @@ def test_tab_in_cycle_names_all_members() -> None:
         ])
     msg = str(exc.value)
     assert all(name in msg for name in ("a.md", "b.md", "c.md"))
+
+
+def test_tab_in_target_on_non_google_docs_backend_rejected() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must use backend google_docs"):
+        MarkgateConfig(mappings=[
+            Mapping(local="a.md", backend="confluence"), _gd("b.md", tab_in="a.md"),
+        ])

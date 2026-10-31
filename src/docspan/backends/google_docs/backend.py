@@ -1910,7 +1910,11 @@ class GoogleDocsBackend(Backend):
         doc = self._client.create_document(title)
         doc_id = doc["documentId"]
         # documents.create doesn't return tabs; look up the real first-tab id.
-        _, first_tab_id, _ = resolve_document_tab(self._client.get_document(doc_id), None)
+        try:
+            _, first_tab_id, _ = resolve_document_tab(self._client.get_document(doc_id), None)
+        except Exception as exc:
+            logger.warning("Created doc %s but could not resolve its first tab id: %s", doc_id, exc)
+            first_tab_id = None
         return CreateResult(
             doc_id=doc_id,
             title=doc.get("title", title),

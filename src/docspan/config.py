@@ -231,12 +231,20 @@ class MarkgateConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_tab_in(self) -> "MarkgateConfig":
-        locals_ = {m.local for m in self.mappings}
+        by_local = {m.local: m for m in self.mappings}
         for m in self.mappings:
-            if m.tab_in is not None and m.tab_in not in locals_:
+            if m.tab_in is None:
+                continue
+            target = by_local.get(m.tab_in)
+            if target is None:
                 raise ValueError(
                     f"mapping {m.local!r}: tab_in {m.tab_in!r} does not match the "
                     "`local` of any mapping in this config"
+                )
+            if target.backend != "google_docs":
+                raise ValueError(
+                    f"mapping {m.local!r}: tab_in target {m.tab_in!r} must use backend "
+                    f"google_docs, not {target.backend!r}"
                 )
         cycle = find_tab_in_cycle(self.mappings)
         if cycle:
