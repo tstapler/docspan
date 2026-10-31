@@ -1012,7 +1012,7 @@ def map_(
 
     doc_title = title or _default_title(file)
     if new_tab_in is not None and len(doc_title) > _TAB_TITLE_MAX_LEN:
-        if title is not None:
+        if title:
             err_console.print(
                 f"Tab title is {len(doc_title)} characters; Google Docs limits tab titles to "
                 f"{_TAB_TITLE_MAX_LEN}. Shorten the value passed to --title."
