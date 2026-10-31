@@ -1830,7 +1830,8 @@ class DocsRequestBuilder:
 
         Runs against the re-fetched document, like the paragraph path, because a
         cell's real indices only exist once pass 1 has written it and heading ids
-        only exist once the headings do.
+        only exist once the headings do. For a table the push itself creates, push()
+        applies `build_table_fill_batch` and re-reads first, so its cells are placed.
 
         Cells are located, not predicted: the target cell's text is searched for
         inside the live cell's text and the offset taken from where it is found. A
@@ -1863,7 +1864,7 @@ class DocsRequestBuilder:
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
-    ) -> List["UnplacedCell"]:
+    ) -> List[UnplacedCell]:
         """Styled cells pass 2 could not place (with coordinates and reason), so push can say so out loud.
 
         The loud half of the same trade `unaligned_span_targets` makes for
@@ -2646,8 +2647,20 @@ class DocsRequestBuilder:
 
         A table this push creates is empty in ``doc``, so its cells' styling can only
         be placed against a document re-read *after* these fills are applied.
+
+        Empty unless that re-read is worth a round trip: some fill must insert text
+        (style resets alone leave the table empty, so a re-read gains nothing) and
+        some target cell must carry styling. Anything else is filled by
+        `build_second_pass_requests` as before.
         """
         requests = self.build_table_fill_requests(doc, target, alignment)
+        styled = any(
+            cell.styled
+            for node in target if isinstance(node, DocsTableNode)
+            for row in node.rows for cell in row
+        )
+        if not styled or not any("insertText" in r for r in requests):
+            return []
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
         return requests
@@ -2680,7 +2693,7 @@ class DocsRequestBuilder:
         # Cell styling reads indices from `doc`. For a table this push creates, push()
         # applies `build_table_fill_batch` and re-reads the document first, so the
         # cells are populated here; otherwise `_cell_placement` finds nothing and
-        # `unplaced_table_cells` reports the gap.
+        # `unplaced_table_cell_details` reports the gap.
         requests += self.build_table_cell_span_requests(doc, target, alignment, resolver, local_path)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)

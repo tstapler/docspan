@@ -9,7 +9,7 @@ import pathlib
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Sequence, Tuple, Union
 
 from googleapiclient.errors import HttpError
 
@@ -95,6 +95,7 @@ from docspan.core.atomic_dir import atomic_replace_dir
 from docspan.core.paths import COMMENTS_SUFFIX, find_data_uris
 
 if TYPE_CHECKING:
+    from docspan.backends.google_docs.docs_request_builder import UnplacedCell
     from docspan.config import GoogleDocsConfig, MarkgateConfig
 
 logger = logging.getLogger(__name__)
@@ -599,7 +600,7 @@ class GoogleDocsBackend(Backend):
             second: list[dict] = []
             filled = False
             unstyled: list[DocsParagraphNode] = []
-            unplaced_cells: list = []
+            unplaced_cells: list[UnplacedCell] = []
             dead_anchors: list[str] = []
             cross_doc_issues: list[str] = []
             unmapped_links: list[str] = []
@@ -723,10 +724,10 @@ class GoogleDocsBackend(Backend):
                 # `unstyled` above and the same reason it has to be said out loud:
                 # the cell got no styling rather than styling aimed at whatever sat
                 # at that ordinal, and a silent drop is indistinguishable from
-                # success. Reachable when a table is created by this very push (its
-                # cells are still empty when the ranges are computed), when a
-                # concurrent edit changed a cell, or when the cell holds an inline
-                # object whose index width the text search cannot see.
+                # success. Reachable when a concurrent edit changed a cell, or when the
+                # cell holds an inline object whose index width the text search
+                # cannot see. (A table created by this push is filled and re-read
+                # above, so its cells are placed.)
                 unplaced_cells = builder.unplaced_table_cell_details(
                     pass2_doc, plan.target_nodes, alignment
                 )
@@ -1300,7 +1301,7 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_unplaced_cells(cells: list) -> str:
+    def _render_unplaced_cells(cells: Sequence[str | UnplacedCell]) -> str:
         """Styled table cells whose styling was not written.
 
         Distinct from _render_unstyled, which is about paragraphs.
@@ -1314,7 +1315,7 @@ class GoogleDocsBackend(Backend):
         Non-convergence is the same known open decision `unresolved_anchor_links`
         documents; misdescribing the remedy is not, so that part is fixed here.
         """
-        def describe(cell) -> str:
+        def describe(cell: str | UnplacedCell) -> str:
             if isinstance(cell, str):
                 return cell[:40] or "(empty)"
             label = cell.text[:40] or "(empty)"
@@ -1325,8 +1326,8 @@ class GoogleDocsBackend(Backend):
         listed = "; ".join(preview) + (f"; +{more} more" if more > 0 else "")
         return (
             f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
-            f"— docspan could not locate them in the written document, so it wrote no "
-            f"styling rather than styling aimed at the wrong cell: {listed}. "
+            f"— docspan wrote no styling for them rather than "
+            f"styling aimed at the wrong cell (see each cell's reason): {listed}. "
             f"If this push created the table, pushing again places the styling. "
             f"Otherwise the cell holds something docspan cannot measure around — a "
             f"smart chip, an image, or more than one paragraph — and pushing again "

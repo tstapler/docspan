@@ -25,6 +25,7 @@ folded into or dropped from this fix.
 """
 from __future__ import annotations
 
+from itertools import groupby
 from typing import List, Optional, Tuple, Union
 
 from docspan.backends.google_docs.docs_structure_parser import (
@@ -128,22 +129,9 @@ def _render_spans(spans: List[TextSpan]) -> str:
     three runs with the same URL; they must be re-joined into a single link.
     """
     parts: List[str] = []
-    group: List[str] = []
-    group_link: Optional[str] = None
-
-    def flush() -> None:
-        if group_link:
-            parts.append(f"[{''.join(group)}]({group_link})")
-        else:
-            parts.extend(group)
-        group.clear()
-
-    for span in spans:
-        if span.link != group_link:
-            flush()
-            group_link = span.link or None
-        group.append(_render_span_marks(span))
-    flush()
+    for link, run in groupby(spans, key=lambda span: span.link or None):
+        body = "".join(_render_span_marks(span) for span in run)
+        parts.append(f"[{body}]({link})" if link else body)
     return "".join(parts)
 
 
