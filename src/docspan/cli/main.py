@@ -390,7 +390,8 @@ def push(
         if dry_run:
             if hasattr(backend, "preview_push"):
                 preview = backend.preview_push(
-                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id,
+                    mappings=mappings, cross_doc_cache=cross_doc_cache,
                 )
                 # escape(): preview text carries literal "[ ]"/"[x]" checklist
                 # markers, which Rich's console markup would otherwise parse

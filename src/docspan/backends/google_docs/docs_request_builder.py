@@ -209,6 +209,20 @@ def _node_is_native_checkbox(node: Node) -> bool:
 
 
 @dataclass
+class SpanChange:
+    """A run of characters whose inline attributes differ between current and target."""
+    text: str
+    old_link: Optional[str] = None
+    new_link: Optional[str] = None
+    old_bold: bool = False
+    new_bold: bool = False
+    old_italic: bool = False
+    new_italic: bool = False
+    old_monospace: bool = False
+    new_monospace: bool = False
+
+
+@dataclass
 class DiffEntry:
     """One row of a human-oriented paragraph/table diff (see plan.md Story 1.2.1).
 
@@ -229,6 +243,9 @@ class DiffEntry:
     # push_preview.find_churn_pairs() scopes remove/add matching by this,
     # not list adjacency — adjacent entries can come from different opcodes.
     edit_group: int = -1
+    # Inline-attribute (link/bold/italic/monospace) differences on a same-text
+    # paragraph; empty for every other kind of change.
+    span_changes: List[SpanChange] = field(default_factory=list)
 
 
 class DocsRequestBuilder:
@@ -1371,6 +1388,8 @@ class DocsRequestBuilder:
         self,
         current: List[Node],
         target: List[Node],
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> Tuple[List[DiffEntry], int]:
         """
         Produce a human-oriented diff summary of current vs. target nodes.
@@ -1417,7 +1436,23 @@ class DocsRequestBuilder:
                             )
                         )
                     else:
-                        unchanged_count += 1
+                        sc = self._span_changes(current[ci], target[ti], resolver, local_path)
+                        if sc:
+                            entries.append(
+                                DiffEntry(
+                                    kind="change",
+                                    current_text=_node_text(current[ci]),
+                                    target_text=_node_text(target[ti]),
+                                    style=_node_style(target[ti]),
+                                    current_is_native_checkbox=_node_is_native_checkbox(
+                                        current[ci]
+                                    ),
+                                    edit_group=edit_group,
+                                    span_changes=sc,
+                                )
+                            )
+                        else:
+                            unchanged_count += 1
 
             elif tag == "delete":
                 for node in current[i1:i2]:
@@ -3132,6 +3167,79 @@ class DocsRequestBuilder:
             abs(current_node.width_pt - target_node.width_pt) > _IMAGE_SIZE_TOLERANCE_PT
             or abs(current_node.height_pt - target_node.height_pt) > _IMAGE_SIZE_TOLERANCE_PT
         )
+
+    @staticmethod
+    def _span_changes(
+        current_node: Node,
+        target_node: Node,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
+    ) -> List[SpanChange]:
+        """Inline additions push would write between two same-text paragraphs.
+
+        Push only ever adds bold/italic/monospace/link (pass 2 never clears
+        them), so only off->on and link-differs-where-target-has-one are
+        reported. Compares per character, so spans split differently on each
+        side still align, and a missing/default span reads the same as an
+        empty one. Target links go through the same link_payload push uses;
+        only a resolved absolute http(s) url is compared, since an anchor
+        needs heading ids that don't exist before pass 1. Table cells are not
+        inspected.
+        """
+        if not isinstance(current_node, DocsParagraphNode) or not isinstance(
+            target_node, DocsParagraphNode
+        ):
+            return []
+
+        def resolved(href: Optional[str]) -> Optional[str]:
+            if not href:
+                return None
+            payload, _detail = cross_doc_links.link_payload(href, local_path, resolver)
+            url = payload.get("url") if payload else None
+            return url if url and url.startswith(("http://", "https://")) else None
+
+        def per_char(node: DocsParagraphNode, is_target: bool) -> List[Tuple]:
+            return [
+                (resolved(sp.link) if is_target else sp.link, sp.bold, sp.italic, sp.monospace)
+                for sp in node.spans
+                for _ in sp.text
+            ]
+
+        tgt_text = "".join(sp.text for sp in target_node.spans)
+        cur, tgt = per_char(current_node, False), per_char(target_node, True)
+        default = (None, False, False, False)
+
+        def added(old: Tuple, new: Tuple) -> Tuple:
+            """The target attributes push would write over ``old`` (None/False = nothing)."""
+            link = new[0] if new[0] and new[0] != old[0] else None
+            return (link, new[1] and not old[1], new[2] and not old[2], new[3] and not old[3])
+
+        changes: List[SpanChange] = []
+        start = 0
+        n = len(tgt)
+        while start < n:
+            old = cur[start] if start < len(cur) else default
+            delta = added(old, tgt[start])
+            if delta == default:
+                start += 1
+                continue
+            end = start + 1
+            while end < n:
+                o2 = cur[end] if end < len(cur) else default
+                if o2 != old or tgt[end] != tgt[start]:
+                    break
+                end += 1
+            changes.append(
+                SpanChange(
+                    text=tgt_text[start:end],
+                    old_link=old[0], new_link=delta[0],
+                    old_bold=old[1], new_bold=delta[1],
+                    old_italic=old[2], new_italic=delta[2],
+                    old_monospace=old[3], new_monospace=delta[3],
+                )
+            )
+            start = end
+        return changes
 
     @staticmethod
     def _restyles(current_node: Node, target_node: Node) -> bool:
