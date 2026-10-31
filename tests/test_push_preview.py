@@ -800,3 +800,51 @@ def test_render_churn_note_should_UseGenericWording_When_PairHasNoStyleUpgradeRe
     assert "comment" in note.lower()
     assert "lost" in note.lower()
     assert "one-time upgrade" not in note
+
+
+def _spanned(*spans) -> DocsParagraphNode:
+    from docspan.backends.google_docs.docs_structure_parser import TextSpan
+
+    return DocsParagraphNode(
+        style="NORMAL_TEXT",
+        text="".join(s.text for s in spans),
+        start_index=1,
+        end_index=10,
+        spans=list(spans),
+    )
+
+
+def test_diff_summary_reports_link_target_only_change_and_render_shows_urls() -> None:
+    from docspan.backends.google_docs.docs_structure_parser import TextSpan
+
+    current = [_spanned(TextSpan("see "), TextSpan("docs", link="https://old.example.com"))]
+    target = [_spanned(TextSpan("see "), TextSpan("docs", link="https://new.example.com"))]
+
+    entries, unchanged = DocsRequestBuilder().diff_summary(current, target)
+
+    assert unchanged == 0
+    assert len(entries) == 1 and entries[0].span_changes
+    assert entries[0].span_changes[0].text == "docs"
+    out = PushPreview(entries=entries, unchanged_count=unchanged, high_risk=[], request_count=1).render()
+    assert "1 change(s)" in out
+    assert "https://old.example.com → https://new.example.com" in out
+
+
+def test_diff_summary_identical_spans_not_flagged() -> None:
+    from docspan.backends.google_docs.docs_structure_parser import TextSpan
+
+    node = lambda: [_spanned(TextSpan("a "), TextSpan("b", link="https://x.example.com"))]
+    entries, unchanged = DocsRequestBuilder().diff_summary(node(), node())
+    assert entries == [] and unchanged == 1
+
+
+def test_span_changes_aligns_differently_split_spans_and_reports_bold() -> None:
+    from docspan.backends.google_docs.docs_structure_parser import TextSpan
+
+    current = _spanned(TextSpan("Visit the new docs", link="https://old.example.com"))
+    target = _spanned(TextSpan("Visit the "), TextSpan("new docs", link="https://new.example.com"))
+    changes = DocsRequestBuilder._span_changes(current, target)
+    assert [c.text for c in changes] == ["Visit the ", "new docs"]
+
+    bold = DocsRequestBuilder._span_changes(_spanned(TextSpan("x")), _spanned(TextSpan("x", bold=True)))
+    assert len(bold) == 1 and bold[0].new_bold and not bold[0].old_bold

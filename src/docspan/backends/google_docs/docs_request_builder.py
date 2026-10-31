@@ -209,6 +209,20 @@ def _node_is_native_checkbox(node: Node) -> bool:
 
 
 @dataclass
+class SpanChange:
+    """A run of characters whose inline attributes differ between current and target."""
+    text: str
+    old_link: Optional[str] = None
+    new_link: Optional[str] = None
+    old_bold: bool = False
+    new_bold: bool = False
+    old_italic: bool = False
+    new_italic: bool = False
+    old_monospace: bool = False
+    new_monospace: bool = False
+
+
+@dataclass
 class DiffEntry:
     """One row of a human-oriented paragraph/table diff (see plan.md Story 1.2.1).
 
@@ -229,6 +243,9 @@ class DiffEntry:
     # push_preview.find_churn_pairs() scopes remove/add matching by this,
     # not list adjacency — adjacent entries can come from different opcodes.
     edit_group: int = -1
+    # Inline-attribute (link/bold/italic/monospace) differences on a same-text
+    # paragraph; empty for every other kind of change.
+    span_changes: List[SpanChange] = field(default_factory=list)
 
 
 class DocsRequestBuilder:
@@ -1417,7 +1434,23 @@ class DocsRequestBuilder:
                             )
                         )
                     else:
-                        unchanged_count += 1
+                        sc = self._span_changes(current[ci], target[ti])
+                        if sc:
+                            entries.append(
+                                DiffEntry(
+                                    kind="change",
+                                    current_text=_node_text(current[ci]),
+                                    target_text=_node_text(target[ti]),
+                                    style=_node_style(target[ti]),
+                                    current_is_native_checkbox=_node_is_native_checkbox(
+                                        current[ci]
+                                    ),
+                                    edit_group=edit_group,
+                                    span_changes=sc,
+                                )
+                            )
+                        else:
+                            unchanged_count += 1
 
             elif tag == "delete":
                 for node in current[i1:i2]:
@@ -3132,6 +3165,58 @@ class DocsRequestBuilder:
             abs(current_node.width_pt - target_node.width_pt) > _IMAGE_SIZE_TOLERANCE_PT
             or abs(current_node.height_pt - target_node.height_pt) > _IMAGE_SIZE_TOLERANCE_PT
         )
+
+    @staticmethod
+    def _span_changes(current_node: Node, target_node: Node) -> List[SpanChange]:
+        """Inline-attribute differences between two same-text paragraphs.
+
+        Compares per character, so spans split differently on each side still
+        align. Known gap: table cells are not inspected.
+        """
+        if not isinstance(current_node, DocsParagraphNode) or not isinstance(
+            target_node, DocsParagraphNode
+        ):
+            return []
+
+        def per_char(node: DocsParagraphNode) -> List[Tuple]:
+            return [
+                (sp.link, sp.bold, sp.italic, sp.monospace)
+                for sp in node.spans
+                for _ in sp.text
+            ]
+
+        def text_of(node: DocsParagraphNode) -> str:
+            return "".join(sp.text for sp in node.spans)
+
+        cur, tgt = per_char(current_node), per_char(target_node)
+        tgt_text = text_of(target_node)
+        default = (None, False, False, False)
+        changes: List[SpanChange] = []
+        start = 0
+        n = len(tgt)
+        while start < n:
+            old = cur[start] if start < len(cur) else default
+            new = tgt[start]
+            if old == new:
+                start += 1
+                continue
+            end = start + 1
+            while end < n:
+                o2 = cur[end] if end < len(cur) else default
+                if o2 != old or tgt[end] != new:
+                    break
+                end += 1
+            changes.append(
+                SpanChange(
+                    text=tgt_text[start:end],
+                    old_link=old[0], new_link=new[0],
+                    old_bold=old[1], new_bold=new[1],
+                    old_italic=old[2], new_italic=new[2],
+                    old_monospace=old[3], new_monospace=new[3],
+                )
+            )
+            start = end
+        return changes
 
     @staticmethod
     def _restyles(current_node: Node, target_node: Node) -> bool:
