@@ -50,6 +50,9 @@ class CreateResult:
     url: Optional[str] = None
     # Set only by create_tab(): the id of the newly created tab within doc_id.
     tab_id: Optional[str] = None
+    # Set only by create() on tab-capable backends: the id of the new doc's
+    # first (default) tab, so callers can record it without a second lookup.
+    first_tab_id: Optional[str] = None
 
 
 class Backend(ABC):
