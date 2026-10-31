@@ -342,28 +342,49 @@ class ReverseDocLinkResolver:
                 "pull link reversal: heading %r not found in %r — linking to the file without a fragment",
                 parsed.heading_id, target.local,
             )
-            return path, None
+            warning = (
+                f"{url!r}: could not read target headings — linked {path} without a fragment"
+                if headings is None
+                else None
+            )
+            return path, warning
         return f"{path}#{slug}", None
 
 
 _DOC_URL_IN_LINK_RE = re.compile(r'\]\((https://docs\.google\.com/document/d/[^)"\s]+)\)')
+_CODE_SPAN_RE = re.compile(r"^(`{3,}|~{3,}).*?^\1[ \t]*$|(`+).+?\2", re.S | re.M)
+_IMAGE_OPENER_RE = re.compile(r"!\[[^\]\n]*$")
+
+
+def _link_destination(path: str) -> str:
+    """Spaces/parens would end the destination early; CommonMark's `<...>` form allows them."""
+    return f"<{path}>" if re.search(r"[\s()]", path) else path
 
 
 def reverse_cross_doc_links(
     markdown: str, resolver: ReverseDocLinkResolver
 ) -> "tuple[str, List[str]]":
-    """Rewrite Doc edit URLs in `](url)` positions back to repo-relative paths.
+    """Rewrite Doc edit URLs in `](url)` link positions back to repo-relative paths.
 
-    Returns `(markdown, warnings)`. Pure string transform; only link
-    destinations are touched, so prose and code fences are left alone.
+    Returns `(markdown, warnings)`. Pure string transform; code fences, code
+    spans and image destinations are left alone.
     """
     warnings: List[str] = []
+    protected = [m.span() for m in _CODE_SPAN_RE.finditer(markdown)]
 
     def replace(match: "re.Match[str]") -> str:
+        start = match.start()
+        if any(lo <= start < hi for lo, hi in protected):
+            return match.group(0)
+        line_start = markdown.rfind("\n", 0, start) + 1
+        if _IMAGE_OPENER_RE.search(markdown[line_start:start]):
+            return match.group(0)
         replacement, warning = resolver.reverse(match.group(1))
         if warning:
             warnings.append(warning)
-        return match.group(0) if replacement == match.group(1) else f"]({replacement})"
+        if replacement == match.group(1):
+            return match.group(0)
+        return f"]({_link_destination(replacement)})"
 
     return _DOC_URL_IN_LINK_RE.sub(replace, markdown), warnings
 

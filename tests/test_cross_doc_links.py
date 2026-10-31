@@ -442,7 +442,8 @@ class TestReverseDocLinkResolver:
             [make_mapping("docs/target.md", remote_id="TARGETID")],
             fetch=fetch_headings_factory({}),
         )
-        assert r.reverse(BASE + "#heading=h.abc123") == ("target.md", None)
+        replacement, warning = r.reverse(BASE + "#heading=h.abc123")
+        assert replacement == "target.md" and warning and "could not read target headings" in warning
 
 
 class TestReverseCrossDocLinks:
@@ -463,3 +464,51 @@ class TestReverseCrossDocLinks:
         )
         out, warnings = reverse_cross_doc_links(f"[a]({BASE})", r)
         assert out == f"[a]({BASE})" and len(warnings) == 1
+
+
+class TestReverseCrossDocLinksMarkdownContexts:
+    @staticmethod
+    def _run(md: str, local: str = "docs/my doc/README.md"):
+        from docspan.backends.google_docs.cross_doc_links import (
+            ReverseDocLinkResolver,
+            reverse_cross_doc_links,
+        )
+        from docspan.config import Mapping
+
+        resolver = ReverseDocLinkResolver(
+            [Mapping(local=local, backend="google_docs", remote_id="AAA")],
+            lambda *_: [], "docs/x.md",
+        )
+        return reverse_cross_doc_links(md, resolver)[0]
+
+    URL = "https://docs.google.com/document/d/AAA/edit"
+
+    def test_fenced_and_inline_code_untouched(self) -> None:
+        md = f"```\n[a]({self.URL})\n```\n\n`[a]({self.URL})`\n"
+        assert self._run(md) == md
+
+    def test_image_destination_untouched(self) -> None:
+        md = f"![i]({self.URL})"
+        assert self._run(md) == md
+
+    def test_path_with_space_uses_angle_brackets(self) -> None:
+        assert self._run(f"[a]({self.URL})") == "[a](<my doc/README.md>)"
+
+    def test_path_with_parens_uses_angle_brackets(self) -> None:
+        assert self._run(f"[a]({self.URL})", local="docs/b(1).md") == "[a](<b(1).md>)"
+
+    def test_heading_fetch_failure_warns_instead_of_silently_dropping_fragment(self) -> None:
+        from docspan.backends.google_docs.cross_doc_links import (
+            ReverseDocLinkResolver,
+            reverse_cross_doc_links,
+        )
+        from docspan.config import Mapping
+
+        def boom(*_):
+            raise RuntimeError("403")
+
+        resolver = ReverseDocLinkResolver(
+            [Mapping(local="docs/o.md", backend="google_docs", remote_id="AAA")], boom, "docs/x.md"
+        )
+        out, warnings = reverse_cross_doc_links(f"[a]({self.URL}#heading=h.abc)", resolver)
+        assert out == "[a](o.md)" and len(warnings) == 1

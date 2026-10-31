@@ -1717,7 +1717,9 @@ class GoogleDocsBackend(Backend):
                         content, section_warnings = cross_doc_links.reverse_cross_doc_links(
                             content, link_reverser
                         )
-                        reverse_warnings.extend(section_warnings)
+                        reverse_warnings.extend(
+                            w for w in section_warnings if w not in reverse_warnings
+                        )
                     section_data_uris.extend(find_data_uris(content))
                     (tmp_dir / filename).write_text(content)
                     section_texts.append((filename, content))
