@@ -2760,6 +2760,10 @@ class TestCreate:
     ) -> None:  # type: ignore[no-untyped-def]
         backend, client = make_backend()
         client.create_document.return_value = {"documentId": "new-doc-1", "title": "My Doc"}
+        client.get_document.return_value = {
+            "documentId": "new-doc-1",
+            "tabs": [{"tabProperties": {"tabId": "t.0"}, "documentTab": {"body": {"content": []}}}],
+        }
 
         result = backend.create("My Doc")
 
@@ -2767,6 +2771,7 @@ class TestCreate:
         assert result.doc_id == "new-doc-1"
         assert result.title == "My Doc"
         assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
+        assert result.first_tab_id == "t.0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
