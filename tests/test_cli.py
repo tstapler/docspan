@@ -1737,7 +1737,7 @@ class TestMapDir:
     def test_rejects_missing_directory(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         result = self._run(tmp_path, tmp_path / "nope")
         assert result.exit_code == 1
-        assert "not a directory" in result.output
+        assert "not a directory" in " ".join(result.output.split())
 
     def test_rejects_empty_directory(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         d = tmp_path / "doc"
