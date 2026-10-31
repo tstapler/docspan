@@ -4297,3 +4297,70 @@ class TestPushPullBlockquoteRoundtrip:
         assert result == markdown_text
         if "```python" in markdown_text:
             assert "python" in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pull() reverses cross-doc Doc URLs back to repo-relative links.
+# ─────────────────────────────────────────────────────────────────────────────
+_TARGET_URL = "https://docs.google.com/document/d/TARGETID/edit"
+
+
+def _reverse_link_mappings(tmp_path):
+    from docspan.config import Mapping
+
+    return [
+        Mapping(local=str(tmp_path / "docs" / "source.md"), backend="google_docs", remote_id="doc-1"),
+        Mapping(local=str(tmp_path / "docs" / "other.md"), backend="google_docs", remote_id="TARGETID"),
+    ]
+
+
+class TestPullReversesCrossDocLinks:
+    def test_structural_path_rewrites_url_to_relative_path(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        doc = _multi_tab_doc()
+        doc["tabs"][1]["documentTab"]["body"]["content"][0]["paragraph"]["elements"] = [
+            {"textRun": {"content": "see "}},
+            {"textRun": {"content": "other", "textStyle": {"link": {"url": _TARGET_URL}}}},
+            {"textRun": {"content": "\n"}},
+        ]
+        fake_client.get_document.return_value = doc
+
+        local = tmp_path / "docs" / "source.md"
+        result = backend.pull(
+            "doc-1", str(local), tab_id="t.second", mappings=_reverse_link_mappings(tmp_path)
+        )
+
+        assert result.status == "ok"
+        content = local.read_text(encoding="utf-8")
+        assert "(other.md)" in content and "docs.google.com" not in content
+
+    def test_default_path_rewrites_url_and_uses_source_local_path(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = f'<p><a href="{_TARGET_URL}">other</a></p>'
+        fake_client.get_document.return_value = _empty_doc()
+
+        scratch = tmp_path / "scratch.md"  # merge/preview temp file
+        result = backend.pull(
+            "doc-1",
+            str(scratch),
+            mappings=_reverse_link_mappings(tmp_path),
+            source_local_path=str(tmp_path / "docs" / "source.md"),
+        )
+
+        assert result.status == "ok"
+        assert "[other](other.md)" in scratch.read_text(encoding="utf-8")
+
+    def test_without_mappings_kwarg_leaves_url_verbatim(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = f'<p><a href="{_TARGET_URL}">other</a></p>'
+        fake_client.get_document.return_value = _empty_doc()
+
+        local = tmp_path / "docs" / "source.md"
+        assert backend.pull("doc-1", str(local)).status == "ok"
+        assert _TARGET_URL in local.read_text(encoding="utf-8")

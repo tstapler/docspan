@@ -329,3 +329,137 @@ class TestLinkPayload:
         )
         assert payload is None
         assert detail is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pull-side reversal: Doc URL -> repo-relative path.
+# ─────────────────────────────────────────────────────────────────────────────
+import logging  # noqa: E402
+
+from docspan.backends.google_docs.cross_doc_links import (  # noqa: E402
+    DocUrl,
+    ReverseDocLinkResolver,
+    parse_doc_url,
+    reverse_cross_doc_links,
+)
+
+BASE = "https://docs.google.com/document/d/TARGETID/edit"
+
+
+def _heading_nodes():
+    from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+
+    return [DocsParagraphNode(text="Some Heading", style="HEADING_2", heading_id="h.abc123")]
+
+
+class TestParseDocUrl:
+    def test_all_forms(self):
+        assert parse_doc_url(BASE) == DocUrl("TARGETID", None, None)
+        assert parse_doc_url(BASE + "?tab=t.x") == DocUrl("TARGETID", "t.x", None)
+        assert parse_doc_url(BASE + "#heading=h.y") == DocUrl("TARGETID", None, "h.y")
+        assert parse_doc_url(BASE + "?tab=t.x#heading=h.y") == DocUrl("TARGETID", "t.x", "h.y")
+
+    def test_non_doc_urls_are_none(self):
+        assert parse_doc_url("https://example.com/document/d/X/edit") is None
+        assert parse_doc_url("https://docs.google.com/spreadsheets/d/X/edit") is None
+        assert parse_doc_url("other.md") is None
+
+
+class TestReverseDocLinkResolver:
+    def _resolver(self, mappings, source="docs/source.md", fetch=None):
+        return ReverseDocLinkResolver(
+            mappings, fetch or (lambda d, t: _heading_nodes()), source
+        )
+
+    def test_url_to_path_no_fragment(self):  # AC-0
+        r = self._resolver([make_mapping("docs/target.md", remote_id="TARGETID")])
+        assert r.reverse(BASE) == ("target.md", None)
+
+    def test_url_with_tab_resolves_correctly(self):  # AC-1
+        mappings = [
+            make_mapping("docs/a.md", remote_id="TARGETID", tab_id="t.a"),
+            make_mapping("docs/b.md", remote_id="TARGETID", tab_id="t.b"),
+        ]
+        r = self._resolver(mappings)
+        assert r.reverse(BASE + "?tab=t.b") == ("b.md", None)
+        assert r.reverse(BASE) == (BASE, None)  # no tab-less mapping
+
+    def test_url_with_heading_resolves_to_slug(self):  # AC-2
+        r = self._resolver([make_mapping("docs/target.md", remote_id="TARGETID")])
+        assert r.reverse(BASE + "#heading=h.abc123") == ("target.md#some-heading", None)
+
+    def test_unmapped_doc_id_left_verbatim(self):  # AC-3
+        r = self._resolver([make_mapping("docs/target.md", remote_id="OTHER")])
+        assert r.reverse(BASE + "?tab=t.x#heading=h.y") == (BASE + "?tab=t.x#heading=h.y", None)
+
+    def test_non_doc_url_left_verbatim(self):  # AC-4
+        r = self._resolver([make_mapping("docs/target.md", remote_id="TARGETID")])
+        for url in ("https://example.com/x", "mailto:a@b.c", "other.md#x"):
+            assert r.reverse(url) == (url, None)
+
+    def test_relative_path_computed_correctly(self):  # AC-5
+        mappings = [make_mapping("docs/api/target.md", remote_id="TARGETID")]
+        assert self._resolver(mappings, source="docs/guide/x.md").reverse(BASE)[0] == "../api/target.md"
+        abs_mappings = [make_mapping("/proj/docs/api/target.md", remote_id="TARGETID")]
+        assert self._resolver(abs_mappings, source="/proj/docs/guide/x.md").reverse(BASE)[0] == "../api/target.md"
+        assert self._resolver(mappings, source="x.md").reverse(BASE)[0] == "docs/api/target.md"
+
+    def test_ambiguous_mapping_warns(self):  # AC-6
+        mappings = [
+            make_mapping("a.md", remote_id="TARGETID"),
+            make_mapping("b.md", remote_id="TARGETID"),
+        ]
+        out, warning = self._resolver(mappings).reverse(BASE)
+        assert out == BASE
+        assert warning and "a.md" in warning and "b.md" in warning
+
+    def test_heading_fetch_called_once_per_target(self):  # AC-11
+        calls = []
+        r = self._resolver(
+            [make_mapping("docs/target.md", remote_id="TARGETID")],
+            fetch=fetch_headings_factory({"TARGETID": _heading_nodes()}, calls),
+        )
+        for _ in range(3):
+            r.reverse(BASE + "#heading=h.abc123")
+        assert calls == [("TARGETID", None)]
+
+    def test_shared_cache_across_resolvers(self):
+        calls, cache = [], {}
+        fetch = fetch_headings_factory({"TARGETID": _heading_nodes()}, calls)
+        m = [make_mapping("docs/target.md", remote_id="TARGETID")]
+        for src in ("docs/a.md", "docs/b.md"):
+            ReverseDocLinkResolver(m, fetch, src, cache=cache).reverse(BASE + "#heading=h.abc123")
+        assert len(calls) == 1
+
+    def test_unknown_heading_id_falls_back_to_path(self, caplog):  # AC-12
+        r = self._resolver([make_mapping("docs/target.md", remote_id="TARGETID")])
+        with caplog.at_level(logging.WARNING):
+            assert r.reverse(BASE + "#heading=h.nope") == ("target.md", None)
+        assert any("h.nope" in rec.getMessage() for rec in caplog.records)
+
+    def test_heading_fetch_failure_falls_back_to_path(self):
+        r = self._resolver(
+            [make_mapping("docs/target.md", remote_id="TARGETID")],
+            fetch=fetch_headings_factory({}),
+        )
+        assert r.reverse(BASE + "#heading=h.abc123") == ("target.md", None)
+
+
+class TestReverseCrossDocLinks:
+    def test_only_link_destinations_rewritten(self):
+        r = ReverseDocLinkResolver(
+            [make_mapping("docs/target.md", remote_id="TARGETID")], lambda d, t: [], "docs/s.md"
+        )
+        md = f"[a]({BASE}) and bare {BASE} and [b](https://example.com)"
+        out, warnings = reverse_cross_doc_links(md, r)
+        assert out == f"[a](target.md) and bare {BASE} and [b](https://example.com)"
+        assert warnings == []
+
+    def test_collects_warnings(self):
+        r = ReverseDocLinkResolver(
+            [make_mapping("a.md", remote_id="TARGETID"), make_mapping("b.md", remote_id="TARGETID")],
+            lambda d, t: [],
+            "s.md",
+        )
+        out, warnings = reverse_cross_doc_links(f"[a]({BASE})", r)
+        assert out == f"[a]({BASE})" and len(warnings) == 1

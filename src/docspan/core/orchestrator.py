@@ -471,17 +471,29 @@ def _classify_pull(
     return "merge"
 
 
+def _pull_link_kwargs(mapping: "Mapping", mappings: Optional[list]) -> dict:
+    """`mappings`/`source_local_path` kwargs so pull can reverse cross-doc Doc URLs.
+
+    `source_local_path` is the real file: several callers pull into a temp
+    path, which would otherwise skew the relative links.
+    """
+    if not mappings:
+        return {}
+    return {"mappings": mappings, "source_local_path": mapping.local}
+
+
 def orchestrate_pull(
     mapping: "Mapping",
     backend: Backend,
     state: SyncState,
     state_dir: str,
     state_path: str,
+    mappings: Optional[list] = None,
 ) -> PullOutcome:
     assert mapping.remote_id is not None, "orchestrate_pull requires a mapping with a created remote doc/page"
 
     if mapping.sectioned:
-        return _orchestrate_pull_sectioned(mapping, backend, state, state_dir, state_path)
+        return _orchestrate_pull_sectioned(mapping, backend, state, state_dir, state_path, mappings)
 
     entry = state.get(mapping.local)
 
@@ -511,11 +523,11 @@ def orchestrate_pull(
     action = _classify_pull(entry, local_exists, current_local_hash, remote_version)
 
     if action == "first-sync":
-        return _first_sync_pull(mapping, backend, state, state_dir, state_path, remote_version)
+        return _first_sync_pull(mapping, backend, state, state_dir, state_path, remote_version, mappings)
     if action == "up-to-date":
         return PullOutcome(local_path=mapping.local, action="up-to-date")
     if action == "fast-forward":
-        return _fast_forward_pull(mapping, backend, state, state_dir, state_path, remote_version)
+        return _fast_forward_pull(mapping, backend, state, state_dir, state_path, remote_version, mappings)
     if action == "local-only":
         return PullOutcome(local_path=mapping.local, action="local-only")
 
@@ -523,7 +535,7 @@ def orchestrate_pull(
     assert entry is not None
     return _merge_pull(
         mapping, backend, state, state_dir, state_path,
-        local_content, remote_version, entry.base_hash,
+        local_content, remote_version, entry.base_hash, mappings,
     )
 
 
@@ -710,10 +722,12 @@ def _first_sync_pull(
     state_dir: str,
     state_path: str,
     remote_version: str,
+    mappings: Optional[list] = None,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
     result = backend.pull(
         mapping.remote_id, mapping.local, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+        **_pull_link_kwargs(mapping, mappings),
     )
     outcome = PullOutcome(local_path=mapping.local, action="first-sync", result=result)
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
@@ -733,6 +747,7 @@ def _fast_forward_pull(
     state_dir: str,
     state_path: str,
     remote_version: str,
+    mappings: Optional[list] = None,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
     # Classified "fast-forward" means the last-recorded local_hash matches
@@ -746,6 +761,7 @@ def _fast_forward_pull(
         _write_orig_backup(mapping.local + ORIG_SUFFIX, pre_pull_content)
     result = backend.pull(
         mapping.remote_id, mapping.local, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+        **_pull_link_kwargs(mapping, mappings),
     )
     outcome = PullOutcome(local_path=mapping.local, action="fast-forward", result=result)
     if result.status in ("ok", "warning") and os.path.exists(mapping.local):
@@ -767,6 +783,7 @@ def _merge_pull(
     local_content: str,
     remote_version: str,
     base_hash: str,
+    mappings: Optional[list] = None,
 ) -> PullOutcome:
     assert mapping.remote_id is not None
     _write_orig_backup(mapping.local + ORIG_SUFFIX, local_content)
@@ -776,6 +793,7 @@ def _merge_pull(
             tmp_path = tmp.name
         tmp_result = backend.pull(
             mapping.remote_id, tmp_path, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+            **_pull_link_kwargs(mapping, mappings),
         )
         if tmp_result.status in ("ok", "warning"):
             with open(tmp_path, encoding="utf-8") as fh:
@@ -991,6 +1009,7 @@ def _orchestrate_pull_sectioned(
     state: SyncState,
     state_dir: str,
     state_path: str,
+    mappings: Optional[list] = None,
 ) -> PullOutcome:
     """Pull dispatch for `mapping.sectioned` mappings.
 
@@ -1024,6 +1043,7 @@ def _orchestrate_pull_sectioned(
             split_level=mapping.split_level,
             tab_id=mapping.tab_id,
             canonical_dir=canonical_dir,
+            **_pull_link_kwargs(mapping, mappings),
         )
         if pull_result.status not in ("ok", "warning"):
             return PullOutcome(local_path=mapping.local, action="error", result=pull_result)
