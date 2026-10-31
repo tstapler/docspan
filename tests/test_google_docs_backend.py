@@ -4364,3 +4364,32 @@ class TestPullReversesCrossDocLinks:
         local = tmp_path / "docs" / "source.md"
         assert backend.pull("doc-1", str(local)).status == "ok"
         assert _TARGET_URL in local.read_text(encoding="utf-8")
+
+    def test_duplicate_remote_and_tab_mappings_leave_url_verbatim_and_warn(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.config import Mapping
+
+        backend, fake_client = make_backend()
+        url = f"{_TARGET_URL}?tab=t.dup"
+        fake_client.get_doc_content.return_value = f'<p><a href="{url}">other</a></p>'
+        fake_client.get_document.return_value = _empty_doc()
+
+        mappings = [
+            Mapping(local=str(tmp_path / "docs" / "source.md"), backend="google_docs", remote_id="doc-1"),
+            Mapping(
+                local=str(tmp_path / "docs" / "a.md"), backend="google_docs",
+                remote_id="TARGETID", tab_id="t.dup",
+            ),
+            Mapping(
+                local=str(tmp_path / "docs" / "b.md"), backend="google_docs",
+                remote_id="TARGETID", tab_id="t.dup",
+            ),
+        ]
+        local = tmp_path / "docs" / "source.md"
+        result = backend.pull("doc-1", str(local), mappings=mappings)
+
+        assert result.status == "warning"
+        assert result.message and "TARGETID" in result.message
+        content = local.read_text(encoding="utf-8")
+        assert url in content and "a.md" not in content and "b.md" not in content
