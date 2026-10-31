@@ -894,11 +894,12 @@ class TestMap:
         new_local = tmp_path / "long_title.md"
         new_local.write_text("# " + "A" * 51 + "\n", encoding="utf-8")
         with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
-             patch("docspan.cli.main._get_backend", return_value=FakeBackend()):
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()) as get_backend:
             result = self._invoke_new_tab(new_local, parent_local, cfg)
         assert result.exit_code == 1
         assert "50" in result.output
         assert "--title" in result.output
+        get_backend.assert_not_called()
 
     def test_new_tab_in_accepts_title_of_exactly_50_chars(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         parent_local, _, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
@@ -912,13 +913,14 @@ class TestMap:
     def test_new_tab_in_rejects_explicit_title_longer_than_50_chars(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
         with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
-             patch("docspan.cli.main._get_backend", return_value=FakeBackend()):
+             patch("docspan.cli.main._get_backend", return_value=FakeBackend()) as get_backend:
             result = self._invoke_new_tab(
                 new_local, parent_local, cfg, extra_args=["--title", "C" * 51]
             )
         assert result.exit_code == 1
         assert "50" in result.output
         assert "Shorten" in result.output
+        get_backend.assert_not_called()
 
     def test_default_title_falls_back_to_basename_when_file_is_not_utf8(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         # Exercised as a unit test on _default_title directly: routing this through
