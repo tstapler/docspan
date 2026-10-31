@@ -5,8 +5,11 @@ Tests verify exit codes and output text; no real backends or network calls.
 """
 from __future__ import annotations
 
+import os
 import re
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -1574,3 +1577,207 @@ class TestResolveMappingForPath:
         result = resolve_mapping_for_path([sectioned, single_file], "docs/big-doc-appendix.md")
 
         assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Declarative creation (create / tab_in) and map-dir
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CreatingBackend(FakeBackend):
+    name = "creating"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list = []
+
+    def create(self, title: str, **kwargs) -> CreateResult:
+        self.calls.append(("create", title))
+        return CreateResult(doc_id="doc-new", title=title, url="u", first_tab_id="t.real0")
+
+    def create_tab(self, doc_id: str, title: str, **kwargs) -> CreateResult:
+        self.calls.append(("create_tab", doc_id, title))
+        return CreateResult(doc_id=doc_id, title=title, tab_id=f"t.{title}")
+
+
+def _declarative_cfg(tmp_path, body: str) -> str:  # type: ignore[no-untyped-def]
+    p = tmp_path / "markgate.yaml"
+    p.write_text(body, encoding="utf-8")
+    return str(p)
+
+
+def _ok_push(mapping, *a, **kw):  # type: ignore[no-untyped-def]
+    return PushOutcome(
+        local_path=mapping.local,
+        result=PushResult(status="ok", doc_id=mapping.remote_id, url="u"),  # type: ignore[arg-type]
+        state_saved=True,
+    )
+
+
+def _run_push(cfg: str, backend: Backend, *extra: str):  # type: ignore[no-untyped-def]
+    with patch("docspan.cli.main._get_backend", return_value=backend), \
+         patch("docspan.cli.main.orchestrate_push", side_effect=_ok_push):
+        return runner.invoke(app, ["push", "--config", cfg, *extra])
+
+
+class TestDeclarativeCreate:
+    BODY = (
+        "mappings:\n"
+        "  - {local: {d}/DETAIL.md, backend: google_docs, create: true, tab_in: {d}/README.md}\n"
+        "  - {local: {d}/README.md, backend: google_docs, create: true, title: My doc}\n"
+    )
+
+    def _setup(self, tmp_path):  # type: ignore[no-untyped-def]
+        for n in ("README.md", "DETAIL.md"):
+            (tmp_path / n).write_text("# x\n", encoding="utf-8")
+        return _declarative_cfg(tmp_path, self.BODY.replace("{d}", str(tmp_path)))
+
+    def test_parent_first_and_ids_written_back(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        backend = CreatingBackend()
+        result = _run_push(cfg, backend)
+        assert result.exit_code == 0, result.output
+        assert [c[0] for c in backend.calls] == ["create", "create_tab"]
+        assert backend.calls[0][1] == "My doc"
+        saved = {m["local"].rsplit("/", 1)[1]: m for m in yaml.safe_load(Path(cfg).read_text())["mappings"]}
+        assert saved["README.md"]["remote_id"] == "doc-new"
+        assert saved["README.md"]["tab_id"] == "t.real0"
+        assert saved["DETAIL.md"]["remote_id"] == "doc-new"
+        assert saved["DETAIL.md"]["tab_id"].startswith("t.")
+
+    def test_rerun_is_idempotent(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        _run_push(cfg, CreatingBackend())
+        backend = CreatingBackend()
+        result = _run_push(cfg, backend)
+        assert result.exit_code == 0, result.output
+        assert backend.calls == []
+
+    def test_resumes_after_partial_run(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        data = yaml.safe_load(Path(cfg).read_text())
+        for m in data["mappings"]:
+            if m["local"].endswith("README.md"):
+                m.update(remote_id="doc-new", tab_id="t.real0")
+        Path(cfg).write_text(yaml.safe_dump(data))
+        backend = CreatingBackend()
+        result = _run_push(cfg, backend)
+        assert result.exit_code == 0, result.output
+        assert [c[0] for c in backend.calls] == ["create_tab"]
+
+    def test_dry_run_creates_nothing(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        before = Path(cfg).read_text()
+        backend = CreatingBackend()
+        result = _run_push(cfg, backend, "--dry-run")
+        assert result.exit_code == 0, result.output
+        assert backend.calls == []
+        assert Path(cfg).read_text() == before
+        assert result.output.count("would create") == 2
+
+    def test_create_does_not_prompt_when_non_interactive(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        with patch("docspan.cli.main._can_prompt", return_value=False):
+            result = _run_push(cfg, CreatingBackend())
+        assert result.exit_code == 0, result.output
+
+    def test_config_mutated_mid_run_reports_unrecorded_doc_and_stops(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        before = Path(cfg).read_text()
+
+        class MutatingBackend(CreatingBackend):
+            name = "creating"
+
+            def create(self, title: str, **kwargs) -> CreateResult:
+                created = super().create(title, **kwargs)
+                Path(cfg).write_text(before)
+                os.utime(cfg, (time.time() + 100, time.time() + 100))
+                return created
+
+        backend = MutatingBackend()
+        result = _run_push(cfg, backend)
+        assert result.exit_code == 1, result.output
+        assert "NOT recorded" in result.output
+        assert "doc-new" in result.output
+        assert [c[0] for c in backend.calls] == ["create"]
+        assert "remote_id" not in Path(cfg).read_text()
+
+    def test_parent_create_failure_skips_child_and_leaves_config(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        cfg = self._setup(tmp_path)
+        before = Path(cfg).read_text()
+
+        class FailingBackend(CreatingBackend):
+            name = "creating"
+
+            def create(self, title: str, **kwargs) -> CreateResult:
+                raise RuntimeError("boom")
+
+        backend = FailingBackend()
+        result = _run_push(cfg, backend)
+        assert result.exit_code == 1, result.output
+        assert backend.calls == []
+        assert Path(cfg).read_text() == before
+
+    def test_sync_creates_declared_mapping_without_assertion_error(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        (tmp_path / "a.md").write_text("# x\n", encoding="utf-8")
+        cfg = _declarative_cfg(
+            tmp_path, f"mappings:\n  - {{local: {tmp_path}/a.md, backend: google_docs, create: true}}\n"
+        )
+        backend = CreatingBackend()
+        with patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.orchestrate_push", side_effect=_ok_push), \
+             patch("docspan.cli.main.orchestrate_pull"):
+            result = runner.invoke(app, ["sync", "--config", cfg])
+        assert result.exit_code == 0, result.output
+        assert result.exception is None or not isinstance(result.exception, AssertionError)
+        assert [c[0] for c in backend.calls] == ["create"]
+        assert yaml.safe_load(Path(cfg).read_text())["mappings"][0]["remote_id"] == "doc-new"
+
+
+class TestMapDir:
+    def test_readme_first_then_alpha_and_pushes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        d = tmp_path / "doc"
+        d.mkdir()
+        for n in ("zeta.md", "Alpha.md", "README.md"):
+            (d / n).write_text("# x\n", encoding="utf-8")
+        cfg = _declarative_cfg(tmp_path, "mappings: []\n")
+        backend = CreatingBackend()
+        with patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.orchestrate_push", side_effect=_ok_push):
+            result = runner.invoke(app, ["map-dir", str(d), "--config", cfg, "--title", "T"])
+        assert result.exit_code == 0, result.output
+        mappings = yaml.safe_load(Path(cfg).read_text())["mappings"]
+        assert [m["local"].rsplit("/", 1)[1] for m in mappings] == ["README.md", "Alpha.md", "zeta.md"]
+        assert all(m["remote_id"] == "doc-new" for m in mappings)
+        assert mappings[0]["tab_id"] == "t.real0"
+        assert [c[0] for c in backend.calls] == ["create", "create_tab", "create_tab"]
+
+    def _run(self, tmp_path, directory, *extra):  # type: ignore[no-untyped-def]
+        cfg = _declarative_cfg(tmp_path, "mappings: []\n")
+        backend = CreatingBackend()
+        with patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch("docspan.cli.main.orchestrate_push", side_effect=_ok_push):
+            result = runner.invoke(app, ["map-dir", str(directory), "--config", cfg, *extra])
+        assert Path(cfg).read_text() == "mappings: []\n"
+        assert backend.calls == []
+        return result
+
+    def test_rejects_non_google_backend(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        d = tmp_path / "doc"
+        d.mkdir()
+        (d / "a.md").write_text("# x\n", encoding="utf-8")
+        result = self._run(tmp_path, d, "--backend", "confluence")
+        assert result.exit_code == 1
+        assert "google_docs" in result.output
+
+    def test_rejects_missing_directory(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        result = self._run(tmp_path, tmp_path / "nope")
+        assert result.exit_code == 1
+        assert "not a directory" in " ".join(result.output.split())
+
+    def test_rejects_empty_directory(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        d = tmp_path / "doc"
+        d.mkdir()
+        (d / "sub.md").mkdir()  # a directory named *.md is not a markdown file
+        result = self._run(tmp_path, d)
+        assert result.exit_code == 1
+        assert "No *.md files" in result.output

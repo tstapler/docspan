@@ -2759,6 +2759,10 @@ class TestCreate:
     ) -> None:  # type: ignore[no-untyped-def]
         backend, client = make_backend()
         client.create_document.return_value = {"documentId": "new-doc-1", "title": "My Doc"}
+        client.get_document.return_value = {
+            "documentId": "new-doc-1",
+            "tabs": [{"tabProperties": {"tabId": "t.0"}, "documentTab": {"body": {"content": []}}}],
+        }
 
         result = backend.create("My Doc")
 
@@ -2766,6 +2770,7 @@ class TestCreate:
         assert result.doc_id == "new-doc-1"
         assert result.title == "My Doc"
         assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
+        assert result.first_tab_id == "t.0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4296,6 +4301,18 @@ class TestPushPullBlockquoteRoundtrip:
         assert result == markdown_text
         if "```python" in markdown_text:
             assert "python" in result
+
+
+class TestCreateFirstTabLookup:
+    def test_create_returns_doc_id_when_first_tab_lookup_fails(self, make_backend) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.create_document.return_value = {"documentId": "doc-9", "title": "T"}
+        client.get_document.side_effect = RuntimeError("transient")
+
+        result = backend.create("T")
+
+        assert result.doc_id == "doc-9"
+        assert result.first_tab_id is None
 
 
 class TestPushRevisionConflictRecovery:
