@@ -1328,10 +1328,11 @@ class GoogleDocsBackend(Backend):
             f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
             f"— docspan wrote no styling for them rather than "
             f"styling aimed at the wrong cell (see each cell's reason): {listed}. "
-            f"If this push created the table, pushing again places the styling. "
-            f"Otherwise the cell holds something docspan cannot measure around — a "
-            f"smart chip, an image, or more than one paragraph — and pushing again "
-            f"will report this same warning; style that cell in the document instead."
+            f"If the table was left empty by an earlier push, pushing again places the "
+            f"styling. Otherwise the cell holds something docspan cannot place styling "
+            f"in — a smart chip, an image, more than one paragraph, or styled text "
+            f"longer than the cell — and pushing again will report this same warning; "
+            f"fix or style that cell in the document instead."
         )
 
     @staticmethod

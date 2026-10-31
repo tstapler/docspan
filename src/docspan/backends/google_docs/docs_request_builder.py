@@ -150,7 +150,11 @@ _REASON_NOT_FOUND = (
     "its text was not found in the written document (the cell may hold a smart chip, "
     "an image, or more than one paragraph)"
 )
-_REASON_OVERFLOW = "its styled text runs past the end of the cell"
+_REASON_NO_LIVE_CELL = (
+    "no matching cell exists in the document (the table's structure changed, or it "
+    "was edited concurrently)"
+)
+_REASON_OVERFLOW ="its styled text runs past the end of the cell"
 
 
 @dataclass(frozen=True)
@@ -1907,7 +1911,10 @@ class DocsRequestBuilder:
                     if not cell.styled:
                         continue
                     live = live_cells[c] if c < len(live_cells) else None
-                    placed = self._cell_placement(live, cell) if live is not None else None
+                    if live is None:
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_NO_LIVE_CELL))
+                        continue
+                    placed = self._cell_placement(live, cell)
                     if placed is None:
                         missed.append(UnplacedCell(r, c, cell.text, _REASON_NOT_FOUND))
                         continue

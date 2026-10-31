@@ -702,10 +702,12 @@ class TestFirstPushStylesNewTableCells:
             for r in call.args[1]
             if "updateTextStyle" in r
         ]
-        assert any(
-            s["textStyle"].get("weightedFontFamily", {}).get("fontFamily") == "Courier New"
+        courier = [
+            s["range"]
             for s in styles
-        ), styles
+            if s["textStyle"].get("weightedFontFamily", {}).get("fontFamily") == "Courier New"
+        ]
+        assert [(r["startIndex"], r["endIndex"]) for r in courier] == [(33, 37)], styles
 
     def test_no_unplaced_cell_warning_on_first_push(self, make_backend, tmp_path) -> None:
         result, _client = self._push(make_backend, tmp_path)
@@ -735,9 +737,19 @@ class TestFirstPushStylesNewTableCells:
         local = tmp_path / "doc.md"
         local.write_text("## A1 — Current state\n\n| h |\n| --- |\n| plain |\n", encoding="utf-8")
         backend.push(str(local), "doc-id")
+        sent = [r for call in client.batch_update.call_args_list for r in call.args[1]]
+        assert not any("updateTextStyle" in r for r in sent)
+        assert client.get_document.call_count <= 2, client.get_document.call_count
         assert builder.build_table_fill_batch(
             empty, markdown.parse(local.read_text(encoding="utf-8"))
         ) == []
+
+    def test_a_missing_live_cell_gets_its_own_reason(self) -> None:
+        doc = _doc_with_rows([[_cell("ref", 30)]])
+        target = markdown.parse("| ref |\n| --- |\n| `code` |\n")
+        details = builder.unplaced_table_cell_details(doc, target)
+        assert [(d.row, d.col) for d in details] == [(1, 0)]
+        assert "no matching cell exists" in details[0].reason
 
 
 class TestUnplacedCellWarningIsActionable:
