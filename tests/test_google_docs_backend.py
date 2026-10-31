@@ -133,11 +133,10 @@ class TestPushRevisionGuard:
 
         result = backend.push(str(local), "doc-1")
 
-        assert result == PushResult(
-            status="conflict",
-            doc_id="doc-1",
-            message="The doc changed since your last pull — run `docspan pull` again",
-        )
+        assert result.status == "conflict"
+        assert result.doc_id == "doc-1"
+        assert "run `docspan pull` again" not in (result.message or "")
+        assert fake_client.batch_update.call_count == 2  # one retry, then give up
 
     def test_push_returns_error_status_for_non_revision_http_error(
         self,
@@ -4297,3 +4296,99 @@ class TestPushPullBlockquoteRoundtrip:
         assert result == markdown_text
         if "```python" in markdown_text:
             assert "python" in result
+
+
+class TestPushRevisionConflictRecovery:
+    def test_push_pass2_refetches_doc_when_only_style_requests_written_in_pass1(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Pass 1 is style-only (pageless toggle) yet still advances the revision."""
+        local = tmp_path / "doc.md"
+        local.write_text("**Beta**\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta", revision_id="rev-1"),
+            _doc_with_paragraph("Beta", revision_id="rev-2"),
+        ]
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1", pageless=True)
+
+        assert result.status == "ok", result.message
+        assert client.get_document.call_count == 2
+        assert client.batch_update.call_count == 2
+        assert client.batch_update.call_args_list[0].kwargs["required_revision_id"] == "rev-1"
+        assert client.batch_update.call_args_list[1].kwargs["required_revision_id"] == "rev-2"
+
+    def test_push_retries_once_on_required_revision_id_conflict_and_succeeds(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.get_document.side_effect = [_empty_doc("rev-1"), _empty_doc("rev-2")]
+        client.batch_update.side_effect = [
+            make_http_error(400, "requiredRevisionId does not match the latest revision"),
+            None,
+        ]
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "ok", result.message
+        assert client.get_document.call_count == 2
+        assert client.batch_update.call_args.kwargs["required_revision_id"] == "rev-2"
+
+    def test_push_returns_conflict_after_two_consecutive_required_revision_id_failures(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.get_document.return_value = _empty_doc("rev-1")
+        client.batch_update.side_effect = make_http_error(
+            400, "requiredRevisionId does not match the latest revision"
+        )
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "conflict"
+        assert client.batch_update.call_count == 2
+        assert "run `docspan pull` again" not in (result.message or "")
+
+    def test_sequential_pushes_to_different_tabs_of_same_doc_all_succeed(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Each push's first read is stale (as after an earlier push in the run)."""
+        backend, client = make_backend()
+        state = {"rev": 1, "fetches": 0}
+
+        def get_document(doc_id, *args, **kwargs):  # type: ignore[no-untyped-def]
+            state["fetches"] += 1
+            stale = state["fetches"] == 1 and state["rev"] > 1
+            return _empty_doc(f"rev-{state['rev'] - 1 if stale else state['rev']}")
+
+        def batch_update(doc_id, requests, required_revision_id=None):  # type: ignore[no-untyped-def]
+            if required_revision_id != f"rev-{state['rev']}":
+                raise make_http_error(400, "requiredRevisionId does not match the latest revision")
+            state["rev"] += 1
+
+        client.get_document.side_effect = get_document
+        client.batch_update.side_effect = batch_update
+
+        results = []
+        for name in ("a", "b", "c"):
+            state["fetches"] = 0
+            local = tmp_path / f"{name}.md"
+            local.write_text(f"# Content {name}\n", encoding="utf-8")
+            results.append(backend.push(str(local), "doc-1"))
+
+        assert [r.status for r in results] == ["ok", "ok", "ok"]
