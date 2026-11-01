@@ -702,6 +702,7 @@ def _preview_pull_merge(
     try:
         tmp_result = backend.pull(
             mapping.remote_id, tmp_path, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+            sidecar_path=mapping.local,
             **_pull_link_kwargs(mapping, mappings),
         )
         if tmp_result.status not in ("ok", "warning"):
@@ -805,6 +806,7 @@ def _merge_pull(
             tmp_path = tmp.name
         tmp_result = backend.pull(
             mapping.remote_id, tmp_path, tab_id=mapping.tab_id, pull_strategy=mapping.pull_strategy,
+            sidecar_path=mapping.local,
             **_pull_link_kwargs(mapping, mappings),
         )
         if tmp_result.status in ("ok", "warning"):

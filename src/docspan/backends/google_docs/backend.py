@@ -1430,6 +1430,7 @@ class GoogleDocsBackend(Backend):
         local_path: str,
         tab_id: Optional[str] = None,
         pull_strategy: Literal["auto", "structural"] = "auto",
+        sidecar_path: Optional[str] = None,
         **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, convert to markdown, write locally.
@@ -1498,7 +1499,10 @@ class GoogleDocsBackend(Backend):
                     image_recovery = recover_structural_mermaid_images(
                         markdown_content,
                         image_nodes,
-                        markdown_path=local_path,
+                        # Merge/preview pulls write to a temp file; sidecar_path
+                        # is the real mapped file whose .mermaid-cache.yaml lives
+                        # next to it.
+                        markdown_path=sidecar_path or local_path,
                         appendix_entries=appendix_entries or None,
                     )
                     markdown_content = image_recovery.markdown
@@ -1605,7 +1609,7 @@ class GoogleDocsBackend(Backend):
             recovery = recover_pulled_images(
                 markdown_content,
                 image_nodes,
-                markdown_path=local_path,
+                markdown_path=sidecar_path or local_path,
                 appendix_entries=appendix_entries or None,
             )
             markdown_content = recovery.markdown
