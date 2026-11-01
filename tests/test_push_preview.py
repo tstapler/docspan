@@ -13,7 +13,7 @@ from googleapiclient.errors import HttpError
 
 from docspan.backends.google_docs.client import GoogleDocsClient
 from docspan.backends.google_docs.docs_request_builder import DiffEntry, DocsRequestBuilder
-from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode
+from docspan.backends.google_docs.docs_structure_parser import DocsParagraphNode, TextSpan
 from docspan.backends.google_docs.push_preview import (
     AtRiskComment,
     HighRiskParagraph,
@@ -800,3 +800,137 @@ def test_render_churn_note_should_UseGenericWording_When_PairHasNoStyleUpgradeRe
     assert "comment" in note.lower()
     assert "lost" in note.lower()
     assert "one-time upgrade" not in note
+
+
+def _spanned(*spans) -> DocsParagraphNode:
+    return DocsParagraphNode(
+        style="NORMAL_TEXT",
+        text="".join(s.text for s in spans),
+        start_index=1,
+        end_index=10,
+        spans=list(spans),
+    )
+
+
+def _render(entries, unchanged=0) -> str:
+    return PushPreview(
+        entries=entries, unchanged_count=unchanged, high_risk=[], request_count=1
+    ).render()
+
+
+def test_diff_summary_reports_link_target_only_change_and_render_shows_urls() -> None:
+    current = [_spanned(TextSpan("see "), TextSpan("docs", link="https://old.example.com"))]
+    target = [_spanned(TextSpan("see "), TextSpan("docs", link="https://new.example.com"))]
+
+    entries, unchanged = DocsRequestBuilder().diff_summary(current, target)
+
+    assert unchanged == 0
+    assert len(entries) == 1 and entries[0].span_changes
+    assert entries[0].span_changes[0].text == "docs"
+    out = _render(entries, unchanged)
+    assert "1 change(s)" in out
+    assert "https://old.example.com → https://new.example.com" in out
+
+
+def test_diff_summary_identical_spans_not_flagged() -> None:
+    def node():
+        return [_spanned(TextSpan("a "), TextSpan("b", link="https://x.example.com"))]
+
+    entries, unchanged = DocsRequestBuilder().diff_summary(node(), node())
+    assert entries == [] and unchanged == 1
+
+
+def test_span_changes_aligns_differently_split_spans_and_reports_bold() -> None:
+    current = _spanned(TextSpan("Visit the new docs", link="https://old.example.com"))
+    target = _spanned(TextSpan("Visit the "), TextSpan("new docs", link="https://new.example.com"))
+    changes = DocsRequestBuilder._span_changes(current, target)
+    assert [c.text for c in changes] == ["new docs"]
+
+    bold = DocsRequestBuilder._span_changes(_spanned(TextSpan("x")), _spanned(TextSpan("x", bold=True)))
+    assert len(bold) == 1 and bold[0].new_bold and not bold[0].old_bold
+
+
+def test_multiple_links_in_one_paragraph_render_each() -> None:
+    current = [_spanned(TextSpan("a", link="https://o1.example.com"), TextSpan(" and "),
+                        TextSpan("b", link="https://o2.example.com"))]
+    target = [_spanned(TextSpan("a", link="https://n1.example.com"), TextSpan(" and "),
+                       TextSpan("b", link="https://n2.example.com"))]
+    entries, unchanged = DocsRequestBuilder().diff_summary(current, target)
+    assert len(entries) == 1 and [c.text for c in entries[0].span_changes] == ["a", "b"]
+    out = _render(entries, unchanged)
+    assert 'link "a": https://o1.example.com → https://n1.example.com' in out
+    assert 'link "b": https://o2.example.com → https://n2.example.com' in out
+
+
+def test_style_only_change_renders_inline_formatting_and_bold_on() -> None:
+    entries, unchanged = DocsRequestBuilder().diff_summary(
+        [_spanned(TextSpan("hello"))], [_spanned(TextSpan("hel"), TextSpan("lo", bold=True))]
+    )
+    out = _render(entries, unchanged)
+    assert "(inline formatting)" in out
+    assert '↳ bold "lo": on' in out
+
+
+@pytest.mark.parametrize("attr", ["italic", "monospace"])
+def test_span_changes_reports_italic_and_monospace_added(attr: str) -> None:
+    changes = DocsRequestBuilder._span_changes(
+        _spanned(TextSpan("x")), _spanned(TextSpan("x", **{attr: True}))
+    )
+    assert len(changes) == 1 and getattr(changes[0], f"new_{attr}")
+    entries, unchanged = DocsRequestBuilder().diff_summary(
+        [_spanned(TextSpan("x"))], [_spanned(TextSpan("x", **{attr: True}))]
+    )
+    assert f'↳ {attr} "x": on' in _render(entries, unchanged)
+
+
+def test_link_added_where_live_has_none_is_reported() -> None:
+    entries, unchanged = DocsRequestBuilder().diff_summary(
+        [_spanned(TextSpan("docs"))], [_spanned(TextSpan("docs", link="https://new.example.com"))]
+    )
+    assert len(entries) == 1
+    assert 'link "docs": (no link) → https://new.example.com' in _render(entries, unchanged)
+
+
+def test_removals_push_never_writes_are_not_flagged() -> None:
+    live = [_spanned(TextSpan("a "), TextSpan("b", bold=True, italic=True, monospace=True,
+                                              link="https://x.example.com"))]
+    for target in ([_spanned(TextSpan("a b"))], [_spanned(TextSpan("a "), TextSpan("b"))]):
+        entries, unchanged = DocsRequestBuilder().diff_summary(live, target)
+        assert entries == [] and unchanged == 1
+
+
+def test_resolved_cross_doc_link_not_flagged_but_real_change_is() -> None:
+    from docspan.backends.google_docs.cross_doc_links import CrossDocLinkResolver
+    from docspan.config import Mapping
+
+    resolver = CrossDocLinkResolver(
+        [Mapping(local="docs/other.md", backend="google_docs", remote_id="ABC")],
+        lambda d, t: [],
+    )
+    url = "https://docs.google.com/document/d/ABC/edit"
+    builder = DocsRequestBuilder()
+    entries, unchanged = builder.diff_summary(
+        [_spanned(TextSpan("see", link=url))],
+        [_spanned(TextSpan("see", link="other.md"))],
+        resolver, "docs/source.md",
+    )
+    assert entries == [] and unchanged == 1
+
+    entries, _ = builder.diff_summary(
+        [_spanned(TextSpan("see", link="https://stale.example.com"))],
+        [_spanned(TextSpan("see", link="other.md"))],
+        resolver, "docs/source.md",
+    )
+    assert len(entries) == 1 and entries[0].span_changes[0].new_link == url
+
+
+def test_unresolved_anchor_and_unresolvable_relative_link_not_flagged() -> None:
+    entries, unchanged = DocsRequestBuilder().diff_summary(
+        [_spanned(TextSpan("a", link="https://x.example.com"))],
+        [_spanned(TextSpan("a", link="#nosuch"))],
+    )
+    assert entries == [] and unchanged == 1
+    entries, unchanged = DocsRequestBuilder().diff_summary(
+        [_spanned(TextSpan("a"))], [_spanned(TextSpan("a", link="other.md"))]
+    )
+    assert entries == [] and unchanged == 1

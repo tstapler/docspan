@@ -418,3 +418,34 @@ def test_bold_monospace_span_with_backtick_renders_and_round_trips() -> None:
     assert len(spans) == 1
     assert spans[0].text == original
     assert spans[0].bold is True
+
+
+def _span(text: str, **kw) -> TextSpan:
+    return TextSpan(text=text, **kw)
+
+
+def _render(spans: list) -> str:
+    return render_nodes_to_markdown([_node(text="".join(s.text for s in spans), spans=spans)]).strip()
+
+
+def test_link_containing_code_span_renders_as_single_link() -> None:
+    url = "https://example.com"
+    spans = [_span("Foo ", link=url), _span("bar", link=url, monospace=True), _span(" baz", link=url)]
+    assert _render(spans) == f"[Foo `bar` baz]({url})"
+
+
+def test_link_containing_bold_and_code_renders_as_single_link() -> None:
+    url = "https://example.com"
+    spans = [_span("bold", link=url, bold=True), _span(" ", link=url), _span("code", link=url, monospace=True)]
+    assert _render(spans) == f"[**bold** `code`]({url})"
+
+
+def test_adjacent_links_with_different_urls_stay_separate() -> None:
+    spans = [_span("a", link="https://a.example"), _span("b", link="https://b.example")]
+    assert _render(spans) == "[a](https://a.example)[b](https://b.example)"
+
+
+def test_same_url_links_separated_by_plain_text_stay_separate() -> None:
+    url = "https://example.com"
+    spans = [_span("a", link=url), _span(" and ", link=None), _span("b", link=url)]
+    assert _render(spans) == f"[a]({url}) and [b]({url})"

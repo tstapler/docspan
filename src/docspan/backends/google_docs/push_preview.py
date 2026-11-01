@@ -402,7 +402,17 @@ class PushPreview:
                 else:
                     lines.append(f"  - {entry.current_text}")
             elif entry.kind == "change":
-                lines.append(f"  ~ {entry.current_text} → {entry.target_text}")
+                if entry.span_changes and entry.current_text == entry.target_text:
+                    lines.append(f"  ~ {entry.current_text} (inline formatting)")
+                else:
+                    lines.append(f"  ~ {entry.current_text} → {entry.target_text}")
+                for sc in entry.span_changes:
+                    if sc.new_link:
+                        old = sc.old_link or "(no link)"
+                        lines.append(f'    ↳ link "{sc.text}": {old} → {sc.new_link}')
+                    for name in ("bold", "italic", "monospace"):
+                        if getattr(sc, f"new_{name}"):
+                            lines.append(f'    ↳ {name} "{sc.text}": on')
 
         if churn_pairs:
             lines.append(render_churn_note(churn_pairs, self.high_risk))

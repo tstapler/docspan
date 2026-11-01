@@ -439,3 +439,49 @@ def test_google_docs_validate_config_passes_with_env_var_json(monkeypatch) -> No
 
     from docspan.backends.google_docs.backend import GoogleDocsBackend
     GoogleDocsBackend(GoogleDocsConfig()).validate_config()  # must not raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Declarative creation: create / tab_in
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gd(local: str, **kw) -> Mapping:  # type: ignore[no-untyped-def]
+    return Mapping(local=local, backend="google_docs", **kw)
+
+
+def test_create_mapping_without_remote_id_loads() -> None:
+    cfg = MarkgateConfig(mappings=[_gd("a.md", create=True, title="T")])
+    assert cfg.mappings[0].remote_id is None and cfg.mappings[0].create
+
+
+def test_create_true_with_remote_id_is_accepted() -> None:
+    cfg = MarkgateConfig(mappings=[_gd("a.md", create=True, remote_id="doc1")])
+    assert cfg.mappings[0].remote_id == "doc1"
+
+
+def test_tab_in_unknown_target_rejected() -> None:
+    with pytest.raises(ValueError, match="does not match"):
+        MarkgateConfig(mappings=[_gd("b.md", create=True, tab_in="missing.md")])
+
+
+def test_tab_in_on_non_google_docs_backend_rejected() -> None:
+    with pytest.raises(ValueError, match="requires backend google_docs"):
+        Mapping(local="b.md", backend="confluence", tab_in="a.md")
+
+
+def test_tab_in_cycle_names_all_members() -> None:
+    with pytest.raises(ValueError) as exc:
+        MarkgateConfig(mappings=[
+            _gd("a.md", tab_in="c.md"), _gd("b.md", tab_in="a.md"), _gd("c.md", tab_in="b.md"),
+        ])
+    msg = str(exc.value)
+    assert all(name in msg for name in ("a.md", "b.md", "c.md"))
+
+
+def test_tab_in_target_on_non_google_docs_backend_rejected() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="must use backend google_docs"):
+        MarkgateConfig(mappings=[
+            Mapping(local="a.md", backend="confluence"), _gd("b.md", tab_in="a.md"),
+        ])

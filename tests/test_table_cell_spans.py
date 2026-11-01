@@ -671,3 +671,99 @@ class TestRendering:
         node = DocsTableNode(rows=[[cell, TableCell(text="y")]])
         rendered = render_nodes_to_markdown([node])
         assert rendered.splitlines()[0] == r"| ``a`b\|c`` | y |"
+
+
+class TestFirstPushStylesNewTableCells:
+    """A table created by this push is empty when pass 2 first reads the document."""
+
+    def _push(self, make_backend, tmp_path):
+        backend, client = make_backend()
+        empty = _doc_with_rows([[_cell("", 30)], [_cell("", 33)]])
+        filled = _doc_with_rows([[_cell("h", 30)], [_cell("code", 33)]])
+        state = {"filled": False}
+
+        def batch_update(doc_id, requests, **_kw):
+            if any(r.get("insertText", {}).get("text") == "code" for r in requests):
+                state["filled"] = True
+            return {}
+
+        client.get_document.side_effect = lambda *_a, **_k: filled if state["filled"] else empty
+        client.batch_update.side_effect = batch_update
+        client.list_comments.return_value = []
+        local = tmp_path / "doc.md"
+        local.write_text("## A1 — Current state\n\n| h |\n| --- |\n| `code` |\n", encoding="utf-8")
+        return backend.push(str(local), "doc-id"), client
+
+    def test_monospace_is_emitted_even_when_pre_fill_cells_are_empty(self, make_backend, tmp_path) -> None:
+        _result, client = self._push(make_backend, tmp_path)
+        styles = [
+            r["updateTextStyle"]
+            for call in client.batch_update.call_args_list
+            for r in call.args[1]
+            if "updateTextStyle" in r
+        ]
+        courier = [
+            s["range"]
+            for s in styles
+            if s["textStyle"].get("weightedFontFamily", {}).get("fontFamily") == "Courier New"
+        ]
+        assert [(r["startIndex"], r["endIndex"]) for r in courier] == [(33, 37)], styles
+
+    def test_no_unplaced_cell_warning_on_first_push(self, make_backend, tmp_path) -> None:
+        result, _client = self._push(make_backend, tmp_path)
+        assert result.status == "ok", result.message
+        assert "table cell" not in (result.message or "")
+
+    def test_fills_are_applied_then_the_document_is_re_read_before_styling(
+        self, make_backend, tmp_path
+    ) -> None:
+        _result, client = self._push(make_backend, tmp_path)
+        calls = client.batch_update.call_args_list
+        fill = [c for c in calls if any("insertText" in r for r in c.args[1])]
+        style = [c for c in calls if any("updateTextStyle" in r for r in c.args[1])]
+        assert fill and style and calls.index(fill[0]) < calls.index(style[0])
+        assert client.get_document.call_count >= 3, "initial read, post-pass-1 read, post-fill read"
+        for call in (fill[0], style[0]):
+            assert call.kwargs.get("required_revision_id") == "rev-1"
+
+    def test_a_table_with_no_styled_cells_costs_no_extra_round_trip(
+        self, make_backend, tmp_path
+    ) -> None:
+        backend, client = make_backend()
+        empty = _doc_with_rows([[_cell("", 30)], [_cell("", 33)]])
+        client.get_document.return_value = empty
+        client.batch_update.return_value = {}
+        client.list_comments.return_value = []
+        local = tmp_path / "doc.md"
+        local.write_text("## A1 — Current state\n\n| h |\n| --- |\n| plain |\n", encoding="utf-8")
+        backend.push(str(local), "doc-id")
+        sent = [r for call in client.batch_update.call_args_list for r in call.args[1]]
+        assert not any("updateTextStyle" in r for r in sent)
+        assert client.get_document.call_count <= 2, client.get_document.call_count
+        assert builder.build_table_fill_batch(
+            empty, markdown.parse(local.read_text(encoding="utf-8"))
+        ) == []
+
+    def test_a_missing_live_cell_gets_its_own_reason(self) -> None:
+        doc = _doc_with_rows([[_cell("ref", 30)]])
+        target = markdown.parse("| ref |\n| --- |\n| `code` |\n")
+        details = builder.unplaced_table_cell_details(doc, target)
+        assert [(d.row, d.col) for d in details] == [(1, 0)]
+        assert "no matching cell exists" in details[0].reason
+
+
+class TestUnplacedCellWarningIsActionable:
+    def test_names_row_column_and_reason(self) -> None:
+        doc = _doc_with_rows([[_cell("ref", 30)], [_cell("", 40)]])
+        target = markdown.parse("| ref |\n| --- |\n| `code` |\n")
+        details = builder.unplaced_table_cell_details(doc, target)
+        assert [(d.row, d.col, d.text) for d in details] == [(1, 0, "code")]
+        message = GoogleDocsBackend._render_unplaced_cells(details)
+        assert "row 2, col 1" in message
+        assert "not found in the written document" in message
+
+    def test_overflow_reason_is_rendered(self) -> None:
+        from docspan.backends.google_docs.docs_request_builder import _REASON_OVERFLOW, UnplacedCell
+
+        message = GoogleDocsBackend._render_unplaced_cells([UnplacedCell(2, 3, "x", _REASON_OVERFLOW)])
+        assert "row 3, col 4" in message and "runs past the end of the cell" in message
