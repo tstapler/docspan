@@ -146,6 +146,26 @@ class Pass2Alignment:
     foreign_ids: dict = field(default_factory=dict)
 
 
+_REASON_NOT_FOUND = (
+    "its text was not found in the written document (the cell may hold a smart chip, "
+    "an image, or more than one paragraph)"
+)
+_REASON_NO_LIVE_CELL = (
+    "no matching cell exists in the document (the table's structure changed, or it "
+    "was edited concurrently)"
+)
+_REASON_OVERFLOW ="its styled text runs past the end of the cell"
+
+
+@dataclass(frozen=True)
+class UnplacedCell:
+    """A styled table cell pass 2 wrote no styling for. `row`/`col` are 0-based."""
+    row: int
+    col: int
+    text: str
+    reason: str
+
+
 @dataclass(frozen=True)
 class DeleteBounds:
     """The range a node's deleteContentRange may actually cover, and why it was trimmed.
@@ -1849,7 +1869,8 @@ class DocsRequestBuilder:
 
         Runs against the re-fetched document, like the paragraph path, because a
         cell's real indices only exist once pass 1 has written it and heading ids
-        only exist once the headings do.
+        only exist once the headings do. For a table the push itself creates, push()
+        applies `build_table_fill_batch` and re-reads first, so its cells are placed.
 
         Cells are located, not predicted: the target cell's text is searched for
         inside the live cell's text and the offset taken from where it is found. A
@@ -1877,13 +1898,13 @@ class DocsRequestBuilder:
                 ))
         return requests
 
-    def unplaced_table_cells(
+    def unplaced_table_cell_details(
         self,
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
-    ) -> List[str]:
-        """Styled cells pass 2 could not place, so push can say so out loud.
+    ) -> List[UnplacedCell]:
+        """Styled cells pass 2 could not place (with coordinates and reason), so push can say so out loud.
 
         The loud half of the same trade `unaligned_span_targets` makes for
         paragraphs: refusing to guess is only safe if the refusal is reported.
@@ -1914,7 +1935,7 @@ class DocsRequestBuilder:
         if not target_tables:
             return []
         aligned = self._aligned(doc, target, alignment)
-        missed: List[str] = []
+        missed: List[UnplacedCell] = []
         paired = {id(tnode): table for table, tnode in self._paired_tables(doc, aligned.table_pairs)}
         for tnode in target_tables:
             table = paired.get(id(tnode))
@@ -1925,9 +1946,12 @@ class DocsRequestBuilder:
                     if not cell.styled:
                         continue
                     live = live_cells[c] if c < len(live_cells) else None
-                    placed = self._cell_placement(live, cell) if live is not None else None
+                    if live is None:
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_NO_LIVE_CELL))
+                        continue
+                    placed = self._cell_placement(live, cell)
                     if placed is None:
-                        missed.append(cell.text)
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_NOT_FOUND))
                         continue
                     # A cell can place and still lose its styling: _span_requests_in
                     # stops at the first span that would cross the cell's bound and
@@ -1940,8 +1964,17 @@ class DocsRequestBuilder:
                     if limit is not None and start + sum(
                         _utf16_len(span.text) for span in cell.spans
                     ) > limit:
-                        missed.append(cell.text)
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_OVERFLOW))
         return missed
+
+    def unplaced_table_cells(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[str]:
+        """Text of each cell `unplaced_table_cell_details` reports."""
+        return [cell.text for cell in self.unplaced_table_cell_details(doc, target, alignment)]
 
     @staticmethod
     def _paired_tables(
@@ -2645,6 +2678,35 @@ class DocsRequestBuilder:
         }
         return slug_to_id, known_ids
 
+    def build_table_fill_batch(
+        self,
+        doc: dict,
+        target: List[Node],
+        tab_id: Optional[str] = None,
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
+        """Table cell fills alone, ready to submit before any cell styling is computed.
+
+        A table this push creates is empty in ``doc``, so its cells' styling can only
+        be placed against a document re-read *after* these fills are applied.
+
+        Empty unless that re-read is worth a round trip: some fill must insert text
+        (style resets alone leave the table empty, so a re-read gains nothing) and
+        some target cell must carry styling. Anything else is filled by
+        `build_second_pass_requests` as before.
+        """
+        requests = self.build_table_fill_requests(doc, target, alignment)
+        styled = any(
+            cell.styled
+            for node in target if isinstance(node, DocsTableNode)
+            for row in node.rows for cell in row
+        )
+        if not styled or not any("insertText" in r for r in requests):
+            return []
+        requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
+        self._inject_tab_id(requests, tab_id)
+        return requests
+
     def build_second_pass_requests(
         self,
         doc: dict,
@@ -2670,15 +2732,10 @@ class DocsRequestBuilder:
         """
         requests = self.build_table_fill_requests(doc, target, alignment)
         requests += self.build_span_style_requests(doc, target, alignment, resolver, local_path)
-        # Cell styling reads indices from `doc`, i.e. from *before* the fills above
-        # are applied. A table that already holds its text — every table on a
-        # second or later push — is placed correctly. A table this push is
-        # *creating* is still empty here, so `_cell_placement` cannot find the
-        # cell's text and emits nothing; `unplaced_table_cells` reports those, so
-        # the gap is loud rather than a silent half-application. Styling a
-        # brand-new table's cells needs the post-fill index, which is predictable
-        # but is index arithmetic that has to be verified by replay, not reasoned
-        # about — left for its own change.
+        # Cell styling reads indices from `doc`. For a table this push creates, push()
+        # applies `build_table_fill_batch` and re-reads the document first, so the
+        # cells are populated here; otherwise `_cell_placement` finds nothing and
+        # `unplaced_table_cell_details` reports the gap.
         requests += self.build_table_cell_span_requests(doc, target, alignment, resolver, local_path)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)

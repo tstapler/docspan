@@ -9,7 +9,7 @@ import pathlib
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Sequence, Tuple, Union
 
 from googleapiclient.errors import HttpError
 
@@ -95,6 +95,7 @@ from docspan.core.atomic_dir import atomic_replace_dir
 from docspan.core.paths import COMMENTS_SUFFIX, find_data_uris
 
 if TYPE_CHECKING:
+    from docspan.backends.google_docs.docs_request_builder import UnplacedCell
     from docspan.config import GoogleDocsConfig, MarkgateConfig
 
 logger = logging.getLogger(__name__)
@@ -603,8 +604,9 @@ class GoogleDocsBackend(Backend):
                 for n in plan.target_nodes
             )
             second: list[dict] = []
+            filled = False
             unstyled: list[DocsParagraphNode] = []
-            unplaced_cells: list[str] = []
+            unplaced_cells: list[UnplacedCell] = []
             dead_anchors: list[str] = []
             cross_doc_issues: list[str] = []
             unmapped_links: list[str] = []
@@ -645,6 +647,23 @@ class GoogleDocsBackend(Backend):
                     pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
                 )
                 pass2_residue = alignment.residue
+                # A table this push created is still empty in pass2_doc, so its
+                # cells' styling cannot be placed. Apply the fills alone, re-read,
+                # and let everything below run against the populated document.
+                fills = builder.build_table_fill_batch(
+                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
+                )
+                if fills:
+                    self._client.batch_update(
+                        doc_id, fills, required_revision_id=pass2_doc["revisionId"]
+                    )
+                    filled = True
+                    whole_doc = self._client.get_document(doc_id)
+                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
+                    alignment = builder.align(
+                        pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
+                    )
+                    pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
                     pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment,
                     resolver=resolver, local_path=local_path,
@@ -711,11 +730,11 @@ class GoogleDocsBackend(Backend):
                 # `unstyled` above and the same reason it has to be said out loud:
                 # the cell got no styling rather than styling aimed at whatever sat
                 # at that ordinal, and a silent drop is indistinguishable from
-                # success. Reachable when a table is created by this very push (its
-                # cells are still empty when the ranges are computed), when a
-                # concurrent edit changed a cell, or when the cell holds an inline
-                # object whose index width the text search cannot see.
-                unplaced_cells = builder.unplaced_table_cells(
+                # success. Reachable when a concurrent edit changed a cell, or when the
+                # cell holds an inline object whose index width the text search
+                # cannot see. (A table created by this push is filled and re-read
+                # above, so its cells are placed.)
+                unplaced_cells = builder.unplaced_table_cell_details(
                     pass2_doc, plan.target_nodes, alignment
                 )
                 if second:
@@ -726,7 +745,7 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if (not plan.requests and not style_requests and not second and not unstyled
+            if (not plan.requests and not style_requests and not second and not filled and not unstyled
                     and not dead_anchors and not unplaced_cells and not cross_doc_issues
                     and not unmapped_links):
                 # Nothing was applied by either pass. That is now a true
@@ -781,7 +800,7 @@ class GoogleDocsBackend(Backend):
                     # blame docspan for a comment a human resolved mid-run, and pay
                     # an extra list_comments call to do it.
                     self._comment_backstop_message(doc_id, len(plan.comments))
-                    if (plan.requests or second)
+                    if (plan.requests or second or filled)
                     else None,
                     self._render_unstyled(unstyled) if unstyled else None,
                     self._render_unplaced_cells(unplaced_cells) if unplaced_cells else None,
@@ -1288,7 +1307,7 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_unplaced_cells(cells: list[str]) -> str:
+    def _render_unplaced_cells(cells: Sequence[str | UnplacedCell]) -> str:
         """Styled table cells whose styling was not written.
 
         Distinct from _render_unstyled, which is about paragraphs.
@@ -1302,17 +1321,24 @@ class GoogleDocsBackend(Backend):
         Non-convergence is the same known open decision `unresolved_anchor_links`
         documents; misdescribing the remedy is not, so that part is fixed here.
         """
-        preview = [(text[:40] or "(empty)") for text in cells[:5]]
+        def describe(cell: str | UnplacedCell) -> str:
+            if isinstance(cell, str):
+                return cell[:40] or "(empty)"
+            label = cell.text[:40] or "(empty)"
+            return f"row {cell.row + 1}, col {cell.col + 1}: {label} ({cell.reason})"
+
+        preview = [describe(cell) for cell in cells[:5]]
         more = len(cells) - len(preview)
         listed = "; ".join(preview) + (f"; +{more} more" if more > 0 else "")
         return (
             f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
-            f"— docspan could not locate them in the written document, so it wrote no "
-            f"styling rather than styling aimed at the wrong cell: {listed}. "
-            f"If this push created the table, pushing again places the styling. "
-            f"Otherwise the cell holds something docspan cannot measure around — a "
-            f"smart chip, an image, or more than one paragraph — and pushing again "
-            f"will report this same warning; style that cell in the document instead."
+            f"— docspan wrote no styling for them rather than "
+            f"styling aimed at the wrong cell (see each cell's reason): {listed}. "
+            f"If the table was left empty by an earlier push, pushing again places the "
+            f"styling. Otherwise the cell holds something docspan cannot place styling "
+            f"in — a smart chip, an image, more than one paragraph, or styled text "
+            f"longer than the cell — and pushing again will report this same warning; "
+            f"fix or style that cell in the document instead."
         )
 
     @staticmethod
