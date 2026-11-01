@@ -398,3 +398,13 @@ parallel agents once T6 scaffolding is in place.
 | Confluence parity | Google Docs first; Confluence backend added in a follow-on (tools are backend-agnostic at the model layer) |
 | Crawl quota | Best-effort with `--max-docs` circuit breaker and per-doc error recovery; not fail-fast |
 | MCP SDK | Use `mcp>=1.0.0,<3` as optional extra; do not implement JSON-RPC framing manually |
+
+---
+
+## 8. Implementation deviations (post-validate)
+
+- SDK: `mcp` 2.x renamed `FastMCP` to `MCPServer` (`mcp.server.mcpserver`); extra pinned `mcp>=2.0.0,<3` for Python >= 3.10 only.
+- `diff_since(doc_id)` diffs live vs. the snapshot `fetch_doc` writes (no `rev` input); `read_section` uses new `sections.find_section_by_path`, not `split_nodes`.
+- Layout is flatter than §1.1: logic in `mcp/service.py` (SDK-free), thin `mcp/server.py`; CLI in `cli/mcp_cmds.py`.
+- `list_comments` uses `client.get_comments` (includes resolved), so the resolved-comments gap in validate §1 does not apply.
+- `crawl --scope` defaults to `all` (matches the issue); `mapped` is opt-in; `--max-docs` defaults to 25.
