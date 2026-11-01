@@ -42,6 +42,7 @@ class FakeBackend(Backend):
     pushed: list = field(default_factory=list)
     pushed_sectioned: list = field(default_factory=list)
     pull_calls: list = field(default_factory=list)
+    pull_kwargs: list = field(default_factory=list)
     pull_sectioned_calls: list = field(default_factory=list)
     # filename -> content, written into the temp dir by pull_sectioned()
     section_files: dict = field(default_factory=dict)
@@ -56,6 +57,7 @@ class FakeBackend(Backend):
 
     def pull(self, doc_id: str, local_path: str, **kwargs: object) -> PullResult:
         self.pull_calls.append((doc_id, local_path))
+        self.pull_kwargs.append(kwargs)
         if self.pull_status in ("ok", "warning"):
             with open(local_path, "w", encoding="utf-8") as fh:
                 fh.write(self.remote_content)
@@ -309,6 +311,17 @@ class TestOrchestratePull:
         merged = local.read_text(encoding="utf-8")
         assert "local edit" in merged
         assert "remote addition" in merged
+
+    def test_merge_pull_passes_real_path_for_sidecar_lookup(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        local = tmp_path / "doc.md"
+        local.write_text("line1\nlocal edit\nline3\n", encoding="utf-8")
+        state, state_path = _synced_state(tmp_path, str(local), "line1\nline2\nline3\n", remote_version="v1")
+        backend = FakeBackend(remote_version="v2", remote_content="line1\nline2\nline3\nremote\n")
+
+        orchestrate_pull(_mapping(str(local)), backend, state, str(tmp_path), state_path)
+
+        assert backend.pull_kwargs[0]["sidecar_path"] == str(local)
+        assert backend.pull_calls[0][1] != str(local)  # pulled into a temp file
 
     def test_three_way_merge_with_conflicts(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         base = "same line\n"

@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ import requests
 from docspan.backends.google_docs import mermaid_cache_sidecar
 from docspan.backends.google_docs.docs_structure_parser import DocsImageNode
 from docspan.backends.google_docs.mermaid_renderer import lookup_mermaid_source
+
+logger = logging.getLogger(__name__)
 
 _DATA_URI_IMAGE = re.compile(r"!\[([^\]]*)\]\((data:image/[^)]+)\)")
 
@@ -200,7 +203,9 @@ def recover_structural_mermaid_images(
     diagrams at the 10s timeout above) for no benefit, since each fetch is
     independent of the others.
     """
-    matches = list(re.finditer(r"!\[([^\]]*)\]\(([^)]+)\)", markdown_content))
+    # `*` not `+`: an image whose contentUri couldn't be resolved renders as
+    # `![]()` and must still count, or one such image disables all recovery.
+    matches = list(re.finditer(r"!\[([^\]]*)\]\(([^)]*)\)", markdown_content))
     if not matches or len(matches) != len(image_nodes):
         return ImageRecoveryResult(markdown=markdown_content, mermaid_restored=0, base64_deflated=0)
 
@@ -229,6 +234,14 @@ def recover_structural_mermaid_images(
             pieces.append(f"```mermaid\n{diagram}\n```")
             mermaid_restored += 1
         else:
+            logger.warning(
+                "Structural pull: image %s could not be matched to mermaid source "
+                "(no sidecar/cache/appendix hit%s); it stays an image, so a later "
+                "push cannot restore the diagram. Checked sidecar: %s",
+                node.object_id or "<unknown>",
+                "" if png_bytes is not None else ", image bytes unavailable",
+                mermaid_cache_sidecar.sidecar_path(markdown_path) if markdown_path else "<none>",
+            )
             pieces.append(f"![{alt}]({node.src})")
         cursor = match.end()
     pieces.append(markdown_content[cursor:])

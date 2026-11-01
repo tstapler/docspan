@@ -298,3 +298,38 @@ def test_structural_recovery_fetches_multiple_distinct_urls_concurrently(
     assert result.mermaid_restored == 2
     assert f"```mermaid\n{diagram_a}\n```" in result.markdown
     assert f"```mermaid\n{diagram_b}\n```" in result.markdown
+
+
+def test_structural_recovery_empty_src_image_does_not_disable_recovery(tmp_path, monkeypatch) -> None:
+    """An unresolved `![]()` image must not trip the count guard for the others."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    diagram = "graph TD\n  A --> B"
+    png_bytes = _PNG_MAGIC + b"second-image"
+    md_path = str(tmp_path / "doc.md")
+    mermaid_cache_sidecar.record(md_path, png_bytes, diagram)
+
+    markdown = "![]()\n\n![x](https://docs.google.com/u2)\n"
+    image_nodes = [DocsImageNode(src="", alt=""), DocsImageNode(src="https://docs.google.com/u2", alt="")]
+
+    result = recover_structural_mermaid_images(
+        markdown, image_nodes, fetch=lambda url: png_bytes, markdown_path=md_path
+    )
+
+    assert result.mermaid_restored == 1
+    assert "![]()" in result.markdown
+    assert f"```mermaid\n{diagram}\n```" in result.markdown
+
+
+def test_structural_recovery_warns_when_image_unrecoverable(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    md_path = str(tmp_path / "doc.md")
+    markdown = "![](https://docs.google.com/u1)\n"
+    image_nodes = [DocsImageNode(src="https://docs.google.com/u1", alt="", object_id="kix.abc")]
+
+    with caplog.at_level("WARNING"):
+        recover_structural_mermaid_images(
+            markdown, image_nodes, fetch=lambda url: None, markdown_path=md_path
+        )
+
+    assert "kix.abc" in caplog.text
+    assert "doc.md.mermaid-cache.yaml" in caplog.text
