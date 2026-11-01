@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/tstapler/docspan/compare/docspan-v0.8.7...docspan-v0.9.0) (2026-11-01)
+
+
+### Features
+
+* create Google Docs and tabs declaratively from config ([#174](https://github.com/tstapler/docspan/issues/174)) ([efbdb47](https://github.com/tstapler/docspan/commit/efbdb4731aab42906cfea43dbe8c88d0ecbdd35d))
+* **google-docs:** report link/inline-style-only changes in push --dry-run ([#177](https://github.com/tstapler/docspan/issues/177)) ([9141e7a](https://github.com/tstapler/docspan/commit/9141e7a65e653d65f3abfb2b5cbb0076e168ebad))
+* **google-docs:** reverse cross-doc Doc URLs to repo-relative links on pull ([#179](https://github.com/tstapler/docspan/issues/179)) ([6398626](https://github.com/tstapler/docspan/commit/6398626dbcdd76650b9233d6ad923e62f974d86b))
+* **map:** add --parent-tab to create nested tabs with --new-tab-in ([#180](https://github.com/tstapler/docspan/issues/180)) ([ac9821c](https://github.com/tstapler/docspan/commit/ac9821ca9832430f2a1be5f49329df4a5125a838))
+
+
+### Bug Fixes
+
+* **cli:** reject --new-tab-in tab titles over 50 chars before calling the API ([#173](https://github.com/tstapler/docspan/issues/173)) ([64f869f](https://github.com/tstapler/docspan/commit/64f869f34de4b0bf5a607277c068d2fc40d33297))
+* **google-docs:** find mermaid sidecar on merge/preview pull and warn on unrecoverable images ([#182](https://github.com/tstapler/docspan/issues/182)) ([b4cf277](https://github.com/tstapler/docspan/commit/b4cf277ee6ce11e76e5c64654e5cf06ce1363da4))
+* **google-docs:** keep text/spans invariant in paragraph, heading, list and blockquote parsing ([#170](https://github.com/tstapler/docspan/issues/170)) ([d14d4aa](https://github.com/tstapler/docspan/commit/d14d4aabc042fab33712c462c70a5755075bb536))
+* **google-docs:** preserve code spans in first-push table cells and merge split links on pull ([#178](https://github.com/tstapler/docspan/issues/178)) ([cdf9c60](https://github.com/tstapler/docspan/commit/cdf9c60ca1417b7830c796aff75c7c6db156bc27))
+* **google-docs:** retry push once on requiredRevisionId conflict ([#175](https://github.com/tstapler/docspan/issues/175)) ([068e4ec](https://github.com/tstapler/docspan/commit/068e4ec38233835c1fef942fc40e86ca69c7de31))
+
 ## [0.8.7](https://github.com/tstapler/docspan/compare/docspan-v0.8.6...docspan-v0.8.7) (2026-10-20)
 
 
