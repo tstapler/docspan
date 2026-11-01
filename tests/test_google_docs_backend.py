@@ -86,6 +86,36 @@ class TestAddDocumentTab:
         ]
 
 
+class TestUpdateDocumentTabProperties:
+    def test_sends_update_document_tab_properties_request(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        execute_mock = client.docs_service.documents.return_value.batchUpdate.return_value.execute
+        execute_mock.return_value = {"replies": [{}]}
+
+        client.update_document_tab_properties("doc-1", "t.child", "t.parent")
+
+        _, kwargs = client.docs_service.documents.return_value.batchUpdate.call_args
+        assert kwargs["documentId"] == "doc-1"
+        assert kwargs["body"]["requests"] == [
+            {
+                "updateDocumentTabProperties": {
+                    "tabProperties": {"tabId": "t.child", "parentTabId": "t.parent"},
+                    "fields": "parentTabId",
+                }
+            }
+        ]
+
+    def test_propagates_api_errors(self, make_client: Callable[[], GoogleDocsClient]) -> None:
+        client = make_client()
+        execute_mock = client.docs_service.documents.return_value.batchUpdate.return_value.execute
+        execute_mock.side_effect = ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            client.update_document_tab_properties("doc-1", "t.child", "t.parent")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsBackend.push() — threads revisionId, handles stale-revision conflict
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,11 +163,10 @@ class TestPushRevisionGuard:
 
         result = backend.push(str(local), "doc-1")
 
-        assert result == PushResult(
-            status="conflict",
-            doc_id="doc-1",
-            message="The doc changed since your last pull — run `docspan pull` again",
-        )
+        assert result.status == "conflict"
+        assert result.doc_id == "doc-1"
+        assert "run `docspan pull` again" not in (result.message or "")
+        assert fake_client.batch_update.call_count == 2  # one retry, then give up
 
     def test_push_returns_error_status_for_non_revision_http_error(
         self,
@@ -1756,6 +1785,25 @@ class TestPullStripsAppendixAndSurfacesDataUriWarnings:
         assert "data:" in (result.message or "")
         assert data_uri in local.read_text(encoding="utf-8")
 
+    def test_default_pull_path_looks_up_sidecar_next_to_sidecar_path_not_temp_file(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = "<p>hi</p>"
+        fake_client.get_document.return_value = _empty_doc()
+        temp = tmp_path / "tmp-pull.md"
+        real = tmp_path / "real" / "doc.md"
+
+        with mock.patch(
+            "docspan.backends.google_docs.backend.recover_pulled_images",
+            wraps=__import__(
+                "docspan.backends.google_docs.backend", fromlist=["recover_pulled_images"]
+            ).recover_pulled_images,
+        ) as spy:
+            backend.pull("doc-1", str(temp), sidecar_path=str(real))
+
+        assert spy.call_args.kwargs["markdown_path"] == str(real)
+
     def test_structural_pull_path_extracts_and_strips_real_appendix_nodes(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]
@@ -2760,6 +2808,10 @@ class TestCreate:
     ) -> None:  # type: ignore[no-untyped-def]
         backend, client = make_backend()
         client.create_document.return_value = {"documentId": "new-doc-1", "title": "My Doc"}
+        client.get_document.return_value = {
+            "documentId": "new-doc-1",
+            "tabs": [{"tabProperties": {"tabId": "t.0"}, "documentTab": {"body": {"content": []}}}],
+        }
 
         result = backend.create("My Doc")
 
@@ -2767,6 +2819,7 @@ class TestCreate:
         assert result.doc_id == "new-doc-1"
         assert result.title == "My Doc"
         assert result.url == "https://docs.google.com/document/d/new-doc-1/edit"
+        assert result.first_tab_id == "t.0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2808,6 +2861,121 @@ class TestCreateTab:
         result = backend.create_tab("doc-1", "Discussion")
 
         assert result.title == "Discussion"
+
+
+def _tabs_doc(*tabs: tuple) -> dict:
+    """Doc from (tabId, nestingLevel, parentTabId-or-None); children go under childTabs."""
+    nodes = {
+        tab_id: {
+            "tabProperties": {
+                "tabId": tab_id,
+                "nestingLevel": level,
+                **({"parentTabId": parent} if parent else {}),
+            }
+        }
+        for tab_id, level, parent in tabs
+    }
+    roots = []
+    for tab_id, _level, parent in tabs:
+        if parent:
+            nodes[parent].setdefault("childTabs", []).append(nodes[tab_id])
+        else:
+            roots.append(nodes[tab_id])
+    return {"tabs": roots}
+
+
+class TestCreateChildTab:
+    def test_without_parent_never_updates_or_fetches(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+
+        backend.create_tab("doc-1", "T")
+
+        client.update_document_tab_properties.assert_not_called()
+        client.get_document.assert_not_called()
+
+    def test_with_parent_adds_updates_and_verifies_nesting(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new", "title": "T"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.new", 1, "t.parent")),
+        ]
+
+        result = backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.parent")
+        assert client.get_document.call_count == 2
+        assert result.tab_id == "t.new"
+
+    def test_raises_if_nesting_not_confirmed(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.new", 0, None)),
+        ]
+
+        with pytest.raises(RuntimeError, match=r"t\.new.*ignored"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.parent")
+
+    def test_raises_if_nested_under_wrong_parent(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None), ("t.other", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.other", 0, None), ("t.new", 1, "t.other")),
+        ]
+
+        with pytest.raises(RuntimeError, match="not nested under 't.parent'"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+
+    def test_grandchild_parent_is_found_via_child_tabs(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        tree = (("t.root", 0, None), ("t.child", 1, "t.root"))
+        client.get_document.side_effect = [
+            _tabs_doc(*tree),
+            _tabs_doc(*tree, ("t.new", 2, "t.child")),
+        ]
+
+        backend.create_tab("doc-1", "T", parent_tab_id="t.child")
+
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.child")
+
+    def test_unknown_parent_raises_before_any_mutation(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.get_document.return_value = _tabs_doc(("t.a", 0, None), ("t.b", 0, None))
+
+        with pytest.raises(ValueError, match="t.a, t.b"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.missing")
+
+        client.add_document_tab.assert_not_called()
+        client.update_document_tab_properties.assert_not_called()
+
+    def test_update_failure_reports_orphan_tab_id(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.return_value = _tabs_doc(("t.parent", 0, None))
+        client.update_document_tab_properties.side_effect = ValueError("403")
+
+        with pytest.raises(RuntimeError, match="t.new.*403"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
 
 
 class _NoTabBackend(Backend):
@@ -4297,3 +4465,207 @@ class TestPushPullBlockquoteRoundtrip:
         assert result == markdown_text
         if "```python" in markdown_text:
             assert "python" in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pull() reverses cross-doc Doc URLs back to repo-relative links.
+# ─────────────────────────────────────────────────────────────────────────────
+_TARGET_URL = "https://docs.google.com/document/d/TARGETID/edit"
+
+
+def _reverse_link_mappings(tmp_path):
+    from docspan.config import Mapping
+
+    return [
+        Mapping(local=str(tmp_path / "docs" / "source.md"), backend="google_docs", remote_id="doc-1"),
+        Mapping(local=str(tmp_path / "docs" / "other.md"), backend="google_docs", remote_id="TARGETID"),
+    ]
+
+
+class TestPullReversesCrossDocLinks:
+    def test_structural_path_rewrites_url_to_relative_path(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        doc = _multi_tab_doc()
+        doc["tabs"][1]["documentTab"]["body"]["content"][0]["paragraph"]["elements"] = [
+            {"textRun": {"content": "see "}},
+            {"textRun": {"content": "other", "textStyle": {"link": {"url": _TARGET_URL}}}},
+            {"textRun": {"content": "\n"}},
+        ]
+        fake_client.get_document.return_value = doc
+
+        local = tmp_path / "docs" / "source.md"
+        result = backend.pull(
+            "doc-1", str(local), tab_id="t.second", mappings=_reverse_link_mappings(tmp_path)
+        )
+
+        assert result.status == "ok"
+        content = local.read_text(encoding="utf-8")
+        assert "(other.md)" in content and "docs.google.com" not in content
+
+    def test_default_path_rewrites_url_and_uses_source_local_path(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = f'<p><a href="{_TARGET_URL}">other</a></p>'
+        fake_client.get_document.return_value = _empty_doc()
+
+        scratch = tmp_path / "scratch.md"  # merge/preview temp file
+        result = backend.pull(
+            "doc-1",
+            str(scratch),
+            mappings=_reverse_link_mappings(tmp_path),
+            source_local_path=str(tmp_path / "docs" / "source.md"),
+        )
+
+        assert result.status == "ok"
+        assert "[other](other.md)" in scratch.read_text(encoding="utf-8")
+
+    def test_without_mappings_kwarg_leaves_url_verbatim(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = f'<p><a href="{_TARGET_URL}">other</a></p>'
+        fake_client.get_document.return_value = _empty_doc()
+
+        local = tmp_path / "docs" / "source.md"
+        assert backend.pull("doc-1", str(local)).status == "ok"
+        assert _TARGET_URL in local.read_text(encoding="utf-8")
+
+    def test_duplicate_remote_and_tab_mappings_leave_url_verbatim_and_warn(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        from docspan.config import Mapping
+
+        backend, fake_client = make_backend()
+        url = f"{_TARGET_URL}?tab=t.dup"
+        fake_client.get_doc_content.return_value = f'<p><a href="{url}">other</a></p>'
+        fake_client.get_document.return_value = _empty_doc()
+
+        mappings = [
+            Mapping(local=str(tmp_path / "docs" / "source.md"), backend="google_docs", remote_id="doc-1"),
+            Mapping(
+                local=str(tmp_path / "docs" / "a.md"), backend="google_docs",
+                remote_id="TARGETID", tab_id="t.dup",
+            ),
+            Mapping(
+                local=str(tmp_path / "docs" / "b.md"), backend="google_docs",
+                remote_id="TARGETID", tab_id="t.dup",
+            ),
+        ]
+        local = tmp_path / "docs" / "source.md"
+        result = backend.pull("doc-1", str(local), mappings=mappings)
+
+        assert result.status == "warning"
+        assert result.message and "TARGETID" in result.message
+        content = local.read_text(encoding="utf-8")
+        assert url in content and "a.md" not in content and "b.md" not in content
+
+
+class TestCreateFirstTabLookup:
+    def test_create_returns_doc_id_when_first_tab_lookup_fails(self, make_backend) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.create_document.return_value = {"documentId": "doc-9", "title": "T"}
+        client.get_document.side_effect = RuntimeError("transient")
+
+        result = backend.create("T")
+
+        assert result.doc_id == "doc-9"
+        assert result.first_tab_id is None
+
+
+class TestPushRevisionConflictRecovery:
+    def test_push_pass2_refetches_doc_when_only_style_requests_written_in_pass1(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Pass 1 is style-only (pageless toggle) yet still advances the revision."""
+        local = tmp_path / "doc.md"
+        local.write_text("**Beta**\n", encoding="utf-8")
+        backend, client = make_backend()
+        client.get_document.side_effect = [
+            _doc_with_paragraph("Beta", revision_id="rev-1"),
+            _doc_with_paragraph("Beta", revision_id="rev-2"),
+        ]
+        client.list_comments.return_value = []
+
+        result = backend.push(str(local), "doc-1", pageless=True)
+
+        assert result.status == "ok", result.message
+        assert client.get_document.call_count == 2
+        assert client.batch_update.call_count == 2
+        assert client.batch_update.call_args_list[0].kwargs["required_revision_id"] == "rev-1"
+        assert client.batch_update.call_args_list[1].kwargs["required_revision_id"] == "rev-2"
+
+    def test_push_retries_once_on_required_revision_id_conflict_and_succeeds(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.get_document.side_effect = [_empty_doc("rev-1"), _empty_doc("rev-2")]
+        client.batch_update.side_effect = [
+            make_http_error(400, "requiredRevisionId does not match the latest revision"),
+            None,
+        ]
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "ok", result.message
+        assert client.get_document.call_count == 2
+        assert client.batch_update.call_args.kwargs["required_revision_id"] == "rev-2"
+
+    def test_push_returns_conflict_after_two_consecutive_required_revision_id_failures(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.get_document.return_value = _empty_doc("rev-1")
+        client.batch_update.side_effect = make_http_error(
+            400, "requiredRevisionId does not match the latest revision"
+        )
+        local = tmp_path / "doc.md"
+        local.write_text("# Some content\n", encoding="utf-8")
+
+        result = backend.push(str(local), "doc-1")
+
+        assert result.status == "conflict"
+        assert client.batch_update.call_count == 2
+        assert "run `docspan pull` again" not in (result.message or "")
+
+    def test_sequential_pushes_to_different_tabs_of_same_doc_all_succeed(
+        self,
+        tmp_path,
+        make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]],
+        make_http_error: Callable[[int, str], object],
+    ) -> None:  # type: ignore[no-untyped-def]
+        """Each push's first read is stale (as after an earlier push in the run)."""
+        backend, client = make_backend()
+        state = {"rev": 1, "fetches": 0}
+
+        def get_document(doc_id, *args, **kwargs):  # type: ignore[no-untyped-def]
+            state["fetches"] += 1
+            stale = state["fetches"] == 1 and state["rev"] > 1
+            return _empty_doc(f"rev-{state['rev'] - 1 if stale else state['rev']}")
+
+        def batch_update(doc_id, requests, required_revision_id=None):  # type: ignore[no-untyped-def]
+            if required_revision_id != f"rev-{state['rev']}":
+                raise make_http_error(400, "requiredRevisionId does not match the latest revision")
+            state["rev"] += 1
+
+        client.get_document.side_effect = get_document
+        client.batch_update.side_effect = batch_update
+
+        results = []
+        for name in ("a", "b", "c"):
+            state["fetches"] = 0
+            local = tmp_path / f"{name}.md"
+            local.write_text(f"# Content {name}\n", encoding="utf-8")
+            results.append(backend.push(str(local), "doc-1"))
+
+        assert [r.status for r in results] == ["ok", "ok", "ok"]

@@ -9,7 +9,7 @@ import pathlib
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Sequence, Tuple, Union
 
 from googleapiclient.errors import HttpError
 
@@ -88,6 +88,7 @@ from docspan.backends.google_docs.push_preview import (
 from docspan.backends.google_docs.section_splitter import SectionSplitError, split_nodes
 from docspan.backends.google_docs.tabs import (
     TabNotFoundError,
+    flatten_tabs,
     heading_ids_by_tab,
     resolve_document_tab,
 )
@@ -95,6 +96,7 @@ from docspan.core.atomic_dir import atomic_replace_dir
 from docspan.core.paths import COMMENTS_SUFFIX, find_data_uris
 
 if TYPE_CHECKING:
+    from docspan.backends.google_docs.docs_request_builder import UnplacedCell
     from docspan.config import GoogleDocsConfig, MarkgateConfig
 
 logger = logging.getLogger(__name__)
@@ -209,6 +211,7 @@ class GoogleDocsBackend(Backend):
         doc_id: str,
         tab_id: Optional[str] = None,
         content: Optional[str] = None,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
     ) -> PushPlan:
         """Fetch the doc + open comments exactly once and compute the diff/risk plan.
 
@@ -337,7 +340,9 @@ class GoogleDocsBackend(Backend):
             requests = request_builder.build(
                 current_nodes, target_nodes, doc_end_index, tab_id=resolved_tab_id
             )
-            entries, unchanged_count = request_builder.diff_summary(current_nodes, target_nodes)
+            entries, unchanged_count = request_builder.diff_summary(
+                current_nodes, target_nodes, resolver, local_path
+            )
 
             comments = self._client.list_comments(doc_id)
             high_risk = find_high_risk_paragraphs(entries, comments)
@@ -371,7 +376,7 @@ class GoogleDocsBackend(Backend):
         )
 
     def preview_push(
-        self, local_path: str, doc_id: str, tab_id: Optional[str] = None
+        self, local_path: str, doc_id: str, tab_id: Optional[str] = None, **kwargs: object
     ) -> PushPreview:
         """Build a read-only, cosmetic preview of what push() would do.
 
@@ -389,7 +394,8 @@ class GoogleDocsBackend(Backend):
         """
         self._ensure_client()
         try:
-            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id)
+            resolver = self._build_cross_doc_resolver(kwargs, caller="preview_push")
+            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id, resolver=resolver)
             # Inside the try/except deliberately: the docstring above promises a
             # PushPreview(error=…) rather than a traceback, and evaluating these
             # in the return expression put them outside that promise.
@@ -501,7 +507,34 @@ class GoogleDocsBackend(Backend):
             mappings, self._fetch_target_headings, cache=cross_doc_cache
         )
 
-    def _execute_push(
+    def _pull_link_reverser(
+        self, kwargs: dict, source_local_path: str, cache: Optional[dict] = None
+    ) -> "Optional[cross_doc_links.ReverseDocLinkResolver]":
+        """Build the pull-side link reverser from a `mappings` kwarg; None when absent."""
+        mappings = kwargs.get("mappings")
+        if not mappings:
+            return None
+        assert isinstance(mappings, list), (
+            f"pull() 'mappings' kwarg must be a list, got {type(mappings).__name__}"
+        )
+        return cross_doc_links.ReverseDocLinkResolver(
+            mappings, self._fetch_target_headings, source_local_path, cache=cache
+        )
+
+    def _execute_push(self, local_path: str, doc_id: str, **kwargs: Any) -> PushResult:
+        """Run `_execute_push_once`, retrying once on a requiredRevisionId conflict.
+
+        An earlier write to the same Doc (e.g. another tab pushed in this run) can
+        advance its revision after this push's plan was built; the retry rebuilds
+        the plan from a fresh `get_document`. A second conflict is genuinely external.
+        """
+        result = self._execute_push_once(local_path, doc_id, **kwargs)
+        if result.status == "conflict":
+            logger.debug("requiredRevisionId conflict for %s; retrying once", doc_id)
+            result = self._execute_push_once(local_path, doc_id, **kwargs)
+        return result
+
+    def _execute_push_once(
         self,
         local_path: str,
         doc_id: str,
@@ -534,7 +567,9 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         plan: Optional[PushPlan] = None
         try:
-            plan = self._build_push_plan(local_path, doc_id, tab_id=tab_id, content=content)
+            plan = self._build_push_plan(
+                local_path, doc_id, tab_id=tab_id, content=content, resolver=resolver
+            )
             # Document-wide, not scoped to plan.doc's resolved tab -- reads
             # from the unresolved whole_doc fetch. Never gated by
             # plan.high_risk/force: it's a metadata toggle, not a content
@@ -584,8 +619,9 @@ class GoogleDocsBackend(Backend):
                 for n in plan.target_nodes
             )
             second: list[dict] = []
+            filled = False
             unstyled: list[DocsParagraphNode] = []
-            unplaced_cells: list[str] = []
+            unplaced_cells: list[UnplacedCell] = []
             dead_anchors: list[str] = []
             cross_doc_issues: list[str] = []
             unmapped_links: list[str] = []
@@ -596,12 +632,12 @@ class GoogleDocsBackend(Backend):
             # original document, and is just as unsafe to drop silently.
             pass2_residue: list = []
             if needs_pass2:
-                # When pass 1 wrote nothing the already-fetched plan.doc is
+                # When pass 1 wrote nothing (content or style) the already-fetched plan.doc is
                 # still current, so pass 2 runs against it and skips a
                 # redundant GET; otherwise the document has moved and must be
                 # re-read. plan.doc is already narrowed to the resolved tab,
                 # which is why PushPlan carries resolved_tab_id.
-                if plan.requests:
+                if first_pass_requests:
                     whole_doc = self._client.get_document(doc_id)
                     pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
                 else:
@@ -626,6 +662,23 @@ class GoogleDocsBackend(Backend):
                     pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
                 )
                 pass2_residue = alignment.residue
+                # A table this push created is still empty in pass2_doc, so its
+                # cells' styling cannot be placed. Apply the fills alone, re-read,
+                # and let everything below run against the populated document.
+                fills = builder.build_table_fill_batch(
+                    pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment
+                )
+                if fills:
+                    self._client.batch_update(
+                        doc_id, fills, required_revision_id=pass2_doc["revisionId"]
+                    )
+                    filled = True
+                    whole_doc = self._client.get_document(doc_id)
+                    pass2_doc, pass2_tab_id, _ = resolve_document_tab(whole_doc, tab_id)
+                    alignment = builder.align(
+                        pass2_doc, plan.target_nodes, heading_ids_by_tab(whole_doc)
+                    )
+                    pass2_residue = alignment.residue
                 second = builder.build_second_pass_requests(
                     pass2_doc, plan.target_nodes, tab_id=pass2_tab_id, alignment=alignment,
                     resolver=resolver, local_path=local_path,
@@ -692,11 +745,11 @@ class GoogleDocsBackend(Backend):
                 # `unstyled` above and the same reason it has to be said out loud:
                 # the cell got no styling rather than styling aimed at whatever sat
                 # at that ordinal, and a silent drop is indistinguishable from
-                # success. Reachable when a table is created by this very push (its
-                # cells are still empty when the ranges are computed), when a
-                # concurrent edit changed a cell, or when the cell holds an inline
-                # object whose index width the text search cannot see.
-                unplaced_cells = builder.unplaced_table_cells(
+                # success. Reachable when a concurrent edit changed a cell, or when the
+                # cell holds an inline object whose index width the text search
+                # cannot see. (A table created by this push is filled and re-read
+                # above, so its cells are placed.)
+                unplaced_cells = builder.unplaced_table_cell_details(
                     pass2_doc, plan.target_nodes, alignment
                 )
                 if second:
@@ -707,7 +760,7 @@ class GoogleDocsBackend(Backend):
                         doc_id, second, required_revision_id=pass2_doc["revisionId"]
                     )
 
-            if (not plan.requests and not style_requests and not second and not unstyled
+            if (not plan.requests and not style_requests and not second and not filled and not unstyled
                     and not dead_anchors and not unplaced_cells and not cross_doc_issues
                     and not unmapped_links):
                 # Nothing was applied by either pass. That is now a true
@@ -762,7 +815,7 @@ class GoogleDocsBackend(Backend):
                     # blame docspan for a comment a human resolved mid-run, and pay
                     # an extra list_comments call to do it.
                     self._comment_backstop_message(doc_id, len(plan.comments))
-                    if (plan.requests or second)
+                    if (plan.requests or second or filled)
                     else None,
                     self._render_unstyled(unstyled) if unstyled else None,
                     self._render_unplaced_cells(unplaced_cells) if unplaced_cells else None,
@@ -837,7 +890,11 @@ class GoogleDocsBackend(Backend):
                 return PushResult(
                     status="conflict",
                     doc_id=doc_id,
-                    message="The doc changed since your last pull — run `docspan pull` again",
+                    message=(
+                        "The doc's revision changed during the push (an external edit, or "
+                        "another push to the same doc) and a retry did not resolve it — "
+                        "re-run the push, or `docspan pull` if the doc was edited elsewhere"
+                    ),
                     retryable_temp_drive_file_ids=retryable,
                 )
             return PushResult(
@@ -1265,7 +1322,7 @@ class GoogleDocsBackend(Backend):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_unplaced_cells(cells: list[str]) -> str:
+    def _render_unplaced_cells(cells: Sequence[str | UnplacedCell]) -> str:
         """Styled table cells whose styling was not written.
 
         Distinct from _render_unstyled, which is about paragraphs.
@@ -1279,17 +1336,24 @@ class GoogleDocsBackend(Backend):
         Non-convergence is the same known open decision `unresolved_anchor_links`
         documents; misdescribing the remedy is not, so that part is fixed here.
         """
-        preview = [(text[:40] or "(empty)") for text in cells[:5]]
+        def describe(cell: str | UnplacedCell) -> str:
+            if isinstance(cell, str):
+                return cell[:40] or "(empty)"
+            label = cell.text[:40] or "(empty)"
+            return f"row {cell.row + 1}, col {cell.col + 1}: {label} ({cell.reason})"
+
+        preview = [describe(cell) for cell in cells[:5]]
         more = len(cells) - len(preview)
         listed = "; ".join(preview) + (f"; +{more} more" if more > 0 else "")
         return (
             f"⚠ {len(cells)} table cell(s) kept their text but not their formatting "
-            f"— docspan could not locate them in the written document, so it wrote no "
-            f"styling rather than styling aimed at the wrong cell: {listed}. "
-            f"If this push created the table, pushing again places the styling. "
-            f"Otherwise the cell holds something docspan cannot measure around — a "
-            f"smart chip, an image, or more than one paragraph — and pushing again "
-            f"will report this same warning; style that cell in the document instead."
+            f"— docspan wrote no styling for them rather than "
+            f"styling aimed at the wrong cell (see each cell's reason): {listed}. "
+            f"If the table was left empty by an earlier push, pushing again places the "
+            f"styling. Otherwise the cell holds something docspan cannot place styling "
+            f"in — a smart chip, an image, more than one paragraph, or styled text "
+            f"longer than the cell — and pushing again will report this same warning; "
+            f"fix or style that cell in the document instead."
         )
 
     @staticmethod
@@ -1367,6 +1431,7 @@ class GoogleDocsBackend(Backend):
         local_path: str,
         tab_id: Optional[str] = None,
         pull_strategy: Literal["auto", "structural"] = "auto",
+        sidecar_path: Optional[str] = None,
         **kwargs: object,
     ) -> PullResult:
         """Fetch the Google Doc, convert to markdown, write locally.
@@ -1413,6 +1478,16 @@ class GoogleDocsBackend(Backend):
                 if appendix_boundary is not None:
                     nodes = nodes[:appendix_boundary]
                 markdown_content = render_nodes_to_markdown(nodes)
+                reverse_warnings: List[str] = []
+                # `source_local_path` is the real file when `local_path` is a
+                # merge/preview temp file, so relative links come out right.
+                link_reverser = self._pull_link_reverser(
+                    kwargs, str(kwargs.get("source_local_path") or local_path)
+                )
+                if link_reverser is not None:
+                    markdown_content, reverse_warnings = cross_doc_links.reverse_cross_doc_links(
+                        markdown_content, link_reverser
+                    )
 
                 # Unlike the default (Drive HTML export) path below, this
                 # renderer never embeds base64 image data -- each image link
@@ -1425,7 +1500,10 @@ class GoogleDocsBackend(Backend):
                     image_recovery = recover_structural_mermaid_images(
                         markdown_content,
                         image_nodes,
-                        markdown_path=local_path,
+                        # Merge/preview pulls write to a temp file; sidecar_path
+                        # is the real mapped file whose .mermaid-cache.yaml lives
+                        # next to it.
+                        markdown_path=sidecar_path or local_path,
                         appendix_entries=appendix_entries or None,
                     )
                     markdown_content = image_recovery.markdown
@@ -1475,6 +1553,7 @@ class GoogleDocsBackend(Backend):
                         f"⚠ {residue_note}" if residue_note else None,
                         self._render_unreadable_links(parser.unreadable_links),
                         data_uri_note,
+                        *(f"⚠ {w}" for w in reverse_warnings),
                     )
                     if message
                 ]
@@ -1531,10 +1610,19 @@ class GoogleDocsBackend(Backend):
             recovery = recover_pulled_images(
                 markdown_content,
                 image_nodes,
-                markdown_path=local_path,
+                markdown_path=sidecar_path or local_path,
                 appendix_entries=appendix_entries or None,
             )
             markdown_content = recovery.markdown
+
+            link_reverser = self._pull_link_reverser(
+                kwargs, str(kwargs.get("source_local_path") or local_path)
+            )
+            reverse_warnings: List[str] = []
+            if link_reverser is not None:
+                markdown_content, reverse_warnings = cross_doc_links.reverse_cross_doc_links(
+                    markdown_content, link_reverser
+                )
 
             # Backstop for any data: URI recover_pulled_images() didn't catch
             # (e.g. its positional-correlation guard bailed out) -- surfaced
@@ -1559,7 +1647,9 @@ class GoogleDocsBackend(Backend):
             # links are "absent from the pulled file" while they sit in the file
             # just written. Only the tab-scoped path above can report what the
             # file lacks, because there the parser's output *is* the file.
-            messages = [w for w in (warning, checkbox_warning, data_uri_warning) if w]
+            messages = [
+                w for w in (warning, checkbox_warning, data_uri_warning, *reverse_warnings) if w
+            ]
             if messages:
                 return PullResult(
                     status="warning",
@@ -1656,6 +1746,8 @@ class GoogleDocsBackend(Backend):
                 tempfile.mkdtemp(dir=str(tmp_parent), prefix=f".{target_dir.name}.", suffix=".tmp")
             )
             section_data_uris: List[str] = []
+            reverse_warnings: List[str] = []
+            reverse_cache: dict = {}
             try:
                 entries: List[SectionManifestEntry] = []
                 section_texts: List[Tuple[str, str]] = []
@@ -1672,6 +1764,16 @@ class GoogleDocsBackend(Backend):
                             markdown_path=str(sidecar_dir / filename),
                             appendix_entries=appendix_entries or None,
                         ).markdown
+                    link_reverser = self._pull_link_reverser(
+                        kwargs, str(sidecar_dir / filename), cache=reverse_cache
+                    )
+                    if link_reverser is not None:
+                        content, section_warnings = cross_doc_links.reverse_cross_doc_links(
+                            content, link_reverser
+                        )
+                        reverse_warnings.extend(
+                            w for w in section_warnings if w not in reverse_warnings
+                        )
                     section_data_uris.extend(find_data_uris(content))
                     (tmp_dir / filename).write_text(content)
                     section_texts.append((filename, content))
@@ -1710,6 +1812,7 @@ class GoogleDocsBackend(Backend):
                     f"⚠ {residue_note}" if residue_note else None,
                     self._render_unreadable_links(parser.unreadable_links),
                     data_uri_note,
+                    *(f"⚠ {w}" for w in reverse_warnings),
                 )
                 if message
             ]
@@ -1909,24 +2012,82 @@ class GoogleDocsBackend(Backend):
         assert self._client is not None
         doc = self._client.create_document(title)
         doc_id = doc["documentId"]
+        # documents.create doesn't return tabs; look up the real first-tab id.
+        try:
+            _, first_tab_id, _ = resolve_document_tab(self._client.get_document(doc_id), None)
+        except Exception as exc:
+            logger.warning("Created doc %s but could not resolve its first tab id: %s", doc_id, exc)
+            first_tab_id = None
         return CreateResult(
             doc_id=doc_id,
             title=doc.get("title", title),
             url=f"https://docs.google.com/document/d/{doc_id}/edit",
+            first_tab_id=first_tab_id,
         )
 
-    def create_tab(self, doc_id: str, title: str, **kwargs: object) -> CreateResult:
-        """Create a new tab named `title` in the existing doc `doc_id`."""
+    def create_tab(
+        self,
+        doc_id: str,
+        title: str,
+        parent_tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> CreateResult:
+        """Create a new tab named `title` in the existing doc `doc_id`.
+
+        With `parent_tab_id`, the tab is nested under that tab. Raises
+        ValueError if the parent doesn't exist (before any mutation) and
+        RuntimeError if the doc doesn't show the tab as nested afterwards.
+        """
         self._ensure_client()
         assert self._client is not None
+        if parent_tab_id is not None:
+            existing = {
+                t["tabProperties"]["tabId"]
+                for t in flatten_tabs(self._client.get_document(doc_id).get("tabs", []))
+            }
+            if parent_tab_id not in existing:
+                raise ValueError(
+                    f"--parent-tab '{parent_tab_id}' not found in doc. "
+                    f"Valid tab IDs: {', '.join(sorted(existing)) or '(none)'}"
+                )
         tab_properties = self._client.add_document_tab(doc_id, title)
         tab_id = tab_properties["tabId"]
+        if parent_tab_id is not None:
+            self._nest_tab(doc_id, tab_id, parent_tab_id)
         return CreateResult(
             doc_id=doc_id,
             title=tab_properties.get("title", title),
             tab_id=tab_id,
             url=f"https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id}",
         )
+
+    def _nest_tab(self, doc_id: str, tab_id: str, parent_tab_id: str) -> None:
+        """Move the just-created root tab under its parent and confirm it stuck.
+
+        A failure leaves the tab in the doc at root level, so errors name its id.
+        """
+        assert self._client is not None
+        orphan = (
+            f"Tab '{tab_id}' was created at root level but not nested under '{parent_tab_id}' "
+            f"(https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id})"
+        )
+        try:
+            self._client.update_document_tab_properties(doc_id, tab_id, parent_tab_id)
+        except Exception as exc:
+            raise RuntimeError(f"{orphan}: {exc}") from exc
+        doc = self._client.get_document(doc_id)
+        props: dict = next(
+            (
+                t["tabProperties"]
+                for t in flatten_tabs(doc.get("tabs", []))
+                if t["tabProperties"].get("tabId") == tab_id
+            ),
+            {},
+        )
+        if props.get("parentTabId") != parent_tab_id and (
+            props.get("parentTabId") or props.get("nestingLevel", 0) < 1
+        ):
+            raise RuntimeError(f"{orphan}: the Docs API ignored the update.")
 
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()

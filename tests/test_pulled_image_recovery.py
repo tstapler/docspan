@@ -298,3 +298,63 @@ def test_structural_recovery_fetches_multiple_distinct_urls_concurrently(
     assert result.mermaid_restored == 2
     assert f"```mermaid\n{diagram_a}\n```" in result.markdown
     assert f"```mermaid\n{diagram_b}\n```" in result.markdown
+
+
+def test_structural_recovery_empty_src_image_does_not_disable_recovery(tmp_path, monkeypatch) -> None:
+    """An unresolved `![]()` image must not trip the count guard for the others."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    diagram = "graph TD\n  A --> B"
+    png_bytes = _PNG_MAGIC + b"second-image"
+    md_path = str(tmp_path / "doc.md")
+    mermaid_cache_sidecar.record(md_path, png_bytes, diagram)
+
+    markdown = "![]()\n\n![x](https://docs.google.com/u2)\n"
+    image_nodes = [DocsImageNode(src="", alt=""), DocsImageNode(src="https://docs.google.com/u2", alt="")]
+
+    result = recover_structural_mermaid_images(
+        markdown, image_nodes, fetch=lambda url: png_bytes, markdown_path=md_path
+    )
+
+    assert result.mermaid_restored == 1
+    assert "![]()" in result.markdown
+    assert f"```mermaid\n{diagram}\n```" in result.markdown
+
+
+def test_structural_recovery_warns_when_image_unrecoverable(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    md_path = str(tmp_path / "doc.md")
+    markdown = "![](https://docs.google.com/u1)\n"
+    image_nodes = [DocsImageNode(src="https://docs.google.com/u1", alt="", object_id="kix.abc")]
+
+    with caplog.at_level("WARNING"):
+        recover_structural_mermaid_images(
+            markdown, image_nodes, fetch=lambda url: None, markdown_path=md_path
+        )
+
+    assert "1 image(s) have no mermaid source" in caplog.text
+    assert "doc.md.mermaid-cache.yaml" in caplog.text
+
+
+def test_structural_recovery_warns_once_for_many_unrecoverable_images(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    markdown = "![](https://docs.google.com/u1)\n\n![](https://docs.google.com/u2)\n"
+    image_nodes = [DocsImageNode(src=f"https://docs.google.com/u{i}", alt="") for i in (1, 2)]
+
+    with caplog.at_level("WARNING"):
+        recover_structural_mermaid_images(markdown, image_nodes, fetch=lambda url: None)
+
+    assert [r.getMessage() for r in caplog.records].count(
+        caplog.records[0].getMessage()
+    ) == 1
+    assert "2 image(s) have no mermaid source" in caplog.text
+
+
+def test_structural_recovery_warns_on_image_count_mismatch(tmp_path, caplog) -> None:
+    markdown = "![](https://docs.google.com/u1)\n"
+    image_nodes = [DocsImageNode(src="a", alt=""), DocsImageNode(src="b", alt="")]
+
+    with caplog.at_level("WARNING"):
+        result = recover_structural_mermaid_images(markdown, image_nodes, fetch=lambda url: None)
+
+    assert result.markdown == markdown
+    assert "found 1 markdown images for 2 Doc images" in caplog.text

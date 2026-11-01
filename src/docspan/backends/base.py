@@ -50,6 +50,9 @@ class CreateResult:
     url: Optional[str] = None
     # Set only by create_tab(): the id of the newly created tab within doc_id.
     tab_id: Optional[str] = None
+    # Set only by create() on tab-capable backends: the id of the new doc's
+    # first (default) tab, so callers can record it without a second lookup.
+    first_tab_id: Optional[str] = None
 
 
 class Backend(ABC):
@@ -138,5 +141,11 @@ class Backend(ABC):
     # Tab creation is only implemented by backends with a tab concept
     # (currently google_docs). Concrete, not @abstractmethod, for the same
     # reason as push_sectioned/pull_sectioned above.
-    def create_tab(self, doc_id: str, title: str, **kwargs: object) -> CreateResult:
+    def create_tab(
+        self,
+        doc_id: str,
+        title: str,
+        parent_tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> CreateResult:
         raise NotImplementedError(f"{self.name} does not support tabs")

@@ -166,6 +166,14 @@ class Mapping(BaseModel):
     # content is. Ignored by backends that have no such notion (e.g.
     # Confluence).
     pageless: Optional[bool] = None
+    # Declarative creation: `push` creates the remote doc (or tab, with
+    # `tab_in`) for a mapping with no remote_id, then writes the IDs back.
+    create: bool = False
+    # `local` of another google_docs mapping whose doc gets a new tab for
+    # this file. Implies creation when remote_id is unset.
+    tab_in: Optional[str] = None
+    # Title for the created doc/tab; default is the file's first H1 / basename.
+    title: Optional[str] = None
 
     @model_validator(mode="after")
     def _validate_sectioned_split_level(self) -> "Mapping":
@@ -195,12 +203,55 @@ class Mapping(BaseModel):
                 "sectioned sync; either set sectioned: false or switch to a backend "
                 "that supports it (e.g. google_docs)"
             )
+        if self.tab_in is not None and self.backend != "google_docs":
+            raise ValueError(
+                f"mapping {self.local!r}: tab_in requires backend google_docs "
+                f"(got {self.backend!r})"
+            )
         return self
+
+
+def find_tab_in_cycle(mappings: "list[Mapping]") -> Optional[list[str]]:
+    """Return the `local` paths of one tab_in cycle, or None if there is none."""
+    parent = {m.local: m.tab_in for m in mappings if m.tab_in}
+    for start in parent:
+        seen: list[str] = []
+        node: Optional[str] = start
+        while node is not None and node not in seen:
+            seen.append(node)
+            node = parent.get(node)
+        if node is not None:
+            return seen[seen.index(node):]
+    return None
 
 
 class MarkgateConfig(BaseModel):
     backends: BackendsConfig = BackendsConfig()
     mappings: list[Mapping] = []
+
+    @model_validator(mode="after")
+    def _validate_tab_in(self) -> "MarkgateConfig":
+        by_local = {m.local: m for m in self.mappings}
+        for m in self.mappings:
+            if m.tab_in is None:
+                continue
+            target = by_local.get(m.tab_in)
+            if target is None:
+                raise ValueError(
+                    f"mapping {m.local!r}: tab_in {m.tab_in!r} does not match the "
+                    "`local` of any mapping in this config"
+                )
+            if target.backend != "google_docs":
+                raise ValueError(
+                    f"mapping {m.local!r}: tab_in target {m.tab_in!r} must use backend "
+                    f"google_docs, not {target.backend!r}"
+                )
+        cycle = find_tab_in_cycle(self.mappings)
+        if cycle:
+            raise ValueError(
+                "tab_in cycle detected among mappings: " + " -> ".join(cycle + [cycle[0]])
+            )
+        return self
 
 
 def load_config(path: Optional[str] = None) -> MarkgateConfig:
