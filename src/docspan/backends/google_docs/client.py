@@ -175,6 +175,26 @@ class GoogleDocsClient:
             Dict[str, str], response["replies"][0]["addDocumentTab"]["tabProperties"]
         )
 
+    def update_document_tab_properties(
+        self, doc_id: str, tab_id: str, parent_tab_id: str
+    ) -> None:
+        """Nest `tab_id` under `parent_tab_id` via `updateDocumentTabProperties`.
+
+        `addDocumentTab` silently ignores `parentTabId`, so nesting a new tab
+        takes this follow-up request.
+        """
+        self.batch_update(
+            doc_id,
+            [
+                {
+                    "updateDocumentTabProperties": {
+                        "tabProperties": {"tabId": tab_id, "parentTabId": parent_tab_id},
+                        "fields": "parentTabId",
+                    }
+                }
+            ],
+        )
+
     def batch_update(
         self,
         doc_id: str,
