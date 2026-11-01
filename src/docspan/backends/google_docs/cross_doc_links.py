@@ -17,6 +17,9 @@ This module:
 * resolves any `#fragment` against the *target* document's live headings,
   fetched and cached at most once per (doc_id, tab_id) for the lifetime of a
   `CrossDocLinkResolver` (`resolve`);
+* reverses the above on pull (`ReverseDocLinkResolver`,
+  `reverse_cross_doc_links`): a Doc edit URL that matches a mapping becomes
+  the repo-relative path (plus readable heading slug) again;
 * wraps `heading_anchors.link_payload` so same-document anchors are
   unaffected (`link_payload`).
 
@@ -28,9 +31,10 @@ from __future__ import annotations
 
 import logging
 import posixpath
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from docspan.backends.google_docs.heading_anchors import (
     is_anchor,
@@ -233,6 +237,10 @@ class CrossDocLinkResolver:
 
         return CrossDocResolution(kind="resolved", url=f"{base_url}#heading={heading_id}")
 
+    def headings_for(self, doc_id: str, tab_id: Optional[str]) -> Optional[TargetHeadings]:
+        """Public, cached (doc_id, tab_id) headings lookup; None if the fetch failed."""
+        return self._headings_for(doc_id, tab_id)
+
     def _headings_for(self, doc_id: str, tab_id: Optional[str]) -> Optional[TargetHeadings]:
         key = (doc_id, tab_id)
         if key not in self._cache:
@@ -253,6 +261,132 @@ class CrossDocLinkResolver:
             return None
         slug_to_id = heading_slug_to_id(nodes)
         return TargetHeadings(slug_to_id=slug_to_id, known_ids=set(slug_to_id.values()))
+
+
+@dataclass(frozen=True)
+class DocUrl:
+    doc_id: str
+    tab_id: Optional[str]
+    heading_id: Optional[str]
+
+
+_DOC_PATH_RE = re.compile(r"^/document/d/(?P<doc_id>[^/]+)/edit/?$")
+
+
+def parse_doc_url(url: str) -> Optional[DocUrl]:
+    """Parse a `docs.google.com/document/d/<id>/edit[?tab=t.x][#heading=h.y]`
+    URL (the shape `CrossDocLinkResolver` writes), or None for anything else."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.netloc != "docs.google.com":
+        return None
+    match = _DOC_PATH_RE.match(parts.path)
+    if match is None:
+        return None
+    tab_id = (parse_qs(parts.query).get("tab") or [None])[0]
+    heading_id = (parse_qs(parts.fragment).get("heading") or [None])[0]
+    return DocUrl(doc_id=match.group("doc_id"), tab_id=tab_id, heading_id=heading_id)
+
+
+class ReverseDocLinkResolver:
+    """Pull-side inverse of `CrossDocLinkResolver`: Doc edit URL -> repo-relative link.
+
+    Matches on `(remote_id, tab_id)` exactly; headings for the target are
+    fetched through a `CrossDocLinkResolver`, so they are cached once per
+    (doc_id, tab_id) and `cache` can be shared across resolvers.
+    """
+
+    def __init__(
+        self,
+        mappings: List["Mapping"],
+        fetch_headings: FetchHeadings,
+        source_local_path: str,
+        cache: Optional[Dict[tuple, Optional[TargetHeadings]]] = None,
+    ):
+        self._mappings = mappings
+        self._source_dir = posixpath.dirname(normalize_local_path(source_local_path)) or "."
+        self._headings = CrossDocLinkResolver(mappings, fetch_headings, cache=cache)
+
+    def reverse(self, url: str) -> "tuple[str, Optional[str]]":
+        """Return `(replacement, warning)`; `replacement == url` when left verbatim."""
+        parsed = parse_doc_url(url)
+        if parsed is None:
+            return url, None
+
+        matches = [
+            m for m in self._mappings
+            if m.backend == "google_docs"
+            and m.remote_id == parsed.doc_id
+            and (m.tab_id or None) == parsed.tab_id
+        ]
+        if not matches:
+            return url, None
+        if len(matches) > 1:
+            return url, (
+                f"{url!r} matches {len(matches)} mapping entries "
+                f"({', '.join(m.local for m in matches)}) — left as a Doc URL"
+            )
+
+        target = matches[0]
+        path = posixpath.relpath(normalize_local_path(target.local), self._source_dir)
+        if parsed.heading_id is None:
+            return path, None
+
+        headings = self._headings.headings_for(parsed.doc_id, target.tab_id or None)
+        slug = None
+        if headings is not None:
+            slug = next(
+                (s for s, hid in headings.slug_to_id.items() if hid == parsed.heading_id), None
+            )
+        if slug is None:
+            logger.warning(
+                "pull link reversal: heading %r not found in %r — linking to the file without a fragment",
+                parsed.heading_id, target.local,
+            )
+            warning = (
+                f"{url!r}: could not read target headings — linked {path} without a fragment"
+                if headings is None
+                else None
+            )
+            return path, warning
+        return f"{path}#{slug}", None
+
+
+_DOC_URL_IN_LINK_RE = re.compile(r'\]\((https://docs\.google\.com/document/d/[^)"\s]+)\)')
+_CODE_SPAN_RE = re.compile(r"^(`{3,}|~{3,}).*?^\1[ \t]*$|(`+).+?\2", re.S | re.M)
+_IMAGE_OPENER_RE = re.compile(r"!\[[^\]\n]*$")
+
+
+def _link_destination(path: str) -> str:
+    """Spaces/parens would end the destination early; CommonMark's `<...>` form allows them."""
+    return f"<{path}>" if re.search(r"[\s()]", path) else path
+
+
+def reverse_cross_doc_links(
+    markdown: str, resolver: ReverseDocLinkResolver
+) -> "tuple[str, List[str]]":
+    """Rewrite Doc edit URLs in `](url)` link positions back to repo-relative paths.
+
+    Returns `(markdown, warnings)`. Pure string transform; code fences, code
+    spans and image destinations are left alone.
+    """
+    warnings: List[str] = []
+    protected = [m.span() for m in _CODE_SPAN_RE.finditer(markdown)]
+
+    def replace(match: "re.Match[str]") -> str:
+        start = match.start()
+        if any(lo <= start < hi for lo, hi in protected):
+            return match.group(0)
+        line_start = markdown.rfind("\n", 0, start) + 1
+        if _IMAGE_OPENER_RE.search(markdown[line_start:start]):
+            return match.group(0)
+        replacement, warning = resolver.reverse(match.group(1))
+        if warning:
+            warnings.append(warning)
+        if replacement == match.group(1):
+            return match.group(0)
+        return f"]({_link_destination(replacement)})"
+
+    return _DOC_URL_IN_LINK_RE.sub(replace, markdown), warnings
 
 
 def is_unmapped_cross_doc_link(

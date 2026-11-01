@@ -506,6 +506,20 @@ class GoogleDocsBackend(Backend):
             mappings, self._fetch_target_headings, cache=cross_doc_cache
         )
 
+    def _pull_link_reverser(
+        self, kwargs: dict, source_local_path: str, cache: Optional[dict] = None
+    ) -> "Optional[cross_doc_links.ReverseDocLinkResolver]":
+        """Build the pull-side link reverser from a `mappings` kwarg; None when absent."""
+        mappings = kwargs.get("mappings")
+        if not mappings:
+            return None
+        assert isinstance(mappings, list), (
+            f"pull() 'mappings' kwarg must be a list, got {type(mappings).__name__}"
+        )
+        return cross_doc_links.ReverseDocLinkResolver(
+            mappings, self._fetch_target_headings, source_local_path, cache=cache
+        )
+
     def _execute_push(self, local_path: str, doc_id: str, **kwargs: Any) -> PushResult:
         """Run `_execute_push_once`, retrying once on a requiredRevisionId conflict.
 
@@ -1462,6 +1476,16 @@ class GoogleDocsBackend(Backend):
                 if appendix_boundary is not None:
                     nodes = nodes[:appendix_boundary]
                 markdown_content = render_nodes_to_markdown(nodes)
+                reverse_warnings: List[str] = []
+                # `source_local_path` is the real file when `local_path` is a
+                # merge/preview temp file, so relative links come out right.
+                link_reverser = self._pull_link_reverser(
+                    kwargs, str(kwargs.get("source_local_path") or local_path)
+                )
+                if link_reverser is not None:
+                    markdown_content, reverse_warnings = cross_doc_links.reverse_cross_doc_links(
+                        markdown_content, link_reverser
+                    )
 
                 # Unlike the default (Drive HTML export) path below, this
                 # renderer never embeds base64 image data -- each image link
@@ -1524,6 +1548,7 @@ class GoogleDocsBackend(Backend):
                         f"⚠ {residue_note}" if residue_note else None,
                         self._render_unreadable_links(parser.unreadable_links),
                         data_uri_note,
+                        *(f"⚠ {w}" for w in reverse_warnings),
                     )
                     if message
                 ]
@@ -1585,6 +1610,15 @@ class GoogleDocsBackend(Backend):
             )
             markdown_content = recovery.markdown
 
+            link_reverser = self._pull_link_reverser(
+                kwargs, str(kwargs.get("source_local_path") or local_path)
+            )
+            reverse_warnings: List[str] = []
+            if link_reverser is not None:
+                markdown_content, reverse_warnings = cross_doc_links.reverse_cross_doc_links(
+                    markdown_content, link_reverser
+                )
+
             # Backstop for any data: URI recover_pulled_images() didn't catch
             # (e.g. its positional-correlation guard bailed out) -- surfaced
             # as a warning, never a reason to withhold the file.
@@ -1608,7 +1642,9 @@ class GoogleDocsBackend(Backend):
             # links are "absent from the pulled file" while they sit in the file
             # just written. Only the tab-scoped path above can report what the
             # file lacks, because there the parser's output *is* the file.
-            messages = [w for w in (warning, checkbox_warning, data_uri_warning) if w]
+            messages = [
+                w for w in (warning, checkbox_warning, data_uri_warning, *reverse_warnings) if w
+            ]
             if messages:
                 return PullResult(
                     status="warning",
@@ -1705,6 +1741,8 @@ class GoogleDocsBackend(Backend):
                 tempfile.mkdtemp(dir=str(tmp_parent), prefix=f".{target_dir.name}.", suffix=".tmp")
             )
             section_data_uris: List[str] = []
+            reverse_warnings: List[str] = []
+            reverse_cache: dict = {}
             try:
                 entries: List[SectionManifestEntry] = []
                 section_texts: List[Tuple[str, str]] = []
@@ -1721,6 +1759,16 @@ class GoogleDocsBackend(Backend):
                             markdown_path=str(sidecar_dir / filename),
                             appendix_entries=appendix_entries or None,
                         ).markdown
+                    link_reverser = self._pull_link_reverser(
+                        kwargs, str(sidecar_dir / filename), cache=reverse_cache
+                    )
+                    if link_reverser is not None:
+                        content, section_warnings = cross_doc_links.reverse_cross_doc_links(
+                            content, link_reverser
+                        )
+                        reverse_warnings.extend(
+                            w for w in section_warnings if w not in reverse_warnings
+                        )
                     section_data_uris.extend(find_data_uris(content))
                     (tmp_dir / filename).write_text(content)
                     section_texts.append((filename, content))
@@ -1759,6 +1807,7 @@ class GoogleDocsBackend(Backend):
                     f"⚠ {residue_note}" if residue_note else None,
                     self._render_unreadable_links(parser.unreadable_links),
                     data_uri_note,
+                    *(f"⚠ {w}" for w in reverse_warnings),
                 )
                 if message
             ]

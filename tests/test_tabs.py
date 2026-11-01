@@ -402,3 +402,38 @@ def test_pull_tab_scoped_should_be_unaffected_by_sectioned_mode_code_when_sectio
     assert "second tab content" in content
     assert "first tab content" not in content
     fake_client.get_doc_content.assert_not_called()
+
+
+def test_pull_sectioned_reverses_cross_doc_urls_per_section(tmp_path, make_backend) -> None:
+    from docspan.config import Mapping
+
+    url = "https://docs.google.com/document/d/TARGETID/edit"
+    linked = {
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [
+                {"textRun": {"content": "other", "textStyle": {"link": {"url": url}}}},
+                {"textRun": {"content": "\n"}},
+            ],
+        }
+    }
+    doc = {
+        "revisionId": "r1",
+        "body": {"content": [_full_heading_paragraph("Alpha", "h.alpha"), linked]},
+    }
+    backend, fake_client = make_backend()
+    fake_client.get_document.return_value = doc
+    mappings = [
+        Mapping(local=str(tmp_path / "docs" / "src"), backend="google_docs", remote_id="doc-1"),
+        Mapping(local=str(tmp_path / "docs" / "other.md"), backend="google_docs", remote_id="TARGETID"),
+    ]
+
+    staging = tmp_path / "staging"
+    result = backend.pull_sectioned(
+        "doc-1", str(staging), split_level="HEADING_1",
+        canonical_dir=str(tmp_path / "docs" / "src"), mappings=mappings,
+    )
+
+    assert result.status == "ok", result.message
+    text = (staging / "01-alpha.md").read_text()
+    assert "(../other.md)" in text and "docs.google.com" not in text
