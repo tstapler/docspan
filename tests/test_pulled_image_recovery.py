@@ -331,5 +331,30 @@ def test_structural_recovery_warns_when_image_unrecoverable(tmp_path, monkeypatc
             markdown, image_nodes, fetch=lambda url: None, markdown_path=md_path
         )
 
-    assert "kix.abc" in caplog.text
+    assert "1 image(s) have no mermaid source" in caplog.text
     assert "doc.md.mermaid-cache.yaml" in caplog.text
+
+
+def test_structural_recovery_warns_once_for_many_unrecoverable_images(tmp_path, monkeypatch, caplog) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    markdown = "![](https://docs.google.com/u1)\n\n![](https://docs.google.com/u2)\n"
+    image_nodes = [DocsImageNode(src=f"https://docs.google.com/u{i}", alt="") for i in (1, 2)]
+
+    with caplog.at_level("WARNING"):
+        recover_structural_mermaid_images(markdown, image_nodes, fetch=lambda url: None)
+
+    assert [r.getMessage() for r in caplog.records].count(
+        caplog.records[0].getMessage()
+    ) == 1
+    assert "2 image(s) have no mermaid source" in caplog.text
+
+
+def test_structural_recovery_warns_on_image_count_mismatch(tmp_path, caplog) -> None:
+    markdown = "![](https://docs.google.com/u1)\n"
+    image_nodes = [DocsImageNode(src="a", alt=""), DocsImageNode(src="b", alt="")]
+
+    with caplog.at_level("WARNING"):
+        result = recover_structural_mermaid_images(markdown, image_nodes, fetch=lambda url: None)
+
+    assert result.markdown == markdown
+    assert "found 1 markdown images for 2 Doc images" in caplog.text

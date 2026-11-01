@@ -207,6 +207,13 @@ def recover_structural_mermaid_images(
     # `![]()` and must still count, or one such image disables all recovery.
     matches = list(re.finditer(r"!\[([^\]]*)\]\(([^)]*)\)", markdown_content))
     if not matches or len(matches) != len(image_nodes):
+        if image_nodes:
+            logger.warning(
+                "Structural pull: found %d markdown images for %d Doc images; skipping "
+                "all mermaid recovery",
+                len(matches),
+                len(image_nodes),
+            )
         return ImageRecoveryResult(markdown=markdown_content, mermaid_restored=0, base64_deflated=0)
 
     unique_urls = list({node.src for node in image_nodes if node.src})
@@ -217,6 +224,7 @@ def recover_structural_mermaid_images(
                 fetched_by_url[url] = png_bytes
 
     mermaid_restored = 0
+    unmatched = 0
     pieces: List[str] = []
     cursor = 0
     for match, node in zip(matches, image_nodes):
@@ -234,17 +242,23 @@ def recover_structural_mermaid_images(
             pieces.append(f"```mermaid\n{diagram}\n```")
             mermaid_restored += 1
         else:
-            logger.warning(
-                "Structural pull: image %s could not be matched to mermaid source "
-                "(no sidecar/cache/appendix hit%s); it stays an image, so a later "
-                "push cannot restore the diagram. Checked sidecar: %s",
+            unmatched += 1
+            logger.debug(
+                "Structural pull: image %s has no mermaid source%s",
                 node.object_id or "<unknown>",
-                "" if png_bytes is not None else ", image bytes unavailable",
-                mermaid_cache_sidecar.sidecar_path(markdown_path) if markdown_path else "<none>",
+                "" if png_bytes is not None else " (image bytes unavailable)",
             )
             pieces.append(f"![{alt}]({node.src})")
         cursor = match.end()
     pieces.append(markdown_content[cursor:])
+    if unmatched:
+        # One summary, not per image: ordinary screenshots also land here.
+        logger.warning(
+            "Structural pull: %d image(s) have no mermaid source and stay images; a later "
+            "push cannot restore any that were diagrams. Checked sidecar: %s",
+            unmatched,
+            mermaid_cache_sidecar.sidecar_path(markdown_path) if markdown_path else "<none>",
+        )
     return ImageRecoveryResult(
         markdown="".join(pieces),
         mermaid_restored=mermaid_restored,

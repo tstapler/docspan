@@ -1535,7 +1535,7 @@ class GoogleDocsBackend(Backend):
             recovery = recover_pulled_images(
                 markdown_content,
                 image_nodes,
-                markdown_path=local_path,
+                markdown_path=sidecar_path or local_path,
                 appendix_entries=appendix_entries or None,
             )
             markdown_content = recovery.markdown

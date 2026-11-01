@@ -1756,6 +1756,25 @@ class TestPullStripsAppendixAndSurfacesDataUriWarnings:
         assert "data:" in (result.message or "")
         assert data_uri in local.read_text(encoding="utf-8")
 
+    def test_default_pull_path_looks_up_sidecar_next_to_sidecar_path_not_temp_file(
+        self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, fake_client = make_backend()
+        fake_client.get_doc_content.return_value = "<p>hi</p>"
+        fake_client.get_document.return_value = _empty_doc()
+        temp = tmp_path / "tmp-pull.md"
+        real = tmp_path / "real" / "doc.md"
+
+        with mock.patch(
+            "docspan.backends.google_docs.backend.recover_pulled_images",
+            wraps=__import__(
+                "docspan.backends.google_docs.backend", fromlist=["recover_pulled_images"]
+            ).recover_pulled_images,
+        ) as spy:
+            backend.pull("doc-1", str(temp), sidecar_path=str(real))
+
+        assert spy.call_args.kwargs["markdown_path"] == str(real)
+
     def test_structural_pull_path_extracts_and_strips_real_appendix_nodes(
         self, tmp_path, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
     ) -> None:  # type: ignore[no-untyped-def]
