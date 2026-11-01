@@ -2063,7 +2063,10 @@ class GoogleDocsBackend(Backend):
         A failure leaves the tab in the doc at root level, so errors name its id.
         """
         assert self._client is not None
-        orphan = f"Tab '{tab_id}' was created at root level but not nested under '{parent_tab_id}'"
+        orphan = (
+            f"Tab '{tab_id}' was created at root level but not nested under '{parent_tab_id}' "
+            f"(https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id})"
+        )
         try:
             self._client.update_document_tab_properties(doc_id, tab_id, parent_tab_id)
         except Exception as exc:
@@ -2077,7 +2080,9 @@ class GoogleDocsBackend(Backend):
             ),
             {},
         )
-        if not props.get("parentTabId") and props.get("nestingLevel", 0) < 1:
+        if props.get("parentTabId") != parent_tab_id and (
+            props.get("parentTabId") or props.get("nestingLevel", 0) < 1
+        ):
             raise RuntimeError(f"{orphan}: the Docs API ignored the update.")
 
     def _has_any_credentials(self) -> bool:

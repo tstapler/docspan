@@ -2845,14 +2845,24 @@ class TestCreateTab:
 
 
 def _tabs_doc(*tabs: tuple) -> dict:
-    """Doc with root tabs given as (tabId, nestingLevel, parentTabId-or-None)."""
-    out = []
-    for tab_id, level, parent in tabs:
-        props: dict = {"tabId": tab_id, "nestingLevel": level}
+    """Doc from (tabId, nestingLevel, parentTabId-or-None); children go under childTabs."""
+    nodes = {
+        tab_id: {
+            "tabProperties": {
+                "tabId": tab_id,
+                "nestingLevel": level,
+                **({"parentTabId": parent} if parent else {}),
+            }
+        }
+        for tab_id, level, parent in tabs
+    }
+    roots = []
+    for tab_id, _level, parent in tabs:
         if parent:
-            props["parentTabId"] = parent
-        out.append({"tabProperties": props})
-    return {"tabs": out}
+            nodes[parent].setdefault("childTabs", []).append(nodes[tab_id])
+        else:
+            roots.append(nodes[tab_id])
+    return {"tabs": roots}
 
 
 class TestCreateChildTab:
@@ -2893,8 +2903,37 @@ class TestCreateChildTab:
             _tabs_doc(("t.parent", 0, None), ("t.new", 0, None)),
         ]
 
-        with pytest.raises(RuntimeError, match="t.new.*ignored"):
+        with pytest.raises(RuntimeError, match=r"t\.new.*ignored"):
             backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.parent")
+
+    def test_raises_if_nested_under_wrong_parent(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None), ("t.other", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.other", 0, None), ("t.new", 1, "t.other")),
+        ]
+
+        with pytest.raises(RuntimeError, match="not nested under 't.parent'"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+
+    def test_grandchild_parent_is_found_via_child_tabs(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        tree = (("t.root", 0, None), ("t.child", 1, "t.root"))
+        client.get_document.side_effect = [
+            _tabs_doc(*tree),
+            _tabs_doc(*tree, ("t.new", 2, "t.child")),
+        ]
+
+        backend.create_tab("doc-1", "T", parent_tab_id="t.child")
+
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.child")
 
     def test_unknown_parent_raises_before_any_mutation(
         self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]

@@ -931,6 +931,28 @@ class TestMap:
         assert result.exit_code == 1
         assert "Valid tab IDs: t.a" in _unwrapped(result.output)
 
+    def test_nesting_failure_exits_nonzero_and_writes_no_mapping(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", side_effect=RuntimeError("Tab 't.x' was created at root level [bold")):
+            result = self._invoke_new_tab(
+                new_local, parent_local, cfg, extra_args=["--parent-tab", "t.parent"]
+            )
+        assert result.exit_code == 1
+        assert "[bold" in _unwrapped(result.output)
+        assert len(yaml.safe_load(open(cfg, encoding="utf-8"))["mappings"]) == 0
+
+    def test_empty_parent_tab_is_not_silently_ignored(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", wraps=backend.create_tab) as spy:
+            self._invoke_new_tab(new_local, parent_local, cfg, extra_args=["--parent-tab", ""])
+        spy.assert_called_once_with("parent-doc-1", "Discussion", parent_tab_id="")
+
     def test_parent_tab_requires_new_tab_in(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         _p, new_local, cfg, _m = self._new_tab_fixtures(tmp_path)
         with patch("docspan.cli.main.load_config", return_value=_config()):

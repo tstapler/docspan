@@ -1152,14 +1152,14 @@ def map_(
 
     try:
         if parent_mapping is not None:
-            tab_kwargs: dict = {"parent_tab_id": parent_tab} if parent_tab else {}
+            tab_kwargs: dict = {"parent_tab_id": parent_tab} if parent_tab is not None else {}
             create_result = backend_instance.create_tab(
                 parent_mapping.remote_id, doc_title, **tab_kwargs
             )
         else:
             create_result = backend_instance.create(doc_title, **create_kwargs)
     except (ValueError, RuntimeError) as exc:
-        err_console.print(str(exc))
+        err_console.print(str(exc), markup=False)
         raise typer.Exit(1)
 
     mapping = Mapping(
