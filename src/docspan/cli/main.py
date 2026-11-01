@@ -390,7 +390,8 @@ def push(
         if dry_run:
             if hasattr(backend, "preview_push"):
                 preview = backend.preview_push(
-                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id
+                    mapping.local, mapping.remote_id, tab_id=mapping.tab_id,
+                    mappings=mappings, cross_doc_cache=cross_doc_cache,
                 )
                 # escape(): preview text carries literal "[ ]"/"[x]" checklist
                 # markers, which Rich's console markup would otherwise parse
@@ -798,13 +799,13 @@ def pull(
                     f"[yellow]dry-run[/yellow]  [{mapping.backend}] {mapping.remote_id} → {mapping.local}"
                 )
                 continue
-            preview = preview_pull(mapping, backend, state, state_dir)
+            preview = preview_pull(mapping, backend, state, state_dir, mappings=config.mappings)
             _render_pull_preview(mapping, preview)
             if preview.action == "error":
                 had_error = True
             continue
 
-        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+        outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path, mappings=config.mappings)
 
         if outcome.action == "up-to-date":
             console.print(f"[dim]up to date[/dim]  {mapping.local}")
@@ -853,7 +854,12 @@ def pull(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sync_pull_step(
-    mapping: Mapping, backend: Backend, state: SyncState, state_dir: str, state_path: str
+    mapping: Mapping,
+    backend: Backend,
+    state: SyncState,
+    state_dir: str,
+    state_path: str,
+    mappings: Optional[list] = None,
 ) -> Literal["ok", "error", "needs-resolve"]:
     """`sync`'s pull half: run a real pull and render it, like `pull` does.
 
@@ -865,7 +871,7 @@ def _sync_pull_step(
         console.print(f"[dim]Skipping {mapping.local} (no remote doc yet)[/dim]")
         return "ok"
 
-    outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path)
+    outcome = orchestrate_pull(mapping, backend, state, state_dir, state_path, mappings=mappings)
 
     if outcome.action == "up-to-date":
         console.print(f"[dim]up to date[/dim]  {mapping.local}")
@@ -941,7 +947,9 @@ def sync(
         backend = _get_backend(mapping.backend, config, config_path)
 
         if mapping.direction != "push":
-            pull_status = _sync_pull_step(mapping, backend, state, state_dir, state_path)
+            pull_status = _sync_pull_step(
+                mapping, backend, state, state_dir, state_path, mappings=config.mappings
+            )
             if pull_status == "error":
                 had_error = True
                 continue

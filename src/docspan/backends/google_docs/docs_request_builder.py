@@ -146,6 +146,26 @@ class Pass2Alignment:
     foreign_ids: dict = field(default_factory=dict)
 
 
+_REASON_NOT_FOUND = (
+    "its text was not found in the written document (the cell may hold a smart chip, "
+    "an image, or more than one paragraph)"
+)
+_REASON_NO_LIVE_CELL = (
+    "no matching cell exists in the document (the table's structure changed, or it "
+    "was edited concurrently)"
+)
+_REASON_OVERFLOW ="its styled text runs past the end of the cell"
+
+
+@dataclass(frozen=True)
+class UnplacedCell:
+    """A styled table cell pass 2 wrote no styling for. `row`/`col` are 0-based."""
+    row: int
+    col: int
+    text: str
+    reason: str
+
+
 @dataclass(frozen=True)
 class DeleteBounds:
     """The range a node's deleteContentRange may actually cover, and why it was trimmed.
@@ -209,6 +229,20 @@ def _node_is_native_checkbox(node: Node) -> bool:
 
 
 @dataclass
+class SpanChange:
+    """A run of characters whose inline attributes differ between current and target."""
+    text: str
+    old_link: Optional[str] = None
+    new_link: Optional[str] = None
+    old_bold: bool = False
+    new_bold: bool = False
+    old_italic: bool = False
+    new_italic: bool = False
+    old_monospace: bool = False
+    new_monospace: bool = False
+
+
+@dataclass
 class DiffEntry:
     """One row of a human-oriented paragraph/table diff (see plan.md Story 1.2.1).
 
@@ -229,6 +263,9 @@ class DiffEntry:
     # push_preview.find_churn_pairs() scopes remove/add matching by this,
     # not list adjacency — adjacent entries can come from different opcodes.
     edit_group: int = -1
+    # Inline-attribute (link/bold/italic/monospace) differences on a same-text
+    # paragraph; empty for every other kind of change.
+    span_changes: List[SpanChange] = field(default_factory=list)
 
 
 class DocsRequestBuilder:
@@ -1371,6 +1408,8 @@ class DocsRequestBuilder:
         self,
         current: List[Node],
         target: List[Node],
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
     ) -> Tuple[List[DiffEntry], int]:
         """
         Produce a human-oriented diff summary of current vs. target nodes.
@@ -1417,7 +1456,23 @@ class DocsRequestBuilder:
                             )
                         )
                     else:
-                        unchanged_count += 1
+                        sc = self._span_changes(current[ci], target[ti], resolver, local_path)
+                        if sc:
+                            entries.append(
+                                DiffEntry(
+                                    kind="change",
+                                    current_text=_node_text(current[ci]),
+                                    target_text=_node_text(target[ti]),
+                                    style=_node_style(target[ti]),
+                                    current_is_native_checkbox=_node_is_native_checkbox(
+                                        current[ci]
+                                    ),
+                                    edit_group=edit_group,
+                                    span_changes=sc,
+                                )
+                            )
+                        else:
+                            unchanged_count += 1
 
             elif tag == "delete":
                 for node in current[i1:i2]:
@@ -1814,7 +1869,8 @@ class DocsRequestBuilder:
 
         Runs against the re-fetched document, like the paragraph path, because a
         cell's real indices only exist once pass 1 has written it and heading ids
-        only exist once the headings do.
+        only exist once the headings do. For a table the push itself creates, push()
+        applies `build_table_fill_batch` and re-reads first, so its cells are placed.
 
         Cells are located, not predicted: the target cell's text is searched for
         inside the live cell's text and the offset taken from where it is found. A
@@ -1842,13 +1898,13 @@ class DocsRequestBuilder:
                 ))
         return requests
 
-    def unplaced_table_cells(
+    def unplaced_table_cell_details(
         self,
         doc: dict,
         target: List[Node],
         alignment: Optional["Pass2Alignment"] = None,
-    ) -> List[str]:
-        """Styled cells pass 2 could not place, so push can say so out loud.
+    ) -> List[UnplacedCell]:
+        """Styled cells pass 2 could not place (with coordinates and reason), so push can say so out loud.
 
         The loud half of the same trade `unaligned_span_targets` makes for
         paragraphs: refusing to guess is only safe if the refusal is reported.
@@ -1879,7 +1935,7 @@ class DocsRequestBuilder:
         if not target_tables:
             return []
         aligned = self._aligned(doc, target, alignment)
-        missed: List[str] = []
+        missed: List[UnplacedCell] = []
         paired = {id(tnode): table for table, tnode in self._paired_tables(doc, aligned.table_pairs)}
         for tnode in target_tables:
             table = paired.get(id(tnode))
@@ -1890,9 +1946,12 @@ class DocsRequestBuilder:
                     if not cell.styled:
                         continue
                     live = live_cells[c] if c < len(live_cells) else None
-                    placed = self._cell_placement(live, cell) if live is not None else None
+                    if live is None:
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_NO_LIVE_CELL))
+                        continue
+                    placed = self._cell_placement(live, cell)
                     if placed is None:
-                        missed.append(cell.text)
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_NOT_FOUND))
                         continue
                     # A cell can place and still lose its styling: _span_requests_in
                     # stops at the first span that would cross the cell's bound and
@@ -1905,8 +1964,17 @@ class DocsRequestBuilder:
                     if limit is not None and start + sum(
                         _utf16_len(span.text) for span in cell.spans
                     ) > limit:
-                        missed.append(cell.text)
+                        missed.append(UnplacedCell(r, c, cell.text, _REASON_OVERFLOW))
         return missed
+
+    def unplaced_table_cells(
+        self,
+        doc: dict,
+        target: List[Node],
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[str]:
+        """Text of each cell `unplaced_table_cell_details` reports."""
+        return [cell.text for cell in self.unplaced_table_cell_details(doc, target, alignment)]
 
     @staticmethod
     def _paired_tables(
@@ -2610,6 +2678,35 @@ class DocsRequestBuilder:
         }
         return slug_to_id, known_ids
 
+    def build_table_fill_batch(
+        self,
+        doc: dict,
+        target: List[Node],
+        tab_id: Optional[str] = None,
+        alignment: Optional["Pass2Alignment"] = None,
+    ) -> List[dict]:
+        """Table cell fills alone, ready to submit before any cell styling is computed.
+
+        A table this push creates is empty in ``doc``, so its cells' styling can only
+        be placed against a document re-read *after* these fills are applied.
+
+        Empty unless that re-read is worth a round trip: some fill must insert text
+        (style resets alone leave the table empty, so a re-read gains nothing) and
+        some target cell must carry styling. Anything else is filled by
+        `build_second_pass_requests` as before.
+        """
+        requests = self.build_table_fill_requests(doc, target, alignment)
+        styled = any(
+            cell.styled
+            for node in target if isinstance(node, DocsTableNode)
+            for row in node.rows for cell in row
+        )
+        if not styled or not any("insertText" in r for r in requests):
+            return []
+        requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
+        self._inject_tab_id(requests, tab_id)
+        return requests
+
     def build_second_pass_requests(
         self,
         doc: dict,
@@ -2635,15 +2732,10 @@ class DocsRequestBuilder:
         """
         requests = self.build_table_fill_requests(doc, target, alignment)
         requests += self.build_span_style_requests(doc, target, alignment, resolver, local_path)
-        # Cell styling reads indices from `doc`, i.e. from *before* the fills above
-        # are applied. A table that already holds its text — every table on a
-        # second or later push — is placed correctly. A table this push is
-        # *creating* is still empty here, so `_cell_placement` cannot find the
-        # cell's text and emits nothing; `unplaced_table_cells` reports those, so
-        # the gap is loud rather than a silent half-application. Styling a
-        # brand-new table's cells needs the post-fill index, which is predictable
-        # but is index arithmetic that has to be verified by replay, not reasoned
-        # about — left for its own change.
+        # Cell styling reads indices from `doc`. For a table this push creates, push()
+        # applies `build_table_fill_batch` and re-reads the document first, so the
+        # cells are populated here; otherwise `_cell_placement` finds nothing and
+        # `unplaced_table_cell_details` reports the gap.
         requests += self.build_table_cell_span_requests(doc, target, alignment, resolver, local_path)
         requests.sort(key=lambda r: self._extract_start_index(r), reverse=True)
         self._inject_tab_id(requests, tab_id)
@@ -3132,6 +3224,79 @@ class DocsRequestBuilder:
             abs(current_node.width_pt - target_node.width_pt) > _IMAGE_SIZE_TOLERANCE_PT
             or abs(current_node.height_pt - target_node.height_pt) > _IMAGE_SIZE_TOLERANCE_PT
         )
+
+    @staticmethod
+    def _span_changes(
+        current_node: Node,
+        target_node: Node,
+        resolver: Optional["cross_doc_links.CrossDocLinkResolver"] = None,
+        local_path: Optional[str] = None,
+    ) -> List[SpanChange]:
+        """Inline additions push would write between two same-text paragraphs.
+
+        Push only ever adds bold/italic/monospace/link (pass 2 never clears
+        them), so only off->on and link-differs-where-target-has-one are
+        reported. Compares per character, so spans split differently on each
+        side still align, and a missing/default span reads the same as an
+        empty one. Target links go through the same link_payload push uses;
+        only a resolved absolute http(s) url is compared, since an anchor
+        needs heading ids that don't exist before pass 1. Table cells are not
+        inspected.
+        """
+        if not isinstance(current_node, DocsParagraphNode) or not isinstance(
+            target_node, DocsParagraphNode
+        ):
+            return []
+
+        def resolved(href: Optional[str]) -> Optional[str]:
+            if not href:
+                return None
+            payload, _detail = cross_doc_links.link_payload(href, local_path, resolver)
+            url = payload.get("url") if payload else None
+            return url if url and url.startswith(("http://", "https://")) else None
+
+        def per_char(node: DocsParagraphNode, is_target: bool) -> List[Tuple]:
+            return [
+                (resolved(sp.link) if is_target else sp.link, sp.bold, sp.italic, sp.monospace)
+                for sp in node.spans
+                for _ in sp.text
+            ]
+
+        tgt_text = "".join(sp.text for sp in target_node.spans)
+        cur, tgt = per_char(current_node, False), per_char(target_node, True)
+        default = (None, False, False, False)
+
+        def added(old: Tuple, new: Tuple) -> Tuple:
+            """The target attributes push would write over ``old`` (None/False = nothing)."""
+            link = new[0] if new[0] and new[0] != old[0] else None
+            return (link, new[1] and not old[1], new[2] and not old[2], new[3] and not old[3])
+
+        changes: List[SpanChange] = []
+        start = 0
+        n = len(tgt)
+        while start < n:
+            old = cur[start] if start < len(cur) else default
+            delta = added(old, tgt[start])
+            if delta == default:
+                start += 1
+                continue
+            end = start + 1
+            while end < n:
+                o2 = cur[end] if end < len(cur) else default
+                if o2 != old or tgt[end] != tgt[start]:
+                    break
+                end += 1
+            changes.append(
+                SpanChange(
+                    text=tgt_text[start:end],
+                    old_link=old[0], new_link=delta[0],
+                    old_bold=old[1], new_bold=delta[1],
+                    old_italic=old[2], new_italic=delta[2],
+                    old_monospace=old[3], new_monospace=delta[3],
+                )
+            )
+            start = end
+        return changes
 
     @staticmethod
     def _restyles(current_node: Node, target_node: Node) -> bool:
