@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 STALE_AFTER_SECONDS = 24 * 3600
+MAX_SCOPE_IDS = 500  # stays under SQLite's bound-variable limit
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS doc_meta (
@@ -53,21 +55,26 @@ class DocspanIndex:
     def __init__(self, db_path: Union[str, Path]) -> None:
         if str(db_path) != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(db_path))
+        # MCP sync tools run on a worker thread pool, so the connection is shared under a lock.
+        self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._lock = threading.RLock()
         self._db.executescript(_SCHEMA)
 
     def close(self) -> None:
         self._db.close()
 
     def is_stale(self, doc_id: str, revision_id: str) -> bool:
-        row = self._db.execute(
-            "SELECT revision_id FROM doc_meta WHERE doc_id = ?", (doc_id,)).fetchone()
+        if not revision_id:
+            return True  # no revision to compare: never claim "unchanged"
+        with self._lock:
+            row = self._db.execute(
+                "SELECT revision_id FROM doc_meta WHERE doc_id = ?", (doc_id,)).fetchone()
         return row is None or row[0] != revision_id
 
     def ingest(self, doc_id: str, revision_id: str, title: str,
                sections: Iterable[IndexedSection]) -> None:
         """Replace everything indexed for ``doc_id`` atomically."""
-        with self._db:
+        with self._lock, self._db:
             self._db.execute("DELETE FROM doc_sections WHERE doc_id = ?", (doc_id,))
             self._db.executemany(
                 "INSERT INTO doc_sections (doc_id, tab_id, heading_id, heading_path, content)"
@@ -78,7 +85,8 @@ class DocspanIndex:
                 " VALUES (?, ?, ?, ?)", (doc_id, revision_id, title, time.time()))
 
     def count_docs(self) -> int:
-        return int(self._db.execute("SELECT COUNT(*) FROM doc_meta").fetchone()[0])
+        with self._lock:
+            return int(self._db.execute("SELECT COUNT(*) FROM doc_meta").fetchone()[0])
 
     def search(self, query: str, limit: int = 10,
                doc_ids: Optional[Sequence[str]] = None) -> List[SearchRow]:
@@ -93,17 +101,20 @@ class DocspanIndex:
         )
         params: List[object] = [expr]
         if doc_ids:
+            doc_ids = list(doc_ids)[:MAX_SCOPE_IDS]
             sql += f" AND s.doc_id IN ({','.join('?' * len(doc_ids))})"
             params += list(doc_ids)
         # heading_path weighted above body so a title match outranks a passing mention
         sql += " ORDER BY bm25(doc_sections, 0, 0, 0, 5.0, 1.0) LIMIT ?"
         params.append(limit)
-        return [SearchRow(*r) for r in self._db.execute(sql, params)]
+        with self._lock:
+            return [SearchRow(*r) for r in self._db.execute(sql, params).fetchall()]
 
     def record_edge(self, source: str, target: str) -> None:
-        with self._db:
+        with self._lock, self._db:
             self._db.execute(
                 "INSERT OR IGNORE INTO doc_edges VALUES (?, ?)", (source, target))
 
     def edges(self) -> List[Tuple[str, str]]:
-        return list(self._db.execute("SELECT source_doc_id, target_doc_id FROM doc_edges"))
+        with self._lock:
+            return list(self._db.execute("SELECT source_doc_id, target_doc_id FROM doc_edges"))

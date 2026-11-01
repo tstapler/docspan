@@ -10,6 +10,7 @@ from typing import Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from docspan.backends.google_docs.tabs import flatten_tabs
+from docspan.mcp.errors import DocspanToolError
 from docspan.mcp.models import DocLink
 from docspan.mcp.sections import doc_url
 
@@ -32,10 +33,20 @@ def parse_doc_url(url: str) -> Optional[Tuple[str, Optional[str], Optional[str]]
     return m.group(1), tab, heading
 
 
+_DOC_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def extract_doc_id(url_or_id: str) -> str:
-    """Accept a bare id or any Docs URL."""
-    parsed = parse_doc_url(url_or_id) if "/" in url_or_id else None
-    return parsed[0] if parsed else url_or_id.strip()
+    """Accept a bare id or any Docs URL; reject anything else.
+
+    The id becomes a directory name under the scratch dir, so it must not be able
+    to carry path separators or ``..``.
+    """
+    parsed = parse_doc_url(url_or_id.strip())
+    doc_id = parsed[0] if parsed else url_or_id.strip()
+    if not _DOC_ID.match(doc_id):
+        raise DocspanToolError("invalid_doc_id", f"Not a Google Doc id or URL: {url_or_id!r}")
+    return doc_id
 
 
 def _walk_content(content: list) -> Iterator[dict]:

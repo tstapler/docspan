@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sqlite3
 
 import pytest
@@ -292,3 +293,90 @@ def test_cli_registers_new_commands_and_keeps_pull_push():
     # Existing commands are untouched.
     assert runner.invoke(app, ["pull", "--help"]).exit_code == 0
     assert runner.invoke(app, ["push", "--help"]).exit_code == 0
+
+
+def test_extract_doc_id_rejects_path_traversal():
+    for bad in ("../../etc", "a/b", "..", ""):
+        with pytest.raises(DocspanToolError) as e:
+            extract_doc_id(bad)
+        assert e.value.code == "invalid_doc_id"
+
+
+def test_same_named_tabs_get_distinct_files(tmp_path):
+    doc = make_doc()
+    doc["tabs"][1]["tabProperties"]["title"] = "Plan"
+    s = DocService(lambda: FakeClient({"DOC1": doc}), tmp_path)
+    paths = {f.local_path for f in s.fetch_doc("DOC1").files}
+    assert len(paths) == 2
+
+
+def _doc_with(paragraphs):
+    return {"documentId": "D", "title": "T", "revisionId": "r", "tabs": [
+        {"tabProperties": {"tabId": "t.0", "title": "Tab"},
+         "documentTab": {"body": {"content": paragraphs}}}]}
+
+
+def test_empty_heading_is_skipped_not_ambiguous():
+    tabs = parse_tabs(_doc_with([
+        _para("Intro", "HEADING_1", "h.1", pos=[1]), _para("", "HEADING_2", "h.2", pos=[50]),
+        _para("body", pos=[60])]))
+    _, sec = find_section_by_path(tabs, "Tab > Intro", "D")
+    assert sec.heading_id == "h.1"
+
+
+def test_duplicate_sibling_headings_get_ordinals_and_distinct_snapshots(tmp_path):
+    doc = _doc_with([
+        _para("Parent", "HEADING_1", "h.p", pos=[1]),
+        _para("Notes", "HEADING_2", "h.a", pos=[20]), _para("first body", pos=[40]),
+        _para("Notes", "HEADING_2", "h.b", pos=[60]), _para("second body", pos=[80])])
+    tabs = parse_tabs(doc)
+    _, a = find_section_by_path(tabs, "Tab > Parent > Notes", "D")
+    _, b = find_section_by_path(tabs, "Tab > Parent > Notes [2]", "D")
+    assert (a.heading_id, b.heading_id) == ("h.a", "h.b")
+    s = DocService(lambda: FakeClient({"D": doc}), tmp_path)
+    s.fetch_doc("D")
+    snap = json.loads((tmp_path / "D" / "snapshot.json").read_text())["sections"]
+    assert len(snap) == 4  # tab + 3 headings, no key collisions
+
+
+def test_level_skip_and_title_levels():
+    tabs = parse_tabs(_doc_with([
+        _para("Doc Title", "TITLE", "h.t", pos=[1]), _para("Deep", "HEADING_3", "h.d", pos=[20]),
+        _para("deep body", pos=[40])]))
+    paths = [s.path for s in tabs[0].sections]
+    assert "Tab > Doc Title > Deep" in paths
+    assert find_section_by_path(tabs, "Tab > Deep", "D")[1].heading_id == "h.d"  # ancestor skipped
+
+
+def test_to_path_rejects_dot_directories_and_non_md(svc, tmp_path, monkeypatch):
+    s, _ = svc
+    monkeypatch.chdir(tmp_path)
+    for bad in (".git/hooks/pre-commit.md", "notes.txt"):
+        with pytest.raises(DocspanToolError) as e:
+            s.fetch_doc("DOC1", tab="Plan", to_path=str(tmp_path / bad))
+        assert e.value.code == "path_not_allowed"
+    ok = s.fetch_doc("DOC1", tab="Plan", to_path=str(tmp_path / "out" / "plan.md"))
+    assert (tmp_path / "out" / "plan.md").read_text() and ok.files[0].local_path.endswith("plan.md")
+
+
+def test_crawl_failures_count_toward_max_docs_and_bad_start_is_recorded(tmp_path):
+    docs = {"A": make_doc("A", links=[u("X"), u("Y"), u("Z")])}
+    s = DocService(lambda: FakeClient(docs), tmp_path)
+
+    class Missing(FakeClient):
+        def get_document(self, doc_id, include_tabs_content=True):
+            if doc_id in docs:
+                return super().get_document(doc_id)
+            raise DocspanToolError("gone", "deleted")
+
+    s = DocService(lambda: Missing(docs), tmp_path)
+    r = crawl(s, "A", depth=1, max_docs=2, sleep=lambda _: None)
+    assert r.fetched == ["A"] and set(r.failed) == {"X"} and r.truncated
+    r = crawl(s, "NOPE", sleep=lambda _: None)
+    assert r.fetched == [] and "NOPE" in r.failed
+
+
+def test_empty_revision_is_always_stale():
+    idx = DocspanIndex(":memory:")
+    idx.ingest("D", "", "t", [])
+    assert idx.is_stale("D", "") is True

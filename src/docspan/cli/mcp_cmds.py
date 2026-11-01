@@ -62,10 +62,7 @@ def register(app: typer.Typer, resolve: Callable) -> None:
     ) -> None:
         """Build/refresh the full-text index over every mapped Google Doc (skips unchanged revisions)."""
         service, cache = _build_service(resolve, config_path, prefix)
-        assert service.config is not None
-        ids = list(dict.fromkeys(
-            m.remote_id for m in service.config.mappings
-            if m.backend == "google_docs" and m.remote_id))
+        ids = service.mapped_google_doc_ids()
         indexed = skipped = 0
         for i, doc_id in enumerate(ids):
             if i:
@@ -96,8 +93,7 @@ def register(app: typer.Typer, resolve: Callable) -> None:
         service, cache = _build_service(resolve, config_path, prefix)
         allowed = None
         if scope == "mapped":
-            assert service.config is not None
-            allowed = {m.remote_id for m in service.config.mappings if m.remote_id}
+            allowed = set(service.mapped_google_doc_ids())
         start = extract_doc_id(url)
         result = crawl(service, start, depth=depth, max_docs=max_docs, delay=delay, allowed_ids=allowed)
         write_graph(cache / "graph.json", start, result)

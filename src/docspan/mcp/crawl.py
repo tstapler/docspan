@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from googleapiclient.errors import HttpError
 
 from docspan.mcp import links as links_mod
+from docspan.mcp.errors import DocspanToolError
 from docspan.mcp.service import DocService
 
 
@@ -24,7 +25,7 @@ class CrawlResult:
 
 
 def crawl(
-    service: DocService,
+    service: "DocService",
     start_doc_id: str,
     depth: int = 2,
     max_docs: int = 25,
@@ -40,22 +41,28 @@ def crawl(
     every remaining doc the same way.
     """
     result = CrawlResult()
+    edge_set: Set[Tuple[str, str]] = set()
+    skipped: Set[str] = set()
+    attempted = 0
     seen: Set[str] = {start_doc_id}
     queue = deque([(start_doc_id, 0)])
     first = True
     while queue:
         doc_id, d = queue.popleft()
-        if len(result.fetched) >= max_docs:
+        if attempted >= max_docs:  # failures count too, so dead links can't run unbounded
             result.truncated = True
             break
         if not first:
             sleep(delay)
         first = False
+        attempted += 1
         try:
-            doc = service._doc(doc_id)
-            service._fetch_from(doc_id, doc, None, None)
+            _, doc = service.pull(doc_id)
         except HttpError as exc:
             result.failed[doc_id] = f"HTTP {getattr(exc.resp, 'status', '?')}"
+            continue
+        except (DocspanToolError, OSError) as exc:
+            result.failed[doc_id] = str(exc)
             continue
         result.fetched.append(doc_id)
         for link in links_mod.resolve_links(doc):
@@ -63,14 +70,15 @@ def crawl(
             if target == doc_id:
                 continue
             edge = (doc_id, target)
-            if edge not in result.edges:
+            if edge not in edge_set:
+                edge_set.add(edge)
                 result.edges.append(edge)
-                if service.index is not None:
-                    service.index.record_edge(*edge)
+                service.record_edge(*edge)
             if target in seen or d >= depth:
                 continue
             if allowed_ids is not None and target not in allowed_ids:
-                if target not in result.skipped_scope:
+                if target not in skipped:
+                    skipped.add(target)
                     result.skipped_scope.append(target)
                 continue
             seen.add(target)

@@ -5,7 +5,8 @@ import hashlib
 import json
 import pathlib
 import re
-from typing import Any, Callable, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from googleapiclient.errors import HttpError
 
@@ -108,6 +109,12 @@ class DocService:
         ]
         return MappingsResult(mappings=entries)
 
+    def mapped_google_doc_ids(self) -> List[str]:
+        if self.config is None:
+            raise DocspanToolError("no_config", "No docspan config is loaded")
+        return list(dict.fromkeys(
+            m.remote_id for m in self.config.mappings if m.backend == "google_docs" and m.remote_id))
+
     # -- outline -------------------------------------------------------------
     def _outline_from(self, doc_id: str, doc: dict, tabs: List[TabContent],
                       last_modified: Optional[str]) -> OutlineResult:
@@ -153,9 +160,13 @@ class DocService:
     def _check_destination(self, to_path: str) -> pathlib.Path:
         dest = pathlib.Path(to_path).expanduser().resolve()
         roots = [self.scratch_dir.resolve(), pathlib.Path.cwd().resolve()]
-        if not any(dest == r or r in dest.parents for r in roots):
+        root = next((r for r in roots if dest == r or r in dest.parents), None)
+        # Dot-directories (.git/hooks, .ssh, ...) are where an overwrite turns into code execution.
+        if root is None or any(p.startswith(".") for p in dest.relative_to(root).parts
+                               if root != self.scratch_dir.resolve()):
             raise DocspanToolError(
-                "path_not_allowed", "to_path must be inside the scratch dir or the working directory",
+                "path_not_allowed",
+                "to_path must be inside the scratch dir or the working directory, outside dot-directories",
                 {"scratch_dir": str(self.scratch_dir)})
         return dest
 
@@ -167,8 +178,17 @@ class DocService:
 
     def fetch_doc(self, doc_id: str, tab: Optional[str] = None,
                   to_path: Optional[str] = None) -> FetchResult:
+        return self.pull(doc_id, tab, to_path)[0]
+
+    def pull(self, doc_id: str, tab: Optional[str] = None,
+             to_path: Optional[str] = None) -> Tuple[FetchResult, dict]:
+        """``fetch_doc`` that also returns the raw document, for callers that walk its links."""
         doc = self._doc(doc_id)
-        return self._fetch_from(doc_id, doc, tab, to_path)
+        return self._fetch_from(doc_id, doc, tab, to_path), doc
+
+    def record_edge(self, source: str, target: str) -> None:
+        if self.index is not None:
+            self.index.record_edge(source, target)
 
     def _fetch_from(self, doc_id: str, doc: dict, tab: Optional[str],
                     to_path: Optional[str]) -> FetchResult:
@@ -189,10 +209,16 @@ class DocService:
             md = section_markdown(t, t.sections[0])
             if dest is not None and len(selected) == 1:
                 path = dest
+                if path.suffix != ".md":
+                    raise DocspanToolError("path_not_allowed", "to_path for a single tab must end in .md")
             else:
-                path = (dest or base) / f"{_slug(t.tab_name) if t.tab_id else _slug(doc_id)}.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(md)
+                name = f"{_slug(t.tab_name)}-{_slug(t.tab_id)}" if t.tab_id else _slug(doc_id)
+                path = (dest or base) / f"{name}.md"  # tab id keeps same-named tabs apart
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(md)
+            except OSError as exc:
+                raise DocspanToolError("write_failed", f"Could not write {path}: {exc}") from exc
             files.append(FetchedTab(tab_id=t.tab_id, tab_name=t.tab_name,
                                     local_path=str(path), char_count=len(md)))
         # The snapshot always covers every tab so diff_since compares like with like.
@@ -226,7 +252,6 @@ class DocService:
                     limit: int = 10) -> SearchResult:
         if self.index is None:
             raise DocspanToolError("no_index", "No index available; run 'docspan index'")
-        import time
         rows = self.index.search(query, limit=limit, doc_ids=scope)
         warning = None
         if self.index.count_docs() == 0:
@@ -284,7 +309,10 @@ class DocService:
         doc = self._doc(doc_id)
         new = self._snapshot(parse_tabs(doc))
         old_sections: Dict[str, List] = old["sections"]
-        label = lambda key: key.split("|", 1)[1]  # noqa: E731
+
+        def label(key: str) -> str:
+            return key.split("|", 1)[1]
+
         added = [label(k) for k in new if k not in old_sections]
         removed = [label(k) for k in old_sections if k not in new]
         changed = [

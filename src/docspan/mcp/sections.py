@@ -35,7 +35,7 @@ def doc_url(doc_id: str, tab_id: str = "", heading_id: Optional[str] = None) -> 
 
 
 def heading_level(style: object) -> int:
-    s = str(style)
+    s = str(getattr(style, "value", style))
     if s in _STYLE_LEVEL:
         return _STYLE_LEVEL[s]
     return int(s.split("_", 1)[1])
@@ -49,6 +49,7 @@ class Section:
     text: str
     heading_id: Optional[str]
     path: str
+    parts: List[str]  # tab name then heading texts; matching uses this, not the joined path
     start: int  # node index of the heading (0 for the tab body)
     end: int  # exclusive; runs to the next same-or-higher heading, so includes subsections
     own_end: int  # exclusive; runs to the next heading of any level (the section's own body)
@@ -68,13 +69,15 @@ def _render(nodes: Sequence) -> str:
 
 def build_sections(nodes: list, tab_id: str, tab_name: str) -> List[Section]:
     """One section per heading, preceded by a level-0 entry covering the whole tab."""
+    # A blank styled paragraph is not a navigable heading; skipping it keeps paths unambiguous.
     heads = [
         i for i, n in enumerate(nodes)
-        if isinstance(n, DocsParagraphNode) and is_heading_style(n.style)
+        if isinstance(n, DocsParagraphNode) and is_heading_style(n.style) and n.text.strip()
     ]
-    sections = [Section(tab_id, tab_name, 0, tab_name, None, tab_name, 0, len(nodes),
+    sections = [Section(tab_id, tab_name, 0, tab_name, None, tab_name, [tab_name], 0, len(nodes),
                         heads[0] if heads else len(nodes))]
     stack: List[Tuple[int, str]] = []
+    seen_paths: Dict[str, int] = {}
     for pos, i in enumerate(heads):
         node = nodes[i]
         level = heading_level(node.style)
@@ -82,14 +85,20 @@ def build_sections(nodes: list, tab_id: str, tab_name: str) -> List[Section]:
             stack.pop()
         text = node.text.strip()
         stack.append((level, text))
-        path = f" {PATH_SEP} ".join([tab_name] + [t for _, t in stack])
+        parts = [tab_name] + [t for _, t in stack]
+        path = f" {PATH_SEP} ".join(parts)
+        # Duplicate sibling headings get an ordinal so each stays individually addressable.
+        seen_paths[path] = seen_paths.get(path, 0) + 1
+        if seen_paths[path] > 1:
+            parts[-1] = f"{parts[-1]} [{seen_paths[path]}]"
+            path = f" {PATH_SEP} ".join(parts)
         end = len(nodes)
         for j in heads[pos + 1:]:
             if heading_level(nodes[j].style) <= level:
                 end = j
                 break
         own_end = heads[pos + 1] if pos + 1 < len(heads) else len(nodes)
-        sections.append(Section(tab_id, tab_name, level, text, node.heading_id, path, i, end, own_end))
+        sections.append(Section(tab_id, tab_name, level, text, node.heading_id, path, parts, i, end, own_end))
     return sections
 
 
@@ -143,7 +152,7 @@ def find_section_by_path(
         raise DocspanToolError("invalid_heading_path", "heading_path is empty")
 
     def matches(sec: Section, want: List[str]) -> bool:
-        have = [_norm(p) for p in split_path(sec.path)]
+        have = [_norm(p) for p in sec.parts]
         if sec.level == 0:
             return want == have
         if have[-1] != want[-1] or len(want) > len(have):
@@ -164,7 +173,7 @@ def find_section_by_path(
     if len(candidates) > 1:
         raise DocspanToolError(
             "ambiguous_heading_path",
-            f"{heading_path!r} matches {len(candidates)} sections; qualify it with a parent heading",
+            f"{heading_path!r} matches {len(candidates)} sections; retry with one of the listed heading_path values",
             {"matches": [
                 {"heading_path": s.path, "heading_id": s.heading_id,
                  "url": doc_url(doc_id, s.tab_id, s.heading_id)}
