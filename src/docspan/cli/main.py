@@ -1062,6 +1062,12 @@ def map_(
         "doc (titled from --title/the file's H1) instead of a new doc, and map "
         "this file to it. Requires --backend google_docs.",
     ),
+    parent_tab: Optional[str] = typer.Option(
+        None,
+        "--parent-tab",
+        help="Tab ID in the --new-tab-in doc to nest the new tab under (e.g. t.abc123). "
+        "Requires --new-tab-in.",
+    ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to markgate.yaml"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
 ) -> None:
@@ -1090,6 +1096,10 @@ def map_(
 
     if backend not in BACKENDS:
         err_console.print(f"Unknown backend '{backend}'. Available: {list(BACKENDS.keys())}")
+        raise typer.Exit(1)
+
+    if parent_tab is not None and new_tab_in is None:
+        err_console.print("--parent-tab requires --new-tab-in")
         raise typer.Exit(1)
 
     parent_mapping: Optional[Mapping] = None
@@ -1142,11 +1152,14 @@ def map_(
 
     try:
         if parent_mapping is not None:
-            create_result = backend_instance.create_tab(parent_mapping.remote_id, doc_title)
+            tab_kwargs: dict = {"parent_tab_id": parent_tab} if parent_tab is not None else {}
+            create_result = backend_instance.create_tab(
+                parent_mapping.remote_id, doc_title, **tab_kwargs
+            )
         else:
             create_result = backend_instance.create(doc_title, **create_kwargs)
-    except ValueError as exc:
-        err_console.print(str(exc))
+    except (ValueError, RuntimeError) as exc:
+        err_console.print(str(exc), markup=False)
         raise typer.Exit(1)
 
     mapping = Mapping(

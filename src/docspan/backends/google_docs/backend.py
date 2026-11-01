@@ -88,6 +88,7 @@ from docspan.backends.google_docs.push_preview import (
 from docspan.backends.google_docs.section_splitter import SectionSplitError, split_nodes
 from docspan.backends.google_docs.tabs import (
     TabNotFoundError,
+    flatten_tabs,
     heading_ids_by_tab,
     resolve_document_tab,
 )
@@ -2024,18 +2025,69 @@ class GoogleDocsBackend(Backend):
             first_tab_id=first_tab_id,
         )
 
-    def create_tab(self, doc_id: str, title: str, **kwargs: object) -> CreateResult:
-        """Create a new tab named `title` in the existing doc `doc_id`."""
+    def create_tab(
+        self,
+        doc_id: str,
+        title: str,
+        parent_tab_id: Optional[str] = None,
+        **kwargs: object,
+    ) -> CreateResult:
+        """Create a new tab named `title` in the existing doc `doc_id`.
+
+        With `parent_tab_id`, the tab is nested under that tab. Raises
+        ValueError if the parent doesn't exist (before any mutation) and
+        RuntimeError if the doc doesn't show the tab as nested afterwards.
+        """
         self._ensure_client()
         assert self._client is not None
+        if parent_tab_id is not None:
+            existing = {
+                t["tabProperties"]["tabId"]
+                for t in flatten_tabs(self._client.get_document(doc_id).get("tabs", []))
+            }
+            if parent_tab_id not in existing:
+                raise ValueError(
+                    f"--parent-tab '{parent_tab_id}' not found in doc. "
+                    f"Valid tab IDs: {', '.join(sorted(existing)) or '(none)'}"
+                )
         tab_properties = self._client.add_document_tab(doc_id, title)
         tab_id = tab_properties["tabId"]
+        if parent_tab_id is not None:
+            self._nest_tab(doc_id, tab_id, parent_tab_id)
         return CreateResult(
             doc_id=doc_id,
             title=tab_properties.get("title", title),
             tab_id=tab_id,
             url=f"https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id}",
         )
+
+    def _nest_tab(self, doc_id: str, tab_id: str, parent_tab_id: str) -> None:
+        """Move the just-created root tab under its parent and confirm it stuck.
+
+        A failure leaves the tab in the doc at root level, so errors name its id.
+        """
+        assert self._client is not None
+        orphan = (
+            f"Tab '{tab_id}' was created at root level but not nested under '{parent_tab_id}' "
+            f"(https://docs.google.com/document/d/{doc_id}/edit?tab={tab_id})"
+        )
+        try:
+            self._client.update_document_tab_properties(doc_id, tab_id, parent_tab_id)
+        except Exception as exc:
+            raise RuntimeError(f"{orphan}: {exc}") from exc
+        doc = self._client.get_document(doc_id)
+        props: dict = next(
+            (
+                t["tabProperties"]
+                for t in flatten_tabs(doc.get("tabs", []))
+                if t["tabProperties"].get("tabId") == tab_id
+            ),
+            {},
+        )
+        if props.get("parentTabId") != parent_tab_id and (
+            props.get("parentTabId") or props.get("nestingLevel", 0) < 1
+        ):
+            raise RuntimeError(f"{orphan}: the Docs API ignored the update.")
 
     def _has_any_credentials(self) -> bool:
         token = self.config.token_path or default_token_path()

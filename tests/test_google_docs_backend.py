@@ -86,6 +86,36 @@ class TestAddDocumentTab:
         ]
 
 
+class TestUpdateDocumentTabProperties:
+    def test_sends_update_document_tab_properties_request(
+        self, make_client: Callable[[], GoogleDocsClient]
+    ) -> None:
+        client = make_client()
+        execute_mock = client.docs_service.documents.return_value.batchUpdate.return_value.execute
+        execute_mock.return_value = {"replies": [{}]}
+
+        client.update_document_tab_properties("doc-1", "t.child", "t.parent")
+
+        _, kwargs = client.docs_service.documents.return_value.batchUpdate.call_args
+        assert kwargs["documentId"] == "doc-1"
+        assert kwargs["body"]["requests"] == [
+            {
+                "updateDocumentTabProperties": {
+                    "tabProperties": {"tabId": "t.child", "parentTabId": "t.parent"},
+                    "fields": "parentTabId",
+                }
+            }
+        ]
+
+    def test_propagates_api_errors(self, make_client: Callable[[], GoogleDocsClient]) -> None:
+        client = make_client()
+        execute_mock = client.docs_service.documents.return_value.batchUpdate.return_value.execute
+        execute_mock.side_effect = ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            client.update_document_tab_properties("doc-1", "t.child", "t.parent")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GoogleDocsBackend.push() — threads revisionId, handles stale-revision conflict
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2831,6 +2861,121 @@ class TestCreateTab:
         result = backend.create_tab("doc-1", "Discussion")
 
         assert result.title == "Discussion"
+
+
+def _tabs_doc(*tabs: tuple) -> dict:
+    """Doc from (tabId, nestingLevel, parentTabId-or-None); children go under childTabs."""
+    nodes = {
+        tab_id: {
+            "tabProperties": {
+                "tabId": tab_id,
+                "nestingLevel": level,
+                **({"parentTabId": parent} if parent else {}),
+            }
+        }
+        for tab_id, level, parent in tabs
+    }
+    roots = []
+    for tab_id, _level, parent in tabs:
+        if parent:
+            nodes[parent].setdefault("childTabs", []).append(nodes[tab_id])
+        else:
+            roots.append(nodes[tab_id])
+    return {"tabs": roots}
+
+
+class TestCreateChildTab:
+    def test_without_parent_never_updates_or_fetches(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+
+        backend.create_tab("doc-1", "T")
+
+        client.update_document_tab_properties.assert_not_called()
+        client.get_document.assert_not_called()
+
+    def test_with_parent_adds_updates_and_verifies_nesting(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new", "title": "T"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.new", 1, "t.parent")),
+        ]
+
+        result = backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.parent")
+        assert client.get_document.call_count == 2
+        assert result.tab_id == "t.new"
+
+    def test_raises_if_nesting_not_confirmed(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.new", 0, None)),
+        ]
+
+        with pytest.raises(RuntimeError, match=r"t\.new.*ignored"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.parent")
+
+    def test_raises_if_nested_under_wrong_parent(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.side_effect = [
+            _tabs_doc(("t.parent", 0, None), ("t.other", 0, None)),
+            _tabs_doc(("t.parent", 0, None), ("t.other", 0, None), ("t.new", 1, "t.other")),
+        ]
+
+        with pytest.raises(RuntimeError, match="not nested under 't.parent'"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
+
+    def test_grandchild_parent_is_found_via_child_tabs(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        tree = (("t.root", 0, None), ("t.child", 1, "t.root"))
+        client.get_document.side_effect = [
+            _tabs_doc(*tree),
+            _tabs_doc(*tree, ("t.new", 2, "t.child")),
+        ]
+
+        backend.create_tab("doc-1", "T", parent_tab_id="t.child")
+
+        client.update_document_tab_properties.assert_called_once_with("doc-1", "t.new", "t.child")
+
+    def test_unknown_parent_raises_before_any_mutation(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.get_document.return_value = _tabs_doc(("t.a", 0, None), ("t.b", 0, None))
+
+        with pytest.raises(ValueError, match="t.a, t.b"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.missing")
+
+        client.add_document_tab.assert_not_called()
+        client.update_document_tab_properties.assert_not_called()
+
+    def test_update_failure_reports_orphan_tab_id(
+        self, make_backend: Callable[[], tuple[GoogleDocsBackend, MagicMock]]
+    ) -> None:  # type: ignore[no-untyped-def]
+        backend, client = make_backend()
+        client.add_document_tab.return_value = {"tabId": "t.new"}
+        client.get_document.return_value = _tabs_doc(("t.parent", 0, None))
+        client.update_document_tab_properties.side_effect = ValueError("403")
+
+        with pytest.raises(RuntimeError, match="t.new.*403"):
+            backend.create_tab("doc-1", "T", parent_tab_id="t.parent")
 
 
 class _NoTabBackend(Backend):

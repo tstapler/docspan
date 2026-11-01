@@ -894,6 +894,76 @@ class TestMap:
         assert result.exit_code == 1
         assert "has no remote_id yet" in _unwrapped(result.output)
 
+    def test_parent_tab_is_passed_to_create_tab(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", wraps=backend.create_tab) as spy:
+            result = self._invoke_new_tab(
+                new_local, parent_local, cfg, extra_args=["--parent-tab", "t.parent"]
+            )
+        assert result.exit_code == 0, result.output
+        spy.assert_called_once_with("parent-doc-1", "Discussion", parent_tab_id="t.parent")
+        saved = yaml.safe_load(open(cfg, encoding="utf-8"))
+        assert saved["mappings"][1]["tab_id"] == "t.newtab"
+        assert "parent_tab_id" not in saved["mappings"][1]
+
+    def test_without_parent_tab_create_tab_gets_no_parent_kwarg(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", wraps=backend.create_tab) as spy:
+            result = self._invoke_new_tab(new_local, parent_local, cfg)
+        assert result.exit_code == 0, result.output
+        spy.assert_called_once_with("parent-doc-1", "Discussion")
+
+    def test_parent_tab_error_exits_nonzero(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", side_effect=ValueError("Valid tab IDs: t.a")):
+            result = self._invoke_new_tab(
+                new_local, parent_local, cfg, extra_args=["--parent-tab", "t.zzz"]
+            )
+        assert result.exit_code == 1
+        assert "Valid tab IDs: t.a" in _unwrapped(result.output)
+
+    def test_nesting_failure_exits_nonzero_and_writes_no_mapping(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", side_effect=RuntimeError("Tab 't.x' was created at root level [bold")):
+            result = self._invoke_new_tab(
+                new_local, parent_local, cfg, extra_args=["--parent-tab", "t.parent"]
+            )
+        assert result.exit_code == 1
+        assert "[bold" in _unwrapped(result.output)
+        assert len(yaml.safe_load(open(cfg, encoding="utf-8"))["mappings"]) == 0
+
+    def test_empty_parent_tab_is_not_silently_ignored(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        parent_local, new_local, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
+        backend = FakeBackend()
+        with patch("docspan.cli.main.load_config", return_value=_config(parent_mapping)), \
+             patch("docspan.cli.main._get_backend", return_value=backend), \
+             patch.object(backend, "create_tab", wraps=backend.create_tab) as spy:
+            self._invoke_new_tab(new_local, parent_local, cfg, extra_args=["--parent-tab", ""])
+        spy.assert_called_once_with("parent-doc-1", "Discussion", parent_tab_id="")
+
+    def test_parent_tab_requires_new_tab_in(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        _p, new_local, cfg, _m = self._new_tab_fixtures(tmp_path)
+        with patch("docspan.cli.main.load_config", return_value=_config()):
+            result = runner.invoke(
+                app,
+                ["map", str(new_local), "--backend", "google_docs",
+                 "--parent-tab", "t.x", "--config", cfg],
+            )
+        assert result.exit_code == 1
+        assert "requires --new-tab-in" in _unwrapped(result.output)
+
     def test_new_tab_in_rejects_derived_title_longer_than_50_chars(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         parent_local, _, cfg, parent_mapping = self._new_tab_fixtures(tmp_path)
         new_local = tmp_path / "long_title.md"
