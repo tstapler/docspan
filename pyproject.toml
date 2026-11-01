@@ -60,6 +60,10 @@ dev = [
     "types-PyYAML>=6.0.0",
     "types-requests>=2.25.0",
 ]
+mcp = [
+    # Tested against 2.3.0; the mcp SDK requires Python >= 3.10.
+    "mcp>=2.0.0,<3; python_version >= '3.10'",
+]
 docs = [
     "mkdocs>=1.5.0,<2.0",
     "mkdocs-material>=9.5.0,<10.0",
