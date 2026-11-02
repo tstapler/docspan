@@ -1719,6 +1719,11 @@ def _resolve_merged(
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+from docspan.cli import mcp_cmds  # noqa: E402
+
+mcp_cmds.register(app, _resolve)
+
+
 def main() -> None:
     app()
 

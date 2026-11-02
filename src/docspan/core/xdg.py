@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+from typing import Optional
 
 APP = "docspan"
 
@@ -67,3 +68,19 @@ def state_dir_for_prefix(prefix: str) -> pathlib.Path:
 def default_token_path(prefix: str) -> pathlib.Path:
     """Default cached-OAuth-token path for a project: $XDG_CONFIG_HOME/docspan/<prefix>/google_token.json."""
     return config_home() / prefix / "google_token.json"
+
+
+def cache_dir_for_prefix(prefix: Optional[str]) -> pathlib.Path:
+    """Per-project cache dir for MCP scratch copies and the FTS index.
+
+    ``$XDG_CACHE_HOME/docspan/<prefix>``; with no prefix (legacy ``--config`` mode)
+    it stays local at ``./.scratch/docspan`` so nothing lands outside the project.
+    """
+    if prefix:
+        return cache_home() / prefix
+    return pathlib.Path(".scratch") / "docspan"
+
+
+def scratch_dir_for_prefix(prefix: Optional[str]) -> pathlib.Path:
+    """Where ``fetch_doc`` writes pulled markdown: ``<cache dir>/scratch``."""
+    return cache_dir_for_prefix(prefix) / "scratch"
