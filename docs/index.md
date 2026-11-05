@@ -1,12 +1,12 @@
 # docspan
 
-Push and pull markdown to Google Docs and Confluence from a single CLI. docspan provides bidirectional sync with three-way merge conflict detection, structural diff push that preserves comments on unchanged paragraphs, and a simple YAML-based configuration file (`markgate.yaml`).
+**Keep markdown files in git and in sync with Google Docs and Confluence.** Write in your editor, review in git, and let teammates who live in Docs or Confluence keep commenting there.
 
-## What it does
-
-Push local markdown files to Google Docs or Confluence. Pull remote documents back into local files. When both sides have changed, docspan performs a three-way merge and writes conflict markers so you can resolve them with `docspan conflicts resolve`.
-
-The push to Google Docs uses a paragraph-level structural diff that emits minimal `batchUpdate` requests, preserving comments on paragraphs that have not changed.
+- **Two-way sync.** `push`, `pull`, or `sync` (pull, then push) per mapping.
+- **Three-way merge.** When both sides changed, docspan merges and writes conflict markers you resolve with `docspan conflicts resolve`.
+- **Comment-safe pushes (Google Docs).** A paragraph-level structural diff sends minimal `batchUpdate` requests, so comments on unchanged paragraphs survive. `push` warns before it would destroy a comment and blocks unless you pass `--force`.
+- **Rich content.** Images, tables, blockquotes, fenced code, and mermaid diagrams (rendered to PNG) on Google Docs; multi-tab docs and sectioned (one file per heading) mappings too.
+- **Comment sidecars.** Pull writes `{file}.comments.md`; reply to or resolve Google Docs comments from it with `docspan comments respond`.
 
 ## Quickstart
 
@@ -16,7 +16,7 @@ The push to Google Docs uses a paragraph-level structural diff that emits minima
 pip install docspan
 ```
 
-**2. Create `markgate.yaml`:**
+**2. Create `markgate.yaml`** (`docspan.yaml` is also recognized):
 
 ```yaml
 backends:
@@ -30,36 +30,38 @@ mappings:
     direction: both
 ```
 
+No doc yet? `docspan map docs/design-doc.md --backend google_docs` creates one and adds the mapping.
+
 **3. Set up authentication:**
 
 ```bash
 docspan auth setup google_docs
 ```
 
-**4. Push and pull:**
+**4. Sync:**
 
 ```bash
+docspan status
+docspan push --dry-run   # preview, including comments at risk
 docspan push
 docspan pull
-docspan status
 ```
 
-See the [Install](install.md) page for full auth setup instructions and the [Commands](commands.md) page for the complete CLI reference.
+See [Install](install.md) for auth setup, [Configuration](configuration.md) for every field, and [Commands](commands.md) for the CLI reference.
 
 ## Backends
 
 | Backend | Auth Method | Push | Pull |
 |---|---|---|---|
-| Google Docs | Service account JSON key | yes | yes |
+| Google Docs | Service account or per-user OAuth | yes | yes |
 | Confluence | Atlassian API token | yes | yes |
 
 ## Known Limitations
 
-!!! warning "Known limitations in v0.1.0"
-    - Google Docs: comments on edited paragraphs are lost on push (paragraph-level structural diff; comments on unchanged paragraphs are preserved)
-    - Google Docs: images push and pull (local files upload to Drive; `https://` URLs are referenced directly)
-    - Google Docs: a pulled image's markdown link is Google's `contentUri`, which can change over time even when the image hasn't — push doesn't misdetect this as a real change, but the stale URI in your local file can still show up as a one-sided edit during conflict resolution
-    - Push: no image support for Confluence — local images cannot be pushed
-    - Push: no table support — markdown tables are not rendered in Google Docs
-    - Confluence: requires an Atlassian API token; no OAuth flow
-    - Confluence: the comment sidecar (`{file}.comments.md`) is informational only; comments cannot be pushed back
+!!! warning
+    - Google Docs: comments on edited paragraphs are lost on push (comments on unchanged paragraphs are preserved). `push --dry-run` lists every at-risk comment, and a real push blocks unless `--force`.
+    - Google Docs: an image must sit alone on its own line. A pulled image's link is Google's `contentUri`, which can change over time even when the image hasn't — the stale URI can show up as a one-sided edit during conflict resolution.
+    - Confluence: no image push, no OAuth (API token only), and comments are pull-only.
+    - Checklists round-trip as literal `- [ ]` / `- [x]` text.
+
+See the [Google Docs](backends/google-docs.md#limitations) and [Confluence](backends/confluence.md#limitations) pages for the full lists.

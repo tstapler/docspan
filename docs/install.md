@@ -26,41 +26,41 @@ To run it without installing, use `uvx docspan`.
 
 ---
 
+## Optional: mermaid diagram rendering (Google Docs only)
+
+Pushing a ` ```mermaid ` fence to Google Docs renders it to a PNG via the official [mermaid-cli](https://github.com/mermaid-js/mermaid-cli) (`mmdc`), which wraps Puppeteer/headless Chrome. It is a Node.js dependency, not declared in `pyproject.toml`. Install it globally so docspan finds a real binary instead of falling back to `npx`, which re-fetches on every render:
+
+```bash
+npm install -g @mermaid-js/mermaid-cli   # tested against 11.x; older 10.x should also work
+```
+
+If Puppeteer's Chrome cache is corrupted (a truncated download or interrupted install), renders fail with `Could not find chrome-headless-shell`. Re-fetch it with:
+
+```bash
+npx puppeteer browsers install chrome-headless-shell
+```
+
+Without `mmdc` and without network access for `npx`, a render failure is reported as a push warning, not a crash.
+
+---
+
 ## Google Docs Auth Setup
 
-docspan uses Google service account credentials for Google Docs access. If credentials are not yet configured, `docspan auth setup google_docs` prints the following instructions:
+docspan supports per-user OAuth (acts as you) and Google service accounts. Run `docspan auth setup google_docs` for setup instructions, or a guided flow in an interactive terminal:
 
 ```
-Google Docs Auth Setup
-========================================
-docspan uses Google service account credentials for Google Docs access.
+Per-user OAuth (recommended — acts as you, like gws):
+  1. Create an OAuth client (Desktop app); download client_secret.json
+  2. docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json
+     (or set backends.google_docs.oauth_client_secret_path in markgate.yaml)
 
-Setup steps:
-  1. Create a service account at:
-     https://console.cloud.google.com/iam-admin/serviceaccounts
-  2. Enable Google Docs API and Google Drive API in your project
-  3. Download the service account JSON key file
-  4. Share your Google Docs with the service account email
-
-Configure credentials via one of:
-  Option A — YAML config:
-    backends:
-      google_docs:
-        credentials_path: /path/to/service-account.json
-  Option B — environment variable (path):
-    export ACCOUNT_A_CREDENTIALS_PATH=/path/to/service-account.json
-  Option C — environment variable (inline JSON):
-    export ACCOUNT_A_CREDENTIALS='{ ... service account JSON ... }'
+Service account (automation):
+  1. Create a service account + JSON key; enable the Docs & Drive APIs
+  2. Share your docs with the service-account email
+  3. Set credentials_path in markgate.yaml (or ACCOUNT_A_CREDENTIALS_PATH env)
 ```
 
-If credentials are already configured, running `docspan auth setup google_docs` tests the connection and reports success or failure.
-
-### Required API scopes
-
-The service account requires:
-
-- `https://www.googleapis.com/auth/documents` — read and write Google Docs
-- `https://www.googleapis.com/auth/drive.readonly` — list and read Drive files
+If credentials are already configured, `docspan auth setup google_docs` tests the connection and reports success or failure. The scopes requested are listed on the [Google Docs backend](backends/google-docs.md#required-scopes) page.
 
 ---
 
@@ -106,4 +106,4 @@ export CONFLUENCE_API_TOKEN=your-token
 
 ## Note about `markgate.yaml`
 
-The config file is gitignored by default because it may contain API tokens. Use the provided `markgate.yaml.example` as a template and add your own `markgate.yaml` locally.
+The config file (`docspan.yaml` is also recognized) is gitignored by default because it may contain API tokens. Use `markgate.yaml.example` as a template and add your own copy locally.

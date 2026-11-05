@@ -2,7 +2,7 @@
 
 ## How it works
 
-The Google Docs backend authenticates either via a Google service account JSON key or via per-user OAuth (an `InstalledAppFlow` that acts as you, similar to `gws`) — whichever `markgate.yaml` configures (`credentials_path` for the service account, `oauth_client_secret_path` for OAuth). Push uses a paragraph-level structural diff that computes the minimal set of `batchUpdate` requests needed to transform the current document into the target content. This approach preserves comments attached to paragraphs that have not changed. Pull exports the Google Doc as HTML and converts it to markdown.
+The Google Docs backend authenticates either via a Google service account JSON key or via per-user OAuth (an `InstalledAppFlow` that acts as you, similar to `gws`) — whichever `markgate.yaml` configures (`credentials_path` for the service account, `oauth_client_secret_path` for OAuth). Push uses a paragraph-level structural diff that computes the minimal set of `batchUpdate` requests needed to transform the current document into the target content. This approach preserves comments attached to paragraphs that have not changed. By default, pull exports the Google Doc as HTML through Drive and converts it to markdown; with `tab_id` or `pull_strategy: structural` it reads the document through the structural API instead.
 
 ## Auth Setup
 
@@ -42,7 +42,7 @@ Every credential path (`GoogleAuthenticator`, `OAuthAuthenticator`) requests the
 backends:
   google_docs:
     credentials_path: /path/to/service-account.json
-    # token_path: .markgate/google_token.json  # default, rarely changed
+    # token_path: ~/.config/docspan/google_token.json  # default ($XDG_CONFIG_HOME/docspan/), rarely changed
 
 mappings:
   - local: docs/design-doc.md
@@ -54,9 +54,9 @@ mappings:
 ## Limitations
 
 !!! warning
-    - **Comments destroyed on push for edited paragraphs**: The structural diff preserves comments on unchanged paragraphs, but any paragraph that is deleted and reinserted loses its comments. This is a known v0.1.0 limitation.
+    - **Comments destroyed on push for edited paragraphs**: The structural diff preserves comments on unchanged paragraphs, but any paragraph that is deleted and reinserted loses its comments. `push --dry-run` lists every at-risk comment, and a real push blocks unless `--force` is passed.
     - **Images push and pull**: `![alt](./local.png)` uploads the local file to Drive and references it by URI; an `https://` URL is referenced directly, bypassing upload. Only a standalone image on its own line is supported — one mixed into a paragraph alongside running text is left as plain text. Missing files, files over 50MB, and unsupported formats (SVG) are reported as push warnings rather than blocking the write or crashing.
-    - **Mermaid diagrams push as rendered PNGs**: a fenced ` ```mermaid ` block is rendered to a raster PNG (via the official `mermaid-cli`/`mmdc`, shelled out to — install with `npm install -g @mermaid-js/mermaid-cli`, tested against 11.x, or it's fetched on demand through `npx`, which re-downloads on every render) and pushed as an inline image, since `insertInlineImage` has no native mermaid or SVG support. See [Install](../../README.md#install) for setup, including the fix for a corrupted Puppeteer headless-Chrome cache. A render failure (missing Node.js/mermaid-cli, invalid diagram syntax, timeout) is reported as a push warning, not a crash. Successful renders are cached on disk (keyed on diagram text, render scale, and the resolved `mmdc --version`) under `$XDG_CACHE_HOME/docspan/mermaid`, so an unchanged fence across repeat pushes skips the mermaid-cli/Puppeteer invocation entirely. There is no pull-side reconstruction — a mermaid diagram round-trips back to markdown as a plain image reference, not a ` ```mermaid ` fence.
+    - **Mermaid diagrams push as rendered PNGs**: a fenced ` ```mermaid ` block is rendered to a raster PNG (via the official `mermaid-cli`/`mmdc`, shelled out to — install with `npm install -g @mermaid-js/mermaid-cli`, tested against 11.x, or it's fetched on demand through `npx`, which re-downloads on every render) and pushed as an inline image, since `insertInlineImage` has no native mermaid or SVG support. See [Install](../install.md#optional-mermaid-diagram-rendering-google-docs-only) for setup, including the fix for a corrupted Puppeteer headless-Chrome cache. A render failure (missing Node.js/mermaid-cli, invalid diagram syntax, timeout) is reported as a push warning, not a crash. Successful renders are cached on disk (keyed on diagram text, render scale, and the resolved `mmdc --version`) under `$XDG_CACHE_HOME/docspan/mermaid`, so an unchanged fence across repeat pushes skips the mermaid-cli/Puppeteer invocation entirely. On pull, docspan restores the ` ```mermaid ` fence when it can find the diagram source: first in the local render cache, then in the committed `{file}.mermaid-cache.yaml` sidecar, then in the "Appendix: Diagram Sources" section that push adds to the end of the Doc. If none match, the diagram comes back as a plain image reference.
     - **Pulled image URIs can go stale**: a pulled `![alt](src)` link is Google's `contentUri` for that embedded object, which Google's API docs say may change over time even when the image itself is unchanged. The push structural diff keys image identity on `alt`/width/height, not this URI, so a rotated `contentUri` alone will not cause the paragraph to be deleted and reinserted (which would destroy any comment anchored to it) — but the stale URI persisted in your markdown file can still surface as a one-sided edit in `docspan conflicts resolve`'s three-way diff.
     - **Table cells hold one paragraph**: a markdown table cell is pushed as a single
       paragraph, and inline formatting inside it (bold, monospace, links, internal
