@@ -1,9 +1,8 @@
 # Configuration
 
-docspan finds its config using the [resolution order](#central-config-and-xdg-storage) below. The simplest case is `markgate.yaml` in the current working directory, or the path passed with `--config`. `docspan.yaml` is also recognized: if present (and no `markgate.yaml` is), docspan reads and writes it instead.
-
+docspan finds its config using the [resolution order](#central-config-and-xdg-storage) below. The simplest case is `docspan.yaml` in the current working directory, or the path passed with `--config`.
 !!! warning
-    `markgate.yaml` is gitignored by default because it may contain API tokens. Use `markgate.yaml.example` as a template.
+    `docspan.yaml` is gitignored by default because it may contain API tokens. Use `docspan.yaml.example` as a template.
 
 ## Full Example
 
@@ -102,23 +101,23 @@ $XDG_STATE_HOME/docspan/<prefix>/…       # sync state + base store, per projec
 default_prefix: design-docs
 projects:
   design-docs:
-    markgate: ~/Documents/design-docs/markgate.yaml
+    markgate: ~/Documents/design-docs/docspan.yaml
 ```
 
 ```bash
-docspan config add design-docs ~/Documents/design-docs/markgate.yaml
+docspan config add design-docs ~/Documents/design-docs/docspan.yaml
 docspan config show
 docspan push --prefix design-docs
 docspan migrate-xdg --prefix design-docs    # move legacy in-repo state to XDG + register
 ```
 
-**Prefix resolution order:** `--config PATH` (legacy — storage stays beside the file) → `--prefix` → `DOCSPAN_PREFIX` → cwd inside a registered project → `default_prefix`. If nothing matches, docspan falls back to a local `./markgate.yaml` with beside-the-file storage.
+**Prefix resolution order:** `--config PATH` (legacy — storage stays beside the file) → `--prefix` → `DOCSPAN_PREFIX` → cwd inside a registered project → `default_prefix`. If nothing matches, docspan falls back to a local `./docspan.yaml` with beside-the-file storage.
 
 ---
 
 ## State Files
 
-After the first sync docspan writes these files. `.markgate-state.json` and `.markgate-base/` live beside the config in legacy mode (`--config`, or the local `./markgate.yaml` fallback) and under `$XDG_STATE_HOME/docspan/<prefix>/` when a central-config prefix is active. The other files always sit beside the markdown file.
+After the first sync docspan writes these files. `.markgate-state.json` and `.markgate-base/` live beside the config in legacy mode (`--config`, or the local `./docspan.yaml` fallback) and under `$XDG_STATE_HOME/docspan/<prefix>/` when a central-config prefix is active. The other files always sit beside the markdown file.
 
 | File | Description |
 |---|---|

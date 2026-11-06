@@ -16,7 +16,7 @@
 pip install docspan
 ```
 
-**2. Create `markgate.yaml`** (`docspan.yaml` is also recognized):
+**2. Create `docspan.yaml`:**
 
 ```yaml
 backends:

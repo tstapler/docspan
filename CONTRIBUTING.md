@@ -71,7 +71,7 @@ from docspan.backends.base import Backend, PushResult, PullResult
 from docspan.config import MarkgateConfig
 
 class MyPlatformBackend(Backend):
-    name = "myplatform"  # must match the key used in markgate.yaml
+    name = "myplatform"  # must match the key used in docspan.yaml
 
     def __init__(self, config) -> None:
         self.config = config
@@ -134,9 +134,9 @@ BACKENDS: dict[str, type[Backend]] = {
 
 Then write tests in `tests/backends/test_myplatform.py` and a docs page at `docs/backends/myplatform.md`.
 
-## Note about `markgate.yaml`
+## Note about `docspan.yaml`
 
-The config file is gitignored by default because it contains API tokens. Add your own `markgate.yaml` locally based on the `markgate.yaml.example` template — it will not be committed.
+The config file is gitignored by default because it contains API tokens. Add your own `docspan.yaml` locally based on the `docspan.yaml.example` template — it will not be committed.
 
 ## PR Process
 

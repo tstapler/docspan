@@ -33,6 +33,7 @@ account_b_credentials.json
 # Configuration files with sensitive data
 config.yaml
 markgate.yaml
+docspan.yaml
 
 # State files
 .sync_state.json

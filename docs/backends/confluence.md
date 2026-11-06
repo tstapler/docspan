@@ -15,7 +15,7 @@ Confluence base URL (e.g. https://yourorg.atlassian.net): https://yourorg.atlass
 Atlassian username (email): you@example.com
 API token (from id.atlassian.com/manage-profile/security/api-tokens): ••••••••
 
-Add to markgate.yaml:
+Add to docspan.yaml:
 
 backends:
   confluence:
@@ -32,7 +32,7 @@ Done. Test with: docspan status
 2. Click **Create API token**
 3. Give it a descriptive label (e.g. `docspan`) and copy the generated token
 
-## `markgate.yaml` Example
+## `docspan.yaml` Example
 
 ```yaml
 backends:
@@ -50,7 +50,7 @@ mappings:
 
 ## Environment Variables
 
-Instead of storing credentials in `markgate.yaml`:
+Instead of storing credentials in `docspan.yaml`:
 
 ```bash
 export CONFLUENCE_BASE_URL=https://yourorg.atlassian.net

@@ -30,7 +30,7 @@ Mermaid rendering on Google Docs needs [mermaid-cli](https://github.com/mermaid-
 
 ## Quick start
 
-**1. Create `markgate.yaml`** (`docspan.yaml` is also recognized). This example uses a service account; for per-user OAuth (recommended for personal use) set `oauth_client_secret_path` instead — see [Install](docs/install.md#google-docs-auth-setup):
+**1. Create `docspan.yaml`.** This example uses a service account; for per-user OAuth (recommended for personal use) set `oauth_client_secret_path` instead — see [Install](docs/install.md#google-docs-auth-setup):
 
 ```yaml
 backends:
@@ -101,22 +101,22 @@ A mapping ties one local file to one remote doc:
 | `pageless` | | Google Docs: force pageless (`true`) or paged (`false`) on each push |
 | `sectioned`, `split_level` | `false` | Google Docs: sync as one file per heading section |
 
-Credentials can also come from environment variables (`ACCOUNT_A_CREDENTIALS_PATH`, `CONFLUENCE_API_TOKEN`, and others). The [configuration reference](docs/configuration.md) lists every field and variable. `markgate.yaml` can contain secrets and is gitignored by default; commit `markgate.yaml.example` instead.
+Credentials can also come from environment variables (`ACCOUNT_A_CREDENTIALS_PATH`, `CONFLUENCE_API_TOKEN`, and others). The [configuration reference](docs/configuration.md) lists every field and variable. `docspan.yaml` can contain secrets and is gitignored by default; commit `docspan.yaml.example` instead.
 
 ### Central config
 
 Register several projects once and run docspan from anywhere. Config, OAuth tokens, and sync state live under the [XDG directories](https://specifications.freedesktop.org/basedir-spec/latest/):
 
 ```bash
-docspan config add design-docs ~/Documents/design-docs/markgate.yaml
+docspan config add design-docs ~/Documents/design-docs/docspan.yaml
 docspan push --prefix design-docs
 ```
 
-Resolution order: `--config` → `--prefix` → `DOCSPAN_PREFIX` → cwd inside a registered project → `default_prefix` → local `./markgate.yaml`.
+Resolution order: `--config` → `--prefix` → `DOCSPAN_PREFIX` → cwd inside a registered project → `default_prefix` → local `./docspan.yaml`.
 
 ### State files
 
-In legacy mode (`--config`, or the local `./markgate.yaml`), docspan writes `.markgate-state.json` and `.markgate-base/` (merge bases) beside the config. **Commit them**: three-way merge across machines and teammates depends on them. With a central-config prefix they live under `$XDG_STATE_HOME/docspan/<prefix>/` and are per-machine. Either way, commit `{file}.mermaid-cache.yaml` (written for files with mermaid fences); `{file}.orig` (pre-merge backup) and `{file}.comments.md` are transient and safe to gitignore.
+In legacy mode (`--config`, or the local `./docspan.yaml`), docspan writes `.markgate-state.json` and `.markgate-base/` (merge bases) beside the config. **Commit them**: three-way merge across machines and teammates depends on them. With a central-config prefix they live under `$XDG_STATE_HOME/docspan/<prefix>/` and are per-machine. Either way, commit `{file}.mermaid-cache.yaml` (written for files with mermaid fences); `{file}.orig` (pre-merge backup) and `{file}.comments.md` are transient and safe to gitignore.
 
 ## Known limitations
 

@@ -52,12 +52,12 @@ docspan supports per-user OAuth (acts as you) and Google service accounts. Run `
 Per-user OAuth (recommended — acts as you, like gws):
   1. Create an OAuth client (Desktop app); download client_secret.json
   2. docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json
-     (or set backends.google_docs.oauth_client_secret_path in markgate.yaml)
+     (or set backends.google_docs.oauth_client_secret_path in docspan.yaml)
 
 Service account (automation):
   1. Create a service account + JSON key; enable the Docs & Drive APIs
   2. Share your docs with the service-account email
-  3. Set credentials_path in markgate.yaml (or ACCOUNT_A_CREDENTIALS_PATH env)
+  3. Set credentials_path in docspan.yaml (or ACCOUNT_A_CREDENTIALS_PATH env)
 ```
 
 If credentials are already configured, `docspan auth setup google_docs` tests the connection and reports success or failure. The scopes requested are listed on the [Google Docs backend](backends/google-docs.md#required-scopes) page.
@@ -76,7 +76,7 @@ Atlassian username (email): you@example.com
 API token (from id.atlassian.com/manage-profile/security/api-tokens): ••••••••
 ```
 
-After entering credentials, the command prints a YAML snippet to add to `markgate.yaml`:
+After entering credentials, the command prints a YAML snippet to add to `docspan.yaml`:
 
 ```yaml
 backends:
@@ -94,7 +94,7 @@ backends:
 
 ### Environment variable alternatives
 
-Instead of storing credentials in `markgate.yaml`, you can export:
+Instead of storing credentials in `docspan.yaml`, you can export:
 
 ```bash
 export CONFLUENCE_BASE_URL=https://yourorg.atlassian.net
@@ -104,6 +104,6 @@ export CONFLUENCE_API_TOKEN=your-token
 
 ---
 
-## Note about `markgate.yaml`
+## Note about `docspan.yaml`
 
-The config file (`docspan.yaml` is also recognized) is gitignored by default because it may contain API tokens. Use `markgate.yaml.example` as a template and add your own copy locally.
+The config file is gitignored by default because it may contain API tokens. Use `docspan.yaml.example` as a template and add your own copy locally.

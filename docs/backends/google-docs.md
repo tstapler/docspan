@@ -2,7 +2,7 @@
 
 ## How it works
 
-The Google Docs backend authenticates either via a Google service account JSON key or via per-user OAuth (an `InstalledAppFlow` that acts as you, similar to `gws`) — whichever `markgate.yaml` configures (`credentials_path` for the service account, `oauth_client_secret_path` for OAuth). Push uses a paragraph-level structural diff that computes the minimal set of `batchUpdate` requests needed to transform the current document into the target content. This approach preserves comments attached to paragraphs that have not changed. By default, pull exports the Google Doc as HTML through Drive and converts it to markdown; with `tab_id` or `pull_strategy: structural` it reads the document through the structural API instead.
+The Google Docs backend authenticates either via a Google service account JSON key or via per-user OAuth (an `InstalledAppFlow` that acts as you, similar to `gws`) — whichever `docspan.yaml` configures (`credentials_path` for the service account, `oauth_client_secret_path` for OAuth). Push uses a paragraph-level structural diff that computes the minimal set of `batchUpdate` requests needed to transform the current document into the target content. This approach preserves comments attached to paragraphs that have not changed. By default, pull exports the Google Doc as HTML through Drive and converts it to markdown; with `tab_id` or `pull_strategy: structural` it reads the document through the structural API instead.
 
 ## Auth Setup
 
@@ -16,12 +16,12 @@ Run this in an interactive terminal for a guided setup, or configure manually:
   Per-user OAuth (recommended — acts as you, like gws):
     1. Create an OAuth client (Desktop app); download client_secret.json
     2. docspan auth setup google_docs --oauth --client-secret /path/to/client_secret.json
-       (or set backends.google_docs.oauth_client_secret_path in markgate.yaml)
+       (or set backends.google_docs.oauth_client_secret_path in docspan.yaml)
 
   Service account (automation):
     1. Create a service account + JSON key; enable the Docs & Drive APIs
     2. Share your docs with the service-account email
-    3. Set credentials_path in markgate.yaml (or ACCOUNT_A_CREDENTIALS_PATH env)
+    3. Set credentials_path in docspan.yaml (or ACCOUNT_A_CREDENTIALS_PATH env)
 ```
 
 Service account credentials can also be provided inline via `ACCOUNT_A_CREDENTIALS` (the JSON itself, not a path) instead of `ACCOUNT_A_CREDENTIALS_PATH`.
@@ -36,7 +36,7 @@ Every credential path (`GoogleAuthenticator`, `OAuthAuthenticator`) requests the
 
 `auth.py` also defines a narrower read-only `PULL_SCOPES`, but nothing in the codebase wires it up today — pull requests the same full grant as push, not a readonly subset. Comment reads/writes reuse this same grant too; no separate scope is added for them.
 
-## `markgate.yaml` Example
+## `docspan.yaml` Example
 
 ```yaml
 backends:
