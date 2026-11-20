@@ -201,7 +201,7 @@ def test_restore_and_local_diff_reject_sectioned_directory(tmp_path):
                  ("revision-diff", d.as_posix(), "--rev", "1")):
         result = invoke(e, make_client(), *args)
         assert result.exit_code == 1
-        assert "is a directory" in result.output
+        assert "is a directory" in " ".join(result.output.split())
 
 
 def test_drive_export_error_paths():

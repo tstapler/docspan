@@ -94,7 +94,10 @@ def test_translate_exception_maps_credential_failures():
 
 def test_translate_exception_maps_revision_export_failures():
     from docspan.core.revisions import (
-        RevisionExportHttpError, RevisionExportLinkError, RevisionPermissionError)
+        RevisionExportHttpError,
+        RevisionExportLinkError,
+        RevisionPermissionError,
+    )
     assert translate_exception(RevisionPermissionError("403")).code == "permission_denied"
     assert translate_exception(RevisionExportLinkError("no exportLinks")).code == "revision_export_failed"
     assert translate_exception(RevisionExportHttpError("HTTP 500")).code == "revision_export_failed"

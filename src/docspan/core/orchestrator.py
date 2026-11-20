@@ -391,7 +391,7 @@ def _remote_only_diff(
     fd, tmp_path = tempfile.mkstemp(suffix=".md")
     os.close(fd)
     try:
-        pulled = backend.pull(mapping.remote_id, tmp_path, tab_id=mapping.tab_id)
+        pulled = backend.pull(mapping.remote_id or "", tmp_path, tab_id=mapping.tab_id)
         if getattr(pulled, "status", "ok") not in ("ok", "warning"):
             return f"(could not fetch remote content for diff: {getattr(pulled, 'message', None) or pulled.status})"
         with open(tmp_path, encoding="utf-8") as fh:
@@ -421,7 +421,7 @@ def _check_remote_unchanged(
     if entry is None or not entry.remote_version:
         return None, None
     try:
-        live = backend.get_remote_version(mapping.remote_id)
+        live = backend.get_remote_version(mapping.remote_id or "")
     except Exception:
         logger.warning("Push guard could not read remote version for %s", mapping.remote_id,
                        exc_info=True)
@@ -435,7 +435,7 @@ def _check_remote_unchanged(
     diff = _remote_only_diff(mapping, backend, entry, state_dir)
     if diff:
         message += "\nRemote-only changes:\n" + diff
-    return PushResult(status="blocked", doc_id=mapping.remote_id, message=message), live
+    return PushResult(status="blocked", doc_id=mapping.remote_id or "", message=message), live
 
 
 def _advance_sibling_versions(

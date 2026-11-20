@@ -478,7 +478,7 @@ class GoogleDocsClient:
         while True:
             token = page_token
 
-            def _list():
+            def _list() -> dict:
                 return self.drive_service.revisions().list(
                     fileId=doc_id, fields=fields, pageSize=200, pageToken=token,
                 ).execute()
@@ -500,7 +500,10 @@ class GoogleDocsClient:
             ).execute()
         )
         from docspan.core.revisions import (
-            RevisionExportHttpError, RevisionExportLinkError, RevisionPermissionError)
+            RevisionExportHttpError,
+            RevisionExportLinkError,
+            RevisionPermissionError,
+        )
         links = rev.get("exportLinks") or {}
         mime = next((m for m in ("text/markdown", "text/plain") if m in links), None)
         if mime is None:

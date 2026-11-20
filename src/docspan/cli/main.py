@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1322,7 +1322,7 @@ def status(
 # revision history commands (Google Docs, via Drive revisions)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _revision_context(file: str, config_path: Optional[str], prefix: Optional[str]):
+def _revision_context(file: str, config_path: Optional[str], prefix: Optional[str]) -> tuple[Mapping, Any]:
     """Resolve `file` to (mapping, Drive-capable client); exit(1) if not a Google Doc mapping."""
     config, config_path, prefix = _resolve(config_path, prefix)
     mapping = resolve_mapping_for_path(config.mappings, file)
@@ -1337,17 +1337,17 @@ def _revision_context(file: str, config_path: Optional[str], prefix: Optional[st
     return mapping, backend._client
 
 
-def _revision_text_or_exit(client, mapping: Mapping, rev: str, tab: Optional[str] = None):
+def _revision_text_or_exit(client: Any, mapping: Mapping, rev: str, tab: Optional[str] = None) -> str:
     from docspan.core.revisions import fetch_revision_text
 
     try:
-        result = fetch_revision_text(client, mapping.remote_id, rev, tab)
+        result = fetch_revision_text(client, mapping.remote_id or "", rev, tab)
     except Exception as exc:
         err_console.print(f"Could not export revision {rev}: {exc}")
         raise typer.Exit(1)
     if result.warning:
         err_console.print(f"warning: {result.warning}")
-    return result.text
+    return str(result.text)
 
 
 def _require_local_file(mapping: Mapping) -> None:
@@ -1421,7 +1421,7 @@ def revision_diff_cmd(
             with open(mapping.local, encoding="utf-8") as fh:
                 return fh.read()
         if ref == "remote":
-            return client.fetch_markdown_export(mapping.remote_id)
+            return str(client.fetch_markdown_export(mapping.remote_id))
         return _revision_text_or_exit(client, mapping, ref)
 
     diff = unified_diff(load(a), load(b), a, b)
