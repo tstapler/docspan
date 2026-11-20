@@ -19,4 +19,8 @@ def translate_exception(exc: BaseException) -> Optional[DocspanToolError]:
         return DocspanToolError("auth_expired", AUTH_EXPIRED_MESSAGE, {"cause": type(exc).__name__})
     if isinstance(exc, TabNotFoundError):
         return DocspanToolError("tab_not_found", str(exc))
+    if isinstance(exc, PermissionError):
+        return DocspanToolError("permission_denied", str(exc))
+    if isinstance(exc, (ValueError, RuntimeError)):
+        return DocspanToolError("revision_export_failed", str(exc))
     return None

@@ -1350,6 +1350,14 @@ def _revision_text_or_exit(client, mapping: Mapping, rev: str, tab: Optional[str
     return result.text
 
 
+def _require_local_file(mapping: Mapping) -> None:
+    if os.path.isdir(mapping.local):
+        err_console.print(
+            f"{mapping.local} is a directory (sectioned mapping); revision diff/restore "
+            "operate on a single markdown file.")
+        raise typer.Exit(1)
+
+
 @app.command("revisions")
 def revisions_cmd(
     file: str = typer.Argument(..., help="Local markdown file mapped to a Google Doc"),
@@ -1409,6 +1417,7 @@ def revision_diff_cmd(
 
     def load(ref: str) -> str:
         if ref == "local":
+            _require_local_file(mapping)
             with open(mapping.local, encoding="utf-8") as fh:
                 return fh.read()
         if ref == "remote":
@@ -1424,7 +1433,9 @@ def restore_cmd(
     file: str = typer.Argument(...),
     rev: str = typer.Option(..., "--rev", help="Drive revision id to restore from"),
     section: Optional[str] = typer.Option(
-        None, "--section", help="Heading to restore; omit to replace the whole local file"
+        None, "--section",
+        help="Heading to restore; omit to replace the whole local file "
+        "(the previous contents are saved to <file>.bak)",
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p"),
@@ -1433,9 +1444,12 @@ def restore_cmd(
     from docspan.core.revisions import SectionNotFound, restore_section
 
     mapping, client = _revision_context(file, config_path, prefix)
+    _require_local_file(mapping)
     old = _revision_text_or_exit(client, mapping, rev)
     if section is None:
         new = old
+        if os.path.exists(mapping.local):
+            shutil.copyfile(mapping.local, mapping.local + ".bak")
     else:
         with open(mapping.local, encoding="utf-8") as fh:
             local = fh.read()

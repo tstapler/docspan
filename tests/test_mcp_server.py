@@ -90,3 +90,9 @@ def test_translate_exception_maps_credential_failures():
     assert translate_exception(RefreshError("x")).code == "auth_expired"
     assert translate_exception(TransportError("x")).code == "auth_expired"
     assert translate_exception(KeyError("bug")) is None
+
+
+def test_translate_exception_maps_revision_export_failures():
+    assert translate_exception(PermissionError("403")).code == "permission_denied"
+    assert translate_exception(ValueError("no exportLinks")).code == "revision_export_failed"
+    assert translate_exception(RuntimeError("HTTP 500")).code == "revision_export_failed"

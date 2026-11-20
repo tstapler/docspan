@@ -149,3 +149,63 @@ def test_restore_section_includes_subsections_and_ignores_fenced_headings():
     assert out == "## A\n\nmine\n\n## Details\n\nold\n\n### Sub\n\nsub\n\n## Z\n\nlocal z\n"
     with pytest.raises(SectionNotFound):
         restore_section(local, old, "Nope", "9")
+
+
+def test_find_section_fence_tracks_marker_char_and_length():
+    from docspan.core.revisions import find_section
+    md = "# A\n```\n# no\n~~~\n# B\n```\n# C\n"
+    assert find_section(md, "C") is not None
+    assert find_section(md, "B") is None
+    assert find_section("# A\n````\n```\n# in\n````\n# D\n", "in") is None
+    assert find_section("# A\n````\n```\n# in\n````\n# D\n", "D") is not None
+
+
+def test_find_section_keeps_trailing_hash_without_space():
+    from docspan.core.revisions import find_section
+    assert find_section("# C#\nx\n", "C#") is not None
+    assert find_section("# C#\nx\n", "C") is None
+    assert find_section("# C ##\nx\n", "C") is not None
+
+
+def test_restore_whole_file_writes_backup(env):
+    local = env[0]
+    before = local.read_text(encoding="utf-8")
+    invoke(env, make_client(), "restore", local.as_posix(), "--rev", "1")
+    assert (local.parent / "doc.md.bak").read_text(encoding="utf-8") == before
+
+
+def test_restore_and_local_diff_reject_sectioned_directory(tmp_path):
+    d = tmp_path / "sections"
+    d.mkdir()
+    cfg = tmp_path / "docspan.yaml"
+    cfg.write_text("mappings: []\n", encoding="utf-8")
+    config = MarkgateConfig(mappings=[Mapping(local=str(d), backend="google_docs", remote_id="DOC1")])
+    e = (d, str(cfg), config)
+    for args in (("restore", d.as_posix(), "--rev", "1", "--section", "X"),
+                 ("restore", d.as_posix(), "--rev", "1"),
+                 ("revision-diff", d.as_posix(), "--rev", "1")):
+        result = invoke(e, make_client(), *args)
+        assert result.exit_code == 1
+        assert "is a directory" in result.output
+
+
+def test_drive_export_error_paths():
+    client = make_client()
+    client.drive_service._http.request.side_effect = None
+    client.drive_service._http.request.return_value = (SimpleNamespace(status=403), b"")
+    with pytest.raises(PermissionError):
+        client.get_revision_export("DOC1", "1")
+    client.drive_service._http.request.return_value = (SimpleNamespace(status=500), b"")
+    with pytest.raises(RuntimeError, match="500"):
+        client.get_revision_export("DOC1", "1")
+    client.drive_service.revisions.return_value.get.side_effect = None
+    client.drive_service.revisions.return_value.get.return_value.execute.return_value = {"id": "1"}
+    with pytest.raises(ValueError, match="exportLink"):
+        client.get_revision_export("DOC1", "1")
+
+
+def test_list_revisions_does_not_request_email():
+    client = make_client()
+    client.list_revisions("DOC1")
+    fields = client.drive_service.revisions.return_value.list.call_args.kwargs["fields"]
+    assert "emailAddress" not in fields

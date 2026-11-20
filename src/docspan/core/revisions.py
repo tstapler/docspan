@@ -6,8 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
-_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
-_FENCE = re.compile(r"^\s*(```|~~~)")
+# A closing run of #s is only an ATX closer when preceded by whitespace (CommonMark).
+_HEADING = re.compile(r"^(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
+_FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 
 @dataclass
@@ -40,12 +41,18 @@ def unified_diff(a: str, b: str, a_label: str, b_label: str) -> str:
 def _headings(md: str) -> List[Tuple[int, int, str]]:
     """(line_index, level, text) for each ATX heading outside code fences."""
     out: List[Tuple[int, int, str]] = []
-    in_fence = False
+    fence: Optional[str] = None  # the opening marker run while inside a fence
     for i, line in enumerate(md.splitlines()):
-        if _FENCE.match(line):
-            in_fence = not in_fence
+        fm = _FENCE.match(line)
+        if fm:
+            marker = fm.group(1)
+            if fence is None:
+                fence = marker
+            elif (marker[0] == fence[0] and len(marker) >= len(fence)
+                  and not fm.group(2).strip()):
+                fence = None
             continue
-        m = None if in_fence else _HEADING.match(line)
+        m = None if fence is not None else _HEADING.match(line)
         if m:
             out.append((i, len(m.group(1)), m.group(2).strip()))
     return out

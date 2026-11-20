@@ -385,18 +385,20 @@ def _synced_entry(state: SyncState, mapping: "Mapping") -> Optional[MappingState
 def _remote_only_diff(
     mapping: "Mapping", backend: Backend, entry: MappingState, state_dir: str
 ) -> str:
-    """Unified diff of the last-synced base vs. the live remote; "" if it can't be computed."""
+    """Unified diff of the last-synced base vs. the live remote, or an explanatory note."""
     if mapping.sectioned:
-        return ""
+        return "(diff unavailable for sectioned mappings)"
     fd, tmp_path = tempfile.mkstemp(suffix=".md")
     os.close(fd)
     try:
-        backend.pull(mapping.remote_id, tmp_path, tab_id=mapping.tab_id)
+        pulled = backend.pull(mapping.remote_id, tmp_path, tab_id=mapping.tab_id)
+        if getattr(pulled, "status", "ok") not in ("ok", "warning"):
+            return f"(could not fetch remote content for diff: {getattr(pulled, 'message', None) or pulled.status})"
         with open(tmp_path, encoding="utf-8") as fh:
             remote = fh.read()
-    except Exception:
+    except Exception as exc:
         logger.warning("Could not fetch remote content for push-guard diff", exc_info=True)
-        return ""
+        return f"(could not fetch remote content for diff: {exc})"
     finally:
         os.unlink(tmp_path)
     base = get_base_content(state_dir, entry.base_hash)
@@ -477,6 +479,13 @@ def orchestrate_push(
         blocked, pre_push_version = _check_remote_unchanged(mapping, backend, state, state_dir)
         if blocked is not None:
             return PushOutcome(local_path=mapping.local, result=blocked)
+    else:
+        # Best effort: siblings can only be advanced if we know the version they sat at.
+        try:
+            pre_push_version = backend.get_remote_version(mapping.remote_id)
+        except Exception:
+            logger.warning("Could not read pre-push remote version for %s", mapping.remote_id,
+                           exc_info=True)
 
     if mapping.sectioned:
         result = backend.push_sectioned(
@@ -494,13 +503,15 @@ def orchestrate_push(
         try:
             remote_version = backend.get_remote_version(mapping.remote_id)
         except Exception:
+            prior = _synced_entry(state, mapping)
+            # Keep the prior version (not "") so the next push guard still fires.
+            remote_version = prior.remote_version if prior and prior.remote_version else ""
             logger.warning(
-                "Could not retrieve remote version after push for %s; "
-                "recording empty version — next pull will re-sync",
-                mapping.remote_id,
+                "Could not retrieve remote version after push for %s; keeping %s — "
+                "the next push will be blocked until you pull or use --force",
+                mapping.remote_id, repr(remote_version) if remote_version else "no recorded version",
                 exc_info=True,
             )
-            remote_version = ""
 
         _advance_sibling_versions(state, mapping, pre_push_version, remote_version)
 

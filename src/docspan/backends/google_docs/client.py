@@ -472,7 +472,7 @@ class GoogleDocsClient:
         Drive revision ids are a different namespace from the Docs API `revisionId`
         that `get_remote_version()` returns.
         """
-        fields = "nextPageToken,revisions(id,modifiedTime,lastModifyingUser(displayName,emailAddress))"
+        fields = "nextPageToken,revisions(id,modifiedTime,lastModifyingUser(displayName))"
         revisions: List[dict] = []
         page_token: Optional[str] = None
         while True:

@@ -98,3 +98,48 @@ def test_cli_push_exits_nonzero_and_prints_diff(tmp_path):
     assert result.exit_code == 1
     assert "Remote-only changes" in result.output and "+manual edit" in result.output
     assert forced.exit_code == 0
+
+
+def test_force_push_advances_sibling_tab_versions(tmp_path):
+    mapping, state, state_dir, state_path = _synced(tmp_path)
+    sibling = tmp_path / "other.md"
+    sibling.write_text("s\n", encoding="utf-8")
+    record_state(state, state_path, state_dir, str(sibling), "doc-123", "fake", "s\n", "rev-A")
+    backend = FakeBackend(remote_version="rev-A")
+
+    def push(local_path, doc_id, **kw):
+        backend.remote_version = "rev-C"
+        return FakeBackend.push(backend, local_path, doc_id, **kw)
+
+    backend.push = push  # type: ignore[method-assign]
+    orchestrate_push(mapping, backend, state, state_dir, state_path, force=True)
+    assert state.get(str(sibling)).remote_version == "rev-C"
+
+
+def test_post_push_version_failure_keeps_prior_version_so_guard_stays_armed(tmp_path):
+    mapping, state, state_dir, state_path = _synced(tmp_path)
+    backend = FakeBackend(remote_version="rev-A")
+    calls = {"n": 0}
+
+    def get_version(doc_id):
+        calls["n"] += 1
+        if calls["n"] > 1:  # guard read succeeds, post-push read fails
+            raise RuntimeError("boom")
+        return "rev-A"
+
+    backend.get_remote_version = get_version  # type: ignore[method-assign]
+    assert orchestrate_push(mapping, backend, state, state_dir, state_path).result.status == "ok"
+    assert state.get(mapping.local).remote_version == "rev-A"
+
+
+def test_blocked_message_explains_failed_diff(tmp_path):
+    mapping, state, state_dir, state_path = _synced(tmp_path)
+    backend = FakeBackend(remote_version="rev-B")
+
+    def bad_pull(*a, **kw):
+        raise RuntimeError("network down")
+
+    backend.pull = bad_pull  # type: ignore[method-assign]
+    outcome = orchestrate_push(mapping, backend, state, state_dir, state_path)
+    assert outcome.result.status == "blocked"
+    assert "could not fetch remote content for diff: network down" in outcome.result.message
