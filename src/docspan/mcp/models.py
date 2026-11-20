@@ -131,3 +131,36 @@ class MappingEntry(BaseModel):
 class MappingsResult(BaseModel):
     mappings: List[MappingEntry]
     url: str = ""
+
+
+class RevisionInfo(BaseModel):
+    id: str
+    modified_time: str
+    author: str
+
+
+class RevisionListResult(BaseModel):
+    doc_id: str
+    revisions: List[RevisionInfo]
+    url: str
+
+
+class RevisionShowResult(BaseModel):
+    doc_id: str
+    revision_id: str
+    mime_type: str
+    text: str
+    char_count: int
+    truncated: bool
+    warning: Optional[str] = None
+    url: str
+
+
+class RevisionDiffResult(BaseModel):
+    doc_id: str
+    rev_a: str
+    rev_b: str
+    unchanged: bool
+    diff: str
+    truncated: bool
+    url: str

@@ -16,7 +16,8 @@ from google.auth.exceptions import RefreshError, TransportError  # noqa: E402
 from docspan.mcp.auth import translate_exception  # noqa: E402
 
 TOOLS = {"list_mappings", "fetch_doc", "outline", "read_section", "search_docs",
-         "list_comments", "resolve_links", "diff_since"}
+         "list_comments", "resolve_links", "diff_since",
+         "revision_list", "revision_show", "revision_diff"}
 
 
 def _rpc(tmp_path, calls):
@@ -66,6 +67,23 @@ def test_stdio_server_registers_tools_and_survives_auth_expiry(tmp_path):
     section = json.loads(r[12]["result"]["content"][0]["text"])
     assert "gadgets" in section["text"] and "widgets" not in section["text"]
     assert r[13]["result"].get("isError") in (None, False)
+
+
+def test_revision_tools_return_structured_results_without_oauth(tmp_path):
+    r = _rpc(tmp_path, [
+        ("revision_list", {"remote_id_or_url": "DOC1"}),
+        ("revision_show", {"remote_id_or_url": "DOC1", "revision_id": "7"}),
+        ("revision_diff", {"remote_id_or_url": "DOC1", "rev_a": "7"}),
+    ])
+    names = {t["name"] for t in r[2]["result"]["tools"]}
+    assert {"revision_list", "revision_show", "revision_diff"} <= names
+    listed = json.loads(r[10]["result"]["content"][0]["text"])
+    assert listed["revisions"] == [
+        {"id": "7", "modified_time": "2026-11-01T00:00:00Z", "author": "Ann"}]
+    shown = json.loads(r[11]["result"]["content"][0]["text"])
+    assert shown["text"] == "# Plan\n\nold text\n" and shown["warning"] is None
+    diffed = json.loads(r[12]["result"]["content"][0]["text"])
+    assert not diffed["unchanged"] and "-old text" in diffed["diff"] and "+new text" in diffed["diff"]
 
 
 def test_translate_exception_maps_credential_failures():
