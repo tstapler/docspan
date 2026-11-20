@@ -1428,6 +1428,15 @@ def revision_diff_cmd(
     typer.echo(diff if diff else f"No differences between {a} and {b}", nl=not diff)
 
 
+def _unused_backup_path(path: str) -> str:
+    """<path>.bak, or <path>.bak.1, .bak.2, ... so an earlier backup is never overwritten."""
+    candidate, n = path + ".bak", 0
+    while os.path.exists(candidate):
+        n += 1
+        candidate = f"{path}.bak.{n}"
+    return candidate
+
+
 @app.command("restore")
 def restore_cmd(
     file: str = typer.Argument(...),
@@ -1435,7 +1444,7 @@ def restore_cmd(
     section: Optional[str] = typer.Option(
         None, "--section",
         help="Heading to restore; omit to replace the whole local file "
-        "(the previous contents are saved to <file>.bak)",
+        "(the previous contents are saved to <file>.bak, or <file>.bak.N if that exists)",
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p"),
@@ -1449,7 +1458,7 @@ def restore_cmd(
     if section is None:
         new = old
         if os.path.exists(mapping.local):
-            shutil.copyfile(mapping.local, mapping.local + ".bak")
+            shutil.copyfile(mapping.local, _unused_backup_path(mapping.local))
     else:
         with open(mapping.local, encoding="utf-8") as fh:
             local = fh.read()

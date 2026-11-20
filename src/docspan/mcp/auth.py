@@ -6,6 +6,7 @@ from typing import Optional
 from google.auth.exceptions import RefreshError, TransportError
 
 from docspan.backends.google_docs.tabs import TabNotFoundError
+from docspan.core.revisions import RevisionExportError
 from docspan.mcp.errors import DocspanToolError
 
 AUTH_EXPIRED_MESSAGE = "Auth expired — run 'docspan auth setup google_docs'"
@@ -19,8 +20,8 @@ def translate_exception(exc: BaseException) -> Optional[DocspanToolError]:
         return DocspanToolError("auth_expired", AUTH_EXPIRED_MESSAGE, {"cause": type(exc).__name__})
     if isinstance(exc, TabNotFoundError):
         return DocspanToolError("tab_not_found", str(exc))
-    if isinstance(exc, PermissionError):
-        return DocspanToolError("permission_denied", str(exc))
-    if isinstance(exc, (ValueError, RuntimeError)):
+    if isinstance(exc, RevisionExportError):
+        if isinstance(exc, PermissionError):
+            return DocspanToolError("permission_denied", str(exc))
         return DocspanToolError("revision_export_failed", str(exc))
     return None

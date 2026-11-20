@@ -93,6 +93,13 @@ def test_translate_exception_maps_credential_failures():
 
 
 def test_translate_exception_maps_revision_export_failures():
-    assert translate_exception(PermissionError("403")).code == "permission_denied"
-    assert translate_exception(ValueError("no exportLinks")).code == "revision_export_failed"
-    assert translate_exception(RuntimeError("HTTP 500")).code == "revision_export_failed"
+    from docspan.core.revisions import (
+        RevisionExportHttpError, RevisionExportLinkError, RevisionPermissionError)
+    assert translate_exception(RevisionPermissionError("403")).code == "permission_denied"
+    assert translate_exception(RevisionExportLinkError("no exportLinks")).code == "revision_export_failed"
+    assert translate_exception(RevisionExportHttpError("HTTP 500")).code == "revision_export_failed"
+
+
+def test_translate_exception_leaves_unrelated_errors_alone():
+    for exc in (PermissionError("x"), ValueError("x"), RuntimeError("x")):
+        assert translate_exception(exc) is None

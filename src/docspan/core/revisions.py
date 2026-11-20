@@ -8,7 +8,24 @@ from typing import Any, List, Optional, Tuple
 
 # A closing run of #s is only an ATX closer when preceded by whitespace (CommonMark).
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)(?:\s+#+)?\s*$")
-_FENCE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+# Up to 3 spaces of indent (4+ is an indented code block); a backtick fence's info string has no backticks.
+_FENCE = re.compile(r"^ {0,3}(?:(`{3,})([^`]*)|(~{3,})(.*))$")
+
+
+class RevisionExportError(Exception):
+    """A Drive revision could not be exported (no export link, HTTP failure)."""
+
+
+class RevisionPermissionError(RevisionExportError, PermissionError):
+    """Drive denied access to a revision's export."""
+
+
+class RevisionExportLinkError(RevisionExportError, ValueError):
+    """The revision offers no text/markdown or text/plain export link."""
+
+
+class RevisionExportHttpError(RevisionExportError, RuntimeError):
+    """The revision export request failed with an HTTP error."""
 
 
 @dataclass
@@ -45,11 +62,12 @@ def _headings(md: str) -> List[Tuple[int, int, str]]:
     for i, line in enumerate(md.splitlines()):
         fm = _FENCE.match(line)
         if fm:
-            marker = fm.group(1)
+            marker = fm.group(1) or fm.group(3)
+            info = fm.group(2) if fm.group(1) else fm.group(4)
             if fence is None:
                 fence = marker
             elif (marker[0] == fence[0] and len(marker) >= len(fence)
-                  and not fm.group(2).strip()):
+                  and not info.strip()):
                 fence = None
             continue
         m = None if fence is not None else _HEADING.match(line)

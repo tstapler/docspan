@@ -499,19 +499,21 @@ class GoogleDocsClient:
                 fileId=doc_id, revisionId=revision_id, fields="id,exportLinks",
             ).execute()
         )
+        from docspan.core.revisions import (
+            RevisionExportHttpError, RevisionExportLinkError, RevisionPermissionError)
         links = rev.get("exportLinks") or {}
         mime = next((m for m in ("text/markdown", "text/plain") if m in links), None)
         if mime is None:
-            raise ValueError(
+            raise RevisionExportLinkError(
                 f"revision {revision_id} has no text/markdown or text/plain exportLink")
         resp, content = self.drive_service._http.request(links[mime])
         status = getattr(resp, "status", 200)
         if status == 403:
-            raise PermissionError(
+            raise RevisionPermissionError(
                 f"Drive denied export of revision {revision_id} (403); re-authenticate with "
                 "an account that can read this document's version history")
         if status >= 400:
-            raise RuntimeError(f"Revision export failed with HTTP {status}")
+            raise RevisionExportHttpError(f"Revision export failed with HTTP {status}")
         return content.decode("utf-8"), mime
 
     def update_doc_content(self, doc_id: str, content: str) -> bool:

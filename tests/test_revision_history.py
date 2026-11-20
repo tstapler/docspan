@@ -174,6 +174,21 @@ def test_restore_whole_file_writes_backup(env):
     assert (local.parent / "doc.md.bak").read_text(encoding="utf-8") == before
 
 
+def test_restore_whole_file_never_overwrites_existing_backup(env):
+    local = env[0]
+    original = local.read_text(encoding="utf-8")
+    invoke(env, make_client(), "restore", local.as_posix(), "--rev", "1")
+    invoke(env, make_client(), "restore", local.as_posix(), "--rev", "1")
+    assert (local.parent / "doc.md.bak").read_text(encoding="utf-8") == original
+    assert (local.parent / "doc.md.bak.1").exists()
+
+
+def test_headings_ignores_inline_backtick_and_indented_fences():
+    from docspan.core.revisions import _headings
+    assert [h[2] for h in _headings("```x``` inline\n# Real\n")] == ["Real"]
+    assert [h[2] for h in _headings("    ```\n# Real\n")] == ["Real"]
+
+
 def test_restore_and_local_diff_reject_sectioned_directory(tmp_path):
     d = tmp_path / "sections"
     d.mkdir()
