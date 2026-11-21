@@ -1,4 +1,4 @@
-"""stdio MCP server exposing the eight read tools. Requires the ``mcp`` extra (SDK >= 2.0)."""
+"""stdio MCP server exposing the read tools. Requires the ``mcp`` extra (SDK >= 2.0)."""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,9 @@ from docspan.mcp.models import (
     LinksResult,
     MappingsResult,
     OutlineResult,
+    RevisionDiffResult,
+    RevisionListResult,
+    RevisionShowResult,
     SearchResult,
     SectionResult,
 )
@@ -90,5 +93,22 @@ def build_server(service: DocService) -> Any:
     def diff_since(remote_id_or_url: str) -> DiffResult:
         """What changed in the live doc since it was last pulled with fetch_doc."""
         return guarded(lambda: service.diff_since(extract_doc_id(remote_id_or_url)))
+
+    @server.tool()
+    def revision_list(remote_id_or_url: str) -> RevisionListResult:
+        """Drive revision history of a doc: id, modified time, author (ids feed revision_show/revision_diff)."""
+        return guarded(lambda: service.revision_list(extract_doc_id(remote_id_or_url)))
+
+    @server.tool()
+    def revision_show(remote_id_or_url: str, revision_id: str, tab: Optional[str] = None,
+                      max_chars: int = DEFAULT_MAX_CHARS) -> RevisionShowResult:
+        """A past revision's content as markdown (plain text with a warning if markdown is unavailable)."""
+        return guarded(lambda: service.revision_show(
+            extract_doc_id(remote_id_or_url), revision_id, tab, max_chars))
+
+    @server.tool()
+    def revision_diff(remote_id_or_url: str, rev_a: str, rev_b: str = "remote") -> RevisionDiffResult:
+        """Unified diff between two revision ids; rev_b defaults to 'remote' (the live doc)."""
+        return guarded(lambda: service.revision_diff(extract_doc_id(remote_id_or_url), rev_a, rev_b))
 
     return server

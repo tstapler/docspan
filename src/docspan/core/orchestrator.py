@@ -6,6 +6,7 @@ outcome that the CLI can render without knowing any sync logic.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import shutil
@@ -371,6 +372,85 @@ def _record_state(
 # Push orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _synced_entry(state: SyncState, mapping: "Mapping") -> Optional[MappingState]:
+    if mapping.sectioned:
+        for filename in _section_files(mapping.local):
+            entry = state.get(os.path.join(mapping.local, filename))
+            if entry is not None:
+                return entry
+        return None
+    return state.get(mapping.local)
+
+
+def _remote_only_diff(
+    mapping: "Mapping", backend: Backend, entry: MappingState, state_dir: str
+) -> str:
+    """Unified diff of the last-synced base vs. the live remote, or an explanatory note."""
+    if mapping.sectioned:
+        return "(diff unavailable for sectioned mappings)"
+    fd, tmp_path = tempfile.mkstemp(suffix=".md")
+    os.close(fd)
+    try:
+        pulled = backend.pull(mapping.remote_id or "", tmp_path, tab_id=mapping.tab_id)
+        if getattr(pulled, "status", "ok") not in ("ok", "warning"):
+            return f"(could not fetch remote content for diff: {getattr(pulled, 'message', None) or pulled.status})"
+        with open(tmp_path, encoding="utf-8") as fh:
+            remote = fh.read()
+    except Exception as exc:
+        logger.warning("Could not fetch remote content for push-guard diff", exc_info=True)
+        return f"(could not fetch remote content for diff: {exc})"
+    finally:
+        os.unlink(tmp_path)
+    base = get_base_content(state_dir, entry.base_hash)
+    return "".join(difflib.unified_diff(
+        base.splitlines(keepends=True), remote.splitlines(keepends=True),
+        "last-synced", "remote",
+    ))
+
+
+def _check_remote_unchanged(
+    mapping: "Mapping", backend: Backend, state: SyncState, state_dir: str
+) -> tuple[Optional[PushResult], Optional[str]]:
+    """Push guard: refuse when the live remote moved since the last sync.
+
+    Returns (blocked_result_or_None, live_remote_version_or_None). Skipped (no
+    block) when there is no recorded version (first push / legacy state) or the
+    live version cannot be read.
+    """
+    entry = _synced_entry(state, mapping)
+    if entry is None or not entry.remote_version:
+        return None, None
+    try:
+        live = backend.get_remote_version(mapping.remote_id or "")
+    except Exception:
+        logger.warning("Push guard could not read remote version for %s", mapping.remote_id,
+                       exc_info=True)
+        return None, None
+    if live == entry.remote_version:
+        return None, live
+    message = (
+        "Remote changed since the last sync (edited outside docspan); push refused. "
+        "Pull to merge, or re-run with --force to overwrite."
+    )
+    diff = _remote_only_diff(mapping, backend, entry, state_dir)
+    if diff:
+        message += "\nRemote-only changes:\n" + diff
+    return PushResult(status="blocked", doc_id=mapping.remote_id or "", message=message), live
+
+
+def _advance_sibling_versions(
+    state: SyncState, mapping: "Mapping", old_version: Optional[str], new_version: str
+) -> None:
+    """Other tabs of the same doc whose state sat at the pre-push version only missed this
+    push's own write, so move them forward; genuinely stale ones keep tripping the guard."""
+    if not old_version or not new_version:
+        return
+    for key, other in state.mappings.items():
+        if (other.doc_id == mapping.remote_id and other.remote_version == old_version
+                and key != mapping.local and not key.startswith(mapping.local + os.sep)):
+            other.remote_version = new_version
+
+
 def orchestrate_push(
     mapping: "Mapping",
     backend: Backend,
@@ -394,6 +474,19 @@ def orchestrate_push(
     """
     assert mapping.remote_id is not None, "orchestrate_push requires a mapping with a created remote doc/page"
 
+    pre_push_version: Optional[str] = None
+    if not force:
+        blocked, pre_push_version = _check_remote_unchanged(mapping, backend, state, state_dir)
+        if blocked is not None:
+            return PushOutcome(local_path=mapping.local, result=blocked)
+    else:
+        # Best effort: siblings can only be advanced if we know the version they sat at.
+        try:
+            pre_push_version = backend.get_remote_version(mapping.remote_id)
+        except Exception:
+            logger.warning("Could not read pre-push remote version for %s", mapping.remote_id,
+                           exc_info=True)
+
     if mapping.sectioned:
         result = backend.push_sectioned(
             mapping.local, mapping.remote_id, force=force, tab_id=mapping.tab_id,
@@ -410,13 +503,17 @@ def orchestrate_push(
         try:
             remote_version = backend.get_remote_version(mapping.remote_id)
         except Exception:
+            prior = _synced_entry(state, mapping)
+            # Keep the prior version (not "") so the next push guard still fires.
+            remote_version = prior.remote_version if prior and prior.remote_version else ""
             logger.warning(
-                "Could not retrieve remote version after push for %s; "
-                "recording empty version — next pull will re-sync",
-                mapping.remote_id,
+                "Could not retrieve remote version after push for %s; keeping %s — "
+                "the next push will be blocked until you pull or use --force",
+                mapping.remote_id, repr(remote_version) if remote_version else "no recorded version",
                 exc_info=True,
             )
-            remote_version = ""
+
+        _advance_sibling_versions(state, mapping, pre_push_version, remote_version)
 
         if mapping.sectioned:
             # One state entry per section file, keyed by that file's own

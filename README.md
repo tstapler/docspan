@@ -72,10 +72,14 @@ docspan conflicts resolve docs/design-doc.md --accept remote   # or local, merge
 
 | Command | What it does |
 |---|---|
-| `docspan push [FILES]...` | Push local markdown to remote docs (`--dry-run`, `--force`; `--fail-on-comment-loss` exits non-zero when a blockquote restyle rewrites a commented paragraph) |
+| `docspan push [FILES]...` | Push local markdown to remote docs (`--dry-run`; `--force` also overrides the refusal when the remote was edited since the last sync; `--fail-on-comment-loss` exits non-zero when a blockquote restyle rewrites a commented paragraph) |
 | `docspan pull [FILES]...` | Pull remote docs into local markdown, with three-way merge |
 | `docspan sync [FILES]...` | Pull, then push, each mapping |
 | `docspan status` | Show configured mappings |
+| `docspan revisions FILE` | List the Google Doc's Drive revisions (id, time, author) |
+| `docspan revision-show FILE --rev N [--tab T]` | Print a past revision as markdown (plain text with a warning if markdown export is unavailable; `--tab` is best-effort) |
+| `docspan revision-diff FILE --rev A [--rev B\|local\|remote]` | Diff two revisions, or a revision against the local file or live doc |
+| `docspan restore FILE --rev N [--section H]` | Merge a section (or the whole file) from an old revision into the local markdown |
 | `docspan map FILE --backend BACKEND` | Create a remote doc or page and map it to a file |
 | `docspan migrate-sectioned FILE` | Split a single-file mapping into a sectioned one |
 | `docspan style-guide` | Print authoring guidance for a backend |

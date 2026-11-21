@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +312,7 @@ def push(
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without writing"),
     force: bool = typer.Option(
-        False, "--force", help="Proceed with a push even if push() flags a comment-risk paragraph"
+        False, "--force", help="Push even if the remote changed since the last sync or push() flags a comment-risk paragraph"
     ),
     fail_on_comment_loss: bool = typer.Option(
         False,
@@ -908,7 +908,7 @@ def sync(
     config_path: Optional[str] = typer.Option(None, "--config", "-c"),
     prefix: Optional[str] = typer.Option(None, "--prefix", "-p", help="Central-config project prefix"),
     force: bool = typer.Option(
-        False, "--force", help="Proceed with a push even if push() flags a comment-risk paragraph"
+        False, "--force", help="Push even if the remote changed since the last sync or push() flags a comment-risk paragraph"
     ),
 ) -> None:
     """Pull then push each mapping — the safe default order.
@@ -1316,6 +1316,160 @@ def status(
         table.add_row(m.local, m.backend, m.remote_id, m.direction)
 
     console.print(table)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# revision history commands (Google Docs, via Drive revisions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _revision_context(file: str, config_path: Optional[str], prefix: Optional[str]) -> tuple[Mapping, Any]:
+    """Resolve `file` to (mapping, Drive-capable client); exit(1) if not a Google Doc mapping."""
+    config, config_path, prefix = _resolve(config_path, prefix)
+    mapping = resolve_mapping_for_path(config.mappings, file)
+    if mapping is None or not mapping.remote_id:
+        err_console.print(f"No mapped remote doc found for: {file}")
+        raise typer.Exit(1)
+    if mapping.backend != "google_docs":
+        err_console.print("Revision history is only supported for google_docs mappings.")
+        raise typer.Exit(1)
+    backend = _get_backend(mapping.backend, config, config_path)
+    backend._ensure_client()
+    return mapping, backend._client
+
+
+def _revision_text_or_exit(client: Any, mapping: Mapping, rev: str, tab: Optional[str] = None) -> str:
+    from docspan.core.revisions import fetch_revision_text
+
+    try:
+        result = fetch_revision_text(client, mapping.remote_id or "", rev, tab)
+    except Exception as exc:
+        err_console.print(f"Could not export revision {rev}: {exc}")
+        raise typer.Exit(1)
+    if result.warning:
+        err_console.print(f"warning: {result.warning}")
+    return str(result.text)
+
+
+def _require_local_file(mapping: Mapping) -> None:
+    if os.path.isdir(mapping.local):
+        err_console.print(
+            f"{mapping.local} is a directory (sectioned mapping); revision diff/restore "
+            "operate on a single markdown file.")
+        raise typer.Exit(1)
+
+
+@app.command("revisions")
+def revisions_cmd(
+    file: str = typer.Argument(..., help="Local markdown file mapped to a Google Doc"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p"),
+) -> None:
+    """List the Google Doc's Drive revisions (id, time, author)."""
+    mapping, client = _revision_context(file, config_path, prefix)
+    try:
+        revs = client.list_revisions(mapping.remote_id)
+    except Exception as exc:
+        err_console.print(f"Could not list revisions: {exc}")
+        raise typer.Exit(1)
+    if not revs:
+        console.print("No revisions found")
+        return
+    table = Table(title=f"{len(revs)} revisions")
+    table.add_column("Revision")
+    table.add_column("Time")
+    table.add_column("Author")
+    for r in revs:
+        user = r.get("lastModifyingUser") or {}
+        table.add_row(str(r.get("id", "")), r.get("modifiedTime", ""), user.get("displayName", ""))
+    console.print(table)
+
+
+@app.command("revision-show")
+def revision_show_cmd(
+    file: str = typer.Argument(...),
+    rev: str = typer.Option(..., "--rev", help="Drive revision id (see `docspan revisions`)"),
+    tab: Optional[str] = typer.Option(None, "--tab", help="Best-effort: Drive exports the whole doc"),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p"),
+) -> None:
+    """Print a past revision of the Google Doc as markdown."""
+    mapping, client = _revision_context(file, config_path, prefix)
+    typer.echo(_revision_text_or_exit(client, mapping, rev, tab), nl=False)
+
+
+@app.command("revision-diff")
+def revision_diff_cmd(
+    file: str = typer.Argument(...),
+    rev: list[str] = typer.Option(
+        ..., "--rev", help="Revision id, 'local', or 'remote'. Give twice (A then B); one value diffs against local"
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p"),
+) -> None:
+    """Unified diff between two revisions, or a revision and the local/live remote text."""
+    from docspan.core.revisions import unified_diff
+
+    if len(rev) > 2:
+        err_console.print("Give --rev at most twice.")
+        raise typer.Exit(1)
+    mapping, client = _revision_context(file, config_path, prefix)
+    a, b = (rev[0], "local") if len(rev) == 1 else (rev[0], rev[1])
+
+    def load(ref: str) -> str:
+        if ref == "local":
+            _require_local_file(mapping)
+            with open(mapping.local, encoding="utf-8") as fh:
+                return fh.read()
+        if ref == "remote":
+            return str(client.fetch_markdown_export(mapping.remote_id))
+        return _revision_text_or_exit(client, mapping, ref)
+
+    diff = unified_diff(load(a), load(b), a, b)
+    typer.echo(diff if diff else f"No differences between {a} and {b}", nl=not diff)
+
+
+def _unused_backup_path(path: str) -> str:
+    """<path>.bak, or <path>.bak.1, .bak.2, ... so an earlier backup is never overwritten."""
+    candidate, n = path + ".bak", 0
+    while os.path.exists(candidate):
+        n += 1
+        candidate = f"{path}.bak.{n}"
+    return candidate
+
+
+@app.command("restore")
+def restore_cmd(
+    file: str = typer.Argument(...),
+    rev: str = typer.Option(..., "--rev", help="Drive revision id to restore from"),
+    section: Optional[str] = typer.Option(
+        None, "--section",
+        help="Heading to restore; omit to replace the whole local file "
+        "(the previous contents are saved to <file>.bak, or <file>.bak.N if that exists)",
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c"),
+    prefix: Optional[str] = typer.Option(None, "--prefix", "-p"),
+) -> None:
+    """Merge a section (or everything) from an old revision into the local markdown."""
+    from docspan.core.revisions import SectionNotFound, restore_section
+
+    mapping, client = _revision_context(file, config_path, prefix)
+    _require_local_file(mapping)
+    old = _revision_text_or_exit(client, mapping, rev)
+    if section is None:
+        new = old
+        if os.path.exists(mapping.local):
+            shutil.copyfile(mapping.local, _unused_backup_path(mapping.local))
+    else:
+        with open(mapping.local, encoding="utf-8") as fh:
+            local = fh.read()
+        try:
+            new = restore_section(local, old, section, rev)
+        except SectionNotFound as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(1)
+    with open(mapping.local, "w", encoding="utf-8") as fh:
+        fh.write(new)
+    console.print(f"[green]✓[/green]  Restored {section or 'whole document'} from revision {rev} → {mapping.local}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

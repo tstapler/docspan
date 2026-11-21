@@ -27,6 +27,10 @@ from docspan.mcp.models import (
     MappingEntry,
     MappingsResult,
     OutlineResult,
+    RevisionDiffResult,
+    RevisionInfo,
+    RevisionListResult,
+    RevisionShowResult,
     SearchHit,
     SearchResult,
     SectionResult,
@@ -325,3 +329,41 @@ class DocService:
             unchanged=not (added or removed or changed),
             added=added, removed=removed, changed=changed, url=doc_url(doc_id))
 
+
+    # -- revision history ----------------------------------------------------
+    def revision_list(self, doc_id: str) -> RevisionListResult:
+        revs = self.client.list_revisions(doc_id)
+        return RevisionListResult(
+            doc_id=doc_id,
+            revisions=[
+                RevisionInfo(
+                    id=str(r.get("id", "")), modified_time=r.get("modifiedTime", ""),
+                    author=(r.get("lastModifyingUser") or {}).get("displayName", ""))
+                for r in revs
+            ],
+            url=doc_url(doc_id))
+
+    def revision_show(self, doc_id: str, revision_id: str, tab: Optional[str] = None,
+                      max_chars: int = DEFAULT_MAX_CHARS) -> RevisionShowResult:
+        from docspan.core.revisions import fetch_revision_text
+
+        rev = fetch_revision_text(self.client, doc_id, revision_id, tab)
+        return RevisionShowResult(
+            doc_id=doc_id, revision_id=revision_id, mime_type=rev.mime_type,
+            text=rev.text[:max_chars], char_count=len(rev.text),
+            truncated=len(rev.text) > max_chars, warning=rev.warning, url=doc_url(doc_id))
+
+    def revision_diff(self, doc_id: str, rev_a: str, rev_b: str = "remote",
+                      max_chars: int = DEFAULT_MAX_CHARS * 4) -> RevisionDiffResult:
+        """Unified diff between two Drive revision ids; ``remote`` means the live doc."""
+        from docspan.core.revisions import fetch_revision_text, unified_diff
+
+        def load(ref: str) -> str:
+            if ref == "remote":
+                return str(self.client.fetch_markdown_export(doc_id))
+            return fetch_revision_text(self.client, doc_id, ref).text
+
+        diff = unified_diff(load(rev_a), load(rev_b), rev_a, rev_b)
+        return RevisionDiffResult(
+            doc_id=doc_id, rev_a=rev_a, rev_b=rev_b, unchanged=not diff,
+            diff=diff[:max_chars], truncated=len(diff) > max_chars, url=doc_url(doc_id))
